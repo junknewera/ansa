@@ -1,6 +1,6 @@
 # oh-my-harness
 
-Независимый C++20 protocol foundation для персонального AI coding agent. Namespace `omh`, executable `omh`. Первый milestone работает offline: строгий Responses admission, чистый tool и stateless native replay.
+Независимый C++20 runtime для персонального AI coding agent. Namespace `omh`, executable `omh`. Offline turn проходит через строгий Responses admission, pure tool и native replay.
 
 Новая инженерная сессия начинается с [AGENTS.md](AGENTS.md) и [текущего состояния проекта](docs/PROJECT_STATE.md).
 
@@ -31,10 +31,31 @@ ASan/UBSan, из того же `nix develop`:
 cmake -S . -B build-sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DOMH_SANITIZERS=ON -DOMH_MUTATION_CHILD=ON
 cmake --build build-sanitize -j 2
-ctest --test-dir build-sanitize --output-on-failure --no-tests=error
+ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+  ctest --test-dir build-sanitize --output-on-failure --no-tests=error
 ```
 
-Обычный CTest включает семь suites, две проверки executable и два mutation-теста. Mutation-тесты меняют копии production replay builder внутри build-каталога и требуют конкретного отказа replay oracle. Ошибка компиляции mutant не считается успешным тестом. Sanitizer-конфигурация проверяет те же семь suites и executable; повторные сборки mutants там отключены.
+Обычный CTest включает семь protocol suites, восемь runtime suites, три проверки executable и два mutation-теста. Mutation-тесты меняют копии production replay builder внутри build-каталога и требуют конкретного отказа replay oracle. Ошибка компиляции mutant не считается успешным тестом. Sanitizer-конфигурация пропускает повторные сборки mutants.
+
+Дополнительная Linux-проверка запускает JSONL с терминалом на stdin и заполняет stdout pipe. Она использует стандартную библиотеку Python.
+
+```sh
+nix develop --no-update-lock-file -c ctest --test-dir build \
+  --output-on-failure --no-tests=error -R '^runtime-' --repeat until-fail:100
+nix develop --no-update-lock-file -c timeout 10 python tests/cli_backpressure.py ./build/omh
+```
+
+## Offline JSONL
+
+`omh --offline-jsonl` читает одну команду на строку и отдаёт события в stdout. Первый snapshot сообщает `session` (`offline`), `incarnation` и `stream_sequence`. В каждой команде передай `schema_version: 1`, эти `session` и `incarnation`, а также `turn`, `command_id`, `type` и одно поле payload.
+
+| `type` | Поле payload | Поведение |
+|---|---|---|
+| `submit` | `text` | Ставит turn в FIFO. `command_accepted` сообщает его `request_id`. Повтор того же `command_id` отклоняется в пределах incarnation. |
+| `cancel` | `target` | Используй `request_id` активного turn. Отмена проходит и при заполненном FIFO. |
+| `snapshot` | `after_sequence` | Передай последний известный cursor или `0`. Ответ содержит актуальное состояние turn и `through_sequence`. |
+
+При разрыве `stream_sequence` или `resync_required` запроси snapshot и продолжи чтение после `through_sequence`. Читай stderr отдельно от событий. Туда идут ошибки разбора и постановки команды в очередь. EOF закрывает ввод и даёт runtime завершить принятые команды.
 
 ## Границы реализации
 
@@ -42,9 +63,9 @@ ctest --test-dir build-sanitize --output-on-failure --no-tests=error
 - Admission требует successful terminal, согласованных IDs/model/items/arguments и завершённого framing. До проверки всего batch executors недоступны.
 - Owning JSON сохраняет порядок native items, opaque strings и числовые tokens без округления. Replay использует исходные prefix, context epoch и advertised tool snapshot.
 - `ToolRegistry` хранит compiled descriptor/schema/validator/executor/revision. Provider получает только descriptions. В production зарегистрирован только детерминированный `get_test_value` без внешних эффектов.
-- Commands/events v1, typed identities, cancellation token и snapshot/resync payloads задают границы будущих frontend/runtime.
+- Один control owner ведёт состояние turn. Worker выполняет mock generation, подготовку и dispatch tool и строит continuation. Commands/events v1 и snapshot/resync обслуживают JSONL frontend.
 
-CLI предоставляет self-check и синтетический round trip. Его final response задан fixture: это проверка протокола, а не inference или оценка модели. Команд для OAuth и live generation в CLI пока нет.
+CLI предоставляет self-check и синтетический round trip. Mock строит финальный response из фактического результата tool в continuation. CLI работает offline.
 
 Сетевой adapter с TLS verification собран, но live HTTP/TLS и OAuth lifecycle этим milestone не подтверждены. Политика MIME по умолчанию строгая; отсутствие MIME можно разрешить только явно для точного `POST https://api.openai.com/v1/responses`, `stream:true`, `store:false`, HTTP 200. Неверный или повторный MIME всегда приводит к отказу.
 

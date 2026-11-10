@@ -1,4 +1,4 @@
-# Протокольный milestone
+# Архитектура oh-my-harness
 
 ## Ответственности
 
@@ -10,7 +10,9 @@
 | `tools.hpp`, `tools.cpp` | Compiled registry, immutable snapshot, schema/domain validation, runtime operation IDs, consume-once batch |
 | `transport.hpp`, `transport.cpp` | libcurl RAII, header/MIME admission, bounded byte callbacks, provider completion gate, offline byte injection |
 | `contracts.hpp` | Commands/events v1, distinct IDs, targeted Cancel и frontend snapshot/resync types |
-| `main.cpp` | Dependency self-check и синтетический offline round trip |
+| `runtime.cpp`, `runtime_inbox.hpp` | Serialized turn state, bounded mailboxes, dispatch и cancellation |
+| `offline.cpp` | Детерминированный mock через production framer и reducer |
+| `main.cpp`, `cli.cpp` | Dependency self-check, offline demo и JSONL frontend |
 
 Core - статическая CMake library `omh_core`. Сторонние runtime dependencies: libcurl, yyjson и libcrypto с их системной closure. Node/Python/agent CLI не участвуют в работе executable. CMake и Nix нужны для сборки.
 
@@ -49,11 +51,17 @@ Opaque reasoning остаётся JSON value с точным encrypted string; �
 
 Операции идентифицирует runtime-side `OperationIds`, а не provider или executor. Executor возвращает `ToolOutcome` без call/operation IDs. Ошибка после dispatch даёт failed/unknown; следующий call не запускается. Cancel до dispatch даёт cancelled/not_started. Cancelled с unknown не превращается в отсутствие эффекта. Replay unknown effects блокируется до будущего reconciliation workflow.
 
-Consume-once batch защищает только конкретный подготовленный batch. Между batches и после рестарта dedup должен обеспечивать будущий runtime/journal. Гарантий exactly-once и crash recovery здесь нет.
+Consume-once batch защищает конкретный подготовленный batch. Runtime дедуплицирует принятые Submit по `CommandId` в пределах incarnation. Dedup после рестарта и crash recovery относятся к будущему journal.
+
+## Offline AgentRuntime
+
+Один control owner меняет публичное состояние одного turn за раз. Worker строит Request и continuation, вызывает mock и проверяет весь batch перед исполнением. Stop worker вызывает `request_stop()`, поскольку registered stop callbacks исполняются синхронно. Владелец состояния обрабатывает Cancel и GetSnapshot во время этих callbacks.
+
+Submit FIFO вмещает 16 команд по умолчанию, ещё по одному слоту выделено для адресного Cancel и GetSnapshot. Runtime хранит до 4096 принятых Submit ID и явно отклоняет новые при исчерпании лимита. Приём Cancel и допуск к каждому provider callback и executor сериализуются под одним mutex. Если matching Cancel уже принят, владелец обрабатывает его перед pending completion. Результаты начатых tools сохраняются. Поздний completion отменённого turn может обновить эти результаты, дальнейший dispatch прекращается.
+
+Outbox вмещает 64 события по умолчанию. Переполнение сбрасывает накопленные события и публикует `ResyncRequired`. Snapshot восстанавливает фазу, идентификаторы, состояние worker, текст, диагностику и результаты начатых tools последнего turn. У событий монотонный cursor в пределах incarnation. Предельный размер Submit - 16 KiB, итогового текста - 64 KiB. Допускается один tool batch на turn.
 
 ## Следующая граница
-
-Сейчас caller сериализует работу; threads, command queue и journal отсутствуют. Следующий runtime должен иметь одного control owner, owning worker completions, priority targeted cancellation и bounded frontend outbox со snapshot/resync. Публичные commands/events отделены от provider JSON. Текущий contract header задаёт types/version checks; wire frontend и исполняемый resync ещё не реализованы.
 
 До side-effecting tools обязательны authoritative append-only journal, durable execution intents, effect_unknown/recovery, cancellation races и process lifecycle tests. File replacement должен отдельно определять rename/preimage/conflict semantics без обещания atomic CAS с внешними writers. Здесь файловых и shell tools нет.
 

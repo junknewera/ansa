@@ -23,3 +23,18 @@
 - x86_64-linux, долгие сессии, модельное качество и расход quota не проверялись.
 
 Команды воспроизведения - в [README](../README.md). Политика replay и границы поддержки - в [architecture.md](architecture.md).
+
+## Offline AgentRuntime
+
+Код `10a11dd`, X13s, NixOS/aarch64, GCC 16.2.0.
+
+| Gate | Результат |
+|---|---|
+| Native Debug CMake и Release Nix package | CTest **20/20** в каждой сборке, включая обе replay mutations. Установленный ELF64 AArch64 проходит self-check, offline demo и JSONL handshake. |
+| ASan/UBSan | **18/18** с leak detection и остановкой на UB. Сборки mutants исключены через `OMH_MUTATION_CHILD=ON`. |
+| Runtime adversarial | **800/800** повторов восьми runtime suites. Детерминированные барьеры для blocked generation, stop callback и Cancel перед completion. Проверены отсутствие dispatch после отмены, сохранение результата запущенного tool, shutdown, stale incarnation, duplicate Submit, queue overflow и snapshot/resync. |
+| Provider admission | Failed, incomplete, malformed, premature EOF и ошибка schema второго call в batch дают ноль executor invocations. Успешный turn использует результат pure tool в production continuation. |
+| Independent review | Отдельный агент проверил сериализацию Cancel/dispatch/completion, stop worker, владение результатами и transport backpressure. Найденные проблемы закрыты регрессиями для blocked callback, valueless command, resync с результатом и PTY с заполненным stdout. |
+| PTY и Git | `tests/cli_backpressure.py` прошёл на Debug executable. `git diff --check` прошёл. |
+
+Границы и команды воспроизведения - в [PROJECT_STATE](PROJECT_STATE.md), [архитектуре](architecture.md#offline-agentruntime) и [README](../README.md).
