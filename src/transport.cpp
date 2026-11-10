@@ -40,10 +40,11 @@ struct Transfer {
     std::size_t body = 0;
     bool admitted = false;
     std::optional<Error> error;
+    bool callback_failed = false;
 };
 void callback_error(Transfer& transfer, const Error& error) noexcept {
     // Keep exceptions from crossing the C ABI, including allocation failures in diagnostics.
-    try { if (!transfer.error) transfer.error = error; } catch (...) {}
+    try { if (!transfer.error) transfer.error = error; } catch (...) { transfer.callback_failed = true; }
 }
 std::size_t size_checked(std::size_t a, std::size_t b) {
     require(a == 0 || b <= std::numeric_limits<std::size_t>::max() / a, "curl_size_overflow", Stage::http);
@@ -57,7 +58,7 @@ std::size_t receive_header(char* ptr, std::size_t size, std::size_t count, void*
         t.parser.line({ptr, n});
         return n;
     } catch (const Error& e) { callback_error(t, e); }
-    catch (...) { callback_error(t, Error(ErrorCode::transport, Stage::http, "header_callback_failure")); }
+    catch (...) { t.callback_failed = true; }
     return CURL_WRITEFUNC_ERROR;
 }
 std::size_t receive_body(char* ptr, std::size_t size, std::size_t count, void* context) noexcept {
@@ -73,7 +74,7 @@ std::size_t receive_body(char* ptr, std::size_t size, std::size_t count, void* c
         t.body += n;
         t.sink({ptr, n}); return n;
     } catch (const Error& e) { callback_error(t, e); }
-    catch (...) { callback_error(t, Error(ErrorCode::transport, Stage::http, "body_callback_failure")); }
+    catch (...) { t.callback_failed = true; }
     return CURL_WRITEFUNC_ERROR;
 }
 int progress(void* ptr, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noexcept {
@@ -192,6 +193,7 @@ Result<std::monostate> CurlTransport::post(const Json& request, std::string_view
         option(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(payload.size()));
         const auto status = curl_easy_perform(curl.get());
         if (transfer.error) throw *transfer.error;
+        require(!transfer.callback_failed, "http_callback_failure", Stage::http, ErrorCode::transport);
         require(!stop.stop_requested(), "http_cancelled", Stage::http, ErrorCode::cancelled);
         require(status == CURLE_OK, "http_transfer_failed", Stage::http, ErrorCode::transport);
         require(transfer.parser.complete(), "http_missing_headers", Stage::http);

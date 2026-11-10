@@ -11,7 +11,7 @@ void same_field(const Json& a, const Json& b, const char* field) {
 void compatible_added(const Json& a, const Json& b) {
     for (const auto& key : a.keys()) {
         if (key == "status" || key == "arguments" || key == "content" || key == "summary" || key == "encrypted_content") continue;
-        require(b.has(key.c_str()) && a.at(key.c_str()) == b.at(key.c_str()), "added_metadata_conflict");
+        require(b.has(key) && a.at(key) == b.at(key), "added_metadata_conflict");
     }
 }
 void append_bounded(std::string& buffer, const std::string& value, std::size_t limit) {
@@ -98,6 +98,8 @@ ResponsesReducer::Item& ResponsesReducer::target(const Json& event) {
     require(event.index("output_index") == it->second, "item_index_conflict");
     auto& item = items_.at(it->second);
     require(!item.done, "event_after_item_done");
+    for (const char* field : {"call_id", "name", "namespace"})
+        if (event.has(field)) require(item.added.has(field) && event.at(field) == item.added.at(field), "event_call_identity_conflict");
     return item;
 }
 void ResponsesReducer::event(SseEvent wire) {
@@ -121,7 +123,8 @@ void ResponsesReducer::event(SseEvent wire) {
     }
     require(created_, "event_before_created");
     if (type == "response.failed" || type == "response.incomplete" || type == "error")
-        fail(ErrorCode::protocol, Stage::admission,
+        fail(type == "response.failed" ? ErrorCode::response_failed :
+             type == "response.incomplete" ? ErrorCode::response_incomplete : ErrorCode::protocol, Stage::admission,
              type == "response.failed" ? "response_failed" : type == "response.incomplete" ? "response_incomplete" : "response_error");
     if (type == "response.in_progress") {
         require(!progress_, "duplicate_in_progress"); progress_ = true;
@@ -234,7 +237,7 @@ void ResponsesReducer::event(SseEvent wire) {
     }
 }
 CompletedResponse ResponsesReducer::seal() {
-    require(!sealed_ && terminal_.has_value(), "eof_before_completed"); sealed_ = true;
+    require(!sealed_ && terminal_.has_value(), "eof_before_completed", Stage::admission, ErrorCode::premature_eof); sealed_ = true;
     auto output = terminal_->at("output").elements();
     std::vector<FunctionCall> calls;
     for (std::size_t i = 0; i < output.size(); ++i) {

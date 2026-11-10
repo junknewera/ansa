@@ -75,6 +75,6 @@ void SseParser::finish() {
     require(!closed_ && !poisoned_, "sse_closed", Stage::framing);
     closed_ = true;
     require(continuation_ == 0, "utf8_eof", Stage::framing);
-    require(line_.empty() && !has_data_ && name_.empty(), "sse_unterminated_event", Stage::framing);
+    require(line_.empty() && !has_data_ && name_.empty(), "sse_unterminated_event", Stage::framing, ErrorCode::premature_eof);
 }
 } // namespace omh

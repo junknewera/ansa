@@ -1,13 +1,12 @@
 #include "omh/json.hpp"
 #include <openssl/evp.h>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
-#include <limits>
 #include <set>
 
 namespace omh {
 namespace {
-yyjson_val* mutable_ptr(const yyjson_val* v) { return const_cast<yyjson_val*>(v); }
 std::string write(const yyjson_val* v) {
     std::size_t n = 0;
     std::unique_ptr<char, decltype(&std::free)> out(yyjson_val_write(v, 0, &n), &std::free);
@@ -17,6 +16,15 @@ std::string write(const yyjson_val* v) {
 void inspect(yyjson_val* v, std::size_t depth, std::size_t& nodes, const std::size_t max_nodes) {
     require(depth > 0 && ++nodes <= max_nodes, "json_structure_limit", Stage::json, ErrorCode::limit);
     if (yyjson_is_real(v)) require(std::isfinite(yyjson_get_real(v)), "json_nonfinite", Stage::json);
+    if (yyjson_is_raw(v)) {
+        const std::string_view token(yyjson_get_raw(v), yyjson_get_len(v));
+        if (token.find_first_of(".eE") != std::string_view::npos) {
+            double finite = 0;
+            const auto result = std::from_chars(token.data(), token.data() + token.size(), finite);
+            require(result.ec == std::errc{} && result.ptr == token.data() + token.size() && std::isfinite(finite),
+                    "json_nonfinite", Stage::json);
+        }
+    }
     if (yyjson_is_obj(v)) {
         std::set<std::string> keys;
         yyjson_obj_iter it = yyjson_obj_iter_with(v);
@@ -32,6 +40,8 @@ void inspect(yyjson_val* v, std::size_t depth, std::size_t& nodes, const std::si
 }
 bool equal(yyjson_val* a, yyjson_val* b) {
     if (yyjson_get_type(a) != yyjson_get_type(b)) return false;
+    if (yyjson_is_raw(a)) return std::string_view(yyjson_get_raw(a), yyjson_get_len(a)) ==
+        std::string_view(yyjson_get_raw(b), yyjson_get_len(b));
     if (yyjson_is_obj(a)) {
         if (yyjson_obj_size(a) != yyjson_obj_size(b)) return false;
         yyjson_obj_iter it = yyjson_obj_iter_with(a);
@@ -72,7 +82,8 @@ Json Json::parse(std::string_view bytes, std::size_t max_bytes, std::size_t dept
         } else if (c == ']' || c == '}') { if (level) --level; }
     }
     // Strict RFC 8259: no comments, invalid Unicode, trailing data, NaN or Infinity.
-    auto* doc = yyjson_read(bytes.data(), bytes.size(), 0);
+    // Retain numeric tokens too: replay must not round opaque item metadata through double.
+    auto* doc = yyjson_read(bytes.data(), bytes.size(), YYJSON_READ_NUMBER_AS_RAW);
     require(doc != nullptr, "json_invalid", Stage::json);
     Json result(doc);
     std::size_t nodes = 0;
@@ -80,9 +91,10 @@ Json Json::parse(std::string_view bytes, std::size_t max_bytes, std::size_t dept
     return result;
 }
 Json Json::string(std::string_view text) {
+    require(text.size() <= 16 * 1024 * 1024, "json_string_limit", Stage::json, ErrorCode::limit);
     std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> doc(yyjson_mut_doc_new(nullptr), yyjson_mut_doc_free);
     require(bool(doc), "json_allocation", Stage::json);
-    auto* str = yyjson_mut_strncpy(doc.get(), text.data(), text.size());
+    auto* str = yyjson_mut_strncpy(doc.get(), text.empty() ? "" : text.data(), text.size());
     require(str != nullptr, "json_allocation", Stage::json);
     yyjson_mut_doc_set_root(doc.get(), str);
     std::size_t len = 0;
@@ -112,8 +124,10 @@ bool Json::is_object() const { return yyjson_is_obj(raw()); }
 bool Json::is_array() const { return yyjson_is_arr(raw()); }
 bool Json::is_null() const { return yyjson_is_null(raw()); }
 bool Json::is_string() const { return yyjson_is_str(raw()); }
-bool Json::is_integer() const { return yyjson_is_int(raw()); }
-bool Json::is_number() const { return yyjson_is_num(raw()); }
+bool Json::is_integer() const {
+    return yyjson_is_raw(raw()) && std::string_view(yyjson_get_raw(raw()), yyjson_get_len(raw())).find_first_of(".eE") == std::string_view::npos;
+}
+bool Json::is_number() const { return yyjson_is_raw(raw()); }
 bool Json::is_boolean() const { return yyjson_is_bool(raw()); }
 std::vector<std::string> Json::keys() const {
     require(is_object(), "json_expected_object", Stage::json);
@@ -122,9 +136,9 @@ std::vector<std::string> Json::keys() const {
     while (auto* key = yyjson_obj_iter_next(&it)) out.emplace_back(yyjson_get_str(key), yyjson_get_len(key));
     return out;
 }
-bool Json::has(const char* key) const { return yyjson_obj_get(mutable_ptr(raw()), key) != nullptr; }
-Json Json::at(const char* key) const {
-    auto* v = yyjson_obj_get(mutable_ptr(raw()), key);
+bool Json::has(std::string_view key) const { return yyjson_obj_getn(raw(), key.empty() ? "" : key.data(), key.size()) != nullptr; }
+Json Json::at(std::string_view key) const {
+    auto* v = yyjson_obj_getn(raw(), key.empty() ? "" : key.data(), key.size());
     require(v != nullptr, "json_missing_field", Stage::json);
     return parse(write(v));
 }
@@ -135,19 +149,22 @@ std::string Json::text() const {
 std::string Json::text(const char* key) const { return at(key).text(); }
 std::size_t Json::index(const char* key) const {
     const auto v = at(key);
-    require(yyjson_is_uint(v.raw()), "json_expected_unsigned_integer", Stage::json);
-    const auto n = yyjson_get_uint(v.raw());
-    require(n <= std::numeric_limits<std::size_t>::max(), "json_integer_overflow", Stage::json);
-    return static_cast<std::size_t>(n);
+    require(v.is_integer(), "json_expected_unsigned_integer", Stage::json);
+    const std::string_view token(yyjson_get_raw(v.raw()), yyjson_get_len(v.raw()));
+    require(!token.empty() && token.front() != '-', "json_expected_unsigned_integer", Stage::json);
+    std::size_t n = 0;
+    const auto result = std::from_chars(token.data(), token.data() + token.size(), n);
+    require(result.ec == std::errc{} && result.ptr == token.data() + token.size(), "json_integer_overflow", Stage::json);
+    return n;
 }
 std::vector<Json> Json::elements() const {
     require(is_array(), "json_expected_array", Stage::json);
     std::vector<Json> out;
-    yyjson_arr_iter it = yyjson_arr_iter_with(mutable_ptr(raw()));
+    yyjson_arr_iter it = yyjson_arr_iter_with(raw());
     while (auto* v = yyjson_arr_iter_next(&it)) out.push_back(parse(write(v)));
     return out;
 }
-bool Json::operator==(const Json& other) const { return equal(mutable_ptr(raw()), mutable_ptr(other.raw())); }
+bool Json::operator==(const Json& other) const { return equal(raw(), other.raw()); }
 std::string sha256(std::string_view bytes) {
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned len = 0;

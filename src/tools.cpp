@@ -129,23 +129,32 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop) {
         require(!consumed_ && bool(snapshot_), "batch_already_consumed", Stage::execution, ErrorCode::validation);
         consumed_ = true;
         std::vector<ToolResult> results;
-        results.reserve(calls_.size()); // No vector allocation after the first dispatch.
+        results.reserve(calls_.size());
+        // Allocate identities and fallback strings before ANY dispatch. An allocation
+        // failure after an executor runs must never erase its unknown-effects outcome.
+        for (const auto& p : calls_)
+            results.push_back({p.operation_id, p.call_id, R"({"error":"cancelled_before_dispatch"})",
+                Execution::cancelled, Effects::not_started});
+        std::string unknown_output = R"({"error":"executor_failure","effects":"unknown"})";
         bool blocked = false;
-        for (const auto& p : calls_) {
-            ToolOutcome outcome{Execution::cancelled, Effects::not_started, R"({"error":"cancelled_before_dispatch"})"};
+        for (std::size_t i = 0; i < calls_.size(); ++i) {
+            const auto& p = calls_[i];
+            auto& result = results[i];
             if (!blocked && !stop.stop_requested()) {
                 try {
-                    outcome = snapshot_->definitions_[p.tool].execute(p.args, stop);
+                    auto outcome = snapshot_->definitions_[p.tool].execute(p.args, stop);
                     require(outcome.output.size() <= 128 * 1024, "executor_output_limit", Stage::execution);
                     (void)Json::string(outcome.output); // UTF-8 validation before any replay.
                     require(outcome.execution != Execution::succeeded || outcome.effects == Effects::known_result,
                             "executor_outcome_conflict", Stage::execution);
+                    result.output = std::move(outcome.output);
+                    result.execution = outcome.execution; result.effects = outcome.effects;
                 } catch (...) {
-                    outcome = {Execution::failed, Effects::unknown, R"({"error":"executor_failure","effects":"unknown"})"};
+                    result.output.swap(unknown_output);
+                    result.execution = Execution::failed; result.effects = Effects::unknown;
                 }
             }
-            if (outcome.effects == Effects::unknown) blocked = true;
-            results.push_back({p.operation_id, p.call_id, std::move(outcome.output), outcome.execution, outcome.effects});
+            if (result.effects == Effects::unknown) blocked = true;
         }
         return results;
     });

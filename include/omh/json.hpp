@@ -11,7 +11,8 @@
 #include <vector>
 
 namespace omh {
-enum class ErrorCode { protocol, limit, transport, mime, validation, cancelled, tool, contract };
+enum class ErrorCode { protocol, limit, transport, mime, validation, cancelled, tool, contract,
+                       response_failed, response_incomplete, premature_eof };
 enum class Stage { json, framing, admission, request, preparation, execution, http, frontend };
 struct Error final : std::exception {
     ErrorCode code;
@@ -61,8 +62,8 @@ public:
     bool is_number() const;
     bool is_boolean() const;
     std::vector<std::string> keys() const;
-    bool has(const char* key) const;
-    Json at(const char* key) const;
+    bool has(std::string_view key) const;
+    Json at(std::string_view key) const;
     std::string text() const;
     std::string text(const char* key) const;
     std::size_t index(const char* key) const;
