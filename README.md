@@ -2,6 +2,8 @@
 
 Независимый C++20 protocol foundation для персонального AI coding agent. Namespace `omh`, executable `omh`. Первый milestone работает offline: строгий Responses admission, чистый tool и stateless native replay.
 
+Новая инженерная сессия начинается с [AGENTS.md](AGENTS.md) и [текущего состояния проекта](docs/PROJECT_STATE.md).
+
 ## Сборка и проверка
 
 Зависимости и компилятор зафиксированы через `flake.lock`. Проверенная платформа - NixOS/aarch64, ThinkPad X13s. В flake также объявлен x86_64-linux; он пока не проверен.
