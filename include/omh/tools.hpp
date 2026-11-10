@@ -22,7 +22,7 @@ public:
     void register_tool(ToolDefinition);
     std::shared_ptr<const ToolSnapshot> snapshot() const;
 };
-// Assigned by the serialized runtime owner, never by a provider adapter.
+// Runtime-owned operation ID space, independent of provider call IDs.
 class OperationIds {
     std::string run_;
     std::uint64_t next_ = 0;
@@ -43,7 +43,8 @@ public:
     PreparedBatch& operator=(PreparedBatch&&) = delete;
     static Result<PreparedBatch> prepare(const CompletedResponse&,
         std::shared_ptr<const ToolSnapshot>, OperationIds&);
-    Result<std::vector<ToolResult>> execute(std::stop_token = {});
+    using BeforeStart = std::function<bool(std::string_view operation, std::string_view call)>;
+    Result<std::vector<ToolResult>> execute(std::stop_token = {}, const BeforeStart& = {});
 };
 ToolDefinition test_value_tool();
 } // namespace omh

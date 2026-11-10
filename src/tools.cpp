@@ -124,7 +124,7 @@ Result<PreparedBatch> PreparedBatch::prepare(const CompletedResponse& response,
         return PreparedBatch(std::move(snapshot), std::move(prepared));
     });
 }
-Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop) {
+Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, const BeforeStart& before_start) {
     return capture([&] {
         require(!consumed_ && bool(snapshot_), "batch_already_consumed", Stage::execution, ErrorCode::validation);
         consumed_ = true;
@@ -136,25 +136,29 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop) {
             results.push_back({p.operation_id, p.call_id, R"({"error":"cancelled_before_dispatch"})",
                 Execution::cancelled, Effects::not_started});
         std::string unknown_output = R"({"error":"executor_failure","effects":"unknown"})";
-        bool blocked = false;
         for (std::size_t i = 0; i < calls_.size(); ++i) {
             const auto& p = calls_[i];
             auto& result = results[i];
-            if (!blocked && !stop.stop_requested()) {
-                try {
-                    auto outcome = snapshot_->definitions_[p.tool].execute(p.args, stop);
-                    require(outcome.output.size() <= 128 * 1024, "executor_output_limit", Stage::execution);
-                    (void)Json::string(outcome.output); // UTF-8 validation before any replay.
-                    require(outcome.execution != Execution::succeeded || outcome.effects == Effects::known_result,
-                            "executor_outcome_conflict", Stage::execution);
-                    result.output = std::move(outcome.output);
-                    result.execution = outcome.execution; result.effects = outcome.effects;
-                } catch (...) {
-                    result.output.swap(unknown_output);
-                    result.execution = Execution::failed; result.effects = Effects::unknown;
-                }
+            if (stop.stop_requested()) break;
+            try {
+                if (before_start && !before_start(p.operation_id, p.call_id)) break;
+            } catch (...) {
+                result.execution = Execution::failed;
+                break;
             }
-            if (result.effects == Effects::unknown) blocked = true;
+            try {
+                auto outcome = snapshot_->definitions_[p.tool].execute(p.args, stop);
+                require(outcome.output.size() <= 128 * 1024, "executor_output_limit", Stage::execution);
+                (void)Json::string(outcome.output); // UTF-8 validation before any replay.
+                require(outcome.execution != Execution::succeeded || outcome.effects == Effects::known_result,
+                        "executor_outcome_conflict", Stage::execution);
+                result.output = std::move(outcome.output);
+                result.execution = outcome.execution; result.effects = outcome.effects;
+            } catch (...) {
+                result.output.swap(unknown_output);
+                result.execution = Execution::failed; result.effects = Effects::unknown;
+            }
+            if (result.effects == Effects::unknown) break;
         }
         return results;
     });

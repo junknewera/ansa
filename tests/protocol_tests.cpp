@@ -431,12 +431,17 @@ void contracts() {
     static_assert(!std::is_default_constructible_v<CompletedResponse>);
     static_assert(!std::is_copy_constructible_v<PreparedBatch>);
     static_assert(!std::is_same_v<SessionId, TurnId> && !std::is_same_v<RequestId, OperationId>);
-    RuntimeCommand command{1, {"session"}, {"turn"}, Submit{"fixture"}}; validate(command);
+    RuntimeCommand command{1, {"session"}, {"turn"}, {"incarnation"}, {"command"}, Submit{"fixture"}}; validate(command);
     command.schema_version = 2; rejects([&] { validate(command); }); command.schema_version = 1;
     command.payload = Cancel{{""}}; rejects([&] { validate(command); });
     command.payload = Cancel{{"request"}}; validate(command);
-    command.payload = Resync{17}; validate(command);
-    RuntimeEvent event{1, 18, {"session"}, {"turn"}, FrontendSnapshot{17, "idle"}}; validate(event);
+    command.payload = GetSnapshot{17}; validate(command);
+    struct ThrowingText {
+        operator std::string() const { throw std::runtime_error("fixture conversion failed"); }
+    };
+    try { command.payload.emplace<Submit>(ThrowingText{}); } catch (const std::runtime_error&) {}
+    if (command.payload.valueless_by_exception()) rejects([&] { validate(command); });
+    RuntimeEvent event{1, 18, {"session"}, {"turn"}, {"incarnation"}, {}, FrontendSnapshot{17, "idle"}}; validate(event);
     event.schema_version = 2; rejects([&] { validate(event); }); event.schema_version = 1;
     event.payload = FrontendSnapshot{19, "idle"}; rejects([&] { validate(event); });
     event.payload = ResyncRequired{20}; validate(event);
