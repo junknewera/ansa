@@ -29,7 +29,7 @@ Request::Request(Binding binding, ContextEpoch epoch, ToolAdvertisement tools, s
             "unsupported_binding", Stage::request);
     nonempty(binding_.account); nonempty(binding_.returned_model); nonempty(epoch_.id);
     require(epoch_.exact_state.is_object() && !tools_.revision.empty(), "request_context", Stage::request);
-    require(input_.size() <= 4096 && tools_.descriptors.size() <= 64, "request_items_limit", Stage::request, ErrorCode::limit);
+    require(input_.size() <= max_request_items && tools_.descriptors.size() <= 64, "request_items_limit", Stage::request, ErrorCode::limit);
     for (const auto& item : input_) {
         require(item.is_object(), "input_item_object", Stage::request);
         if (item.has("role")) require(item.text("role") != "system", "siwc_system_role", Stage::request);

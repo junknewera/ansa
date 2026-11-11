@@ -3,7 +3,7 @@
 #include "omh/transport.hpp"
 #include <iostream>
 
-namespace omh { int offline_cli(); }
+namespace omh { int offline_cli(const std::filesystem::path&); }
 
 namespace {
 omh::Json demo() {
@@ -31,11 +31,13 @@ omh::Json demo() {
 int main(int argc, char** argv) {
     try {
         const std::string_view command = argc > 1 ? argv[1] : "--self-check";
+        if (argc == 4 && command == "--offline-jsonl" && std::string_view(argv[2]) == "--session")
+            return omh::offline_cli(argv[3]);
         if (argc > 2 || (command != "--self-check" && command != "--offline-demo" && command != "--offline-jsonl")) {
-            std::cerr << "Usage: omh [--self-check|--offline-demo|--offline-jsonl]\n";
+            std::cerr << "Usage: omh [--self-check|--offline-demo|--offline-jsonl [--session PATH]]\n";
             return 2;
         }
-        if (command == "--offline-jsonl") return omh::offline_cli();
+        if (command == "--offline-jsonl") return omh::offline_cli({});
         if (command == "--offline-demo") std::cout << demo().dump() << '\n';
         else {
             const auto info = omh::dependency_smoke();

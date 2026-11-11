@@ -33,6 +33,7 @@ RuntimeCommand decode_command(std::string_view line) {
                            {json.text("command_id")}, GetSnapshot{0}};
     if (type == "submit") command.payload = Submit{json.text("text")};
     else if (type == "cancel") command.payload = Cancel{{json.text("target")}};
+    else if (type == "resume") command.payload = Resume{{json.text("target")}};
     else if (type == "snapshot") command.payload = GetSnapshot{json.index("after_sequence")};
     else fail(ErrorCode::contract, Stage::frontend, "command_type");
     return command;
@@ -97,12 +98,21 @@ Json encode_event(const RuntimeEvent& event) {
         std::vector<Json> tools;
         for (const auto& tool : snapshot->tools) tools.push_back(encode_tool_activity(tool));
         field("tools", Json::array(tools));
+        field("history_items", number(snapshot->history_items));
+        field("compactions", number(snapshot->compactions));
+        field("storage_failed", Json::parse(snapshot->storage_failed ? "true" : "false"));
+        field("durable", Json::parse(snapshot->durable ? "true" : "false"));
+        field("resume_available", Json::parse(snapshot->resume_available ? "true" : "false"));
     } else if (const auto* resync = std::get_if<ResyncRequired>(&event.payload)) {
         type("resync_required");
         field("oldest_available", number(resync->oldest_available));
     } else if (const auto* accepted = std::get_if<CommandAccepted>(&event.payload)) {
         type("command_accepted");
         field("command_id", Json::string(accepted->command.value));
+    } else if (const auto* replayed = std::get_if<CommandReplayed>(&event.payload)) {
+        type("command_replayed");
+        field("command_id", Json::string(replayed->command.value));
+        field("state", Json::string(replayed->state));
     } else if (const auto* error = std::get_if<RuntimeError>(&event.payload)) {
         type("error");
         field("command_id", nullable_id(error->command));
@@ -152,17 +162,18 @@ void post_command(Runtime& runtime, RuntimeCommand command) {
         case PostStatus::closed: fail(ErrorCode::contract, Stage::frontend, "runtime_closed");
         case PostStatus::stale_target: fail(ErrorCode::contract, Stage::frontend, "stale_cancel_target");
         case PostStatus::stale_incarnation: fail(ErrorCode::contract, Stage::frontend, "stale_incarnation");
-        case PostStatus::duplicate: fail(ErrorCode::contract, Stage::frontend, "duplicate_command");
+        case PostStatus::duplicate: return;
         case PostStatus::command_id_limit: fail(ErrorCode::limit, Stage::frontend, "submit_id_limit");
+        case PostStatus::command_conflict: fail(ErrorCode::contract, Stage::frontend, "command_id_conflict");
     }
 }
 } // namespace
 
-int offline_cli() {
+int offline_cli(const std::filesystem::path& directory) {
     ToolRegistry registry;
     registry.register_tool(test_value_tool());
     Runtime runtime({"offline"}, {"offline_epoch", "Use the pure fixture tool", Json::parse(R"({"mode":"offline"})")},
-                    registry.snapshot(), delayed_fixture);
+                    registry.snapshot(), delayed_fixture, {}, {directory, offline_compact, {}});
     // Detach both iostream ties and stdio's line-buffered input flush.
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);

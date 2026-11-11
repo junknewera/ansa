@@ -25,11 +25,15 @@ std::string wire(const std::string& response_id, const std::string& model, const
     return bytes;
 }
 
-Json fixture_call() {
-    return Json::parse(R"({"type":"function_call","id":"fixture_item","call_id":"fixture_call","namespace":"omh","name":"get_test_value","arguments":"{}","status":"completed"})");
+Json fixture_call(const std::string& suffix) {
+    return Json::object({{"type", Json::string("function_call")}, {"id", Json::string("fixture_item" + suffix)},
+        {"call_id", Json::string("fixture_call" + suffix)}, {"namespace", Json::string("omh")},
+        {"name", Json::string("get_test_value")}, {"arguments", Json::string("{}")},
+        {"status", Json::string("completed")}});
 }
-Json fixture_reasoning() {
-    return Json::parse(R"({"type":"reasoning","id":"fixture_reasoning","summary":[],"encrypted_content":"synthetic_opaque_value"})");
+Json fixture_reasoning(const std::string& suffix) {
+    return Json::object({{"type", Json::string("reasoning")}, {"id", Json::string("fixture_reasoning" + suffix)},
+        {"summary", Json::array({})}, {"encrypted_content", Json::string("synthetic_opaque_value" + suffix)}});
 }
 } // namespace
 
@@ -40,21 +44,46 @@ Result<CompletedResponse> offline_generate(const Request& request, std::stop_tok
         const auto& model = request.binding().returned_model;
         const HttpHead head{200, {"text/event-stream"}};
         if (input.empty() || !input.back().has("type") || input.back().text("type") != "function_call_output") {
-            return decode_offline(request, head, {wire("fixture_response1", model, {fixture_reasoning(), fixture_call()})},
+            const auto suffix = input.size() <= 1 ? std::string{} : "_" + sha256(Json::array(input).dump()).substr(0, 16);
+            return decode_offline(request, head, {wire("fixture_response1" + suffix, model,
+                                  {fixture_reasoning(suffix), fixture_call(suffix)})},
                                   {}, MimePolicy::strict, stop);
         }
 
-        require(input.size() == 4 && input[input.size() - 3] == fixture_reasoning() &&
-                input[input.size() - 2] == fixture_call() && input.back().text("call_id") == "fixture_call",
+        require(input.size() >= 4, "fixture_replay_conflict", Stage::request);
+        const auto& call = input[input.size() - 2];
+        const auto call_id = call.text("call_id");
+        require(call_id.starts_with("fixture_call"), "fixture_replay_conflict", Stage::request);
+        const auto suffix = call_id.substr(std::string("fixture_call").size());
+        require(input[input.size() - 3] == fixture_reasoning(suffix) &&
+                call == fixture_call(suffix) && input.back().text("call_id") == call_id,
                 "fixture_replay_conflict", Stage::request);
         const auto result = Json::parse(input.back().text("output"), 128 * 1024);
         const auto part = Json::object({{"type", Json::string("output_text")},
             {"text", Json::string("OMH_TOOL_OK:" + result.text("value"))}});
-        const auto message = Json::object({{"type", Json::string("message")}, {"id", Json::string("fixture_message")},
+        const auto message = Json::object({{"type", Json::string("message")}, {"id", Json::string("fixture_message" + suffix)},
             {"role", Json::string("assistant")}, {"status", Json::string("completed")}, {"content", Json::array({part})}});
-        return decode_offline(request, head, {wire("fixture_response2", model, {message})}, {}, MimePolicy::strict, stop);
+        return decode_offline(request, head, {wire("fixture_response2" + suffix, model, {message})}, {}, MimePolicy::strict, stop);
     } catch (const Error& error) {
         return error;
     }
+}
+
+Result<CompactedContext> offline_compact(const Request& request, std::stop_token stop) {
+    return capture([&] {
+        require(!stop.stop_requested(), "offline_cancelled", Stage::admission, ErrorCode::cancelled);
+        const auto digest = sha256(Json::array(request.input()).dump());
+        std::vector<Json> output;
+        for (auto item = request.input().rbegin(); item != request.input().rend(); ++item) {
+            if (item->has("role") && item->text("role") == "user") { output.push_back(*item); break; }
+        }
+        output.push_back(Json::object({{"type", Json::string("compaction")},
+            {"id", Json::string("mock_compact_" + digest.substr(0, 16))},
+            {"encrypted_content", Json::string("synthetic_compacted_state_" + digest)}}));
+        auto result = CompactedContext::admit(request, Json::object({{"object", Json::string("response.compaction")},
+            {"id", Json::string("mock_compaction_" + digest.substr(0, 16))}, {"output", Json::array(output)}}));
+        if (auto* error = std::get_if<Error>(&result)) throw *error;
+        return std::get<CompactedContext>(std::move(result));
+    });
 }
 } // namespace omh

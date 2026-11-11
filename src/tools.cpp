@@ -124,7 +124,17 @@ Result<PreparedBatch> PreparedBatch::prepare(const CompletedResponse& response,
         return PreparedBatch(std::move(snapshot), std::move(prepared));
     });
 }
-Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, const BeforeStart& before_start) {
+std::vector<ToolInvocation> PreparedBatch::plan() const {
+    std::vector<ToolInvocation> out;
+    for (const auto& call : calls_) {
+        const auto& descriptor = snapshot_->definitions_[call.tool].descriptor;
+        out.push_back({call.operation_id, call.call_id, descriptor.name,
+                       descriptor.implementation_revision, call.args});
+    }
+    return out;
+}
+Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, const BeforeStart& before_start,
+    const AfterFinish& after_finish, const std::vector<ToolResult>& completed) {
     return capture([&] {
         require(!consumed_ && bool(snapshot_), "batch_already_consumed", Stage::execution, ErrorCode::validation);
         consumed_ = true;
@@ -135,8 +145,15 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, con
         for (const auto& p : calls_)
             results.push_back({p.operation_id, p.call_id, R"({"error":"cancelled_before_dispatch"})",
                 Execution::cancelled, Effects::not_started});
+        require(completed.size() <= results.size(), "completed_prefix_size", Stage::execution);
+        for (std::size_t i = 0; i < completed.size(); ++i) {
+            require(completed[i].operation_id == results[i].operation_id && completed[i].call_id == results[i].call_id &&
+                    completed[i].execution == Execution::succeeded && completed[i].effects == Effects::known_result,
+                    "completed_prefix_conflict", Stage::execution);
+            results[i] = completed[i];
+        }
         std::string unknown_output = R"({"error":"executor_failure","effects":"unknown"})";
-        for (std::size_t i = 0; i < calls_.size(); ++i) {
+        for (std::size_t i = completed.size(); i < calls_.size(); ++i) {
             const auto& p = calls_[i];
             auto& result = results[i];
             if (stop.stop_requested()) break;
@@ -147,6 +164,7 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, con
                 break;
             }
             try {
+                result.dispatched = true;
                 auto outcome = snapshot_->definitions_[p.tool].execute(p.args, stop);
                 require(outcome.output.size() <= 128 * 1024, "executor_output_limit", Stage::execution);
                 (void)Json::string(outcome.output); // UTF-8 validation before any replay.
@@ -158,6 +176,9 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, con
                 result.output.swap(unknown_output);
                 result.execution = Execution::failed; result.effects = Effects::unknown;
             }
+            // A failed checkpoint stops dispatch while preserving the known outcome.
+            try { if (after_finish && !after_finish(result)) break; }
+            catch (...) { break; }
             if (result.effects == Effects::unknown) break;
         }
         return results;

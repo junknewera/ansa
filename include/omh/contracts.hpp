@@ -16,7 +16,8 @@ using RuntimeIncarnation = Id<struct RuntimeIncarnationTag>;
 struct Submit { std::string text; };
 struct Cancel { RequestId target; };
 struct GetSnapshot { std::uint64_t after_sequence; };
-using CommandPayload = std::variant<Submit, Cancel, GetSnapshot>;
+struct Resume { RequestId target; };
+using CommandPayload = std::variant<Submit, Cancel, GetSnapshot, Resume>;
 struct RuntimeCommand {
     std::uint32_t schema_version = 1;
     SessionId session;
@@ -26,6 +27,7 @@ struct RuntimeCommand {
     CommandPayload payload;
 };
 struct CommandAccepted { CommandId command; std::optional<RequestId> request; };
+struct CommandReplayed { CommandId command; std::string state; };
 struct TextDelta { std::string text; };
 struct ToolStarted { OperationId operation; std::string call_id; };
 struct ToolFinished {
@@ -51,9 +53,11 @@ struct FrontendSnapshot {
     std::optional<CommandId> submit;
     std::optional<CommandId> command;
     std::vector<ToolActivity> tools;
+    std::size_t history_items = 0, compactions = 0;
+    bool storage_failed = false, durable = true, resume_available = false;
 };
 struct ResyncRequired { std::uint64_t oldest_available; };
-using EventPayload = std::variant<CommandAccepted, TextDelta, ToolStarted, ToolFinished, Cancelled, Done,
+using EventPayload = std::variant<CommandAccepted, CommandReplayed, TextDelta, ToolStarted, ToolFinished, Cancelled, Done,
                                   RuntimeError, RecoveryRequired, FrontendSnapshot, ResyncRequired>;
 struct RuntimeEvent {
     std::uint32_t schema_version = 1;
@@ -76,6 +80,8 @@ inline void validate(const RuntimeCommand& c) {
             "command_contract", Stage::frontend, ErrorCode::contract);
     if (const auto* cancel = std::get_if<Cancel>(&c.payload))
         require(valid_id(cancel->target.value), "cancel_target", Stage::frontend, ErrorCode::contract);
+    if (const auto* resume = std::get_if<Resume>(&c.payload))
+        require(valid_id(resume->target.value), "resume_target", Stage::frontend, ErrorCode::contract);
     if (const auto* submit = std::get_if<Submit>(&c.payload)) {
         require(!submit->text.empty() && submit->text.size() <= max_submit_bytes,
                 "submit_size", Stage::frontend, ErrorCode::limit);

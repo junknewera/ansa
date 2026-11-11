@@ -76,7 +76,9 @@ RuntimeCommand command(const Runtime& runtime, std::string id, CommandPayload pa
 }
 
 void post(Runtime& runtime, RuntimeCommand cmd, PostStatus expected = PostStatus::accepted) {
-    check(unwrap(runtime.post(std::move(cmd))) == expected, "unexpected post status");
+    const auto actual = unwrap(runtime.post(std::move(cmd)));
+    if (actual != expected) throw std::runtime_error("post status " + std::to_string(static_cast<int>(actual)) +
+        ", expected " + std::to_string(static_cast<int>(expected)));
 }
 
 std::optional<RuntimeEvent> next(Runtime& runtime) {
@@ -208,9 +210,13 @@ void admission() {
     post(runtime, stale, PostStatus::stale_incarnation);
     post(runtime, command(runtime, "wrong_turn", Cancel{target}, {"another"}), PostStatus::stale_target);
 
-    post(runtime, command(runtime, "submit", Submit{"changed"}, {"another"}), PostStatus::duplicate);
+    post(runtime, command(runtime, "submit", Submit{"changed"}, {"another"}), PostStatus::command_conflict);
+    post(runtime, command(runtime, "submit", Submit{"fixture"}), PostStatus::duplicate);
+    until<CommandReplayed>(runtime);
     post(runtime, command(runtime, "queued", Submit{"next"}, {"next"}));
-    post(runtime, command(runtime, "queued", Submit{"retry"}, {"different"}), PostStatus::duplicate);
+    post(runtime, command(runtime, "queued", Submit{"retry"}, {"different"}), PostStatus::command_conflict);
+    post(runtime, command(runtime, "queued", Submit{"next"}, {"next"}), PostStatus::duplicate);
+    until<CommandReplayed>(runtime);
     post(runtime, command(runtime, "overflow", Submit{"last"}, {"last"}), PostStatus::queue_full);
     const auto active = get_snapshot(runtime, 0, "active");
     check(active.request == target && std::get<FrontendSnapshot>(active.payload).state == "generating" &&
@@ -225,7 +231,7 @@ void admission() {
 
     post(runtime, command(runtime, "overflow", Submit{"last"}, {"last"}));
     post(runtime, command(runtime, "new_id", Submit{"extra"}), PostStatus::command_id_limit);
-    post(runtime, command(runtime, "submit", Submit{"duplicate"}), PostStatus::duplicate);
+    post(runtime, command(runtime, "submit", Submit{"fixture"}), PostStatus::duplicate);
     runtime.close_input();
     std::vector<std::string> done;
     while (auto event = next(runtime)) {

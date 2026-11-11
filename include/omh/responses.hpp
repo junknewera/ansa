@@ -6,6 +6,7 @@
 #include <stop_token>
 
 namespace omh {
+inline constexpr std::size_t max_request_items = 4096;
 struct Binding {
     std::string provider = "openai-siwc";
     std::string account = "offline-fixture";
@@ -108,6 +109,7 @@ struct ToolResult {
     std::string operation_id, call_id, output;
     Execution execution;
     Effects effects;
+    bool dispatched = false;
 };
 Request continuation(const CompletedResponse&, const std::vector<ToolResult>&);
 } // namespace omh
