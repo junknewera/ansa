@@ -7,6 +7,7 @@ struct WorkIdentity {
     RuntimeIncarnation incarnation;
     TurnId turn;
     RequestId request;
+    std::uint64_t resume_epoch = 0;
     bool operator==(const WorkIdentity&) const = default;
 };
 struct GenerateRequest { Request request; };
@@ -16,7 +17,11 @@ struct RunTools {
     PreparedBatch batch;
     std::vector<ToolResult> completed;
 };
-struct Replay { CompletedResponse response; std::shared_ptr<const std::vector<ToolResult>> results; };
+struct Replay {
+    CompletedResponse response;
+    std::shared_ptr<const std::vector<ToolResult>> results;
+    std::optional<Error> dispatch_error{};
+};
 struct CompactRequest { Request request; };
 using Task = std::variant<GenerateRequest, PrepareTools, RunTools, Replay, CompactRequest>;
 using WorkerResult = std::variant<CompletedResponse, RunTools, Replay, CompactedContext, Error>;

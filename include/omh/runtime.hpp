@@ -18,6 +18,10 @@ struct SessionOptions {
     std::filesystem::path directory;
     Compact compact;
     JournalOptions journal;
+    Binding binding;
+    std::size_t keep_recent_turns = 0;
+    std::function<void(std::uint64_t resume_epoch, std::stop_token)> check_dispatch;
+    std::function<std::shared_ptr<void>(std::stop_token)> tool_guard;
 };
 
 // One session, one turn at a time. Submits wait in FIFO order while the worker is busy.

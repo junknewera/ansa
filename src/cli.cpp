@@ -1,5 +1,6 @@
 #include "omh/offline.hpp"
 #include "omh/runtime.hpp"
+#include "omh/auth.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
@@ -169,11 +170,7 @@ void post_command(Runtime& runtime, RuntimeCommand command) {
 }
 } // namespace
 
-int offline_cli(const std::filesystem::path& directory) {
-    ToolRegistry registry;
-    registry.register_tool(test_value_tool());
-    Runtime runtime({"offline"}, {"offline_epoch", "Use the pure fixture tool", Json::parse(R"({"mode":"offline"})")},
-                    registry.snapshot(), delayed_fixture, {}, {directory, offline_compact, {}});
+int jsonl_frontend(Runtime& runtime) {
     // Detach both iostream ties and stdio's line-buffered input flush.
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
@@ -211,5 +208,56 @@ int offline_cli(const std::filesystem::path& directory) {
     runtime.close_input();
     output.join();
     return output_failed || std::cin.bad() ? 1 : 0;
+}
+
+int offline_cli(const std::filesystem::path& directory) {
+    ToolRegistry registry;
+    registry.register_tool(test_value_tool());
+    Runtime runtime({"offline"}, {"offline_epoch", "Use the pure fixture tool", Json::parse(R"({"mode":"offline"})")},
+                    registry.snapshot(), delayed_fixture, {}, {directory, offline_compact, {}});
+    return jsonl_frontend(runtime);
+}
+
+int live_cli(const std::filesystem::path& directory, const std::filesystem::path& auth_directory,
+             const std::string& model, const std::string& returned_model, std::size_t compact_bytes) {
+    AuthManager auth(auth_directory);
+    auto authorization = auth.access();
+    const auto account = authorization.account;
+    const auto catalog = auth.models().at("models").elements();
+    require(std::any_of(catalog.begin(), catalog.end(), [&](const Json& item) {
+        return item.text("slug") == model && item.text("visibility") == "list";
+    }), "model_not_available", Stage::frontend);
+    std::uint64_t authorization_epoch = 0;
+    const auto guard = [&](std::uint64_t epoch, std::stop_token stop) {
+        auto current = auth.access(stop);
+        require(current.account == account, "auth_account_mismatch", Stage::frontend);
+        if (epoch != authorization_epoch) {
+            authorization = current;
+            authorization_epoch = epoch;
+        }
+        require(current.session == authorization.session, "auth_required", Stage::frontend);
+    };
+    const auto generate = [&](const Request& request, std::stop_token stop) {
+        return auth.generate(request, stop, authorization.session);
+    };
+    const auto compact = [&](const Request& request, std::stop_token stop) -> Result<CompactedContext> {
+        try {
+            auto response = generate(summary_request(request), stop);
+            if (auto* error = std::get_if<Error>(&response)) return *error;
+            return CompactedContext::from_summary(request, std::get<CompletedResponse>(response));
+        } catch (const Error& error) { return error; }
+    };
+    ToolRegistry registry;
+    registry.register_tool(test_value_tool());
+    Binding binding{"openai-siwc", account, model, returned_model};
+    Runtime runtime({"live"}, {"live_epoch_v1",
+        "You are oh-my-harness. Use the compiled get_test_value tool when requested. "
+        "Keep replies concise and preserve facts from the conversation.",
+        Json::parse(R"({"mode":"live","compaction":"prompt_summary_keep_two_v1"})")},
+        registry.snapshot(), generate, {.compact_bytes = compact_bytes},
+        {directory, compact, {}, binding, 2, guard, [&](std::stop_token stop) {
+            return auth.hold_session(authorization.session, stop);
+        }});
+    return jsonl_frontend(runtime);
 }
 } // namespace omh

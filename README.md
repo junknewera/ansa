@@ -1,6 +1,6 @@
 # oh-my-harness
 
-Независимый C++20 runtime для персонального AI coding agent. Namespace `omh`, executable `omh`. Offline turn проходит через строгий Responses admission, pure tool и native replay.
+Независимый C++20 runtime для персонального AI coding agent. Namespace `omh`, executable `omh`. Offline mock и собственный Sign in with ChatGPT используют общий Responses admission, pure tool, native replay и сохраняемые сессии.
 
 Новая инженерная сессия начинается с [AGENTS.md](AGENTS.md) и [текущего состояния проекта](docs/PROJECT_STATE.md).
 
@@ -35,7 +35,7 @@ ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
   ctest --test-dir build-sanitize --output-on-failure --no-tests=error
 ```
 
-Обычный CTest включает семь protocol suites, восемь runtime suites, шестнадцать session suites, четыре проверки executable и два mutation-теста. Session suites проверяют SIGKILL на durable boundaries, журнал, Resume, дедупликацию, ошибки хранения и compact. Mutation-тесты меняют копии production replay builder внутри build-каталога и требуют конкретного отказа replay oracle. Ошибка компиляции mutant не считается успешным тестом. Sanitizer-конфигурация пропускает повторные сборки mutants.
+Обычный CTest включает 56 проверок: семь protocol suites, восемь runtime, семнадцать session, пятнадцать auth, три summary, четыре проверки executable и два mutation-теста. Session suites проверяют SIGKILL на durable boundaries, журнал, Resume, дедупликацию, ошибки хранения и compact. Auth suites проверяют JWT/PKCE, refresh между процессами, гонки logout/dispatch и crash при замене credentials. Mutation-тесты меняют копии production replay builder внутри build-каталога и требуют конкретного отказа replay oracle. Ошибка компиляции mutant не считается успешным тестом. Sanitizer-конфигурация пропускает повторные сборки mutants.
 
 Дополнительная Linux-проверка запускает JSONL с терминалом на stdin и заполняет stdout pipe. Она использует стандартную библиотеку Python.
 
@@ -45,7 +45,35 @@ nix develop --no-update-lock-file -c ctest --test-dir build \
 nix develop --no-update-lock-file -c timeout 10 python tests/cli_backpressure.py ./build/omh
 ```
 
-## Offline JSONL
+## Вход и live JSONL
+
+```sh
+./build/omh --login
+./build/omh --auth-status
+./build/omh --models
+./build/omh --live-jsonl --session .omh-session --model gpt-6.1-sol
+```
+
+Собственная регистрация использует браузер, PKCE S256, state и nonce. Если Firefox предлагает выбрать профиль, выбери его и заверши вход. CLI также печатает ссылку для ручного открытия в браузере на той же машине. Callback слушает только `127.0.0.1` и ждёт до пяти минут. Для повторного запроса разрешения использовать ChatGPT plan есть `--login-consent`.
+
+Lifecycle следует официальным контрактам [регистрации и входа](https://developers.openai.com/siwc/token-sharing-open-source/sign-in), [профилей и сессий](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions) и [токенов](https://developers.openai.com/siwc/token-sharing-open-source/token-reference).
+
+Один профиль хранится в `$XDG_STATE_HOME/oh-my-harness` или `~/.local/state/oh-my-harness`. Каталог имеет права `0700`, файлы - `0600`. Токены хранятся в открытом виде отдельно от журнала и исходников. `--auth-dir /absolute/path` выбирает другой собственный каталог для любой auth-команды или live CLI. Credential stores других приложений не используются. `--auth-status` выводит только статус, хеш привязки учётной записи и интервалы до expiry/refresh.
+
+Live JSONL использует команды из таблицы ниже и `session: "live"` из начального snapshot. Каталог session связывается с выбранными account, requested/returned model и context policy. Обычный новый Submit получает сохранённую историю; смена binding требует новой сессии. `--returned-model EXACT` задаёт точную policy, если сервер возвращает имя, отличающееся от выбранного slug. По умолчанию обе строки равны. Автоматического выбора другого аккаунта или модели нет.
+
+`--compact-bytes N` задаёт мягкий порог активного JSON-контекста (по умолчанию 262144). Live compact - обычный Responses-запрос со специальным prompt и пустым списком tools. Он создаёт сводку старой части разговора, сохраняя два последних завершённых turn и текущий запрос полностью. Сводка и её provenance синхронизируются до применения новой context epoch; полная история остаётся в журнале. Ошибка compact приостанавливает turn до Resume. До накопления трёх завершённых turns compact не применяется. Это JSON budget, оценка tokens пока не реализована.
+
+```sh
+./build/omh --refresh-auth
+./build/omh --logout
+```
+
+Вход сохраняется между запусками. Rotating refresh сериализуется файловой блокировкой и выполняется перед истечением access token. Явный `--refresh-auth` также соблюдает серверный `earliest_refresh_at`; до этого времени он возвращает `auth_refresh_not_ready`. При неопределённом результате обмена токен не используется повторно, требуется новый вход. Logout немедленно запрещает новый dispatch, удаляет локальные токены и пытается отозвать refresh token. Поле `remote_revocation_confirmed` сообщает результат. Сеть недоступна, неизвестен результат предыдущего обмена или повторный вход заменил ещё активную сессию - подтверждение полного отзыва остаётся `false`. Забытые сессии можно отозвать через настройки ChatGPT.
+
+При сетевой ошибке turn остаётся в `paused`; после устранения причины можно отправить Resume с его `request_id`. После logout и повторного входа Resume явно принимает новую auth-сессию того же аккаунта. Известные outcomes tools сохраняются, незапущенный хвост допускает безопасную повторную попытку. Уже начатый executor завершается до завершения logout. Сейчас зарегистрирован только pure `get_test_value`.
+
+## Команды JSONL
 
 `omh --offline-jsonl` читает одну команду на строку и отдаёт события в stdout. Первый snapshot сообщает `session` (`offline`), `incarnation` и `stream_sequence`. В каждой команде передай `schema_version: 1`, эти `session` и `incarnation`, а также `turn`, `command_id`, `type` и одно поле payload.
 
@@ -86,11 +114,11 @@ Runtime накапливает контекст между завершённы�
 - `ToolRegistry` хранит compiled descriptor/schema/validator/executor/revision. Provider получает только descriptions. В production зарегистрирован только детерминированный `get_test_value` без внешних эффектов.
 - Один control owner ведёт состояние turn. Worker выполняет mock generation, подготовку и dispatch tool и строит continuation. Commands/events v1 и snapshot/resync обслуживают JSONL frontend.
 
-CLI предоставляет self-check и синтетический round trip. Mock строит финальный response из фактического результата tool в continuation. CLI работает offline.
+CLI предоставляет self-check, offline round trip и live SIWC. Mock строит финальный response из фактического результата tool в continuation.
 
-Сетевой adapter с TLS verification собран, но live HTTP/TLS и OAuth lifecycle этим milestone не подтверждены. Политика MIME по умолчанию строгая; отсутствие MIME можно разрешить только явно для точного `POST https://api.openai.com/v1/responses`, `stream:true`, `store:false`, HTTP 200. Неверный или повторный MIME всегда приводит к отказу.
+Сетевой adapter проверяет TLS, ограничивает размер и длительность transfer и не следует redirects. Политика MIME по умолчанию строгая; отсутствие MIME разрешается явно только для точного `POST https://api.openai.com/v1/responses`, `stream:true`, `store:false`, HTTP 200. Неверный или повторный MIME всегда приводит к отказу. Текущий live путь буферизует ограниченный HTTP body и применяет общий SSE reducer после успешного transfer; frontend пока получает текст после admission.
 
-Поддерживается закрытое подмножество Responses events: lifecycle, function arguments, message text/refusal и reasoning summary. Неизвестные events/items отклоняются. Требуются `response.created`, непрерывные unsigned sequence numbers с нуля и точное совпадение returned model с явно выбранной policy. Для reasoning обязательно непустое `encrypted_content`. Это консервативный adapter, а не полная реализация всех Responses capabilities.
+Поддерживается закрытое подмножество Responses events: lifecycle, function arguments, message text/refusal, reasoning summary и неисполняемый `response.metadata` с явным matching response ID. Неизвестные events/items отклоняются. Требуются `response.created`, непрерывные unsigned sequence numbers с нуля и точное совпадение returned model с явно выбранной policy. Для reasoning обязательно непустое `encrypted_content`. Это консервативный adapter, а не полная реализация всех Responses capabilities.
 
 Для нового pure tool достаточно `ToolDefinition` и регистрации; пример с аргументами есть в suite `tools`. Поддерживаемая локальная schema: object/array/string/integer/number/boolean/null, все properties обязательны, `additionalProperties:false`; domain validation задаётся compiled validator. Неизвестные schema keywords отклоняются. При изменении реализации нужно менять `implementation_revision`.
 

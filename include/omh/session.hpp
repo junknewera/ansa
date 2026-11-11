@@ -2,18 +2,14 @@
 #include "omh/compaction.hpp"
 #include "omh/contracts.hpp"
 #include "omh/tools.hpp"
+#include "omh/context_codec.hpp"
 
 namespace omh {
 inline constexpr std::size_t compact_item_threshold = max_request_items - 2 * Limits{}.items - Limits{}.calls;
-Json save_request(const Request&);
-Request load_request(const Json&);
-Json save_response(const CompletedResponse&);
-CompletedResponse load_response(const Json&);
 Json save_invocation(const ToolInvocation&);
 ToolInvocation load_invocation(const Json&);
 Json save_result(const ToolResult&);
 ToolResult load_result(const Json&);
-std::string response_text(const CompletedResponse&);
 
 struct SubmitReceipt {
     CommandId command;

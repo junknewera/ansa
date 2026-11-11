@@ -47,6 +47,10 @@ class Runtime::Impl {
     const Generate generate_;
     const Compact compact_;
     const RuntimeLimits limits_;
+    const std::size_t keep_recent_turns_;
+    const std::function<void(std::uint64_t, std::stop_token)> check_dispatch_;
+    const std::function<std::shared_ptr<void>(std::stop_token)> tool_guard_;
+    std::uint64_t resume_epoch_ = 0;
     const std::size_t profile_bytes_;
     std::shared_ptr<SessionState> state_;
     std::unique_ptr<Journal> journal_;
@@ -84,7 +88,7 @@ class Runtime::Impl {
         if (state_->turn) return state_->turn->receipt.request;
         return {};
     }
-    WorkIdentity identity() const { return {incarnation_, turn(), *request()}; }
+    WorkIdentity identity() const { return {incarnation_, turn(), *request(), resume_epoch_}; }
     bool can_cancel() const {
         return (pending_receipt_ || state_->turn) && phase_ != "completed" && phase_ != "cancelled" && phase_ != "finishing";
     }
@@ -233,6 +237,7 @@ class Runtime::Impl {
                 break;
             case Commit::resume:
                 recovered_pause_ = false;
+                ++resume_epoch_;
                 phase_ = state_->turn->stage;
                 diagnostic_.clear();
                 stop_ = std::stop_source{};
@@ -277,7 +282,9 @@ class Runtime::Impl {
         input.push_back(Json::object({{"role", Json::string("user")},
             {"content", Json::string(std::get<Submit>(command.payload).text)}}));
         Request next(state_->configuration.binding(), state_->epoch, tools_->advertisement(), std::move(input));
-        const bool compact = !state_->history.empty() &&
+        const auto user_turns = static_cast<std::size_t>(std::count_if(state_->history.begin(), state_->history.end(),
+            [](const Json& item) { return item.has("role") && item.text("role") == "user"; }));
+        const bool compact = user_turns > keep_recent_turns_ &&
             (next.input().size() >= compact_item_threshold ||
              state_->history_bytes + receipt.text->size() * 6 + profile_bytes_ >= limits_.compact_bytes);
         receipt.request = {"request_" + std::to_string(state_->next_request + 1)};
@@ -351,6 +358,10 @@ class Runtime::Impl {
             }
             if (phase_ == "cancelled" || shutting_down_ || storage_failed_) { snapshot(); return; }
             if (recovery_) { phase_ = "paused"; snapshot(); return; }
+            if (replay->dispatch_error) {
+                persist(event("pause", {{"diagnostic", Json::string(replay->dispatch_error->diagnostic)}}), Commit::pause);
+                return;
+            }
             const auto failed = std::any_of(replay->results->begin(), replay->results->end(),
                 [](const ToolResult& result) { return result.execution != Execution::succeeded; });
             persist(failed ? event("pause", {{"diagnostic", Json::string("tool_failed")}}) : event("continued"),
@@ -520,6 +531,7 @@ class Runtime::Impl {
     }
 
     CompletedResponse generate(const Request& request, const Job& job) {
+        if (check_dispatch_) check_dispatch_(job.identity.resume_epoch, job.stop);
         {
             std::lock_guard lock(mutex_);
             require(can_dispatch(job.identity), "generation_cancelled", Stage::admission, ErrorCode::cancelled);
@@ -547,10 +559,20 @@ class Runtime::Impl {
             if (auto* tools = std::get_if<RunTools>(&job.task)) {
                 const auto plan = tools->batch.plan();
                 auto results = std::make_shared<std::vector<ToolResult>>();
+                std::optional<Error> dispatch_error;
+                std::shared_ptr<void> authorization_hold;
                 std::size_t index = tools->completed.size();
                 *results = unwrap(tools->batch.execute(job.stop,
                     [&](std::string_view operation, std::string_view call) {
+                        if (check_dispatch_) {
+                            try { check_dispatch_(job.identity.resume_epoch, job.stop); }
+                            catch (const Error& error) { dispatch_error = error; return false; }
+                        }
                         if (!tool_checkpoint(job.identity, plan.at(index))) return false;
+                        try {
+                            if (check_dispatch_) check_dispatch_(job.identity.resume_epoch, job.stop);
+                            if (tool_guard_) authorization_hold = tool_guard_(job.stop);
+                        } catch (const Error& error) { dispatch_error = error; return false; }
                         std::lock_guard lock(mutex_);
                         if (!can_dispatch(job.identity)) return false;
                         inbox_.tool_starts.push_back({{std::string(operation)}, std::string(call)});
@@ -558,14 +580,16 @@ class Runtime::Impl {
                         return true;
                     },
                     [&](const ToolResult& result) {
+                        authorization_hold.reset();
                         ++index;
                         return tool_checkpoint(job.identity, result);
                     }, tools->completed));
-                return Replay{std::move(tools->response), std::move(results)};
+                return Replay{std::move(tools->response), std::move(results), std::move(dispatch_error)};
             }
             if (const auto* replay = std::get_if<Replay>(&job.task))
                 return generate(continuation(replay->response, *replay->results), job);
             const auto& request = std::get<CompactRequest>(job.task).request;
+            if (check_dispatch_) check_dispatch_(job.identity.resume_epoch, job.stop);
             {
                 std::lock_guard lock(mutex_);
                 require(can_dispatch(job.identity), "compaction_cancelled", Stage::admission, ErrorCode::cancelled);
@@ -601,9 +625,11 @@ public:
     Impl(SessionId session, ContextEpoch context, std::shared_ptr<const ToolSnapshot> tools,
          Generate generate, RuntimeLimits limits, SessionOptions options)
         : tools_(std::move(tools)), generate_(std::move(generate)), compact_(std::move(options.compact)), limits_(limits),
-          profile_bytes_(Request({}, context, tools_ ? tools_->advertisement() : ToolAdvertisement{}, {}).json().dump().size()),
+          keep_recent_turns_(options.keep_recent_turns), check_dispatch_(std::move(options.check_dispatch)),
+          tool_guard_(std::move(options.tool_guard)),
+          profile_bytes_(Request(options.binding, context, tools_ ? tools_->advertisement() : ToolAdvertisement{}, {}).json().dump().size()),
           state_(std::make_shared<SessionState>(session,
-              Request({}, std::move(context), tools_ ? tools_->advertisement() : ToolAdvertisement{}, {}))) {
+              Request(options.binding, std::move(context), tools_ ? tools_->advertisement() : ToolAdvertisement{}, {}))) {
         require(valid_id(session.value) && tools_ && generate_ && limits.commands > 0 && limits.commands <= 256 &&
                 limits.events >= 2 && limits.events <= 256 && limits.submit_ids > 0 && limits.submit_ids <= 65536 &&
                 limits.compact_bytes >= 256 && limits.compact_bytes <= 4 * 1024 * 1024,

@@ -9,10 +9,13 @@ class CompactedContext {
     CompactedContext(Request, Json);
 public:
     static Result<CompactedContext> admit(Request, Json);
+    static Result<CompactedContext> from_summary(Request original, const CompletedResponse&);
     const Request& request() const { return request_; }
     const Json& native() const { return native_; }
     std::vector<Json> output() const { return native_.at("output").elements(); }
 };
 using Compact = std::function<Result<CompactedContext>(const Request&, std::stop_token)>;
 ContextEpoch compact_epoch(const ContextEpoch& base, std::size_t generation, const CompactedContext&);
+std::size_t summary_prefix_size(const Request&);
+Request summary_request(const Request&);
 } // namespace omh

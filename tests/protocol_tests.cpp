@@ -187,6 +187,22 @@ void reducer() {
     auto negative = [&](const std::string& name, const std::function<void(std::vector<Json>&)>& mutate) {
         auto es = original; mutate(es); reject_wire(env, name, wire(es));
     };
+    const auto metadata = Json::parse(R"({"type":"response.metadata","response_id":"resp_a","metadata":{"openai_chatgpt_moderation_metadata":{}}})");
+    auto with_metadata = original;
+    with_metadata.insert(with_metadata.begin() + 1, set(metadata, "response_id", original.front().at("response").at("id")));
+    check(decode(env, wire(with_metadata)).items() == decode(env, body).items(), "SIWC metadata altered native output");
+    auto bad_metadata = with_metadata;
+    bad_metadata[1] = set(bad_metadata[1], "response_id", Json::string("wrong"));
+    reject_wire(env, "metadata response identity", wire(bad_metadata));
+    bad_metadata = with_metadata;
+    bad_metadata[1] = without(bad_metadata[1], "response_id");
+    reject_wire(env, "metadata missing identity", wire(bad_metadata));
+    bad_metadata = with_metadata;
+    bad_metadata[1] = set(bad_metadata[1], "metadata", Json::parse("[]"));
+    reject_wire(env, "metadata shape", wire(bad_metadata));
+    bad_metadata = with_metadata;
+    bad_metadata.back() = set(bad_metadata.back(), "type", Json::string("response.failed"));
+    reject_wire(env, "metadata never authorizes failed response", wire(bad_metadata));
     negative("orphan argument item", [](auto& e) { e[4] = set(e[4], "item_id", Json::string("orphan")); });
     negative("argument output index", [](auto& e) { e[4] = set(e[4], "output_index", number(0)); });
     negative("argument event call identity", [](auto& e) { e[4] = set(e[4], "call_id", Json::string("other")); });
@@ -343,7 +359,10 @@ void replay() {
     reversed = multi_results; reversed[1].operation_id = reversed[0].operation_id; rejects([&] { (void)continuation(multi, reversed); });
     rejects([&] { Request bad({}, env.request.epoch(), env.request.tools(), {Json::parse(R"({"type":"message","role":"system","content":"bad"})")}); });
     Binding wrong; wrong.provider = "other"; rejects([&] { Request bad(wrong, env.request.epoch(), env.request.tools(), {}); });
-    wrong = {}; wrong.requested_model = "other"; rejects([&] { Request bad(wrong, env.request.epoch(), env.request.tools(), {}); });
+    wrong = {}; wrong.requested_model.clear(); rejects([&] { Request bad(wrong, env.request.epoch(), env.request.tools(), {}); });
+    Binding explicit_model; explicit_model.requested_model = "fixture-model"; explicit_model.returned_model = "fixture-model";
+    check(Request(explicit_model, env.request.epoch(), env.request.tools(), {}).json().text("model") == "fixture-model",
+          "explicit account-selected model");
 }
 void tools() {
     const auto env = environment(); const auto response = decode(env, fixture());

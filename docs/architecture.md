@@ -12,16 +12,20 @@
 | `contracts.hpp` | Commands/events v1, distinct IDs, targeted Cancel и frontend snapshot/resync types |
 | `runtime.cpp`, `runtime_inbox.hpp` | Serialized turn state, bounded mailboxes, dispatch и cancellation |
 | `journal.hpp`, `journal.cpp` | Exclusive session lock, append-only framed records, hashes, fsync и восстановление оборванного хвоста |
-| `session.hpp`, `session.cpp` | Canonical session reducer, owning codecs, history, durable command identity и восстановление Responses через production admission |
-| `compaction.hpp`, `compaction.cpp` | Admission результата compact и новая exact context epoch |
+| `session.hpp`, `session.cpp` | Canonical session reducer, history и durable command identity |
+| `context_codec.hpp`, `context_codec.cpp` | Owning request/response codecs и восстановление Responses через production admission |
+| `compaction.hpp`, `compaction.cpp` | Prompt summary, admission результата compact и новая exact context epoch |
+| `auth.hpp`, `auth.cpp`, `auth_crypto.cpp` | Собственный SIWC/OIDC lifecycle, PKCE/JWT/JWKS, приватное хранилище и rotating refresh |
 | `offline.cpp` | Детерминированный mock через production framer и reducer |
-| `main.cpp`, `cli.cpp` | Dependency self-check, offline demo и JSONL frontend |
+| `main.cpp`, `cli.cpp`, `auth_cli.cpp` | Dependency self-check, offline/live JSONL и команды входа |
 
 Core - статическая CMake library `omh_core`. Сторонние runtime dependencies: libcurl, yyjson и libcrypto с их системной closure. Node/Python/agent CLI не участвуют в работе executable. CMake и Nix нужны для сборки.
 
 ## Admission и ownership
 
 `SiwcProvider::generate` создаёт `ResponseStream`, передаёт ему decoded HTTP bytes и вызывает `finish` только после успешного libcurl transfer и проверки финальных headers. Offline adapter использует те же framer, reducer и request builder. Ни curl callback, ни `output_item.done` не дают разрешения на tools.
+
+Live AuthManager удерживает lease профиля во время HTTP, получает bounded body и затем вызывает общий decoder. Это сохраняет EOF/terminal gate; streaming text в frontend пока не публикуется. SIWC `response.metadata` допускается только с явным совпадающим response ID и объектом metadata, проходит общие sequence/size проверки и не добавляется в executable output.
 
 Reducer требует created identity/model, последовательных sequence numbers, уникальных item/call IDs и согласованных output indices. Added/delta/done/terminal representations сверяются. Function arguments проверяются и при final-only delivery. Item order должен совпадать в done events и completed response. Для text/summary parts отдельно проверяются IDs, indices, deltas и final values. Unknown executable types и unknown events приводят к отказу.
 
@@ -78,12 +82,28 @@ Session reducer хранит исходные binding, requested/returned model 
 
 Compact выполняется отдельной provider-операцией на границе перед новым turn. Порог учитывает JSON budget и резерв items под весь tool round и финальный response. В журнал попадают полный исходный Request и полный native result compact. После синхронизации новая exact epoch и весь returned output становятся активным контекстом.
 
-Поддерживаемое подмножество standalone result включает retained user messages и один opaque `compaction` item с encrypted_content. Unknown retained executable items отклоняются. Mock сохраняет synthetic digest и последнее user message. Реальная semantic compaction, token budget и доступность SIWC endpoint пока требуют live-проверки. [Официальный контракт](https://developers.openai.com/api/docs/guides/compaction).
+Live compact выполняется обычным Responses-запросом с отдельным summarization prompt и пустыми tools. Старый prefix сворачивается в assistant summary; два последних завершённых turn сохраняются полностью, pending user добавляется без изменений после compact. Prompt сохраняет цель, ограничения, решения и незавершённую работу. Размер summary ограничен 16 KiB. Сохраняемый `omh.summary.v1` содержит полный admitted summary response и результирующий контекст. Recovery снова проверяет production admission, exact request provenance и равенство summary/tail. Prompt v1 является частью replay-контракта и должен оставаться стабильным при будущих форматах.
+
+Порог live compact мягкий: до трёх завершённых turns сохраняется полный контекст. Отдельные жёсткие request/item limits продолжают действовать. При ошибке старый контекст остаётся активным, turn ждёт Resume. Native `/responses/compact` live путь не используется.
+
+Прежний offline journal format остаётся читаемым. Его standalone result включает retained user messages и один synthetic opaque `compaction` item с encrypted_content; unknown retained executable items отклоняются. Это legacy mock-контракт, отдельный от prompt summary.
+
+## Собственный SIWC профиль
+
+AuthManager создаёт own registration с постоянным opaque host UUID. Первый вход использует dynamic client registration, последующие - выданный client ID. Loopback callback, свежие state/nonce и PKCE S256 проверяются до code exchange. Discovery ограничен доверенными endpoint URLs. OpenSSL проверяет RS256/JWK, signature, issuer, audience/azp, время, nonce и неизменность subject. Identity привязана к issuer, issued client и subject; workspace не выводится из email.
+
+Auth directory и файлы проверяются по owner, permissions, type и link count. Записи проходят temporary file fsync, atomic rename и directory fsync. Один stop-aware flock сериализует обмены между процессами. JWT и access/refresh tokens находятся только в auth profile, отдельно от session journal и логов. Public binding хранит хеш identity. Identity-only scope сохраняется, но inference требует всех plan scopes. Текущая реализация ожидает полный token response с access/refresh token и expires_in, ID-token-only response без них отклоняется.
+
+Refresh сохраняет durable pending до отправки rotating token и публикует проверенную замену после ответа. После неопределённого результата повторная отправка запрещена. Logout marker публикуется до ожидания flock, останавливает login/refresh/request и запрещает новый dispatch. Токены удаляются до попытки remote revoke. Неизвестный результат rotation/code exchange и замена активного grant при повторном входе оставляют sticky revocation uncertainty: отзыв нового grant не доказывает отзыв прежнего. Crash residue временных файлов очищается под lock; неподтверждённый revoke сохраняет это состояние между запусками.
+
+Worker проверяет auth до provider callback и до durable tool intent, затем ещё раз после intent. Scoped lease удерживает auth lock от допуска executor до его возврата. Logout завершается после уже допущенного executor; известный outcome записывается в session journal. Отказ после intent сохраняет known not_started и приостанавливает turn. Resume удаляет только неисполненный хвост и сохраняет известные outcomes/operation IDs. Повторный вход не меняет активный auth session ID неявно: новый lease принимается только при явном Resume и прежней account binding.
+
+401 требует входа, 403 обозначает policy denial, 429 - usage limit. Автоматического переключения аккаунта, model, billing route и повторной отправки ambiguous refresh нет. Credentials других агентов не используются.
 
 ## Следующая граница
 
 До side-effecting tools остаются явный reconciliation workflow и tool-specific recovery. File replacement должен отдельно определять rename/preimage/conflict semantics без обещания atomic CAS с внешними writers. Здесь файловых и shell tools нет.
 
-OAuth должен быть самостоятельным: own registration, PKCE/state/nonce, строгая ID token/JWKS validation через OpenSSL/проверенную JOSE library, identity binding, secure storage, rotating/concurrent refresh. Сейчас OpenSSL проверен как native crypto dependency; OIDC verifier и credential lifecycle не реализованы. Auth files и credentials существующих агентов не используются.
+Расширение auth включает несколько профилей, системный secret store и более подробную безопасную классификацию серверных ошибок. Streaming frontend и token-aware context budget требуют отдельного контракта. File tools, ProcessRunner, TUI и subagents остаются следующими этапами.
 
 Исходные audit/P0 reports из `/home/gusevsaint/harness-research/` использованы read-only. Python probes не запускаются и не становятся dependency. Репозиторий содержит только синтетические fixture data.

@@ -42,7 +42,7 @@ struct Transfer {
     std::optional<Error> error;
     bool callback_failed = false;
 };
-void callback_error(Transfer& transfer, const Error& error) noexcept {
+template<class T> void callback_error(T& transfer, const Error& error) noexcept {
     // Keep exceptions from crossing the C ABI, including allocation failures in diagnostics.
     try { if (!transfer.error) transfer.error = error; } catch (...) { transfer.callback_failed = true; }
 }
@@ -223,5 +223,102 @@ Result<CompletedResponse> decode_offline(const Request& request, const HttpHead&
         if (const auto* error = std::get_if<Error>(&response)) throw *error;
         return std::get<CompletedResponse>(std::move(response));
     });
+}
+namespace {
+struct BufferedTransfer {
+    HttpHeadParser parser;
+    std::string body;
+    std::size_t limit;
+    std::stop_token stop;
+    std::optional<Error> error;
+    bool callback_failed = false;
+};
+std::size_t buffered_head(char* bytes, std::size_t size, std::size_t count, void* opaque) noexcept {
+    auto& transfer = *static_cast<BufferedTransfer*>(opaque);
+    try {
+        const auto length = size_checked(size, count);
+        transfer.parser.line({bytes, length});
+        return length;
+    } catch (const Error& error) { callback_error(transfer, error); }
+    catch (...) { transfer.callback_failed = true; }
+    return CURL_WRITEFUNC_ERROR;
+}
+std::size_t buffered_body(char* bytes, std::size_t size, std::size_t count, void* opaque) noexcept {
+    auto& transfer = *static_cast<BufferedTransfer*>(opaque);
+    try {
+        const auto length = size_checked(size, count);
+        require(transfer.parser.complete() && length <= transfer.limit - transfer.body.size(),
+                "http_body_limit", Stage::http, ErrorCode::limit);
+        transfer.body.append(bytes, length);
+        return length;
+    } catch (const Error& error) { callback_error(transfer, error); }
+    catch (...) { transfer.callback_failed = true; }
+    return CURL_WRITEFUNC_ERROR;
+}
+int buffered_progress(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noexcept {
+    return static_cast<BufferedTransfer*>(opaque)->stop.stop_requested() ? 1 : 0;
+}
+} // namespace
+
+HttpReply http_exchange(const HttpRequest& request, std::stop_token stop) {
+    require(!stop.stop_requested(), "http_cancelled", Stage::http, ErrorCode::cancelled);
+    require((request.url.starts_with("https://auth.openai.com/") ||
+             request.url == responses_endpoint || request.url == "https://api.openai.com/v1/models") &&
+            request.url.find_first_of("\r\n?#@") == std::string::npos &&
+            (request.method == "GET" || request.method == "POST") &&
+            request.body.size() <= 16 * 1024 * 1024 && request.body_limit <= 16 * 1024 * 1024,
+            "http_request_contract", Stage::http);
+    require(request.bearer.find_first_of("\r\n") == std::string::npos &&
+            request.bearer.size() <= 16384 &&
+            (request.content_type.empty() || request.content_type == "application/json" ||
+             request.content_type == "application/x-www-form-urlencoded"), "http_header_contract", Stage::http);
+    initialize();
+    Easy curl(curl_easy_init(), curl_easy_cleanup);
+    require(bool(curl), "curl_easy_init", Stage::http);
+    BufferedTransfer transfer{{}, {}, request.body_limit, stop, {}};
+    Headers headers(nullptr, curl_slist_free_all);
+    std::vector<std::string> fields{"Accept: application/json, text/event-stream"};
+    if (!request.content_type.empty()) fields.push_back("Content-Type: " + request.content_type);
+    if (!request.bearer.empty()) fields.push_back("Authorization: Bearer " + request.bearer);
+    for (const auto& field : fields) {
+        auto* added = curl_slist_append(headers.get(), field.c_str());
+        require(added != nullptr, "curl_header_allocation", Stage::http);
+        (void)headers.release();
+        headers.reset(added);
+    }
+    option(curl.get(), CURLOPT_URL, request.url.c_str());
+    option(curl.get(), CURLOPT_PROTOCOLS_STR, "https");
+    option(curl.get(), CURLOPT_FOLLOWLOCATION, 0L);
+    option(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
+    option(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+    option(curl.get(), CURLOPT_NOSIGNAL, 1L);
+    option(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 6000L);
+    option(curl.get(), CURLOPT_TIMEOUT_MS, request.timeout_ms);
+    option(curl.get(), CURLOPT_USERAGENT, "oh-my-harness/0.1");
+    option(curl.get(), CURLOPT_NOPROGRESS, 0L);
+    option(curl.get(), CURLOPT_XFERINFOFUNCTION, &buffered_progress);
+    option(curl.get(), CURLOPT_XFERINFODATA, &transfer);
+    option(curl.get(), CURLOPT_HEADERFUNCTION, &buffered_head);
+    option(curl.get(), CURLOPT_HEADERDATA, &transfer);
+    option(curl.get(), CURLOPT_WRITEFUNCTION, &buffered_body);
+    option(curl.get(), CURLOPT_WRITEDATA, &transfer);
+    option(curl.get(), CURLOPT_HTTPHEADER, headers.get());
+    option(curl.get(), CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
+    if (request.method == "POST") {
+        option(curl.get(), CURLOPT_POST, 1L);
+        option(curl.get(), CURLOPT_POSTFIELDS, request.body.data());
+        option(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(request.body.size()));
+    }
+    const auto status = curl_easy_perform(curl.get());
+    if (transfer.error) throw *transfer.error;
+    require(!transfer.callback_failed, "http_callback_failure", Stage::http, ErrorCode::transport);
+    require(!stop.stop_requested(), "http_cancelled", Stage::http, ErrorCode::cancelled);
+    if (status == CURLE_OPERATION_TIMEDOUT) fail(ErrorCode::transport, Stage::http, "http_timeout");
+    if (status == CURLE_COULDNT_RESOLVE_HOST) fail(ErrorCode::transport, Stage::http, "http_resolve_failed");
+    if (status == CURLE_COULDNT_CONNECT) fail(ErrorCode::transport, Stage::http, "http_connect_failed");
+    if (status == CURLE_PEER_FAILED_VERIFICATION) fail(ErrorCode::transport, Stage::http, "http_tls_verification");
+    require(status == CURLE_OK, "http_transfer_failed", Stage::http, ErrorCode::transport);
+    require(transfer.parser.complete(), "http_missing_headers", Stage::http, ErrorCode::transport);
+    return {transfer.parser.head(), std::move(transfer.body)};
 }
 } // namespace omh

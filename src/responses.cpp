@@ -25,7 +25,8 @@ bool advertised(const Request& request, const std::string& name) {
 } // namespace
 Request::Request(Binding binding, ContextEpoch epoch, ToolAdvertisement tools, std::vector<Json> input)
     : binding_(std::move(binding)), epoch_(std::move(epoch)), tools_(std::move(tools)), input_(std::move(input)) {
-    require(binding_.provider == "openai-siwc" && binding_.requested_model == "gpt-6.1-sol",
+    require(binding_.provider == "openai-siwc" && !binding_.requested_model.empty() &&
+            binding_.requested_model.size() <= 256,
             "unsupported_binding", Stage::request);
     nonempty(binding_.account); nonempty(binding_.returned_model); nonempty(epoch_.id);
     require(epoch_.exact_state.is_object() && !tools_.revision.empty(), "request_context", Stage::request);
@@ -45,7 +46,7 @@ Json Request::json() const {
         {"description", Json::string("Compiled local tools")}, {"tools", Json::array(tools)}});
     return Json::object({{"model", Json::string(binding_.requested_model)}, {"store", Json::parse("false")},
         {"stream", Json::parse("true")}, {"instructions", Json::string(epoch_.instructions)},
-        {"input", Json::array(input_)}, {"tools", Json::array({namespaced})},
+        {"input", Json::array(input_)}, {"tools", tools_.descriptors.empty() ? Json::array({}) : Json::array({namespaced})},
         {"include", Json::array({Json::string("reasoning.encrypted_content")})}});
 }
 CompletedResponse::CompletedResponse(Request request, std::string id, std::string model,
@@ -130,6 +131,11 @@ void ResponsesReducer::event(SseEvent wire) {
         require(!progress_, "duplicate_in_progress"); progress_ = true;
         const auto response = e.at("response"); identity(response);
         require(response.text("status") == "in_progress" && response.at("output").elements().empty(), "progress_status");
+    } else if (type == "response.metadata") {
+        // SIWC emits non-executable metadata alongside the response. It never
+        // replaces terminal admission or contributes items to continuation.
+        require(e.has("response_id") && e.text("response_id") == id_ && e.at("metadata").is_object(),
+                "response_metadata");
     } else if (type == "response.output_item.added") {
         const auto index = e.index("output_index");
         require(index == items_.size() && index < limits_.items, "item_order_or_limit");

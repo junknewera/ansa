@@ -4,6 +4,14 @@
 namespace omh {
 inline constexpr std::string_view responses_endpoint = "https://api.openai.com/v1/responses";
 struct HttpHead { long status = 0; std::vector<std::string> content_types; };
+struct HttpRequest {
+    std::string method, url, body, content_type, bearer;
+    std::size_t body_limit = 2 * 1024 * 1024;
+    long timeout_ms = 20000;
+};
+struct HttpReply { HttpHead head; std::string body; };
+using HttpExchange = std::function<HttpReply(const HttpRequest&, std::stop_token)>;
+HttpReply http_exchange(const HttpRequest&, std::stop_token = {});
 class HttpHeadParser {
     HttpHead head_;
     std::size_t bytes_ = 0, fields_ = 0;

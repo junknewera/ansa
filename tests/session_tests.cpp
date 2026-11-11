@@ -601,6 +601,28 @@ void batch_recovery() {
           "Resume duplicated prefix or lost next tool");
     finish(*run);
 }
+void dispatch_guard() {
+    Temp temp;
+    std::atomic<bool> permitted = true, revoke_once = true;
+    JournalOptions hooks{[&](JournalPoint point, std::string_view kind) {
+        if (point == JournalPoint::after_sync && kind == "intent" && revoke_once.exchange(false))
+            permitted = false;
+    }};
+    Runtime run({"offline"}, epoch(), tools(), generate, {}, {temp.session, compact, hooks, {}, 0,
+        [&](std::uint64_t, std::stop_token) {
+            require(permitted, "auth_required", Stage::frontend, ErrorCode::validation);
+        }});
+    const auto target = submit(run);
+    const auto failure = std::get<RuntimeError>(until<RuntimeError>(run).payload);
+    const auto view = snapshot(run);
+    check(failure.diagnostic == "auth_required" && counts->tools == 0 && view.tools.empty() &&
+          view.resume_available && !view.recovery_operation, "guard after durable intent did not stop tool");
+    permitted = true;
+    post(run, cmd(run, "resume", Resume{target}));
+    until<Done>(run);
+    check(counts->tools == 1, "safe not_started guard result could not Resume");
+    finish(run);
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -626,6 +648,7 @@ int main(int argc, char** argv) {
         else if (suite == "compact-budget") oversized_compaction();
         else if (suite == "parts-limit") journal_parts_limit();
         else if (suite == "batch-recovery") batch_recovery();
+        else if (suite == "dispatch-guard") dispatch_guard();
         else throw std::runtime_error("unknown suite");
         counts->~Counters();
         ::munmap(memory, sizeof(Counters));
