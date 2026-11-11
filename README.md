@@ -51,7 +51,7 @@ nix develop --no-update-lock-file -c timeout 10 python tests/cli_backpressure.py
 ./build/omh --login
 ./build/omh --auth-status
 ./build/omh --models
-./build/omh --live-jsonl --session .omh-session --model gpt-6.1-sol
+./build/omh --live-jsonl --session .omh-live-session --model gpt-6.1-sol
 ```
 
 Собственная регистрация использует браузер, PKCE S256, state и nonce. Если Firefox предлагает выбрать профиль, выбери его и заверши вход. CLI также печатает ссылку для ручного открытия в браузере на той же машине. Callback слушает только `127.0.0.1` и ждёт до пяти минут. Для повторного запроса разрешения использовать ChatGPT plan есть `--login-consent`.
@@ -60,7 +60,7 @@ Lifecycle следует официальным контрактам [регис
 
 Один профиль хранится в `$XDG_STATE_HOME/oh-my-harness` или `~/.local/state/oh-my-harness`. Каталог имеет права `0700`, файлы - `0600`. Токены хранятся в открытом виде отдельно от журнала и исходников. `--auth-dir /absolute/path` выбирает другой собственный каталог для любой auth-команды или live CLI. Credential stores других приложений не используются. `--auth-status` выводит только статус, хеш привязки учётной записи и интервалы до expiry/refresh.
 
-Live JSONL использует команды из таблицы ниже и `session: "live"` из начального snapshot. Каталог session связывается с выбранными account, requested/returned model и context policy. Обычный новый Submit получает сохранённую историю; смена binding требует новой сессии. `--returned-model EXACT` задаёт точную policy, если сервер возвращает имя, отличающееся от выбранного slug. По умолчанию обе строки равны. Автоматического выбора другого аккаунта или модели нет.
+Live JSONL использует команды из таблицы ниже и `session: "live"` из начального snapshot. `.omh-live-session/` исключён из Git; для offline сессии используется отдельный каталог. Каталог session связывается с выбранными account, requested/returned model и context policy. Обычный новый Submit получает сохранённую историю; смена binding требует новой сессии. `--returned-model EXACT` задаёт точную policy, если сервер возвращает имя, отличающееся от выбранного slug. По умолчанию обе строки равны. Автоматического выбора другого аккаунта или модели нет.
 
 `--compact-bytes N` задаёт мягкий порог активного JSON-контекста (по умолчанию 262144). Live compact - обычный Responses-запрос со специальным prompt и пустым списком tools. Он создаёт сводку старой части разговора, сохраняя два последних завершённых turn и текущий запрос полностью. Сводка и её provenance синхронизируются до применения новой context epoch; полная история остаётся в журнале. Ошибка compact приостанавливает turn до Resume. До накопления трёх завершённых turns compact не применяется. Это JSON budget, оценка tokens пока не реализована.
 

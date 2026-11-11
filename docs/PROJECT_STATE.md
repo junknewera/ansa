@@ -1,6 +1,6 @@
 # Состояние oh-my-harness
 
-Обновлено 2026-11-11. Текущий implementation checkpoint - `e2f8e1c` на `main`: собственный SIWC login, live turns и prompt compact. Native gates пройдены; milestone пока ожидает реальный rotating refresh после серверного earliest_refresh_at, примерно 13:59 МСК. Last known good завершённого milestone - persistent offline sessions `c0295bd`. Предыдущие baselines - offline runtime `10a11dd` и protocol `ede828d`. [Отчёт о проверках](implementation-report.md#собственный-siwc-и-live-provider).
+Обновлено 2026-11-11. Milestone **собственный SIWC login, live turns и prompt compact закрыт**. Last known good для кода - `e2f8e1c` на `main`. Пройдены native gates и реальный rotating refresh с последующим live turn. Предыдущие baselines - persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Отчёт о проверках](implementation-report.md#собственный-siwc-и-live-provider).
 
 ## Что работает
 
@@ -19,13 +19,13 @@
 
 Черновик `dc6766f` в `wip/offline-runtime` сохранён. Проверенные commits и последующие изменения доступны в Git.
 
-## Проверка checkpoint `e2f8e1c`
+## Проверка `e2f8e1c`
 
-NixOS/aarch64, GCC 16.2.0: Debug CTest **56/56**, Release Nix package **56/56**, ASan/UBSan **54/54** с detect_leaks=1 и halt_on_error=1, без сборок mutants. Production executable проходит self-check и offline demo; PTY backpressure regression прошла. `git diff --check` чистый. Независимые runtime и security review состоялись, все findings исправлены и закреплены регрессиями.
+NixOS/aarch64, GCC 16.2.0: Debug CTest **56/56**, Release Nix package **56/56**, ASan/UBSan **54/54** с detect_leaks=1 и halt_on_error=1, без сборок mutants. Семь новых concurrency suites прошли по 20 повторов, **140/140**. Production executable проходит self-check и offline demo; PTY backpressure regression прошла. `git diff --check` чистый. Независимые runtime и security review состоялись, все findings исправлены и закреплены регрессиями.
 
-Собственный браузерный вход и каталог моделей проверены вживую. Пять synthetic turns завершены, включая два прохода model → get_test_value → continuation → Done. Между запусками сохраняются вход, история и durable Submit dedup. Prompt compact применился дважды; marker старой истории сохранился после compact и restart. Пятый запрос после ошибки транспорта восстановлен явным Resume и дошёл до Done.
+Собственный браузерный вход и каталог моделей проверены вживую. Шесть synthetic turns завершены, включая два прохода model → get_test_value → continuation → Done. Между запусками сохраняются вход, история и durable Submit dedup. Prompt compact применился трижды; marker старой истории сохранился после compact и restart. Пятый запрос после ошибки транспорта восстановлен явным Resume и дошёл до Done.
 
-Реальный refresh ещё не пройден: ожидается разрешённое сервером время. Тесты проверяют rotating refresh между двумя процессами, crash pending, scope loss, logout во время refresh/login, запрет dispatch после logout, удержание lease на executor и отсутствие ложного подтверждения отзыва старых grants. Реальные credentials и live journal находятся вне репозитория.
+Реальный refresh прошёл около 14:00 МСК после разрешённого сервером времени: новые credentials сохранены, expires_in снова 3600, каталог из восьми моделей доступен. Шестой live turn с обновлённым входом завершился ответом REFRESH_OK, без повторной авторизации. Тесты также проверяют rotating refresh между двумя процессами, crash pending, scope loss, logout во время refresh/login, запрет dispatch после logout, удержание lease на executor и отсутствие ложного подтверждения отзыва старых grants. Реальные credentials и live journal находятся вне репозитория.
 
 ## Проверка baseline `c0295bd`
 
@@ -44,7 +44,7 @@ Crash tests посылают SIGKILL собственным дочерним п�
 - SIGKILL и fault injection проверены. Физическое отключение питания, поведение накопителя при power loss, ThreadSanitizer, x86_64-linux и длительные сессии пока открыты. Durability опирается на успешный fsync файловой системы и оборудования.
 - Session journal version 1 восстанавливается полным replay. Миграции, отдельные индексы и ротация по общему размеру отложены. По умолчанию лимит Submit IDs - 4096, records - 32 MiB, parts - 4096. Compact уменьшает активный контекст; история журнала сохраняется.
 - Reconciliation неизвестных эффектов требует отдельного workflow. Side-effecting tools и file replacement semantics остаются отдельными gates. Advisory lock и проверки inode/size ограничены взаимодействием с внешними writers.
-- Ближайший gate - реальный refresh и доступ к API с обновлённым входом. До него текущий checkpoint не обозначается закрытым live milestone. File tools, ProcessRunner, TUI и subagents остаются дальнейшими этапами.
+- Следующие границы - token-aware context budget, streaming frontend и явный reconciliation перед side effects. File tools, ProcessRunner, TUI и subagents остаются отдельными дальнейшими этапами.
 
 ## Первоисточники
 
