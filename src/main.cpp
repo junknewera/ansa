@@ -2,11 +2,13 @@
 #include "omh/runtime.hpp"
 #include "omh/transport.hpp"
 #include "omh/auth.hpp"
+#include "omh/process.hpp"
 #include <iostream>
 #include <charconv>
 #include <set>
 
 namespace omh {
+int agent_cli(int, char**);
 int offline_cli(const std::filesystem::path&);
 int auth_cli(std::string_view, const std::filesystem::path&);
 int live_cli(const std::filesystem::path&, const std::filesystem::path&,
@@ -38,7 +40,16 @@ omh::Json demo() {
 } // namespace
 int main(int argc, char** argv) {
     try {
-        const std::string_view command = argc > 1 ? argv[1] : "--self-check";
+        if (argc == 3 && std::string_view(argv[1]) == "--process-worker") return omh::process_worker(argv[2]);
+        const std::string_view command = argc > 1 ? argv[1] : "";
+        if (command == "--help" || command == "-h") {
+            std::cout << "Usage: ansa [--continue | --session ID] [--cwd PATH] [--model SLUG] [PROMPT]\n"
+                "       ansa --offline [PROMPT]\n"
+                "       ansa --login | --auth-status | --models | --logout\n"
+                "       ansa --print-config\n"
+                "Commands: /status /cancel /resume /exit. Ctrl+C cancels; Ctrl+D finishes accepted work.\n";
+            return 0;
+        }
         if (command == "--live-jsonl") {
             auto auth_directory = omh::default_auth_directory();
             std::filesystem::path session;
@@ -66,20 +77,22 @@ int main(int argc, char** argv) {
             command == "--refresh-auth" || command == "--models") {
             if (argc == 2) return omh::auth_cli(command, omh::default_auth_directory());
             if (argc == 4 && std::string_view(argv[2]) == "--auth-dir") return omh::auth_cli(command, argv[3]);
-            std::cerr << "Usage: omh " << command << " [--auth-dir PATH]\n";
+            std::cerr << "Usage: ansa " << command << " [--auth-dir PATH]\n";
             return 2;
         }
         if (argc == 4 && command == "--offline-jsonl" && std::string_view(argv[2]) == "--session")
             return omh::offline_cli(argv[3]);
-        if (argc > 2 || (command != "--self-check" && command != "--offline-demo" && command != "--offline-jsonl")) {
-            std::cerr << "Usage: omh [--self-check|--offline-demo|--offline-jsonl [--session PATH]]\n";
+        if (command != "--self-check" && command != "--offline-demo" && command != "--offline-jsonl")
+            return omh::agent_cli(argc, argv);
+        if (argc > 2) {
+            std::cerr << "Usage: ansa [--self-check|--offline-demo|--offline-jsonl [--session PATH]]\n";
             return 2;
         }
         if (command == "--offline-jsonl") return omh::offline_cli({});
         if (command == "--offline-demo") std::cout << demo().dump() << '\n';
         else {
             const auto info = omh::dependency_smoke();
-            std::cout << omh::Json::object({{"project", omh::Json::string("oh-my-harness")},
+            std::cout << omh::Json::object({{"project", omh::Json::string("ansa")},
                 {"target", omh::Json::string(info.target)}, {"curl", omh::Json::string(info.curl)},
                 {"tls", omh::Json::string(info.tls)}, {"yyjson", omh::Json::string(info.yyjson)},
                 {"openssl", omh::Json::string(info.openssl)}}).dump() << '\n';

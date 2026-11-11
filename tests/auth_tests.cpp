@@ -533,6 +533,30 @@ void held_dispatch() {
     check(done, "logout did not finish after lease release");
     rejects([&] { (void)manager->hold_session(lease.session); });
 }
+void execution_logout() {
+    Temp temp; Mock mock;
+    auto manager = mock.manager(temp.path); mock.login(*manager);
+    const auto identity = manager->access().session;
+    std::stop_source parent;
+    auto execution = manager->hold_execution(identity, parent.get_token());
+    parent.request_stop();
+    check(execution.stop.stop_requested(), "parent cancellation did not reach executor");
+    execution.ownership.reset();
+    execution = manager->hold_execution(identity);
+    manager.reset(); // The watcher owns its descriptor, not the AuthManager.
+    std::atomic<bool> done = false;
+    std::jthread logout([&] {
+        auto another = mock.manager(temp.path); (void)another->logout(); done = true;
+    });
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!execution.stop.stop_requested()) {
+        check(std::chrono::steady_clock::now() < deadline, "logout did not cancel active execution");
+        std::this_thread::sleep_for(1ms);
+    }
+    check(!done, "logout bypassed execution lease");
+    execution.ownership.reset(); logout.join();
+    check(done, "logout blocked after stopped executor released lease");
+}
 }
 int main(int argc, char** argv) {
     try {
@@ -553,6 +577,7 @@ int main(int argc, char** argv) {
         else if (suite == "uncertain-login") uncertain_login();
         else if (suite == "committed-login-crash") committed_login_crash();
         else if (suite == "held-dispatch") held_dispatch();
+        else if (suite == "execution-logout") execution_logout();
         else throw std::runtime_error("unknown suite");
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

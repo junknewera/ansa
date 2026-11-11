@@ -29,7 +29,7 @@ struct RuntimeCommand {
 struct CommandAccepted { CommandId command; std::optional<RequestId> request; };
 struct CommandReplayed { CommandId command; std::string state; };
 struct TextDelta { std::string text; };
-struct ToolStarted { OperationId operation; std::string call_id; };
+struct ToolStarted { OperationId operation; std::string call_id; std::string name{}; };
 struct ToolFinished {
     OperationId operation;
     std::string call_id;

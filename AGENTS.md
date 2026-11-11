@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`oh-my-harness` - минимальный C++20 agent runtime, который легко читать, менять и расширять. Namespace `omh`, executable `omh`. Agent loop принадлежит проекту и не зависит от Codex SDK или app-server.
+`ansa` - минимальный C++20 agent runtime, который легко читать, менять и расширять. Executable `ansa`; внутренний namespace `omh` сохраняется для совместимости протокольной основы. Agent loop принадлежит проекту и не зависит от Codex SDK или app-server.
 
 ## Начало задачи
 

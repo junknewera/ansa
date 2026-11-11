@@ -49,7 +49,7 @@ class Runtime::Impl {
     const RuntimeLimits limits_;
     const std::size_t keep_recent_turns_;
     const std::function<void(std::uint64_t, std::stop_token)> check_dispatch_;
-    const std::function<std::shared_ptr<void>(std::stop_token)> tool_guard_;
+    const std::function<ToolLease(std::stop_token)> tool_guard_;
     std::uint64_t resume_epoch_ = 0;
     const std::size_t profile_bytes_;
     std::shared_ptr<SessionState> state_;
@@ -268,7 +268,7 @@ class Runtime::Impl {
             schedule(CompactRequest{Request(state_->configuration.binding(), state_->epoch,
                 tools_->advertisement(), state_->history)}, "compacting");
         } else if (current.stage == "tools") {
-            schedule(PrepareTools{*current.tools_response, current.operation_run, current.results}, "executing");
+            schedule(PrepareTools{*current.tools_response, current.operation_run, current.results, current.operation_offset}, "executing");
         } else if (current.stage == "final") {
             phase_ = "finishing";
             persist(event("done"), Commit::done);
@@ -296,12 +296,14 @@ class Runtime::Impl {
         recovered_pause_ = false;
         stop_ = std::stop_source{};
         phase_ = "persisting";
-        persist([receipt, next = std::move(next), run, request_number, compact] {
+        persist([receipt, next = std::move(next), run, request_number, compact,
+                 round_limit = limits_.tool_rounds, call_limit = limits_.tool_calls] {
             return Json::object({{"kind", Json::string("accepted")}, {"command", Json::string(receipt.command.value)},
                 {"turn", Json::string(receipt.turn.value)}, {"request", Json::string(receipt.request.value)},
                 {"request_number", number(request_number)}, {"text", Json::string(*receipt.text)},
                 {"operation_run", Json::string(run)}, {"next", save_request(next)},
-                {"compact", Json::parse(compact ? "true" : "false")}});
+                {"compact", Json::parse(compact ? "true" : "false")},
+                {"round_limit", number(round_limit)}, {"call_limit", number(call_limit)}});
         }, Commit::accepted);
     }
 
@@ -363,7 +365,7 @@ class Runtime::Impl {
                 return;
             }
             const auto failed = std::any_of(replay->results->begin(), replay->results->end(),
-                [](const ToolResult& result) { return result.execution != Execution::succeeded; });
+                [](const ToolResult& result) { return result.effects != Effects::known_result; });
             persist(failed ? event("pause", {{"diagnostic", Json::string("tool_failed")}}) : event("continued"),
                     failed ? Commit::pause : Commit::continued);
             return;
@@ -373,6 +375,16 @@ class Runtime::Impl {
             const auto diagnostic = valid_id(error->diagnostic) ? error->diagnostic : "worker_failure";
             persist(event("pause", {{"diagnostic", Json::string(diagnostic)}}), Commit::pause);
         } else if (auto* response = std::get_if<CompletedResponse>(&done.result)) {
+            const auto& current = *state_->turn;
+            const auto completed = current.operation_offset + current.results.size();
+            if (!response->calls().empty() &&
+                (current.rounds >= 64 || current.rounds - current.resume_round >= current.round_limit ||
+                 completed > 256 || response->calls().size() > 256 - completed ||
+                 completed - current.resume_operation > current.call_limit ||
+                 response->calls().size() > current.call_limit - (completed - current.resume_operation))) {
+                persist(event("pause", {{"diagnostic", Json::string("tool_round_limit")}}), Commit::pause);
+                return;
+            }
             persist([turn_id = turn(), response = std::move(*response)] {
                 return transition(turn_id, "response", {{"response", save_response(response)}});
             }, Commit::response);
@@ -542,8 +554,6 @@ class Runtime::Impl {
                 "provider_request_mismatch", Stage::admission);
         require(response.calls().size() <= Limits{}.calls && response.items().size() <= Limits{}.items,
                 "runtime_response_limit", Stage::admission, ErrorCode::limit);
-        require(!std::holds_alternative<Replay>(job.task) || response.calls().empty(),
-                "tool_round_limit", Stage::admission);
         if (response.calls().empty()) (void)response_text(response);
         return response;
     }
@@ -552,7 +562,7 @@ class Runtime::Impl {
         try {
             if (const auto* generation = std::get_if<GenerateRequest>(&job.task)) return generate(generation->request, job);
             if (const auto* preparation = std::get_if<PrepareTools>(&job.task)) {
-                OperationIds ids(preparation->operation_run);
+                OperationIds ids(preparation->operation_run, preparation->operation_offset);
                 auto batch = unwrap(PreparedBatch::prepare(preparation->response, tools_, ids));
                 return RunTools{preparation->response, std::move(batch), preparation->completed};
             }
@@ -560,9 +570,12 @@ class Runtime::Impl {
                 const auto plan = tools->batch.plan();
                 auto results = std::make_shared<std::vector<ToolResult>>();
                 std::optional<Error> dispatch_error;
-                std::shared_ptr<void> authorization_hold;
+                ToolLease authorization_hold;
+                std::stop_source execution_stop;
+                std::stop_callback bridge(job.stop, [source = execution_stop]() mutable { source.request_stop(); });
+                std::optional<std::stop_callback<std::function<void()>>> authorization_bridge;
                 std::size_t index = tools->completed.size();
-                *results = unwrap(tools->batch.execute(job.stop,
+                *results = unwrap(tools->batch.execute(execution_stop.get_token(),
                     [&](std::string_view operation, std::string_view call) {
                         if (check_dispatch_) {
                             try { check_dispatch_(job.identity.resume_epoch, job.stop); }
@@ -571,19 +584,26 @@ class Runtime::Impl {
                         if (!tool_checkpoint(job.identity, plan.at(index))) return false;
                         try {
                             if (check_dispatch_) check_dispatch_(job.identity.resume_epoch, job.stop);
-                            if (tool_guard_) authorization_hold = tool_guard_(job.stop);
+                            if (tool_guard_) {
+                                authorization_hold = tool_guard_(job.stop);
+                                authorization_bridge.emplace(authorization_hold.stop,
+                                    [source = execution_stop]() mutable { source.request_stop(); });
+                            }
                         } catch (const Error& error) { dispatch_error = error; return false; }
                         std::lock_guard lock(mutex_);
-                        if (!can_dispatch(job.identity)) return false;
-                        inbox_.tool_starts.push_back({{std::string(operation)}, std::string(call)});
+                        if (!can_dispatch(job.identity) || execution_stop.stop_requested()) return false;
+                        inbox_.tool_starts.push_back({{std::string(operation)}, std::string(call), plan.at(index).name});
                         changed_.notify_all();
                         return true;
                     },
                     [&](const ToolResult& result) {
-                        authorization_hold.reset();
+                        authorization_bridge.reset();
+                        authorization_hold = {};
                         ++index;
                         return tool_checkpoint(job.identity, result);
                     }, tools->completed));
+                if (execution_stop.stop_requested() && !job.stop.stop_requested() && !dispatch_error)
+                    dispatch_error.emplace(ErrorCode::cancelled, Stage::frontend, "auth_required");
                 return Replay{std::move(tools->response), std::move(results), std::move(dispatch_error)};
             }
             if (const auto* replay = std::get_if<Replay>(&job.task))
@@ -634,6 +654,9 @@ public:
                 limits.events >= 2 && limits.events <= 256 && limits.submit_ids > 0 && limits.submit_ids <= 65536 &&
                 limits.compact_bytes >= 256 && limits.compact_bytes <= 4 * 1024 * 1024,
                 "runtime_configuration", Stage::frontend, ErrorCode::contract);
+        require(limits.tool_rounds > 0 && limits.tool_rounds <= 64 &&
+                limits.tool_calls > 0 && limits.tool_calls <= 256, "runtime_turn_limits", Stage::frontend);
+        require(!tools_->requires_journal() || !options.directory.empty(), "durable_tools_require_session", Stage::frontend);
         if (!options.directory.empty()) {
             journal_ = std::make_unique<Journal>(options.directory, [&](const Json& record) { state_->apply(record); },
                                                   std::move(options.journal));
@@ -645,11 +668,29 @@ public:
             diagnostic_ = journal_->diagnostic();
             storage_failed_ = !diagnostic_.empty();
         } else state_->apply(state_->initialization());
+        if (!storage_failed_ && state_->turn && state_->turn->intent) {
+            try {
+                const auto invocation = *state_->turn->intent;
+                if (auto recovered = tools_->recover(invocation)) {
+                    ToolResult result{invocation.operation_id, invocation.call_id, recovered->output,
+                                      recovered->execution, recovered->effects, true};
+                    const auto value = transition(state_->turn->receipt.turn, "outcome", {{"result", save_result(result)}});
+                    auto next = std::make_shared<SessionState>(*state_);
+                    next->apply(value);
+                    state_ = std::move(next);
+                    try { journal_->append(value); }
+                    catch (const Error& error) { storage_failed_ = true; diagnostic_ = error.diagnostic; }
+                    catch (...) { storage_failed_ = true; diagnostic_ = "journal_recovery_append_failed"; }
+                }
+            } catch (...) { diagnostic_ = "operation_recovery_failed"; }
+        }
         require(state_->submits.size() <= limits_.submit_ids, "session_command_limit");
         receipts_ = state_->submits;
         if (state_->turn) {
             phase_ = state_->turn->stage;
-            for (const auto& result : state_->turn->results) {
+            auto restored_results = state_->turn->previous_results;
+            restored_results.insert(restored_results.end(), state_->turn->results.begin(), state_->turn->results.end());
+            for (const auto& result : restored_results) {
                 if (!result.dispatched) continue;
                 auto output = std::make_shared<const std::string>(result.output);
                 activity_.emplace_back(ToolFinished{{result.operation_id}, result.call_id, result.execution, result.effects, output});
@@ -668,11 +709,7 @@ public:
         owner_ = std::jthread([this](std::stop_token stop) { run_owner(stop); });
     }
     ~Impl() {
-        {
-            std::lock_guard lock(mutex_);
-            inbox_.aborting = true;
-        }
-        changed_.notify_all();
+        shutdown();
         owner_.join();
         worker_.join();
         storage_worker_.join();
@@ -731,6 +768,11 @@ public:
         inbox_.input_closed = true;
         changed_.notify_all();
     }
+    void shutdown() {
+        std::lock_guard lock(mutex_);
+        inbox_.aborting = true;
+        changed_.notify_all();
+    }
 };
 
 Runtime::Runtime(SessionId session, ContextEpoch context, std::shared_ptr<const ToolSnapshot> tools,
@@ -742,4 +784,5 @@ const RuntimeIncarnation& Runtime::incarnation() const { return impl_->incarnati
 Result<PostStatus> Runtime::post(RuntimeCommand command) { return impl_->post(std::move(command)); }
 std::optional<RuntimeEvent> Runtime::next_event(std::stop_token stop) { return impl_->next_event(stop); }
 void Runtime::close_input() { impl_->close_input(); }
+void Runtime::shutdown() { impl_->shutdown(); }
 } // namespace omh

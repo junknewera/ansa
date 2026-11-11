@@ -71,12 +71,15 @@ ToolSnapshot::ToolSnapshot(std::vector<ToolDefinition> definitions) : definition
     std::vector<Json> records;
     for (const auto& d : definitions_) {
         advertisement_.descriptors.push_back(d.descriptor);
-        records.push_back(descriptor_json(d.descriptor));
+        auto record = descriptor_json(d.descriptor);
+        if (d.requires_journal) record = Json::object({{"descriptor", record}, {"requires_journal", Json::parse("true")}});
+        records.push_back(std::move(record));
     }
     advertisement_.revision = sha256(Json::array(records).dump());
 }
 void ToolRegistry::register_tool(ToolDefinition definition) {
-    require(definitions_.size() < 64 && name_valid(definition.descriptor.name) && definition.validate && definition.execute &&
+    require(definitions_.size() < 64 && name_valid(definition.descriptor.name) && definition.validate &&
+            (definition.execute || definition.invoke) &&
             !definition.descriptor.implementation_revision.empty() && definition.descriptor.implementation_revision.size() <= 128,
             "invalid_tool_registration", Stage::preparation, ErrorCode::validation);
     require(definition.descriptor.schema.text("type") == "object", "tool_schema_root", Stage::preparation);
@@ -89,7 +92,25 @@ void ToolRegistry::register_tool(ToolDefinition definition) {
 std::shared_ptr<const ToolSnapshot> ToolRegistry::snapshot() const {
     return std::shared_ptr<const ToolSnapshot>(new ToolSnapshot(definitions_));
 }
-OperationIds::OperationIds(std::string run) : run_(std::move(run)) {
+Json save_invocation(const ToolInvocation& invocation) {
+    return Json::object({{"operation", Json::string(invocation.operation_id)}, {"call", Json::string(invocation.call_id)},
+        {"name", Json::string(invocation.name)}, {"revision", Json::string(invocation.implementation_revision)},
+        {"arguments", invocation.arguments}});
+}
+ToolInvocation load_invocation(const Json& value) {
+    return {value.text("operation"), value.text("call"), value.text("name"), value.text("revision"), value.at("arguments")};
+}
+bool ToolSnapshot::requires_journal() const {
+    return std::any_of(definitions_.begin(), definitions_.end(), [](const auto& tool) { return tool.requires_journal; });
+}
+std::optional<ToolOutcome> ToolSnapshot::recover(const ToolInvocation& invocation) const {
+    const auto found = std::find_if(definitions_.begin(), definitions_.end(), [&](const auto& tool) {
+        return tool.descriptor.name == invocation.name && tool.descriptor.implementation_revision == invocation.implementation_revision;
+    });
+    require(found != definitions_.end(), "recovery_tool_mismatch", Stage::execution);
+    return found->recover ? found->recover(invocation) : std::nullopt;
+}
+OperationIds::OperationIds(std::string run, std::uint64_t offset) : run_(std::move(run)), next_(offset) {
     require(name_valid(run_), "invalid_run_id", Stage::preparation);
 }
 std::string OperationIds::next() {
@@ -137,6 +158,9 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, con
     const AfterFinish& after_finish, const std::vector<ToolResult>& completed) {
     return capture([&] {
         require(!consumed_ && bool(snapshot_), "batch_already_consumed", Stage::execution, ErrorCode::validation);
+        require((before_start && after_finish) || std::none_of(calls_.begin(), calls_.end(), [&](const auto& call) {
+            return snapshot_->definitions_[call.tool].requires_journal;
+        }), "durable_checkpoint_required", Stage::execution);
         consumed_ = true;
         std::vector<ToolResult> results;
         results.reserve(calls_.size());
@@ -148,11 +172,12 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, con
         require(completed.size() <= results.size(), "completed_prefix_size", Stage::execution);
         for (std::size_t i = 0; i < completed.size(); ++i) {
             require(completed[i].operation_id == results[i].operation_id && completed[i].call_id == results[i].call_id &&
-                    completed[i].execution == Execution::succeeded && completed[i].effects == Effects::known_result,
+                    completed[i].dispatched && completed[i].effects == Effects::known_result,
                     "completed_prefix_conflict", Stage::execution);
             results[i] = completed[i];
         }
         std::string unknown_output = R"({"error":"executor_failure","effects":"unknown"})";
+        const auto invocations = plan();
         for (std::size_t i = completed.size(); i < calls_.size(); ++i) {
             const auto& p = calls_[i];
             auto& result = results[i];
@@ -165,7 +190,8 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, con
             }
             try {
                 result.dispatched = true;
-                auto outcome = snapshot_->definitions_[p.tool].execute(p.args, stop);
+                const auto& definition = snapshot_->definitions_[p.tool];
+                auto outcome = definition.invoke ? definition.invoke(invocations[i], stop) : definition.execute(p.args, stop);
                 require(outcome.output.size() <= 128 * 1024, "executor_output_limit", Stage::execution);
                 (void)Json::string(outcome.output); // UTF-8 validation before any replay.
                 require(outcome.execution != Execution::succeeded || outcome.effects == Effects::known_result,

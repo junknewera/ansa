@@ -25,6 +25,7 @@ struct AuthStatus {
     std::string account;
     std::uint64_t expires_in = 0, refresh_wait = 0;
 };
+struct AuthExecutionLease { std::shared_ptr<void> ownership; std::stop_token stop; };
 enum class AuthStorePoint { temporary_synced, replaced, before_dispatch, tokens_removed };
 using AuthStoreObserver = std::function<void(AuthStorePoint, std::string_view name)>;
 
@@ -43,6 +44,7 @@ public:
     bool logout(std::stop_token = {});
     bool current(const AuthLease&);
     std::shared_ptr<void> hold_session(std::string_view session, std::stop_token = {});
+    AuthExecutionLease hold_execution(std::string_view session, std::stop_token = {});
     Json models(std::stop_token = {});
     Result<CompletedResponse> generate(const Request&, std::stop_token = {}, std::string_view expected_session = {});
 };

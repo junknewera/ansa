@@ -13,6 +13,9 @@ struct RuntimeLimits {
     std::size_t events = 64;
     std::size_t submit_ids = 4096;
     std::size_t compact_bytes = 256 * 1024;
+    // Legacy frontends retain their one-round contract. The local agent opts in.
+    std::size_t tool_rounds = 1;
+    std::size_t tool_calls = 16;
 };
 struct SessionOptions {
     std::filesystem::path directory;
@@ -21,7 +24,7 @@ struct SessionOptions {
     Binding binding;
     std::size_t keep_recent_turns = 0;
     std::function<void(std::uint64_t resume_epoch, std::stop_token)> check_dispatch;
-    std::function<std::shared_ptr<void>(std::stop_token)> tool_guard;
+    std::function<ToolLease(std::stop_token)> tool_guard;
 };
 
 // One session, one turn at a time. Submits wait in FIFO order while the worker is busy.
@@ -40,5 +43,6 @@ public:
     std::optional<RuntimeEvent> next_event(std::stop_token = {});
     // Finish accepted commands and drain the outbox. Destruction requests stop instead.
     void close_input();
+    void shutdown();
 };
 } // namespace omh

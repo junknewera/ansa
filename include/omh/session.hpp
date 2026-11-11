@@ -6,8 +6,6 @@
 
 namespace omh {
 inline constexpr std::size_t compact_item_threshold = max_request_items - 2 * Limits{}.items - Limits{}.calls;
-Json save_invocation(const ToolInvocation&);
-ToolInvocation load_invocation(const Json&);
 Json save_result(const ToolResult&);
 ToolResult load_result(const Json&);
 
@@ -28,6 +26,10 @@ struct SavedTurn {
     std::string stage, diagnostic;
     bool paused = false;
     std::set<std::string> resumes;
+    std::vector<ToolResult> previous_results{};
+    std::size_t rounds = 0, operation_offset = 0;
+    std::size_t round_limit = 1, call_limit = 16;
+    std::size_t resume_round = 0, resume_operation = 0;
 };
 
 // Reducer for the canonical journal. apply() commits an owning state only after

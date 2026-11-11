@@ -294,7 +294,7 @@ HttpReply http_exchange(const HttpRequest& request, std::stop_token stop) {
     option(curl.get(), CURLOPT_NOSIGNAL, 1L);
     option(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 6000L);
     option(curl.get(), CURLOPT_TIMEOUT_MS, request.timeout_ms);
-    option(curl.get(), CURLOPT_USERAGENT, "oh-my-harness/0.1");
+    option(curl.get(), CURLOPT_USERAGENT, "ansa/0.1");
     option(curl.get(), CURLOPT_NOPROGRESS, 0L);
     option(curl.get(), CURLOPT_XFERINFOFUNCTION, &buffered_progress);
     option(curl.get(), CURLOPT_XFERINFODATA, &transfer);

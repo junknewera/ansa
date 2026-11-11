@@ -129,6 +129,7 @@ Json encode_event(const RuntimeEvent& event) {
         type("tool_started");
         field("operation_id", Json::string(started->operation.value));
         field("call_id", Json::string(started->call_id));
+        if (!started->name.empty()) field("name", Json::string(started->name));
     } else if (const auto* finished = std::get_if<ToolFinished>(&event.payload)) {
         type("tool_finished");
         field("operation_id", Json::string(finished->operation.value));
@@ -256,7 +257,8 @@ int live_cli(const std::filesystem::path& directory, const std::filesystem::path
         Json::parse(R"({"mode":"live","compaction":"prompt_summary_keep_two_v1"})")},
         registry.snapshot(), generate, {.compact_bytes = compact_bytes},
         {directory, compact, {}, binding, 2, guard, [&](std::stop_token stop) {
-            return auth.hold_session(authorization.session, stop);
+            auto lease = auth.hold_execution(authorization.session, stop);
+            return ToolLease{std::move(lease.ownership), lease.stop};
         }});
     return jsonl_frontend(runtime);
 }

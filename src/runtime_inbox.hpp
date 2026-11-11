@@ -11,7 +11,12 @@ struct WorkIdentity {
     bool operator==(const WorkIdentity&) const = default;
 };
 struct GenerateRequest { Request request; };
-struct PrepareTools { CompletedResponse response; std::string operation_run; std::vector<ToolResult> completed; };
+struct PrepareTools {
+    CompletedResponse response;
+    std::string operation_run;
+    std::vector<ToolResult> completed;
+    std::size_t operation_offset = 0;
+};
 struct RunTools {
     CompletedResponse response;
     PreparedBatch batch;

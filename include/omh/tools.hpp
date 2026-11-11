@@ -4,12 +4,30 @@
 
 namespace omh {
 struct ToolOutcome { Execution execution; Effects effects; std::string output; };
-using Validator = bool (*)(const Json&);
-using Executor = ToolOutcome (*)(const Json&, std::stop_token);
-struct ToolDefinition { ToolDescriptor descriptor; Validator validate; Executor execute; };
+using Validator = std::function<bool(const Json&)>;
+using Executor = std::function<ToolOutcome(const Json&, std::stop_token)>;
 struct ToolInvocation {
     std::string operation_id, call_id, name, implementation_revision;
     Json arguments;
+};
+Json save_invocation(const ToolInvocation&);
+ToolInvocation load_invocation(const Json&);
+using ContextExecutor = std::function<ToolOutcome(const ToolInvocation&, std::stop_token)>;
+using ToolRecovery = std::function<std::optional<ToolOutcome>(const ToolInvocation&)>;
+struct ToolDefinition {
+    ToolDescriptor descriptor;
+    Validator validate;
+    Executor execute;
+    ContextExecutor invoke{};
+    ToolRecovery recover{};
+    bool requires_journal = false;
+};
+struct ToolLease {
+    std::shared_ptr<void> ownership;
+    std::stop_token stop;
+    ToolLease() = default;
+    ToolLease(std::shared_ptr<void> value) : ownership(std::move(value)) {}
+    ToolLease(std::shared_ptr<void> value, std::stop_token token) : ownership(std::move(value)), stop(token) {}
 };
 class ToolSnapshot {
     std::vector<ToolDefinition> definitions_;
@@ -19,6 +37,8 @@ class ToolSnapshot {
     friend class PreparedBatch;
 public:
     const ToolAdvertisement& advertisement() const { return advertisement_; }
+    bool requires_journal() const;
+    std::optional<ToolOutcome> recover(const ToolInvocation&) const;
 };
 class ToolRegistry {
     std::vector<ToolDefinition> definitions_;
@@ -31,7 +51,7 @@ class OperationIds {
     std::string run_;
     std::uint64_t next_ = 0;
 public:
-    explicit OperationIds(std::string run);
+    explicit OperationIds(std::string run, std::uint64_t offset = 0);
     std::string next();
 };
 class PreparedBatch {

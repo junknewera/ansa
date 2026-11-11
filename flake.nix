@@ -1,5 +1,5 @@
 {
-  description = "oh-my-harness: independent C++20 protocol foundation";
+  description = "ansa: independent C++20 local agent";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/7fd4004d0511991fff3a0524856a9be09e28c5f0";
   outputs = { nixpkgs, ... }:
     let
@@ -8,7 +8,7 @@
       package = system:
         let pkgs = import nixpkgs { inherit system; }; in
         pkgs.stdenv.mkDerivation {
-          pname = "oh-my-harness";
+          pname = "ansa";
           version = "0.1.0";
           src = nixpkgs.lib.cleanSource ./.;
           strictDeps = true;

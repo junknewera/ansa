@@ -1,4 +1,4 @@
-# Архитектура oh-my-harness
+# Архитектура ansa
 
 ## Ответственности
 
@@ -17,7 +17,9 @@
 | `compaction.hpp`, `compaction.cpp` | Prompt summary, admission результата compact и новая exact context epoch |
 | `auth.hpp`, `auth.cpp`, `auth_crypto.cpp` | Собственный SIWC/OIDC lifecycle, PKCE/JWT/JWKS, приватное хранилище и rotating refresh |
 | `offline.cpp` | Детерминированный mock через production framer и reducer |
-| `main.cpp`, `cli.cpp`, `auth_cli.cpp` | Dependency self-check, offline/live JSONL и команды входа |
+| `local_storage.cpp`, `process.cpp` | Приватные evidence records, отдельный process supervisor/subreaper, cancellation и recovery |
+| `agent_config.cpp`, `local_tools.cpp` | Детерминированные settings, иерархия AGENTS и compiled локальные tools |
+| `main.cpp`, `cli.cpp`, `auth_cli.cpp`, `agent_cli.cpp` | Текстовый CLI, dependency self-check, offline/live JSONL и команды входа |
 
 Core - статическая CMake library `omh_core`. Сторонние runtime dependencies: libcurl, yyjson и libcrypto с их системной closure. Node/Python/agent CLI не участвуют в работе executable. CMake и Nix нужны для сборки.
 
@@ -66,7 +68,7 @@ Consume-once batch защищает конкретный подготовлен�
 
 Submit FIFO вмещает 16 команд по умолчанию, ещё по одному слоту выделено для адресного Cancel, GetSnapshot и Resume. Runtime хранит до 4096 Submit ID и явно отклоняет новые при исчерпании лимита. Lookups повторных команд также ограничены размером FIFO. Storage, checkpoint и worker mailboxes имеют по одному слоту. Приём Cancel и допуск к каждому provider callback и executor сериализуются под одним mutex. Если matching Cancel уже принят, владелец обрабатывает его перед pending completion. Поздний completion отменённого turn сохраняет известные outcomes, дальнейший dispatch прекращается.
 
-Outbox вмещает 64 события по умолчанию. Переполнение сбрасывает накопленные события и публикует `ResyncRequired`. Snapshot восстанавливает фазу, идентификаторы, состояние worker, текст, диагностику и результаты начатых tools последнего turn. У событий монотонный cursor в пределах incarnation. Предельный размер Submit - 16 KiB, итогового текста - 64 KiB. Допускается один tool batch на turn.
+Outbox вмещает 64 события по умолчанию. Переполнение сбрасывает накопленные события и публикует `ResyncRequired`. Snapshot восстанавливает фазу, идентификаторы, состояние worker, текст, диагностику и результаты начатых tools последнего turn. У событий монотонный cursor в пределах incarnation. Предельный размер Submit - 16 KiB, итогового текста - 64 KiB. Legacy frontends сохраняют default один batch; текстовый агент допускает 32 раунда и 64 calls на сегмент Resume, с абсолютными пределами 64/256 на turn. Operation IDs продолжаются между раундами; native continuation и архив известных outcomes не теряются. Ненулевой process exit является известным результатом и допускает следующий шаг модели.
 
 ## Canonical journal и восстановление
 
@@ -76,7 +78,21 @@ Journal version 1 содержит framed JSON records с length/complement, SHA
 
 Session reducer хранит исходные binding, requested/returned model policy, полную epoch, tool descriptors/revisions, native items и результаты. Восстановление CompletedResponse снова проходит через production decoder/reducer. История завершённых turns образует следующий input. Frontend snapshot остаётся производным публичным представлением.
 
-На restart любой незавершённый turn приостановлен до Resume. Завершённый prefix tools используется с прежними operation IDs. Незавершённый intent блокирует Resume как effect_unknown. Outcome хранит факт фактического dispatch, поэтому отменённый до executor intent не создаёт ложных ToolStarted/ToolFinished. Известный результат при storage failure остаётся в snapshot с `durable:false`. Ручное reconciliation неизвестных эффектов относится к следующей границе.
+На restart любой незавершённый turn приостановлен до Resume. Завершённый prefix tools используется с прежними operation IDs. Для незавершённого process intent recovery проверяет синхронизированное свидетельство supervisor и дописывает outcome в canonical journal. Без достоверного результата intent блокирует Resume как effect_unknown. Outcome хранит факт фактического dispatch, поэтому отменённый до executor intent не создаёт ложных ToolStarted/ToolFinished. Известный результат при storage failure остаётся в snapshot с `durable:false`. Ручное reconciliation неизвестных эффектов относится к следующей границе.
+
+## Локальные tools и процессы
+
+`ToolDefinition` может получать полный runtime-assigned `ToolInvocation` и recovery callback. `requires_journal` входит в snapshot revision и требует durable callbacks до любого dispatch. Process tool нельзя запустить через неперсистентный runtime или голый batch без checkpoints. Provider по-прежнему получает только descriptors; журнал и loop не содержат switch по именам tools.
+
+ProcessRunner сохраняет private request specification, затем fork/exec запускает свежий однопоточный supervisor через тот же ELF. Между fork/exec многопоточного runtime выполняются только syscalls. Supervisor удерживает worker lock и создаёт append-only consumed marker до запуска команды. Повторный internal worker не повторяет side effect. Result связан с точными invocation/options и consumed marker по hash; missing/conflicting evidence не допускается. Atomic publication использует fsync temporary file, renameat2 NOREPLACE и fsync directory. Evidence не заменяет canonical session journal.
+
+Supervisor сбрасывает inherited signal dispositions/mask, является subreaper, держит primary waitable до group cleanup, прекращает усыновлённых потомков включая setsid, собирает bounded stdout/stderr и точный status. Control pipe EOF означает Cancel либо гибель runtime. Timeout и Cancel прекращают дальнейший dispatch, известный итог сохраняется. Если сам supervisor уничтожен, effect остаётся unknown, повтор запуска запрещён; без cgroup гарантировать прекращение всех отделившихся потомков нельзя. PDEATHSIG прекращает primary при гибели supervisor, с проверкой исходного parent PID после установки.
+
+Backend отклоняет direct sudo, очищает capabilities, требует non-root identity и устанавливает `no_new_privs` до exec. Это ограничение повышения через exec, а не OS sandbox или блокировка уже разрешённых privileged brokers. [Контракт Linux no_new_privs](https://docs.kernel.org/userspace-api/no_new_privs.html).
+
+File tools проверяют весь batch до execution, читают только regular single-link files с nofollow walk каждого компонента. Dotenv, известные credential stores и собственные auth/session roots исключены. Search ограничивает visited entries, files, prefix bytes, matches и encoded output. Config/AGENTS также не следуют symlink/hardlink. Вложенные инструкции требуют актуального token перед доступом; shell остаётся full access и не является sandbox. Effective settings и начальные инструкции входят в exact context epoch: их смена требует новой сессии. Catalog info.json используется только для выбора сессии, canonical journal проверяет binding/config самостоятельно.
+
+Текстовый frontend использует те же typed commands/events. Self-pipe обрабатывает SIGINT; stdout и stderr не блокируют input/control. При resync финальный текст дописывается до публикации completed локальному input loop. Pending Submit имеет локальную identity; ранний Cancel получает snapshot receipt даже во время fsync, затем отправляет targeted Cancel. EOF ждёт отправки такой отмены. Busy input явно отклоняется с exit 1, прерванный one-shot возвращает 130.
 
 ## Compact
 
@@ -96,14 +112,14 @@ Auth directory и файлы проверяются по owner, permissions, typ
 
 Refresh сохраняет durable pending до отправки rotating token и публикует проверенную замену после ответа. После неопределённого результата повторная отправка запрещена. Logout marker публикуется до ожидания flock, останавливает login/refresh/request и запрещает новый dispatch. Токены удаляются до попытки remote revoke. Неизвестный результат rotation/code exchange и замена активного grant при повторном входе оставляют sticky revocation uncertainty: отзыв нового grant не доказывает отзыв прежнего. Crash residue временных файлов очищается под lock; неподтверждённый revoke сохраняет это состояние между запусками.
 
-Worker проверяет auth до provider callback и до durable tool intent, затем ещё раз после intent. Scoped lease удерживает auth lock от допуска executor до его возврата. Logout завершается после уже допущенного executor; известный outcome записывается в session journal. Отказ после intent сохраняет known not_started и приостанавливает turn. Resume удаляет только неисполненный хвост и сохраняет известные outcomes/operation IDs. Повторный вход не меняет активный auth session ID неявно: новый lease принимается только при явном Resume и прежней account binding.
+Worker проверяет auth до provider callback и до durable tool intent, затем ещё раз после intent. Scoped lease удерживает auth lock от допуска executor до его возврата. Watcher с собственным directory fd передаёт logout stop активному executor; runtime объединяет его с targeted Cancel. Logout ждёт освобождения lease; известный outcome записывается в session journal. Отказ после intent сохраняет known not_started и приостанавливает turn. Resume удаляет только неисполненный хвост и сохраняет известные outcomes/operation IDs. Повторный вход не меняет активный auth session ID неявно: новый lease принимается только при явном Resume и прежней account binding.
 
 401 требует входа, 403 обозначает policy denial, 429 - usage limit. Автоматического переключения аккаунта, model, billing route и повторной отправки ambiguous refresh нет. Credentials других агентов не используются.
 
 ## Следующая граница
 
-До side-effecting tools остаются явный reconciliation workflow и tool-specific recovery. File replacement должен отдельно определять rename/preimage/conflict semantics без обещания atomic CAS с внешними writers. Здесь файловых и shell tools нет.
+Неизвестные эффекты требуют явного reconciliation workflow. File replacement отдельным compiled tool должен определить rename/preimage/conflict semantics без обещания atomic CAS с внешними writers; произвольная команда таких гарантий не даёт.
 
-Расширение auth включает несколько профилей, системный secret store и более подробную безопасную классификацию серверных ошибок. Streaming frontend и token-aware context budget требуют отдельного контракта. File tools, ProcessRunner, TUI и subagents остаются следующими этапами.
+Расширение auth включает несколько профилей и системный secret store. Streaming frontend, token-aware context budget, MCP, hooks, Ask, интерактивный sudo и TUI остаются в TODO.
 
 Исходные audit/P0 reports из `/home/gusevsaint/harness-research/` использованы read-only. Python probes не запускаются и не становятся dependency. Репозиторий содержит только синтетические fixture data.

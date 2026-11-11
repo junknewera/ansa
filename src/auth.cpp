@@ -442,7 +442,7 @@ public:
             {"client_id", client}, {"ext_agent_host_id", saved.text("host_id")}, {"response_type", "code"},
             {"redirect_uri", redirect}, {"scope", std::string(scopes)}, {"resource", std::string(resource)},
             {"state", state}, {"nonce", nonce}, {"code_challenge_method", "S256"}, {"code_challenge", pkce_challenge(verifier)}};
-        if (client == "dynamic_agent_client") fields.emplace_back("agent_name_hint", "oh-my-harness");
+        if (client == "dynamic_agent_client") fields.emplace_back("agent_name_hint", "ansa");
         if (consent) fields.emplace_back("prompt", "consent");
         open_browser(endpoints.authorization + "?" + form_encode(fields));
         const auto returned = callback(listener.get(), state, port, stop);
@@ -537,6 +537,29 @@ public:
                      record->index("expires_at") > clock_() && plan_enabled(record->text("scope")), "auth_required");
         return hold;
     }
+    AuthExecutionLease hold_execution(std::string_view session, std::stop_token stop) {
+        struct ExecutionHold {
+            std::shared_ptr<void> lock;
+            std::stop_source operation;
+            std::optional<std::stop_callback<std::function<void()>>> bridge;
+            std::jthread watcher;
+        };
+        auto hold = std::make_shared<ExecutionHold>();
+        hold->lock = hold_session(session, stop);
+        hold->bridge.emplace(stop, [source = hold->operation]() mutable { source.request_stop(); });
+        auto directory = std::make_shared<Fd>(::fcntl(directory_.get(), F_DUPFD_CLOEXEC, 3));
+        auth_require(directory->get() >= 0, "auth_directory_duplicate");
+        hold->watcher = std::jthread([directory, source = hold->operation](std::stop_token done) mutable {
+            while (!done.stop_requested()) {
+                struct stat marker{};
+                if (::fstatat(directory->get(), "signed-out", &marker, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+                    source.request_stop(); return;
+                }
+                delay(done, 50ms);
+            }
+        });
+        return {hold, hold->operation.get_token()};
+    }
     bool logout(std::stop_token stop) {
         request_logout();
         StoreLock lock(directory_.get(), stop);
@@ -606,15 +629,21 @@ bool AuthManager::current(const AuthLease& lease) { return impl_->current(lease)
 std::shared_ptr<void> AuthManager::hold_session(std::string_view session, std::stop_token stop) {
     return impl_->hold_session(session, stop);
 }
+AuthExecutionLease AuthManager::hold_execution(std::string_view session, std::stop_token stop) {
+    return impl_->hold_execution(session, stop);
+}
 Json AuthManager::models(std::stop_token stop) { return impl_->models(stop); }
 Result<CompletedResponse> AuthManager::generate(const Request& request, std::stop_token stop, std::string_view expected) {
     return impl_->generate(request, stop, expected);
 }
 std::filesystem::path default_auth_directory() {
-    if (const auto* state = std::getenv("XDG_STATE_HOME"); state && *state)
-        return std::filesystem::path(state) / "oh-my-harness";
     const auto* home = std::getenv("HOME");
     auth_require(home && *home, "auth_home_directory");
-    return std::filesystem::path(home) / ".local/state/oh-my-harness";
+    const auto* state = std::getenv("XDG_STATE_HOME");
+    const auto legacy = state && *state ? std::filesystem::path(state) / "oh-my-harness" :
+        std::filesystem::path(home) / ".local/state/oh-my-harness";
+    // Existing credentials and registration stay in place during the rename.
+    if (std::filesystem::exists(legacy)) return legacy;
+    return std::filesystem::path(home) / ".ansa/auth";
 }
 } // namespace omh

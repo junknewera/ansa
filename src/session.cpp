@@ -18,16 +18,6 @@ std::vector<Json> input_for(const std::vector<Json>& history, const std::string&
 }
 } // namespace
 
-Json save_invocation(const ToolInvocation& invocation) {
-    return Json::object({{"operation", Json::string(invocation.operation_id)}, {"call", Json::string(invocation.call_id)},
-        {"name", Json::string(invocation.name)}, {"revision", Json::string(invocation.implementation_revision)},
-        {"arguments", invocation.arguments}});
-}
-
-ToolInvocation load_invocation(const Json& value) {
-    return {value.text("operation"), value.text("call"), value.text("name"), value.text("revision"), value.at("arguments")};
-}
-
 Json save_result(const ToolResult& result) {
     return Json::object({{"operation", Json::string(result.operation_id)}, {"call", Json::string(result.call_id)},
         {"output", Json::string(result.output)}, {"execution", number(static_cast<std::size_t>(result.execution))},
@@ -94,6 +84,10 @@ void SessionState::reduce(const Json& event) {
         const auto run = event.text("operation_run");
         OperationIds validate_run(run);
         turn.emplace(SavedTurn{receipt, run, std::move(request), {}, {}, {}, {}, stage, {}, false, {}});
+        turn->round_limit = event.has("round_limit") ? event.index("round_limit") : 1;
+        turn->call_limit = event.has("call_limit") ? event.index("call_limit") : 16;
+        require(turn->round_limit > 0 && turn->round_limit <= 64 &&
+                turn->call_limit > 0 && turn->call_limit <= 256, "session_turn_limits");
         submits.emplace(id, std::move(receipt));
         ++next_request;
         return;
@@ -110,8 +104,24 @@ void SessionState::reduce(const Json& event) {
             expected = continuation(*current.tools_response, current.results);
         }
         require(same_request(response.request(), expected), "session_response_request");
+        const auto completed = current.operation_offset + current.results.size();
+        if (!response.calls().empty())
+            require(current.rounds < 64 && current.rounds - current.resume_round < current.round_limit &&
+                    completed <= 256 && response.calls().size() <= 256 - completed &&
+                    completed - current.resume_operation <= current.call_limit &&
+                    response.calls().size() <= current.call_limit - (completed - current.resume_operation),
+                    "session_turn_limits");
+        if (current.tools_response) {
+            // Commit the previous round only after validating exact continuation.
+            for (const auto& result : current.results)
+                require(result.dispatched && result.effects == Effects::known_result, "session_round_incomplete");
+            current.previous_results.insert(current.previous_results.end(), current.results.begin(), current.results.end());
+            current.operation_offset = completed;
+            current.results.clear();
+            current.tools_response.reset();
+        }
         if (!response.calls().empty()) {
-            require(!current.tools_response, "tool_round_limit");
+            ++current.rounds;
             current.tools_response = response;
             current.stage = "tools";
         } else current.stage = "final";
@@ -126,7 +136,7 @@ void SessionState::reduce(const Json& event) {
         const auto& descriptors = configuration.tools().descriptors;
         const auto descriptor = std::find_if(descriptors.begin(), descriptors.end(),
             [&](const ToolDescriptor& d) { return d.name == invocation.name; });
-        require(invocation.operation_id == current.operation_run + ":op:" + std::to_string(index + 1) &&
+        require(invocation.operation_id == current.operation_run + ":op:" + std::to_string(current.operation_offset + index + 1) &&
                 invocation.call_id == call.call_id && invocation.name == call.name &&
                 invocation.arguments == Json::parse(call.arguments) && descriptor != descriptors.end() &&
                 descriptor->implementation_revision == invocation.implementation_revision, "session_intent_conflict");
@@ -143,7 +153,7 @@ void SessionState::reduce(const Json& event) {
         require(current.stage == "tools" && current.tools_response && !current.intent &&
                 current.results.size() == current.tools_response->calls().size(), "session_continuation");
         for (const auto& result : current.results)
-            require(result.execution == Execution::succeeded && result.effects == Effects::known_result, "session_tool_failed");
+            require(result.dispatched && result.effects == Effects::known_result, "session_tool_failed");
         current.stage = "generating";
     } else if (kind == "compacted") {
         require(current.stage == "compacting", "session_compaction_stage");
@@ -179,9 +189,11 @@ void SessionState::reduce(const Json& event) {
                 valid_id(id) && !current.resumes.contains(id) && current.resumes.size() < 4096,
                 "session_resume");
         current.resumes.insert(id);
+        current.resume_round = current.rounds;
         while (!current.results.empty() && !current.results.back().dispatched &&
                current.results.back().effects == Effects::not_started)
             current.results.pop_back();
+        current.resume_operation = current.operation_offset + current.results.size();
         current.paused = false;
         current.diagnostic.clear();
     } else fail(ErrorCode::contract, Stage::frontend, "session_record_kind");
