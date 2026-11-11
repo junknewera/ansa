@@ -1,12 +1,12 @@
 # Состояние ansa
 
-Обновлено 2026-11-11. Milestone **собственный SIWC login, live turns и prompt compact закрыт**. Last known good для кода - `e2f8e1c` на `main`. Пройдены native gates и реальный rotating refresh с последующим live turn. Предыдущие baselines - persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Отчёт о проверках](implementation-report.md#собственный-siwc-и-live-provider).
+Обновлено 2026-11-11. Milestone **локальный многошаговый агент ansa закрыт**. Last known good для кода - [66250f7](https://github.com/junknewera/oh-my-harness/commit/66250f78498f484e904c7261e9c173c0852f4fc7) на `main`. Пройдены Debug, Release Nix, ASan/UBSan, независимые reviews и live приёмка в каталоге без Git. Предыдущие baselines - SIWC `e2f8e1c`, persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Отчёт о проверках](implementation-report.md#локальный-многошаговый-агент-ansa).
 
-## Переименование и следующий milestone
+## Переименование и реализованный milestone
 
 Выбрано имя **ansa**. Рабочее дерево перенесено в `/home/gusevsaint/Workspace/pet/ansa`. Прежний путь `oh-my-harness` пока является ссылкой на него для текущего Codex turn и старых build paths. Cwd текущей сессии Codex обновлён штатным app-server API; `thread/read` и фильтр `thread/list`, используемый обычным resume picker, подтверждают новый путь. Rollout и внутренние БД вручную не редактировались. После переноса прошли reducer, self-check и offline roundtrip: **3/3**, Git diff чистый.
 
-Следующий milestone - универсальный локальный многошаговый агент. Scope собран интервью; перед реализацией подтверждается итоговый план:
+Универсальный локальный многошаговый агент реализован в согласованном scope:
 
 - Каталог запуска служит рабочим контекстом; Git не требуется. Агент может исследовать файлы и окружение за пределами этого каталога в рамках прав пользователя.
 - Обычный текстовый CLI и executable `ansa`. Новый запуск создаёт новую сессию; `--continue` выбирает последнюю сессию этого каталога, `--session` - указанную. Существующий typed JSONL сохраняется.
@@ -17,24 +17,35 @@
 - Лимиты раундов, процессов и вывода задаются явно; достижение лимита не приводит к бесконтрольному продолжению или повтору уже выполненного эффекта. Сохраняются bounded queues, один control owner, targeted Cancel, IDs, snapshot/resync, canonical journal и exact replay provenance.
 - Переименование текущих project/CLI/package labels выполняется с сохранением существующего входа и проверкой совместимости сохранённых данных. Приёмка включает native build, полный CTest, ASan/UBSan, adversarial process/recovery tests, независимый review и короткий live сценарий в каталоге без Git.
 
-Код следующего milestone ещё не реализован. [Отложенные возможности](TODO.md).
+Реализация - `66250f7`. [Отложенные возможности](TODO.md).
 
 ## Что работает
 
 | Компонент | Поведение |
 |---|---|
 | Native runtime | C++20, pinned Nix flake, ELF64 AArch64 на X13s. GCC 16.2.0, libcurl 8.22.0, yyjson 0.12.0, OpenSSL 3.5.8. Один control owner, bounded mailboxes, отдельные generation/tools, storage и stop workers. |
-| Protocol и tools | Строгие SSE/JSON/HTTP/Responses admission и batch validation, pure `get_test_value`, production native continuation. Оба replay mutants обнаруживаются. |
+| Protocol и tools | Строгие SSE/JSON/HTTP/Responses admission и batch validation. Обычный CLI регистрирует list/read/search файлов, run_command и get_test_value; legacy JSONL сохраняет pure snapshot. Оба replay mutants обнаруживаются. |
+| Многошаговый loop | Default CLI 32 раунда и 64 calls на сегмент Resume; hard cap 64/256 на turn. Уникальные operation IDs, полный native continuation, known failed outcomes и явное продолжение после budget pause. |
+| ProcessRunner | Noninteractive supervisor/subreaper, bounded time/output, Cancel/timeout/runtime crash cleanup. Durable consumed marker и outcome evidence предотвращают повторный запуск; неизвестный эффект блокирует Resume. Exec elevation отключён, full access не является sandbox. |
+| Config и инструкции | Пользовательский и проектный JSON, типы/лимиты/приоритеты проверяет backend. Иерархия AGENTS и scoped instruction tokens, protected roots и nofollow/single-link file reads. |
 | Canonical journal | Exclusive session lock, append-only framed records и hash chains. CommandAccepted, intent, outcome и Done проходят fsync barriers. Синхронизируются также parent/session directories. |
-| Recovery | Явный Resume после restart. Сохранённый prefix tools использует прежние operation IDs, исполненные calls не повторяются. Intent без outcome даёт effect_unknown и блокирует Resume. |
+| Recovery | Явный Resume после restart. Исполненные calls не повторяются. Для process intent startup проверяет artifact supervisor и синхронизирует canonical outcome. Без достоверного результата effect_unknown блокирует Resume. |
 | History и compact | Новый turn получает контекст завершённых turns. Live prompt compact сохраняет сводку старой истории, два последних завершённых turn и pending user без изменений. Summary provenance и exact epoch синхронизируются до generation. Прежний offline compact journal читается. Полная история остаётся в журнале. |
 | Ошибки хранения | Snapshot и Cancel доступны при блокированном storage worker. При write/sync failure dispatch прекращается, известный outcome остаётся в публичном snapshot с durable:false. Оборванный хвост сохраняется, новые записи идут в связанную part. Повреждение середины блокирует запись. |
 | Frontend v1 | Submit, Cancel, GetSnapshot, Resume, typed IDs и incarnation. Durable Submit dedup между restart, payload conflicts, CommandReplayed, bounded outbox со snapshot/resync. |
 | Own SIWC | Собственная регистрация, браузерный PKCE/state/nonce, RS256/JWKS, account/workspace binding, один профиль, приватные файлы 0600, rotating/concurrent refresh и logout. Неопределённый обмен не повторяется, полный remote revoke не подтверждается без оснований. |
-| Live runtime | Account catalog, явные requested/returned model, store:false/stream:true, общий admission и replay. Auth проверяется после durable intent; lease удерживается до возврата executor. Отказ сохраняет not_started, продолжение - через Resume. |
-| CLI | Self-check, offline demo, offline/live JSONL, login/status/models/refresh/logout. Вход и session history сохраняются между запусками. Команды и параметры - в README. |
+| Live runtime | Account catalog, явные requested/returned model, store:false/stream:true, общий admission и replay. Auth проверяется после durable intent; lease удерживается до возврата executor. Logout stop передаётся активному tool. Отказ сохраняет not_started, продолжение - через Resume. |
+| CLI | Обычный текст, --continue/--session/--cwd, /status /cancel /resume /exit, SIGINT и EOF. Неблокирующий control при заполненном stdout. Сохранены JSONL/auth/self-check команды. Вход и история переживают restart. |
 
 Черновик `dc6766f` в `wip/offline-runtime` сохранён. Проверенные commits и последующие изменения доступны в Git.
+
+## Проверка `66250f7`
+
+Native NixOS/aarch64 на `x13s`, GCC 16.2.0: Debug CTest **81/81**, Release Nix package **81/81**, ASan/UBSan **79/79** с leak detection и halt_on_error. Десять новых loop/process/auth/CLI suites прошли по 20 повторов, **200/200**. Установленный `result/bin/ansa` - ELF64 AArch64; self-check, offline demo и сохранённый auth status успешны. Production CLI проверен на UTF-8, new/continue/explicit session, status/exit и configuration mismatch. `git diff --check` чистый.
+
+Независимые runtime и security review завершены; все findings исправлены и закреплены regression tests. Проверены early Cancel при blocked accepted fsync с нулём generation dispatch, resync/full stdout/SIGINT, tool recovery после crash с known artifact и failed outcome append, duplicate workers, signal inheritance, evidence identity и file/instruction aliases. [Подробности](implementation-report.md#локальный-многошаговый-агент-ansa).
+
+В live каталоге без Git пройдены пять вызовов `list_directory → read_file → run_command(exit 7) → run_command(exit 0) → read_file`, затем Done. Итоговый файл, process evidence и canonical journal проверены. Повторный запуск `--continue` использовал прежний вход и ту же сессию, получил marker предыдущего turn без tools и сохранил второй Done. Credentials и synthetic live journal находятся вне репозитория.
 
 ## Проверка `e2f8e1c`
 
@@ -56,12 +67,13 @@ Crash tests посылают SIGKILL собственным дочерним п�
 
 ## Ограничения и следующий шаг
 
-- Production использует live SIWC либо offline mock и единственный pure tool. Prompt compact проверен на коротком marker-сценарии; качество длинных сводок и token-aware budget остаются открытыми. Native compact endpoint не нужен live пути. HTTP body ограничен и буферизуется; frontend пока получает текст после admission. [Контракт и границы](architecture.md#compact).
+- Production CLI использует live SIWC и локальные tools; offline режим остаётся детерминированным mock/get_test_value. Prompt compact проверен на коротком marker-сценарии; качество длинных сводок и token-aware budget остаются открытыми. Native compact endpoint не нужен live пути. HTTP body ограничен и буферизуется; frontend получает текст после admission. [Контракт и границы](architecture.md#compact).
 - Credentials хранятся plaintext с правами 0600. Несколько профилей и системный secret store отложены. Identity-only scope поддержан при полном token response; ответ только с ID token без access/refresh отклоняется. Remote revoke проверен fixtures; отдельной реальной logout-приёмки пока нет. Неопределённый либо забытый прежний grant оставляет remote_revocation_confirmed:false.
 - SIGKILL и fault injection проверены. Физическое отключение питания, поведение накопителя при power loss, ThreadSanitizer, x86_64-linux и длительные сессии пока открыты. Durability опирается на успешный fsync файловой системы и оборудования.
 - Session journal version 1 восстанавливается полным replay. Миграции, отдельные индексы и ротация по общему размеру отложены. По умолчанию лимит Submit IDs - 4096, records - 32 MiB, parts - 4096. Compact уменьшает активный контекст; история журнала сохраняется.
-- Reconciliation неизвестных эффектов требует отдельного workflow. Side-effecting tools и file replacement semantics остаются отдельными gates. Advisory lock и проверки inode/size ограничены взаимодействием с внешними writers.
-- Следующие границы - token-aware context budget, streaming frontend и явный reconciliation перед side effects. File tools, ProcessRunner, TUI и subagents остаются отдельными дальнейшими этапами.
+- Full access не является sandbox. no_new_privs запрещает повышение через exec, но не обращение к уже разрешённым privileged brokers. При SIGKILL самого supervisor результат unknown; без cgroup не гарантируется прекращение всех отделившихся потомков. Нет автоматического повтора неизвестного эффекта.
+- Reconciliation неизвестных эффектов и отдельный compiled file replacement tool требуют самостоятельного контракта. Произвольный shell не обещает preimage/conflict semantics или atomic CAS с внешними writers. Advisory lock и проверки inode/size имеют те же границы.
+- Изменение effective config или начальных AGENTS требует новой сессии из-за exact context epoch. Полный старый диалог пока не печатается; frontend показывает новые ответы. Следующие milestones выбираются из [TODO](TODO.md): MCP, hooks, Ask, интерактивный sudo, TUI, streaming и token-aware budget.
 
 ## Первоисточники
 

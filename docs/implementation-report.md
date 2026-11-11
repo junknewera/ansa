@@ -1,4 +1,29 @@
-# Отчёт о первом milestone
+# Отчёт о milestones
+
+## Локальный многошаговый агент ansa
+
+2026-11-11, `x13s`, NixOS/aarch64, GCC 16.2.0. Код - [66250f7](https://github.com/junknewera/oh-my-harness/commit/66250f78498f484e904c7261e9c173c0852f4fc7). Собственный loop расширен на несколько tool rounds; добавлены local tools, ProcessRunner и текстовый CLI. Переименование не меняет внутренний namespace, legacy JSONL или сохранённый auth profile.
+
+| Gate | Результат |
+|---|---|
+| Debug CMake/CTest | PASSED **81/81**, 155.11 s, включая прежние protocol suites и оба replay mutants. |
+| ASan/UBSan | PASSED **79/79**, 32.86 s, `detect_leaks=1:halt_on_error=1`, `UBSAN_OPTIONS=halt_on_error=1`. Mutant rebuilds выключены. |
+| Native Nix package | PASSED **81/81**, Release, CTest 123.57 s. Установленный ELF64 AArch64 проходит self-check, offline demo и использует сохранённый вход. |
+| Повторы concurrency | PASSED **200/200**: шесть loop/process/auth suites и четыре CLI suites по 20 повторов. |
+| Production CLI | PASSED: UTF-8, fresh/continue/explicit session, status/exit, EOF, отказ при exact config mismatch. |
+| Live без Git | PASSED: `list_directory → read_file → run_command(exit 7) → run_command(exit 0) → read_file → Done`. Marker и файл результата проверены; durable process evidence подтверждает два запуска и завершённый cleanup. |
+| Повторный live запуск | PASSED: тот же session ID и сохранённый вход, новый turn вернул marker предыдущего разговора без tools; второй durable Done подтверждён в canonical journal. |
+| Независимые review | COMPLETE: runtime reviewer **10/10 + 4/4**, security reviewer **26/26**. Все P1/P2 исправлены; `git diff --check` чистый. |
+
+Новые regression suites проверяют уникальные operation IDs между раундами, known failed outcomes, bounded rounds с явным Resume, crash на границах второго раунда и Cancel после второго durable response. Process recovery проверен реальным subprocess: runtime падает после команды до canonical outcome, startup подхватывает синхронизированный artifact, Resume не повторяет команду. Ошибки recovery append как `Error`, так и `std::exception` оставляют known outcome видимым с durable:false и запрещают dispatch.
+
+Process tests покрывают stdout/stderr flood и некорректные UTF-8 bytes, timeout, Cancel, crash runtime, setsid descendants, ненулевой exit, NUL cwd, inherited SIGCHLD/SA_NOCLDWAIT, повторный и параллельный internal worker, consumed launch без результата, missing/conflicting evidence marker и SIGKILL supervisor. Неизвестный результат не запускается повторно.
+
+Независимый adversarial review выявил и закрепил регрессиями: повторный запуск internal worker, ложный status при inherited SIGCHLD, отсутствие marker binding у evidence, утечку credentials через ссылки AGENTS/file tools, некорректный parent-death setup и две гонки CLI. Полный stdout при snapshot fallback не выключает обработку SIGINT; прежний порядок воспроизведён как зависающий mutant. Ранний `/cancel` при blocked acceptance fsync проверяет **ноль generation dispatch**. Busy multi-line input и overflow незавершённой строки возвращают ошибку. Logout передаёт stop исполнителю, ждёт lease и не требует живого AuthManager для lifetime watcher.
+
+Границы: full access не является sandbox; no_new_privs блокирует exec elevation, но не уже разрешённые privileged brokers. Уничтожение supervisor оставляет unknown и не гарантирует прекращение всех отделившихся потомков без cgroup. Config/начальные инструкции привязаны к exact epoch, их изменение требует новой сессии. Reconciliation unknown effects, streaming, MCP, hooks, Ask, interactive sudo и TUI отложены. Реальные credentials и acceptance journal находятся вне Git.
+
+## Первый protocol milestone
 
 Срез: 2026-11-11, `x13s`, NixOS/aarch64. Реализованы `omh_core` и `omh`, bounded SSE/JSON, Responses admission, compiled pure tool и production request/replay builder. Audit и P0 использованы как read-only references.
 
