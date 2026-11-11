@@ -38,3 +38,20 @@
 | PTY и Git | `tests/cli_backpressure.py` прошёл на Debug executable. `git diff --check` прошёл. |
 
 Границы и команды воспроизведения - в [PROJECT_STATE](PROJECT_STATE.md), [архитектуре](architecture.md#offline-agentruntime) и [README](../README.md).
+
+## Persistent sessions, recovery и compact
+
+Код `c0295bd`, X13s, NixOS/aarch64, GCC 16.2.0.
+
+| Gate | Результат |
+|---|---|
+| Native Debug CMake и Release Nix package | CTest **37/37** в каждой сборке. Установленный executable проходит self-check, offline demo и persistent JSONL через два запуска. |
+| ASan/UBSan | **35/35**, detect_leaks=1 и halt_on_error=1, без сборок mutants. |
+| Crash recovery | SIGKILL после acceptance, response, intent, outcome, continuation, Done и compact. Resume сохраняет native context и operation IDs, завершённый prefix batch не исполняется повторно. Intent без outcome блокирует Resume. |
+| Storage errors | Failed write/sync, blocked disk, late known outcome после failed Cancel, advisory lock между процессами, внешнее изменение файла, torn tail и partial part header, повреждённый checksum, parts limit. Snapshot/Cancel остаются доступны. |
+| Compact | Автоматический JSON/item budget, durable epoch, restart после compact, Cancel во время compact, отказ и Resume, oversized output. Mock проверяет форму и lifecycle synthetic native state. |
+| Concurrency | Пять новых suites по 20 повторов, **100/100**. PTY regression с заполненным stdout также прошёл. |
+| Independent review | Отдельный агент проверил concurrency/storage/replay. Исправлены все findings, добавлены соответствующие regressions. Финальный focused review без открытых замечаний. |
+| Filesystem и Git | strace подтвердил fsync родителя нового session directory, part и session directory. `git diff --check` прошёл. |
+
+Power-cut hardware tests, TSan, x86_64-linux, длительные сессии, semantic quality и доступность live SIWC compaction остаются открытыми. Доступен closed offline compaction subset с synthetic encrypted item. Полный scope, лимиты и следующий шаг записаны в [PROJECT_STATE](PROJECT_STATE.md).

@@ -11,6 +11,9 @@
 | `transport.hpp`, `transport.cpp` | libcurl RAII, header/MIME admission, bounded byte callbacks, provider completion gate, offline byte injection |
 | `contracts.hpp` | Commands/events v1, distinct IDs, targeted Cancel и frontend snapshot/resync types |
 | `runtime.cpp`, `runtime_inbox.hpp` | Serialized turn state, bounded mailboxes, dispatch и cancellation |
+| `journal.hpp`, `journal.cpp` | Exclusive session lock, append-only framed records, hashes, fsync и восстановление оборванного хвоста |
+| `session.hpp`, `session.cpp` | Canonical session reducer, owning codecs, history, durable command identity и восстановление Responses через production admission |
+| `compaction.hpp`, `compaction.cpp` | Admission результата compact и новая exact context epoch |
 | `offline.cpp` | Детерминированный mock через production framer и reducer |
 | `main.cpp`, `cli.cpp` | Dependency self-check, offline demo и JSONL frontend |
 
@@ -51,19 +54,35 @@ Opaque reasoning остаётся JSON value с точным encrypted string; �
 
 Операции идентифицирует runtime-side `OperationIds`, а не provider или executor. Executor возвращает `ToolOutcome` без call/operation IDs. Ошибка после dispatch даёт failed/unknown; следующий call не запускается. Cancel до dispatch даёт cancelled/not_started. Cancelled с unknown не превращается в отсутствие эффекта. Replay unknown effects блокируется до будущего reconciliation workflow.
 
-Consume-once batch защищает конкретный подготовленный batch. Runtime дедуплицирует принятые Submit по `CommandId` в пределах incarnation. Dedup после рестарта и crash recovery относятся к будущему journal.
+Consume-once batch защищает конкретный подготовленный batch. Journal сохраняет принятые Submit и их identities. Runtime сверяет payload при повторе CommandId, возвращает состояние исходного turn и восстанавливает уже завершённый prefix batch с прежними operation IDs.
 
 ## Offline AgentRuntime
 
-Один control owner меняет публичное состояние одного turn за раз. Worker строит Request и continuation, вызывает mock и проверяет весь batch перед исполнением. Stop worker вызывает `request_stop()`, поскольку registered stop callbacks исполняются синхронно. Владелец состояния обрабатывает Cancel и GetSnapshot во время этих callbacks.
+Один control owner меняет публичное состояние одного turn за раз. Worker строит Request и continuation, вызывает mock и проверяет весь batch перед исполнением. Storage worker строит records, применяет session reducer, восстанавливает provider responses и выполняет disk I/O. Он получает immutable owning state и возвращает новый state. Owner заменяет state после completion. Stop worker вызывает `request_stop()`, поскольку registered stop callbacks исполняются синхронно. Cancel и GetSnapshot доступны во время ожидания диска и stop callbacks.
 
-Submit FIFO вмещает 16 команд по умолчанию, ещё по одному слоту выделено для адресного Cancel и GetSnapshot. Runtime хранит до 4096 принятых Submit ID и явно отклоняет новые при исчерпании лимита. Приём Cancel и допуск к каждому provider callback и executor сериализуются под одним mutex. Если matching Cancel уже принят, владелец обрабатывает его перед pending completion. Результаты начатых tools сохраняются. Поздний completion отменённого turn может обновить эти результаты, дальнейший dispatch прекращается.
+Submit FIFO вмещает 16 команд по умолчанию, ещё по одному слоту выделено для адресного Cancel, GetSnapshot и Resume. Runtime хранит до 4096 Submit ID и явно отклоняет новые при исчерпании лимита. Lookups повторных команд также ограничены размером FIFO. Storage, checkpoint и worker mailboxes имеют по одному слоту. Приём Cancel и допуск к каждому provider callback и executor сериализуются под одним mutex. Если matching Cancel уже принят, владелец обрабатывает его перед pending completion. Поздний completion отменённого turn сохраняет известные outcomes, дальнейший dispatch прекращается.
 
 Outbox вмещает 64 события по умолчанию. Переполнение сбрасывает накопленные события и публикует `ResyncRequired`. Snapshot восстанавливает фазу, идентификаторы, состояние worker, текст, диагностику и результаты начатых tools последнего turn. У событий монотонный cursor в пределах incarnation. Предельный размер Submit - 16 KiB, итогового текста - 64 KiB. Допускается один tool batch на turn.
 
+## Canonical journal и восстановление
+
+Session directory удерживается через advisory `flock`. Новая запись проходит `fsync` до CommandAccepted, допуска executor, подтверждения outcome и Done. Создание session directory синхронизирует родителя, создание part - сам файл и session directory. Проверки inode/path/size выявляют внешнюю замену и изменение размера перед append. Эти проверки ограничены advisory locking и проверкой состояния перед записью.
+
+Journal version 1 содержит framed JSON records с length/complement, SHA-256 и последовательной hash chain. Максимальный record - 32 MiB. Parts образуют цепочку по digest всего предыдущего файла, включая оборванные байты. Частичная последняя запись восстанавливает проверенный prefix; новый part сохраняет связь с исходными байтами. Поддерживается до 4096 parts. Существующие bytes сохраняются. Ошибка checksum, sequence, semantic replay или configuration блокирует запись и dispatch.
+
+Session reducer хранит исходные binding, requested/returned model policy, полную epoch, tool descriptors/revisions, native items и результаты. Восстановление CompletedResponse снова проходит через production decoder/reducer. История завершённых turns образует следующий input. Frontend snapshot остаётся производным публичным представлением.
+
+На restart любой незавершённый turn приостановлен до Resume. Завершённый prefix tools используется с прежними operation IDs. Незавершённый intent блокирует Resume как effect_unknown. Outcome хранит факт фактического dispatch, поэтому отменённый до executor intent не создаёт ложных ToolStarted/ToolFinished. Известный результат при storage failure остаётся в snapshot с `durable:false`. Ручное reconciliation неизвестных эффектов относится к следующей границе.
+
+## Compact
+
+Compact выполняется отдельной provider-операцией на границе перед новым turn. Порог учитывает JSON budget и резерв items под весь tool round и финальный response. В журнал попадают полный исходный Request и полный native result compact. После синхронизации новая exact epoch и весь returned output становятся активным контекстом.
+
+Поддерживаемое подмножество standalone result включает retained user messages и один opaque `compaction` item с encrypted_content. Unknown retained executable items отклоняются. Mock сохраняет synthetic digest и последнее user message. Реальная semantic compaction, token budget и доступность SIWC endpoint пока требуют live-проверки. [Официальный контракт](https://developers.openai.com/api/docs/guides/compaction).
+
 ## Следующая граница
 
-До side-effecting tools обязательны authoritative append-only journal, durable execution intents, effect_unknown/recovery, cancellation races и process lifecycle tests. File replacement должен отдельно определять rename/preimage/conflict semantics без обещания atomic CAS с внешними writers. Здесь файловых и shell tools нет.
+До side-effecting tools остаются явный reconciliation workflow и tool-specific recovery. File replacement должен отдельно определять rename/preimage/conflict semantics без обещания atomic CAS с внешними writers. Здесь файловых и shell tools нет.
 
 OAuth должен быть самостоятельным: own registration, PKCE/state/nonce, строгая ID token/JWKS validation через OpenSSL/проверенную JOSE library, identity binding, secure storage, rotating/concurrent refresh. Сейчас OpenSSL проверен как native crypto dependency; OIDC verifier и credential lifecycle не реализованы. Auth files и credentials существующих агентов не используются.
 

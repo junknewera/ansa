@@ -35,7 +35,7 @@ ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
   ctest --test-dir build-sanitize --output-on-failure --no-tests=error
 ```
 
-Обычный CTest включает семь protocol suites, восемь runtime suites, три проверки executable и два mutation-теста. Mutation-тесты меняют копии production replay builder внутри build-каталога и требуют конкретного отказа replay oracle. Ошибка компиляции mutant не считается успешным тестом. Sanitizer-конфигурация пропускает повторные сборки mutants.
+Обычный CTest включает семь protocol suites, восемь runtime suites, шестнадцать session suites, четыре проверки executable и два mutation-теста. Session suites проверяют SIGKILL на durable boundaries, журнал, Resume, дедупликацию, ошибки хранения и compact. Mutation-тесты меняют копии production replay builder внутри build-каталога и требуют конкретного отказа replay oracle. Ошибка компиляции mutant не считается успешным тестом. Sanitizer-конфигурация пропускает повторные сборки mutants.
 
 Дополнительная Linux-проверка запускает JSONL с терминалом на stdin и заполняет stdout pipe. Она использует стандартную библиотеку Python.
 
@@ -51,11 +51,32 @@ nix develop --no-update-lock-file -c timeout 10 python tests/cli_backpressure.py
 
 | `type` | Поле payload | Поведение |
 |---|---|---|
-| `submit` | `text` | Ставит turn в FIFO. `command_accepted` сообщает его `request_id`. Повтор того же `command_id` отклоняется в пределах incarnation. |
+| `submit` | `text` | Ставит turn в FIFO. `command_accepted` сообщает его `request_id`. Повтор той же команды даёт `command_replayed` с состоянием исходного turn. Изменённый payload с тем же ID даёт ошибку. |
 | `cancel` | `target` | Используй `request_id` активного turn. Отмена проходит и при заполненном FIFO. |
+| `resume` | `target` | Используй `request_id` приостановленного turn и новый `command_id`. Продолжение начинается после сохранённой безопасной границы. |
 | `snapshot` | `after_sequence` | Передай последний известный cursor или `0`. Ответ содержит актуальное состояние turn и `through_sequence`. |
 
-При разрыве `stream_sequence` или `resync_required` запроси snapshot и продолжи чтение после `through_sequence`. Читай stderr отдельно от событий. Туда идут ошибки разбора и постановки команды в очередь. EOF закрывает ввод и даёт runtime завершить принятые команды.
+При разрыве `stream_sequence` или `resync_required` запроси snapshot и продолжи чтение после `through_sequence`. Читай stderr отдельно от событий. Туда идут ошибки разбора и постановки команды в очередь. EOF закрывает ввод и даёт runtime завершить текущую работу. Приостановленный turn остаётся ждать Resume.
+
+## Сохранённая сессия
+
+```sh
+./build/omh --offline-jsonl --session .omh-session
+```
+
+Каталог создаётся с правами `0700`, journal parts - `0600`. `.omh-session/` исключён из Git. Повторный запуск с тем же каталогом восстанавливает сессию и выдаёт новую runtime incarnation. Перенеси её из начального snapshot в команды текущего подключения. Незавершённый turn получает состояние `paused` и ждёт явный `resume`. Поля `request_id`, `turn` и `resume_available` доступны в snapshot.
+
+Журнал сохраняет историю завершённых turns, полные provider-native items, контекст и результаты tools. `command_accepted` и `done` публикуются после `fsync`. Постановка команды в FIFO сама по себе сохраняет её только в памяти. Durable Submit IDs дедуплицируются между перезапусками. Другой процесс получает `session_busy`.
+
+Перед executor сохраняется intent, после него - outcome. Outcome синхронизируется до следующего executor. Intent без outcome после аварии получает `effect_unknown` и блокирует Resume. При ошибке записи доступны snapshot и Cancel, дальнейший dispatch останавливается. Snapshot помечает такое состояние через `storage_failed` и `durable:false`, включая известные результаты, которые не удалось сохранить.
+
+Оборванный хвост остаётся в исходном файле, запись продолжается в следующей связанной части. Повреждение проверенной записи переводит сессию в режим просмотра с диагностикой.
+
+## Автоматический compact
+
+Runtime накапливает контекст между завершёнными turns. Перед новым turn он запускает compact при достижении бюджета JSON или числа items, сохраняя запас для response и tool outputs. По умолчанию бюджет составляет 256 KiB, с консервативным учётом экранирования и request profile. Это локальный offline budget. После compact новая context epoch и полный возвращённый контекст синхронизируются до generation. Полная история остаётся в append-only journal.
+
+Ошибка compact приостанавливает turn до Resume. Offline mock возвращает retained user message и synthetic opaque compaction item. Качество сжатия реальной моделью и доступность native compact для SIWC остаются live-проверками. Контракт формы результата взят из официальной документации. [OpenAI compaction](https://developers.openai.com/api/docs/guides/compaction).
 
 ## Границы реализации
 
