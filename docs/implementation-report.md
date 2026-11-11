@@ -55,3 +55,24 @@
 | Filesystem и Git | strace подтвердил fsync родителя нового session directory, part и session directory. `git diff --check` прошёл. |
 
 Power-cut hardware tests, TSan, x86_64-linux, длительные сессии, semantic quality и доступность live SIWC compaction остаются открытыми. Доступен closed offline compaction subset с synthetic encrypted item. Полный scope, лимиты и следующий шаг записаны в [PROJECT_STATE](PROJECT_STATE.md).
+
+## Собственный SIWC и live provider
+
+Implementation checkpoint `e2f8e1c`, 2026-11-11, NixOS/aarch64, GCC 16.2.0. Реальный rotating refresh пока ожидает разрешённое сервером время; live milestone ещё не закрыт.
+
+| Gate | Результат |
+|---|---|
+| Native Debug и Release Nix package | **56/56** CTest в каждой конфигурации, включая оба replay mutants. Установленный AArch64 executable проходит self-check и offline demo. |
+| ASan/UBSan | **54/54**, detect_leaks=1, halt_on_error=1, без сборок mutants. |
+| Собственный OAuth | Реальный browser login, issued registration, JWT/JWKS validation и account catalog прошли. Вход сохраняется после запуска нового процесса. |
+| Live turns | Пять завершённых synthetic turns. В первом и четвёртом - model → get_test_value → native continuation → Done. Повтор Submit после restart даёт command_replayed без повторного turn. |
+| Prompt compact и recovery | Две реальные сводки через обычный Responses prompt. Два последних завершённых turn сохраняются точно; marker старого prefix остаётся после compact и restart. После transport failure пятый turn восстановлен Resume и завершён. |
+| Auth adversarial | 15 suites: RS256/JWK/claims, PKCE RFC oracle, permission, private storage, crash residue, rotating refresh между процессами, pending crash, refresh scope loss, logout races и held executor lease. Повторный вход с двумя разными grants не создаёт ложного обещания их общего отзыва. |
+| Summary adversarial | Provenance и exact tail, durable recovery, late cancelled summary, пустой/oversized/refusal response и подмена output. Отказ summary сохраняет прежний контекст. |
+| Independent review | Отдельные runtime и security reviewers. Закрыты findings о dispatch после logout, guard после intent, crash identity binding, credential residue, ambiguous refresh и достоверности revoke receipt. Все исправления закреплены регрессиями; финальные focused review без blockers. |
+| PTY и Git | Backpressure regression прошла. Working и staged diff проверены, diff --check чистый. |
+| Реальный refresh | ОТКРЫТ. earliest_refresh_at запрещает преждевременный обмен. Запущено ожидание серверного времени без повторного использования rotating token. |
+
+В live probe найден `response.metadata` с explicit response_id. Reducer принимает bounded object metadata, сохраняя sequence/identity/terminal gates. Событие не добавляет executable items; negative regressions проверяют malformed identity/shape и failed terminal. Неподдерживаемые events по-прежнему отклоняются.
+
+Реальные токены, callback codes и live journal не включены в Git или fixtures. Live encrypted reasoning отдельно не наблюдался; сохранение opaque bytes проверяется synthetic protocol/replay tests. Качество больших summary, token-aware budget, streaming frontend, hardware power loss, TSan и другие платформы остаются ограничениями. Remote revoke проверен на synthetic server; реальная logout-приёмка отдельно не проводилась.
