@@ -102,3 +102,23 @@ Power-cut hardware tests, TSan, x86_64-linux, длительные сессии,
 В live probe найден `response.metadata` с explicit response_id. Reducer принимает bounded object metadata, сохраняя sequence/identity/terminal gates. Событие не добавляет executable items; negative regressions проверяют malformed identity/shape и failed terminal. Неподдерживаемые events по-прежнему отклоняются.
 
 Реальные токены, callback codes и live journal не включены в Git или fixtures. Live encrypted reasoning отдельно не наблюдался; сохранение opaque bytes проверяется synthetic protocol/replay tests. Качество больших summary, token-aware budget, streaming frontend, hardware power loss, TSan и другие платформы остаются ограничениями. Remote revoke проверен на synthetic server; реальная logout-приёмка отдельно не проводилась.
+
+## Carbon CLI
+
+Проверенный код `93393ab`, 2026-11-12, `x13s`, NixOS/aarch64, GCC 16.2.0. Milestone закрыт: Carbon, восстановление диалога, настоящий streaming и durable basic/plan с переключением Tab. Следующий согласованный спринт - orchestrate.
+
+| Gate | Результат |
+|---|---|
+| Native Debug и Release Nix package | **87/87** CTest в каждой конфигурации, включая replay mutants. Release derivation `r6pn7lch16l8vrwd1p1mddl3m632xmvw-ansa-0.1.0.drv`; установленный ELF64 AArch64 проходит self-check и offline roundtrip. |
+| ASan/UBSan | **85/85**, detect_leaks=1 и halt_on_error=1, без сборок mutants. |
+| Concurrency stress | Пять frontend suites и PTY terminal по 20 повторов, **120/120** на финальном коде. Дополнительные targeted прогоны при исправлении гонок не включены в этот итог. |
+| History и replay | Accepted user и durable Done assistant, прежний basic journal без mode, общий диалог basic/plan, restart и compact. Immutable blocks по 64 записи, byte-limited страницы в обоих направлениях, query echo и первая история до prompt. |
+| Streaming admission | Preview до terminal; invalid terminal/batch, oversized text, late callback, Cancel, storage failure и overflow. Ноль executors при отвергнутом batch. Snapshot не возвращает отменённый ответ; fsync failure Done не публикует несохранённый assistant в transcript. |
+| Plan | Только read_only descriptors и соответствующий backend snapshot. Mixed safe/write batch целиком отклоняется до executors. Mode входит в durable Submit identity, exact epoch и Resume; последовательность basic → plan → basic сохраняет историю. |
+| Terminal | PTY с outbox из двух событий и 300 preview, sticky overflow, busy input preservation, Ctrl+F/PgUp/PgDn, Tab/Shift+Tab, resize, SIGINT/SIGTERM и восстановление termios. Кириллица, emoji, combining и некорректные bytes проверены при LC_ALL=C без LOCALE_ARCHIVE. Отдельная cli_backpressure.py прошла через pinned Nix Python. |
+| Independent review | Native GPT-6.1 Terra low: независимые runtime/provider/session и CLI/TTY reviewers. Все подтверждённые findings исправлены, финальные source review закрыты. Реализацию также выполняли native Terra low workers. |
+| Live | Terra в каталоге без Git: plan list_directory/read_file → PLAN_OK без изменений; basic после ошибки transport и явного Resume → run_command → BASIC_OK, файл совпадает с marker. Реальный текст был виден частями до завершения. Ctrl+F/PgUp/PgDn сохраняют черновик. |
+| Restart | --session и --continue восстановили обе реплики и basic. Финальный --continue показал историю до первого prompt. Открытие не продолжило завершённый turn. |
+| Git | Working и staged diff проверены, diff --check чистый. Пользовательский designs/ сохранён вне checkpoint. Credentials и synthetic live journal вне репозитория. |
+
+Открыты прежние hardware power loss, TSan, x86_64-linux и длительные сессии; основной reducer всё ещё копирует submit map. Ручной reconciliation неизвестного эффекта, качество длинных summary и token-aware budget остаются отдельными задачами. Plan намеренно не допускает произвольные команды; preview хранится только в живом frontend state, после restart доступен подтверждённый transcript.

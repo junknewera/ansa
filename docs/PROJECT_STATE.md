@@ -1,6 +1,23 @@
 # Состояние ansa
 
-Обновлено 2026-11-11. Milestone **локальный многошаговый агент ansa закрыт**. Last known good для кода - [66250f7](https://github.com/junknewera/oh-my-harness/commit/66250f78498f484e904c7261e9c173c0852f4fc7) на `main`. Пройдены Debug, Release Nix, ASan/UBSan, независимые reviews и live приёмка в каталоге без Git. Предыдущие baselines - SIWC `e2f8e1c`, persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Отчёт о проверках](implementation-report.md#локальный-многошаговый-агент-ansa).
+Обновлено 2026-11-12. Milestone **Carbon CLI: история, streaming и basic/plan закрыт**. Last known good для кода - [93393ab](https://github.com/junknewera/oh-my-harness/commit/93393ab9e4316faabad931e23676b8a61c41f67a) на `main`. Пройдены Debug, Release Nix, ASan/UBSan, независимые reviews и live приёмка на Terra в каталоге без Git. Предыдущие baselines - локальный агент `66250f7`, SIWC `e2f8e1c`, persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Отчёт о проверках](implementation-report.md#carbon-cli).
+
+## Carbon CLI
+
+- Диалог в основном буфере терминала, широкая строка ввода и компактный статус. UTF-8 не зависит от установленной локали, управляющие символы не исполняются терминалом. Pipe, one-shot и legacy JSONL сохраняют прежний путь вывода.
+- Первая страница истории появляется до первого prompt: три последних обмена и незавершённый запрос. Ctrl+F раскрывает/скрывает диалог; PgUp/PgDn листают и загружают bounded страницы. Ввод сохраняется при просмотре истории и отказе занятого runtime.
+- Transcript строится из canonical accepted/done records независимо от model context и compact. Неизменяемые блоки ограничивают стоимость обновления конца истории. Фронтенд получает страницы с query echo и восстанавливается после resync. Ошибка fsync не продвигает публичный transcript до несохранённого assistant.
+- Live HTTP chunks дают предварительный текст до terminal. Preview имеет generation identity, состояния preview/committed/discarded и snapshot/resync. Cancel, ошибка transport/admission/batch и storage failure не превращают фрагмент в успешный ответ. Tools по-прежнему требуют полной проверки и durable intent.
+- Tab/Shift+Tab переключают basic/plan между задачами, slash-команды служат альтернативой. Режим записан в turn, входит в exact request provenance и сохраняется при Resume. Общая история продолжается в обоих режимах. Plan использует backend snapshot только из tools с read_only, без произвольного shell.
+- Следующий согласованный спринт - orchestrate: дочерние агенты, их задачи и состояния, сбор и проверка результатов. После реализации он станет третьим режимом Tab. [Границы](TODO.md).
+
+## Проверка `93393ab`
+
+Native `x13s`, NixOS/aarch64, GCC 16.2.0: Debug CTest **87/87**, Release Nix package **87/87**, ASan/UBSan **85/85** с detect_leaks=1 и halt_on_error=1, без сборок mutants. Шесть новых frontend/PTY suites прошли по 20 повторов, **120/120**. Установленный `result/bin/ansa` - ELF64 AArch64, self-check и offline roundtrip успешны. Отдельная Python PTY backpressure regression прошла в pinned Nix shell.
+
+Независимые runtime/provider/session и CLI/TTY review завершены без открытых подтверждённых findings. Закреплены регрессии fsync failure при Done, invalid/mixed tool batch с нулём executors, поздних preview после Cancel, outbox overflow, mode replay/Resume, byte-limited forward/backward paging, sticky input overflow, busy input preservation, первой истории до prompt, locale C, UTF-8/emoji/combining, resize и восстановления termios после SIGTERM. Работу выполняли native агенты GPT-6.1 Terra с low reasoning по запросу пользователя.
+
+Live Terra: plan выполнил list_directory/read_file, вернул PLAN_OK и marker без изменения файлов; basic после transport failure и явного Resume выполнил run_command, создал и прочитал файл, вернул BASIC_OK. Содержимое совпало с marker. Ctrl+F/PgUp/PgDn сохранили черновик. Повторные `--session` и `--continue` восстановили обе реплики и basic; финальный `--continue` показал историю до первого prompt. Credentials и synthetic journal остались вне репозитория. `git diff --check` чистый.
 
 ## Переименование и реализованный milestone
 
@@ -32,10 +49,10 @@
 | Recovery | Явный Resume после restart. Исполненные calls не повторяются. Для process intent startup проверяет artifact supervisor и синхронизирует canonical outcome. Без достоверного результата effect_unknown блокирует Resume. |
 | History и compact | Новый turn получает контекст завершённых turns. Live prompt compact сохраняет сводку старой истории, два последних завершённых turn и pending user без изменений. Summary provenance и exact epoch синхронизируются до generation. Прежний offline compact journal читается. Полная история остаётся в журнале. |
 | Ошибки хранения | Snapshot и Cancel доступны при блокированном storage worker. При write/sync failure dispatch прекращается, известный outcome остаётся в публичном snapshot с durable:false. Оборванный хвост сохраняется, новые записи идут в связанную part. Повреждение середины блокирует запись. |
-| Frontend v1 | Submit, Cancel, GetSnapshot, Resume, typed IDs и incarnation. Durable Submit dedup между restart, payload conflicts, CommandReplayed, bounded outbox со snapshot/resync. |
+| Frontend v1 | Submit с per-turn mode, Cancel, GetSnapshot, GetTranscript, Resume, typed IDs и incarnation. Durable Submit dedup проверяет также mode. Bounded transcript pages и preview со snapshot/resync. |
 | Own SIWC | Собственная регистрация, браузерный PKCE/state/nonce, RS256/JWKS, account/workspace binding, один профиль, приватные файлы 0600, rotating/concurrent refresh и logout. Неопределённый обмен не повторяется, полный remote revoke не подтверждается без оснований. |
 | Live runtime | Account catalog, явные requested/returned model, store:false/stream:true, общий admission и replay. Auth проверяется после durable intent; lease удерживается до возврата executor. Logout stop передаётся активному tool. Отказ сохраняет not_started, продолжение - через Resume. |
-| CLI | Обычный текст, --continue/--session/--cwd, /status /cancel /resume /exit, SIGINT и EOF. Неблокирующий control при заполненном stdout. Сохранены JSONL/auth/self-check команды. Вход и история переживают restart. |
+| CLI | Carbon в основном буфере терминала, streaming, три последних обмена, Ctrl+F и PgUp/PgDn. Tab/Shift+Tab и /basic /plan, --continue/--session/--cwd, /status /cancel /resume /exit. Неблокирующий control, RAII termios, JSONL/auth/self-check сохранены. |
 
 Черновик `dc6766f` в `wip/offline-runtime` сохранён. Проверенные commits и последующие изменения доступны в Git.
 
@@ -67,13 +84,13 @@ Crash tests посылают SIGKILL собственным дочерним п�
 
 ## Ограничения и следующий шаг
 
-- Production CLI использует live SIWC и локальные tools; offline режим остаётся детерминированным mock/get_test_value. Prompt compact проверен на коротком marker-сценарии; качество длинных сводок и token-aware budget остаются открытыми. Native compact endpoint не нужен live пути. HTTP body ограничен и буферизуется; frontend получает текст после admission. [Контракт и границы](architecture.md#compact).
+- Production CLI использует live SIWC и локальные tools; offline режим остаётся детерминированным mock/get_test_value. Prompt compact проверен на коротком marker-сценарии; качество длинных сводок и token-aware budget остаются открытыми. Native compact endpoint не нужен live пути. HTTP body ограничен, production streaming проходит через общий reducer. Preview не заменяет полный admission; после restart восстанавливается подтверждённый transcript. [Контракт и границы](architecture.md#compact).
 - Credentials хранятся plaintext с правами 0600. Несколько профилей и системный secret store отложены. Identity-only scope поддержан при полном token response; ответ только с ID token без access/refresh отклоняется. Remote revoke проверен fixtures; отдельной реальной logout-приёмки пока нет. Неопределённый либо забытый прежний grant оставляет remote_revocation_confirmed:false.
 - SIGKILL и fault injection проверены. Физическое отключение питания, поведение накопителя при power loss, ThreadSanitizer, x86_64-linux и длительные сессии пока открыты. Durability опирается на успешный fsync файловой системы и оборудования.
 - Session journal version 1 восстанавливается полным replay. Миграции, отдельные индексы и ротация по общему размеру отложены. По умолчанию лимит Submit IDs - 4096, records - 32 MiB, parts - 4096. Compact уменьшает активный контекст; история журнала сохраняется.
 - Full access не является sandbox. no_new_privs запрещает повышение через exec, но не обращение к уже разрешённым privileged brokers. При SIGKILL самого supervisor результат unknown; без cgroup не гарантируется прекращение всех отделившихся потомков. Нет автоматического повтора неизвестного эффекта.
 - Reconciliation неизвестных эффектов и отдельный compiled file replacement tool требуют самостоятельного контракта. Произвольный shell не обещает preimage/conflict semantics или atomic CAS с внешними writers. Advisory lock и проверки inode/size имеют те же границы.
-- Изменение effective config или начальных AGENTS требует новой сессии из-за exact context epoch. Полный старый диалог пока не печатается; frontend показывает новые ответы. Следующие milestones выбираются из [TODO](TODO.md): MCP, hooks, Ask, интерактивный sudo, TUI, streaming и token-aware budget.
+- Изменение effective config или начальных AGENTS требует новой сессии из-за exact context epoch; basic/plan задаются отдельно на turn. Полная модельная история по-прежнему восстанавливается replay, стоимость копирования submit map и длительные сессии требуют отдельной проверки. Следующий спринт - orchestrate; MCP, hooks, Ask, интерактивный sudo, отдельный TUI и token-aware budget остаются в [TODO](TODO.md).
 
 ## Первоисточники
 
