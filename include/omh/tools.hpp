@@ -21,6 +21,7 @@ struct ToolDefinition {
     ContextExecutor invoke{};
     ToolRecovery recover{};
     bool requires_journal = false;
+    bool read_only = false;
 };
 struct ToolLease {
     std::shared_ptr<void> ownership;
@@ -38,6 +39,7 @@ class ToolSnapshot {
 public:
     const ToolAdvertisement& advertisement() const { return advertisement_; }
     bool requires_journal() const;
+    std::shared_ptr<const ToolSnapshot> read_only() const;
     std::optional<ToolOutcome> recover(const ToolInvocation&) const;
 };
 class ToolRegistry {

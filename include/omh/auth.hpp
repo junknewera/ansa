@@ -27,6 +27,8 @@ struct AuthStatus {
 };
 struct AuthExecutionLease { std::shared_ptr<void> ownership; std::stop_token stop; };
 enum class AuthStorePoint { temporary_synced, replaced, before_dispatch, tokens_removed };
+using StreamingExchange = std::function<Result<std::monostate>(const Json&, std::string_view,
+    const std::function<void(std::string_view)>&, std::stop_token)>;
 using AuthStoreObserver = std::function<void(AuthStorePoint, std::string_view name)>;
 
 // Own credential directory only. All read/replace/refresh operations share a
@@ -36,7 +38,7 @@ class AuthManager {
     std::unique_ptr<Impl> impl_;
 public:
     explicit AuthManager(std::filesystem::path, HttpExchange = http_exchange,
-                         std::function<std::uint64_t()> clock = {}, AuthStoreObserver = {});
+                         std::function<std::uint64_t()> clock = {}, AuthStoreObserver = {}, StreamingExchange = {});
     ~AuthManager();
     void login(const std::function<void(std::string_view url)>& open_browser, std::stop_token = {}, bool consent = false);
     AuthStatus status();
@@ -46,7 +48,7 @@ public:
     std::shared_ptr<void> hold_session(std::string_view session, std::stop_token = {});
     AuthExecutionLease hold_execution(std::string_view session, std::stop_token = {});
     Json models(std::stop_token = {});
-    Result<CompletedResponse> generate(const Request&, std::stop_token = {}, std::string_view expected_session = {});
+    Result<CompletedResponse> generate(const Request&, std::stop_token = {}, std::string_view expected_session = {}, TextPreview = {});
 };
 std::filesystem::path default_auth_directory();
 } // namespace omh

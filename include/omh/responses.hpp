@@ -1,11 +1,13 @@
 #pragma once
 #include "omh/sse.hpp"
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
 #include <stop_token>
 
 namespace omh {
+using TextPreview = std::function<void(std::string_view)>;
 inline constexpr std::size_t max_request_items = 4096;
 struct Binding {
     std::string provider = "openai-siwc";
@@ -75,6 +77,9 @@ class ResponsesReducer {
     };
     Request request_;
     Limits limits_;
+    TextPreview preview_;
+    std::string preview_text_;
+    void emit_preview();
     std::string id_, model_;
     std::map<std::size_t, Item> items_;
     std::map<std::string, std::size_t> ids_;
@@ -88,7 +93,7 @@ class ResponsesReducer {
     CompletedResponse seal();
     friend class ResponseStream;
 public:
-    explicit ResponsesReducer(Request, Limits = {});
+    explicit ResponsesReducer(Request, Limits = {}, TextPreview = {});
     void event(SseEvent);
 };
 class ResponseStream {
@@ -97,7 +102,7 @@ class ResponseStream {
     std::stop_token stop_;
     bool closed_ = false;
 public:
-    explicit ResponseStream(Request, Limits = {}, std::stop_token = {});
+    explicit ResponseStream(Request, Limits = {}, std::stop_token = {}, TextPreview = {});
     ResponseStream(const ResponseStream&) = delete;
     ResponseStream& operator=(const ResponseStream&) = delete;
     void feed(std::string_view);

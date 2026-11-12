@@ -53,7 +53,37 @@ CompletedResponse::CompletedResponse(Request request, std::string id, std::strin
                                      std::vector<Json> items, std::vector<FunctionCall> calls)
     : request_(std::move(request)), id_(std::move(id)), returned_model_(std::move(model)),
       items_(std::move(items)), calls_(std::move(calls)) {}
-ResponsesReducer::ResponsesReducer(Request request, Limits limits) : request_(std::move(request)), limits_(limits) {}
+ResponsesReducer::ResponsesReducer(Request request, Limits limits, TextPreview preview)
+    : request_(std::move(request)), limits_(limits), preview_(std::move(preview)) {}
+void ResponsesReducer::emit_preview() {
+    if (!preview_) return;
+    std::string text;
+    auto append = [&](std::string_view value) {
+        if (value.size() > 64 * 1024 - text.size()) return false;
+        text.append(value); return true;
+    };
+    for (const auto& [index, item] : items_) {
+        (void)index;
+        if (item.done) {
+            if (item.done->text("type") == "message")
+                for (const auto& part : item.done->at("content").elements())
+                    if (!append(part.text(part.text("type") == "refusal" ? "refusal" : "text"))) return;
+            continue;
+        }
+        if (item.added.text("type") == "message") {
+            for (const auto& [part_index, part] : item.parts) {
+                (void)part_index;
+                if (!append(part.final_text ? *part.final_text : part.delta)) return;
+                if (!part.done) break;
+            }
+        }
+        break;
+    }
+    if (text.size() > preview_text_.size() && text.starts_with(preview_text_)) {
+        preview_text_ = std::move(text);
+        preview_(preview_text_);
+    }
+}
 void ResponsesReducer::identity(const Json& response) const {
     require(response.text("id") == id_, "response_identity");
     require(response.text("model") == model_, "response_model_conflict");
@@ -241,6 +271,7 @@ void ResponsesReducer::event(SseEvent wire) {
             }
         }
     }
+    emit_preview();
 }
 CompletedResponse ResponsesReducer::seal() {
     require(!sealed_ && terminal_.has_value(), "eof_before_completed", Stage::admission, ErrorCode::premature_eof); sealed_ = true;
@@ -253,8 +284,11 @@ CompletedResponse ResponsesReducer::seal() {
     }
     return CompletedResponse(request_, id_, model_, std::move(output), std::move(calls));
 }
-ResponseStream::ResponseStream(Request request, Limits limits, std::stop_token stop)
-    : reducer_(std::move(request), limits), framer_([this](SseEvent e) { reducer_.event(std::move(e)); }, limits), stop_(stop) {}
+ResponseStream::ResponseStream(Request request, Limits limits, std::stop_token stop, TextPreview preview)
+    : reducer_(std::move(request), limits, std::move(preview)), framer_([this](SseEvent e) {
+        require(!stop_.stop_requested(), "stream_cancelled", Stage::admission, ErrorCode::cancelled);
+        reducer_.event(std::move(e));
+    }, limits), stop_(stop) {}
 void ResponseStream::feed(std::string_view bytes) {
     require(!closed_, "stream_closed");
     require(!stop_.stop_requested(), "stream_cancelled", Stage::admission, ErrorCode::cancelled);

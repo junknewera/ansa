@@ -44,7 +44,9 @@ struct Checkpoint {
 class Runtime::Impl {
     const RuntimeIncarnation incarnation_ = new_incarnation();
     const std::shared_ptr<const ToolSnapshot> tools_;
+    const std::shared_ptr<const ToolSnapshot> plan_tools_;
     const Generate generate_;
+    const StreamingGenerate stream_generate_;
     const Compact compact_;
     const RuntimeLimits limits_;
     const std::size_t keep_recent_turns_;
@@ -53,6 +55,9 @@ class Runtime::Impl {
     std::uint64_t resume_epoch_ = 0;
     const std::size_t profile_bytes_;
     std::shared_ptr<SessionState> state_;
+    // Failed fsync can retain a candidate state for known outcomes, but cannot
+    // promote its messages into the canonical frontend transcript.
+    std::shared_ptr<const TranscriptIndex> durable_transcript_;
     std::unique_ptr<Journal> journal_;
 
     std::mutex mutex_;
@@ -75,6 +80,8 @@ class Runtime::Impl {
     std::optional<OperationId> recovery_;
     std::vector<ToolActivity> activity_;
     std::uint64_t sequence_ = 0;
+    std::uint64_t generation_sequence_ = 0;
+    std::optional<PreviewText> preview_;
     std::stop_source stop_;
     std::jthread worker_, storage_worker_, stop_worker_, owner_;
 
@@ -117,13 +124,34 @@ class Runtime::Impl {
             if (const auto* result = std::get_if<ToolFinished>(&tool); result && result->effects == Effects::known_result)
                 ++completed;
         std::string text;
-        if (!pending_receipt_ && state_->turn && state_->turn->response && state_->turn->response->calls().empty())
+        if (!pending_receipt_ && phase_ == "completed" && state_->turn && state_->turn->stage == "completed" &&
+            !storage_failed_ && state_->turn->response && state_->turn->response->calls().empty())
             text = response_text(*state_->turn->response);
         publish(FrontendSnapshot{0, phase_, request(), worker_busy_ || storing_, completed, std::move(text),
             diagnostic_, recovery_, pending_receipt_ ? std::optional<CommandId>{pending_receipt_->command} :
                 state_->turn ? std::optional<CommandId>{state_->turn->receipt.command} : std::nullopt,
             std::move(command), activity_, state_->history.size(), state_->compactions, storage_failed_,
-            !storing_ && !storage_failed_, state_->turn && phase_ == "paused" && !recovery_ && !storage_failed_});
+            !storing_ && !storage_failed_, state_->turn && phase_ == "paused" && !recovery_ && !storage_failed_,
+            pending_receipt_ ? pending_receipt_->mode : state_->turn ? state_->turn->receipt.mode : AgentMode::basic,
+            durable_transcript_->size(), preview_});
+    }
+
+    void finish_preview(std::string state, bool final_text = false) {
+        if (!preview_ || preview_->state != "preview") return;
+        if (final_text && state_->turn && state_->turn->response)
+            preview_->text = response_text(*state_->turn->response);
+        preview_->state = std::move(state);
+        inbox_.preview.reset();
+        publish(*preview_);
+    }
+
+    void preview(PreviewUpdate update) {
+        if (!preview_ || preview_->generation != update.generation || preview_->state != "preview" ||
+            !can_dispatch(update.identity)) return;
+        require(update.text.size() <= 64 * 1024 && update.text.starts_with(preview_->text),
+                "preview_prefix_conflict", Stage::frontend);
+        preview_->text = std::move(update.text);
+        publish(*preview_);
     }
 
     void reject(const RuntimeCommand& command, std::string diagnostic) {
@@ -143,7 +171,12 @@ class Runtime::Impl {
         persist([value = std::move(value)] { return value; }, commit);
     }
     void schedule(Task task, const char* phase) {
-        job_.emplace(Job{identity(), stop_.get_token(), std::move(task)});
+        std::uint64_t generation = 0;
+        if (stream_generate_ && (std::holds_alternative<GenerateRequest>(task) || std::holds_alternative<Replay>(task))) {
+            generation = ++generation_sequence_;
+            preview_ = PreviewText{generation, {}, "preview"};
+        }
+        job_.emplace(Job{identity(), stop_.get_token(), std::move(task), generation});
         worker_busy_ = true;
         phase_ = phase;
         snapshot();
@@ -177,6 +210,7 @@ class Runtime::Impl {
     }
 
     void storage_failure(const Error& error) {
+        finish_preview("discarded");
         storage_failed_ = true;
         phase_ = "paused";
         diagnostic_ = valid_id(error.diagnostic) ? error.diagnostic : "journal_failure";
@@ -217,6 +251,7 @@ class Runtime::Impl {
                 break;
             case Commit::done:
                 phase_ = "completed";
+                finish_preview("committed", true);
                 if (const auto text = response_text(*state_->turn->response); !text.empty()) publish(TextDelta{text});
                 publish(Done{});
                 snapshot();
@@ -245,6 +280,7 @@ class Runtime::Impl {
                 resuming_.reset();
                 break;
             case Commit::response:
+                break;
             case Commit::continued:
             case Commit::compacted: break;
         }
@@ -278,10 +314,8 @@ class Runtime::Impl {
     void submit(RuntimeCommand command) {
         auto& receipt = receipts_.at(command.command.value);
         if (recovery_ || storage_failed_) { reject(command, recovery_ ? "recovery_required" : "journal_read_only"); return; }
-        auto input = state_->history;
-        input.push_back(Json::object({{"role", Json::string("user")},
-            {"content", Json::string(std::get<Submit>(command.payload).text)}}));
-        Request next(state_->configuration.binding(), state_->epoch, tools_->advertisement(), std::move(input));
+        const auto& submitted = std::get<Submit>(command.payload);
+        Request next = state_->request_for(submitted.text, submitted.mode);
         const auto user_turns = static_cast<std::size_t>(std::count_if(state_->history.begin(), state_->history.end(),
             [](const Json& item) { return item.has("role") && item.text("role") == "user"; }));
         const bool compact = user_turns > keep_recent_turns_ &&
@@ -292,6 +326,8 @@ class Runtime::Impl {
         const auto request_number = state_->next_request + 1;
         pending_receipt_ = receipt;
         activity_.clear();
+        preview_.reset();
+        inbox_.preview.reset();
         diagnostic_.clear();
         recovered_pause_ = false;
         stop_ = std::stop_source{};
@@ -301,6 +337,7 @@ class Runtime::Impl {
             return Json::object({{"kind", Json::string("accepted")}, {"command", Json::string(receipt.command.value)},
                 {"turn", Json::string(receipt.turn.value)}, {"request", Json::string(receipt.request.value)},
                 {"request_number", number(request_number)}, {"text", Json::string(*receipt.text)},
+                {"mode", Json::string(receipt.mode == AgentMode::plan ? "plan" : "basic")},
                 {"operation_run", Json::string(run)}, {"next", save_request(next)},
                 {"compact", Json::parse(compact ? "true" : "false")},
                 {"round_limit", number(round_limit)}, {"call_limit", number(call_limit)}});
@@ -309,6 +346,7 @@ class Runtime::Impl {
 
     void cancel(RuntimeCommand command) {
         if (!can_cancel()) return;
+        finish_preview("discarded");
         cancelling_ = std::move(command);
         phase_ = "cancelled";
         if (job_) { job_.reset(); worker_busy_ = false; }
@@ -372,6 +410,7 @@ class Runtime::Impl {
         }
         if (phase_ == "cancelled" || shutting_down_ || storage_failed_) { snapshot(); return; }
         if (auto* error = std::get_if<Error>(&done.result)) {
+            finish_preview("discarded");
             const auto diagnostic = valid_id(error->diagnostic) ? error->diagnostic : "worker_failure";
             persist(event("pause", {{"diagnostic", Json::string(diagnostic)}}), Commit::pause);
         } else if (auto* response = std::get_if<CompletedResponse>(&done.result)) {
@@ -382,6 +421,7 @@ class Runtime::Impl {
                  completed > 256 || response->calls().size() > 256 - completed ||
                  completed - current.resume_operation > current.call_limit ||
                  response->calls().size() > current.call_limit - (completed - current.resume_operation))) {
+                finish_preview("discarded");
                 persist(event("pause", {{"diagnostic", Json::string("tool_round_limit")}}), Commit::pause);
                 return;
             }
@@ -389,6 +429,8 @@ class Runtime::Impl {
                 return transition(turn_id, "response", {{"response", save_response(response)}});
             }, Commit::response);
         } else if (auto* prepared = std::get_if<RunTools>(&done.result)) {
+            // A tool-bearing response is confirmed only after the entire batch validates.
+            finish_preview("committed", true);
             schedule(std::move(*prepared), "executing");
         } else {
             persist([turn_id = turn(), compacted = std::get<CompactedContext>(std::move(done.result))] {
@@ -408,6 +450,7 @@ class Runtime::Impl {
         snapshot();
         const auto ready = [&] {
             return (inbox_.aborting && !shutting_down_) || !inbox_.tool_starts.empty() || inbox_.cancel ||
+                inbox_.preview || inbox_.transcript ||
                 store_done_ || (!storing_ && checkpoint_) || (!storing_ && inbox_.completion) ||
                 !inbox_.lookups.empty() || inbox_.snapshot || (!storing_ && !worker_busy_ && inbox_.resume) ||
                 (available() && !inbox_.submits.empty()) ||
@@ -430,6 +473,10 @@ class Runtime::Impl {
                     auto command = std::move(*inbox_.cancel);
                     inbox_.cancel.reset();
                     cancel(std::move(command));
+                } else if (inbox_.preview) {
+                    auto update = std::move(*inbox_.preview);
+                    inbox_.preview.reset();
+                    preview(std::move(update));
                 } else if (store_done_) {
                     auto done = std::move(*store_done_);
                     store_done_.reset();
@@ -440,7 +487,10 @@ class Runtime::Impl {
                         pending_receipt_.reset();
                     }
                     if (done.error) storage_failure(*done.error);
-                    else committed(done.commit);
+                    else {
+                        durable_transcript_ = state_->transcript();
+                        committed(done.commit);
+                    }
                 } else if (!storing_ && checkpoint_) {
                     checkpoint();
                 } else if (!storing_ && inbox_.completion) {
@@ -459,6 +509,10 @@ class Runtime::Impl {
                     inbox_.snapshot.reset();
                     if (std::get<GetSnapshot>(command.payload).after_sequence > sequence_) reject(command, "resync_cursor_ahead");
                     else snapshot(command.command);
+                } else if (inbox_.transcript) {
+                    auto command = std::move(*inbox_.transcript);
+                    inbox_.transcript.reset();
+                    publish(durable_transcript_->page(std::get<GetTranscript>(command.payload)));
                 } else if (!storing_ && !worker_busy_ && inbox_.resume) {
                     auto command = std::move(*inbox_.resume);
                     inbox_.resume.reset();
@@ -548,13 +602,20 @@ class Runtime::Impl {
             std::lock_guard lock(mutex_);
             require(can_dispatch(job.identity), "generation_cancelled", Stage::admission, ErrorCode::cancelled);
         }
-        auto response = unwrap(generate_(request, job.stop));
+        auto on_preview = [this, id = job.identity, generation = job.generation](std::string_view text) {
+            require(text.size() <= 64 * 1024, "preview_text_limit", Stage::admission, ErrorCode::limit);
+            std::lock_guard lock(mutex_);
+            if (!can_dispatch(id) || !preview_ || preview_->generation != generation || preview_->state != "preview") return;
+            inbox_.preview = PreviewUpdate{id, generation, std::string(text)};
+            changed_.notify_all();
+        };
+        auto response = unwrap(stream_generate_ ? stream_generate_(request, job.stop, on_preview) : generate_(request, job.stop));
         require(save_request(response.request()) == save_request(request) &&
                 response.returned_model() == request.binding().returned_model,
                 "provider_request_mismatch", Stage::admission);
         require(response.calls().size() <= Limits{}.calls && response.items().size() <= Limits{}.items,
                 "runtime_response_limit", Stage::admission, ErrorCode::limit);
-        if (response.calls().empty()) (void)response_text(response);
+        if (response.calls().empty() || stream_generate_) (void)response_text(response);
         return response;
     }
 
@@ -563,7 +624,9 @@ class Runtime::Impl {
             if (const auto* generation = std::get_if<GenerateRequest>(&job.task)) return generate(generation->request, job);
             if (const auto* preparation = std::get_if<PrepareTools>(&job.task)) {
                 OperationIds ids(preparation->operation_run, preparation->operation_offset);
-                auto batch = unwrap(PreparedBatch::prepare(preparation->response, tools_, ids));
+                const auto selected = preparation->response.request().tools().revision == plan_tools_->advertisement().revision ?
+                    plan_tools_ : tools_;
+                auto batch = unwrap(PreparedBatch::prepare(preparation->response, selected, ids));
                 return RunTools{preparation->response, std::move(batch), preparation->completed};
             }
             if (auto* tools = std::get_if<RunTools>(&job.task)) {
@@ -644,12 +707,14 @@ class Runtime::Impl {
 public:
     Impl(SessionId session, ContextEpoch context, std::shared_ptr<const ToolSnapshot> tools,
          Generate generate, RuntimeLimits limits, SessionOptions options)
-        : tools_(std::move(tools)), generate_(std::move(generate)), compact_(std::move(options.compact)), limits_(limits),
+        : tools_(std::move(tools)), plan_tools_(tools_ ? tools_->read_only() : nullptr), generate_(std::move(generate)),
+          stream_generate_(std::move(options.stream_generate)), compact_(std::move(options.compact)), limits_(limits),
           keep_recent_turns_(options.keep_recent_turns), check_dispatch_(std::move(options.check_dispatch)),
           tool_guard_(std::move(options.tool_guard)),
           profile_bytes_(Request(options.binding, context, tools_ ? tools_->advertisement() : ToolAdvertisement{}, {}).json().dump().size()),
           state_(std::make_shared<SessionState>(session,
-              Request(options.binding, std::move(context), tools_ ? tools_->advertisement() : ToolAdvertisement{}, {}))) {
+              Request(options.binding, std::move(context), tools_ ? tools_->advertisement() : ToolAdvertisement{}, {}),
+              plan_tools_ ? plan_tools_->advertisement() : ToolAdvertisement{})) {
         require(valid_id(session.value) && tools_ && generate_ && limits.commands > 0 && limits.commands <= 256 &&
                 limits.events >= 2 && limits.events <= 256 && limits.submit_ids > 0 && limits.submit_ids <= 65536 &&
                 limits.compact_bytes >= 256 && limits.compact_bytes <= 4 * 1024 * 1024,
@@ -668,6 +733,7 @@ public:
             diagnostic_ = journal_->diagnostic();
             storage_failed_ = !diagnostic_.empty();
         } else state_->apply(state_->initialization());
+        durable_transcript_ = state_->transcript();
         if (!storage_failed_ && state_->turn && state_->turn->intent) {
             try {
                 const auto invocation = *state_->turn->intent;
@@ -678,7 +744,7 @@ public:
                     auto next = std::make_shared<SessionState>(*state_);
                     next->apply(value);
                     state_ = std::move(next);
-                    try { journal_->append(value); }
+                    try { journal_->append(value); durable_transcript_ = state_->transcript(); }
                     catch (const Error& error) { storage_failed_ = true; diagnostic_ = error.diagnostic; }
                     catch (...) { storage_failed_ = true; diagnostic_ = "journal_recovery_append_failed"; }
                 }
@@ -735,10 +801,15 @@ public:
             } else if (std::holds_alternative<GetSnapshot>(command.payload)) {
                 if (inbox_.snapshot) return PostStatus::queue_full;
                 inbox_.snapshot = std::move(command);
+            } else if (std::holds_alternative<GetTranscript>(command.payload)) {
+                if (inbox_.transcript) return PostStatus::queue_full;
+                inbox_.transcript = std::move(command);
             } else {
-                const auto& text = std::get<Submit>(command.payload).text;
+                const auto& submitted = std::get<Submit>(command.payload);
+                const auto& text = submitted.text;
                 if (const auto found = receipts_.find(command.command.value); found != receipts_.end()) {
-                    if (*found->second.text != text || found->second.turn != command.turn) return PostStatus::command_conflict;
+                    if (*found->second.text != text || found->second.turn != command.turn || found->second.mode != submitted.mode)
+                        return PostStatus::command_conflict;
                     if (inbox_.lookups.size() == limits_.commands) return PostStatus::queue_full;
                     inbox_.lookups.push_back(command.command);
                     changed_.notify_all();
@@ -747,7 +818,7 @@ public:
                 if (receipts_.size() == limits_.submit_ids) return PostStatus::command_id_limit;
                 if (inbox_.submits.size() == limits_.commands) return PostStatus::queue_full;
                 const auto id = receipts_.emplace(command.command.value,
-                    SubmitReceipt{command.command, command.turn, {}, std::make_shared<const std::string>(text), "queued"}).first;
+                    SubmitReceipt{command.command, command.turn, {}, std::make_shared<const std::string>(text), "queued", submitted.mode}).first;
                 try { inbox_.submits.push_back(std::move(command)); }
                 catch (...) { receipts_.erase(id); throw; }
             }

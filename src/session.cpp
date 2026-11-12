@@ -39,8 +39,90 @@ ToolResult load_result(const Json& value) {
             static_cast<Execution>(execution), static_cast<Effects>(effects), dispatched};
 }
 
-SessionState::SessionState(SessionId id, Request config)
-    : session(std::move(id)), configuration(std::move(config)), epoch(configuration.epoch()) {}
+SessionState::SessionState(SessionId id, Request config, ToolAdvertisement plan_tools)
+    : plan_tools_(std::move(plan_tools)), session(std::move(id)), configuration(std::move(config)), epoch(configuration.epoch()) {}
+Request SessionState::request_for(const std::string& text, AgentMode mode) const {
+    if (mode == AgentMode::basic) return Request(configuration.binding(), epoch, configuration.tools(), input_for(history, text));
+    require(mode == AgentMode::plan && !plan_tools_.revision.empty(), "session_plan_tools");
+    const auto provenance = Json::object({{"base_epoch", Json::string(epoch.id)}, {"base_state", epoch.exact_state}, {"base_instructions", Json::string(epoch.instructions)},
+        {"mode", Json::string("plan")}, {"tools_revision", Json::string(plan_tools_.revision)}});
+    ContextEpoch plan{sha256(provenance.dump()), epoch.instructions +
+        "\nPlan mode: inspect and reason using read-only tools. Do not modify files or execute commands. Provide a concrete plan.", provenance};
+    return Request(configuration.binding(), std::move(plan), plan_tools_, input_for(history, text));
+}
+void TranscriptIndex::append(TranscriptEntry entry) {
+    auto block = std::make_shared<Block>();
+    if (tail_ && tail_->entries.size() < 64) {
+        block->previous = tail_->previous;
+        block->entries = tail_->entries;
+    } else block->previous = tail_;
+    block->entries.push_back(std::make_shared<const TranscriptEntry>(std::move(entry)));
+    tail_ = std::move(block);
+    ++size_;
+}
+const TranscriptEntry& TranscriptIndex::back() const { return *tail_->entries.back(); }
+void TranscriptIndex::set_last_state(const std::string& state) {
+    auto block = std::make_shared<Block>(*tail_);
+    auto entry = std::make_shared<TranscriptEntry>(*block->entries.back());
+    entry->state = state;
+    block->entries.back() = std::move(entry);
+    tail_ = std::move(block);
+}
+TranscriptPage TranscriptIndex::page(GetTranscript query) const {
+    if (query.forward) {
+        const auto begin = std::min(query.before, size_);
+        const auto limit = std::min<std::size_t>(query.limit, 64);
+        const auto max_end = begin + std::min(limit, size_ - begin);
+        std::vector<std::pair<std::size_t, std::shared_ptr<const Block>>> blocks;
+        auto cursor = size_;
+        for (auto block = tail_; block && cursor > begin; block = block->previous) {
+            const auto block_begin = cursor - block->entries.size();
+            if (block_begin < max_end) blocks.emplace_back(block_begin, block);
+            cursor = block_begin;
+        }
+        std::reverse(blocks.begin(), blocks.end());
+        TranscriptPage page{begin, begin, size_, {}, query};
+        std::size_t bytes = 0;
+        for (const auto& [block_begin, block] : blocks) {
+            const auto first = std::max(begin, block_begin) - block_begin;
+            for (auto i = first; i < block->entries.size() && page.end < max_end; ++i) {
+                const auto& entry = *block->entries[i];
+                if (!page.entries.empty() && bytes + entry.text.size() > 256 * 1024) return page;
+                bytes += entry.text.size();
+                page.entries.push_back(entry);
+                ++page.end;
+            }
+        }
+        return page;
+    }
+    const auto end = query.before == 0 ? size_ : std::min(query.before, size_);
+    auto cursor = size_;
+    auto block = tail_;
+    while (block && cursor - block->entries.size() >= end) {
+        cursor -= block->entries.size();
+        block = block->previous;
+    }
+    auto begin = end;
+    std::size_t bytes = 0;
+    const auto limit = std::min<std::size_t>(query.limit, 64);
+    std::vector<TranscriptEntry> reversed;
+    while (block && begin > 0 && reversed.size() < limit) {
+        const auto block_begin = cursor - block->entries.size();
+        while (begin > block_begin && reversed.size() < limit) {
+            const auto& entry = *block->entries[begin - block_begin - 1];
+            if (!reversed.empty() && bytes + entry.text.size() > 256 * 1024) goto complete;
+            bytes += entry.text.size();
+            reversed.push_back(entry);
+            --begin;
+        }
+        cursor = block_begin;
+        block = block->previous;
+    }
+complete:
+    std::reverse(reversed.begin(), reversed.end());
+    return {begin, end, size_, std::move(reversed), query};
+}
+TranscriptPage SessionState::transcript_page(GetTranscript query) const { return transcript_->page(query); }
 Json SessionState::initialization() const {
     return Json::object({{"kind", Json::string("init")}, {"version", number(1)},
         {"session", Json::string(session.value)}, {"configuration", save_request(configuration)}});
@@ -77,10 +159,13 @@ void SessionState::reduce(const Json& event) {
                 submits.size() < 65536 && event.index("request_number") == next_request + 1,
                 "session_submit");
         auto request = load_request(event.at("next"));
-        Request expected(configuration.binding(), epoch, configuration.tools(), input_for(history, text));
+        const auto mode_text = event.has("mode") ? event.text("mode") : "basic";
+        require(mode_text == "basic" || mode_text == "plan", "session_mode");
+        const auto mode = mode_text == "plan" ? AgentMode::plan : AgentMode::basic;
+        auto expected = request_for(text, mode);
         require(same_request(request, expected), "session_request_conflict");
         const auto stage = event.at("compact") == Json::parse("true") ? "compacting" : "generating";
-        SubmitReceipt receipt{{id}, {turn_id}, {request_id}, std::make_shared<const std::string>(text), stage};
+        SubmitReceipt receipt{{id}, {turn_id}, {request_id}, std::make_shared<const std::string>(text), stage, mode};
         const auto run = event.text("operation_run");
         OperationIds validate_run(run);
         turn.emplace(SavedTurn{receipt, run, std::move(request), {}, {}, {}, {}, stage, {}, false, {}});
@@ -88,6 +173,9 @@ void SessionState::reduce(const Json& event) {
         turn->call_limit = event.has("call_limit") ? event.index("call_limit") : 16;
         require(turn->round_limit > 0 && turn->round_limit <= 64 &&
                 turn->call_limit > 0 && turn->call_limit <= 256, "session_turn_limits");
+        auto entries = std::make_shared<TranscriptIndex>(*transcript_);
+        entries->append({{turn_id}, {request_id}, "user", text, stage, mode});
+        transcript_ = std::move(entries);
         submits.emplace(id, std::move(receipt));
         ++next_request;
         return;
@@ -133,7 +221,7 @@ void SessionState::reduce(const Json& event) {
         auto invocation = load_invocation(event.at("invocation"));
         const auto index = current.results.size();
         const auto& call = current.tools_response->calls()[index];
-        const auto& descriptors = configuration.tools().descriptors;
+        const auto& descriptors = current.next.tools().descriptors;
         const auto descriptor = std::find_if(descriptors.begin(), descriptors.end(),
             [&](const ToolDescriptor& d) { return d.name == invocation.name; });
         require(invocation.operation_id == current.operation_run + ":op:" + std::to_string(current.operation_offset + index + 1) &&
@@ -165,11 +253,15 @@ void SessionState::reduce(const Json& event) {
         epoch = compact_epoch(configuration.epoch(), ++compactions, compacted);
         history = compacted.output();
         history_bytes = Json::array(history).dump().size();
-        current.next = Request(configuration.binding(), epoch, configuration.tools(), input_for(history, *current.receipt.text));
+        current.next = request_for(*current.receipt.text, current.receipt.mode);
         current.stage = "generating";
     } else if (kind == "done") {
         require(current.stage == "final" && current.response && current.response->calls().empty(), "session_done_stage");
-        (void)response_text(*current.response);
+        auto final_text = response_text(*current.response);
+        auto entries = std::make_shared<TranscriptIndex>(*transcript_);
+        entries->set_last_state("completed");
+        entries->append({current.receipt.turn, current.receipt.request, "assistant", std::move(final_text), "completed", current.receipt.mode});
+        transcript_ = std::move(entries);
         history = current.response->request().input();
         for (const auto& item : current.response->items()) history.push_back(item);
         history_bytes = Json::array(history).dump().size();
@@ -198,6 +290,11 @@ void SessionState::reduce(const Json& event) {
         current.diagnostic.clear();
     } else fail(ErrorCode::contract, Stage::frontend, "session_record_kind");
     current.receipt.state = current.paused ? "paused" : current.stage;
+    if (kind != "done" && transcript_->back().state != current.receipt.state) {
+        auto entries = std::make_shared<TranscriptIndex>(*transcript_);
+        entries->set_last_state(current.receipt.state);
+        transcript_ = std::move(entries);
+    }
     submits.at(current.receipt.command.value).state = current.receipt.state;
 }
 } // namespace omh

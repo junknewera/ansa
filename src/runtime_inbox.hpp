@@ -30,13 +30,16 @@ struct Replay {
 struct CompactRequest { Request request; };
 using Task = std::variant<GenerateRequest, PrepareTools, RunTools, Replay, CompactRequest>;
 using WorkerResult = std::variant<CompletedResponse, RunTools, Replay, CompactedContext, Error>;
-struct Job { WorkIdentity identity; std::stop_token stop; Task task; };
+struct Job { WorkIdentity identity; std::stop_token stop; Task task; std::uint64_t generation = 0; };
 struct Completion { WorkIdentity identity; WorkerResult result; };
+struct PreviewUpdate { WorkIdentity identity; std::uint64_t generation; std::string text; };
 
 enum class Action { wait, stop, tool_started, cancel, complete, snapshot, submit };
 struct OwnerInbox {
     std::deque<RuntimeCommand> submits;
     std::optional<RuntimeCommand> cancel, snapshot, resume;
+    std::optional<RuntimeCommand> transcript;
+    std::optional<PreviewUpdate> preview;
     std::deque<CommandId> lookups;
     std::deque<ToolStarted> tool_starts;
     std::optional<Completion> completion;

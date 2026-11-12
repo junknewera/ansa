@@ -36,9 +36,9 @@ public:
 class SiwcProvider {
 public:
     Result<CompletedResponse> generate(const Request&, std::string_view bearer,
-        std::stop_token = {}, MimePolicy = MimePolicy::strict) const;
+        std::stop_token = {}, MimePolicy = MimePolicy::strict, TextPreview = {}) const;
 };
 Result<CompletedResponse> decode_offline(const Request&, const HttpHead&,
     const std::vector<std::string>& chunks, Limits = {}, MimePolicy = MimePolicy::strict,
-    std::stop_token = {});
+    std::stop_token = {}, TextPreview = {});
 } // namespace omh

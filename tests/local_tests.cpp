@@ -90,6 +90,10 @@ void files() {
     check(epoch.instructions.find("MARKER_GLOBAL") != std::string::npos && epoch.instructions.find("MARKER_PROJECT") != std::string::npos &&
           epoch.instructions.find("MARKER_NESTED") == std::string::npos, "instruction scopes flattened");
     auto tools = local_tools(settings, epoch, temp.root / "session", temp.root / "auth");
+    const auto readonly = tools->read_only();
+    check(readonly->advertisement().descriptors.size() == 4, "read-only tool count");
+    for (const auto& descriptor : readonly->advertisement().descriptors)
+        check(descriptor.name != "run_command", "process in read-only snapshot");
     const auto args = Json::object({{"path", Json::string("value.txt")}, {"offset", number(0)}, {"max_bytes", number(8192)},
         {"instruction_token", Json::string(token(epoch))}});
     check(invoke(tools, epoch, "read_file", args).text("content") == "line one\nneedle line\n", "file read");

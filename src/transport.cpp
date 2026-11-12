@@ -31,6 +31,15 @@ bool header_name(std::string_view s) {
             punctuation.find(static_cast<char>(c)) != std::string_view::npos;
     });
 }
+void admit_responses(const HttpHead& head, const Json& request, MimePolicy policy) {
+    if (policy == MimePolicy::allow_missing_siwc_responses) {
+        if (head.status == 401) fail(ErrorCode::transport, Stage::http, "auth_required");
+        if (head.status == 403) fail(ErrorCode::transport, Stage::http, "provider_policy_denied");
+        if (head.status == 429) fail(ErrorCode::transport, Stage::http, "provider_usage_limit");
+        if (head.status != 200) fail(ErrorCode::transport, Stage::http, "provider_http_failure");
+    }
+    admit_http(head, responses_endpoint, "POST", request, policy);
+}
 struct Transfer {
     const Json& request;
     const std::function<void(std::string_view)>& sink;
@@ -68,7 +77,7 @@ std::size_t receive_body(char* ptr, std::size_t size, std::size_t count, void* c
         const auto n = size_checked(size, count);
         require(t.parser.complete(), "body_before_headers", Stage::http);
         if (!t.admitted) {
-            admit_http(t.parser.head(), responses_endpoint, "POST", t.request, t.policy); t.admitted = true;
+            admit_responses(t.parser.head(), t.request, t.policy); t.admitted = true;
         }
         require(n <= 16 * 1024 * 1024 - t.body, "http_body_limit", Stage::http, ErrorCode::limit);
         t.body += n;
@@ -197,14 +206,14 @@ Result<std::monostate> CurlTransport::post(const Json& request, std::string_view
         require(!stop.stop_requested(), "http_cancelled", Stage::http, ErrorCode::cancelled);
         require(status == CURLE_OK, "http_transfer_failed", Stage::http, ErrorCode::transport);
         require(transfer.parser.complete(), "http_missing_headers", Stage::http);
-        admit_http(transfer.parser.head(), responses_endpoint, "POST", request, policy);
+        admit_responses(transfer.parser.head(), request, policy);
         return std::monostate{};
     });
 }
 Result<CompletedResponse> SiwcProvider::generate(const Request& request, std::string_view bearer,
-    std::stop_token stop, MimePolicy policy) const {
+    std::stop_token stop, MimePolicy policy, TextPreview preview) const {
     return capture([&]() -> CompletedResponse {
-        ResponseStream stream(request, {}, stop);
+        ResponseStream stream(request, {}, stop, std::move(preview));
         const auto status = CurlTransport{}.post(request.json(), bearer,
             [&](std::string_view bytes) { stream.feed(bytes); }, stop, policy);
         if (const auto* error = std::get_if<Error>(&status)) throw *error;
@@ -214,10 +223,10 @@ Result<CompletedResponse> SiwcProvider::generate(const Request& request, std::st
     });
 }
 Result<CompletedResponse> decode_offline(const Request& request, const HttpHead& head,
-    const std::vector<std::string>& chunks, Limits limits, MimePolicy policy, std::stop_token stop) {
+    const std::vector<std::string>& chunks, Limits limits, MimePolicy policy, std::stop_token stop, TextPreview preview) {
     return capture([&]() -> CompletedResponse {
         admit_http(head, responses_endpoint, "POST", request.json(), policy);
-        ResponseStream stream(request, limits, stop);
+        ResponseStream stream(request, limits, stop, std::move(preview));
         for (const auto& chunk : chunks) stream.feed(chunk);
         auto response = stream.finish();
         if (const auto* error = std::get_if<Error>(&response)) throw *error;

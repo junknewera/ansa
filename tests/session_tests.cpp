@@ -242,6 +242,87 @@ void history_and_dedup() {
     check(journal.diagnostic().empty() && restored.history.size() == 10 &&
           restored.history[0].text("content") == "fixture" && restored.history[5].text("content") == "remember first" &&
           restored.history[1].text("encrypted_content") == "synthetic_opaque_value", "native history changed");
+    const auto page = restored.transcript_page({0, 16});
+    check(page.total == 4 && page.entries[0].text == "fixture" && page.entries[0].role == "user" &&
+          page.entries[1].role == "assistant" && page.entries[1].state == "completed" &&
+          page.entries[2].text == "remember first" && page.entries[0].mode == AgentMode::basic,
+          "transcript replay mismatch");
+    const auto older = restored.transcript_page({2, 1});
+    check(older.begin == 1 && older.end == 2 && older.entries.size() == 1, "transcript cursor mismatch");
+    auto full = tools();
+    auto plan_ad = full->read_only()->advertisement();
+    Request config({}, epoch(), full->advertisement(), {});
+    SessionState plan({"plan_session"}, config, plan_ad);
+    auto init = plan.initialization();
+    plan.apply(init);
+    const auto request = plan.request_for("inspect", AgentMode::plan);
+    check(request.epoch().id != plan.epoch.id && request.tools().revision == plan_ad.revision,
+          "plan request provenance mismatch");
+    auto accepted = Json::object({{"kind", Json::string("accepted")}, {"command", Json::string("p")},
+        {"turn", Json::string("t")}, {"request", Json::string("r")}, {"request_number", Json::parse("1")},
+        {"text", Json::string("inspect")}, {"mode", Json::string("plan")},
+        {"operation_run", Json::string("run")}, {"next", save_request(request)}, {"compact", Json::parse("false")}});
+    plan.apply(accepted);
+    auto cancel = Json::object({{"kind", Json::string("cancel")}, {"turn", Json::string("t")}});
+    plan.apply(cancel);
+    check(plan.transcript_page({}).entries[0].state == "cancelled" &&
+          plan.turn->receipt.mode == AgentMode::plan, "plan cancellation lost mode");
+    SessionState replay({"plan_session"}, config, plan_ad);
+    replay.apply(init); replay.apply(accepted); replay.apply(cancel);
+    check(replay.transcript_page({}).entries[0].mode == AgentMode::plan &&
+          replay.transcript_page({}).entries[0].state == "cancelled", "plan replay mismatch");
+    check(save_request(plan.request_for("next")) == save_request(replay.request_for("next")), "base epoch changed");
+    SessionState long_replay({"long_session"}, config);
+    long_replay.apply(long_replay.initialization());
+    std::shared_ptr<const TranscriptIndex> early;
+    for (std::size_t i = 1; i <= 300; ++i) {
+        const auto id = std::to_string(i);
+        auto event = Json::object({{"kind", Json::string("accepted")}, {"command", Json::string("c" + id)},
+            {"turn", Json::string("t" + id)}, {"request", Json::string("r" + id)},
+            {"request_number", Json::parse(id)}, {"text", Json::string("item " + id)},
+            {"operation_run", Json::string("run" + id)},
+            {"next", save_request(long_replay.request_for("item " + id))}, {"compact", Json::parse("false")}});
+        long_replay.apply(event);
+        if (i == 64) early = long_replay.transcript();
+        long_replay.apply(Json::object({{"kind", Json::string("cancel")}, {"turn", Json::string("t" + id)}}));
+    }
+    check(early->size() == 64 && early->page({}).entries.back().state == "generating",
+          "transcript snapshot changed after append");
+    const auto boundary = long_replay.transcript_page({130, 64});
+    check(boundary.begin == 66 && boundary.end == 130 && boundary.total == 300 &&
+          boundary.entries.front().text == "item 67" && boundary.entries.back().text == "item 130" &&
+          boundary.entries.back().state == "cancelled", "long replay block cursor mismatch");
+    const auto across = long_replay.transcript_page({61, 8, true});
+    check(across.begin == 61 && across.end == 69 && across.entries.front().text == "item 62" &&
+          across.entries.back().text == "item 69" && across.query == GetTranscript{61, 8, true},
+          "forward block boundary or query mismatch");
+    const auto oldest = long_replay.transcript_page({2, 16});
+    check(oldest.begin == 0 && oldest.entries.front().text == "item 1", "long replay oldest entries lost");
+    SessionState sized({"sized_session"}, config);
+    sized.apply(sized.initialization());
+    for (std::size_t i = 0; i < 24; ++i) {
+        const auto id = std::to_string(i + 1);
+        const std::string text(i < 4 ? 1 : max_submit_bytes, static_cast<char>('a' + i));
+        sized.apply(Json::object({{"kind", Json::string("accepted")}, {"command", Json::string("c" + id)},
+            {"turn", Json::string("t" + id)}, {"request", Json::string("r" + id)},
+            {"request_number", Json::parse(id)}, {"text", Json::string(text)},
+            {"operation_run", Json::string("run" + id)}, {"next", save_request(sized.request_for(text))},
+            {"compact", Json::parse("false")}}));
+        sized.apply(Json::object({{"kind", Json::string("cancel")}, {"turn", Json::string("t" + id)}}));
+    }
+    const auto forward = sized.transcript_page({4, 64, true});
+    check(forward.begin == 4 && forward.end == 20 && forward.entries.size() == 16 &&
+          forward.entries.front().text.front() == 'e' && forward.entries.back().text.front() == 't',
+          "forward byte limit or cursor mismatch");
+    const auto next_page = sized.transcript_page({forward.end, 64, true});
+    check(next_page.begin == 20 && next_page.end == 24 && next_page.entries.front().text.front() == 'u',
+          "forward continuation skipped entries");
+    const auto reverse_page = sized.transcript_page({20, 64});
+    check(reverse_page.begin == 4 && reverse_page.end == 20 && reverse_page.entries.size() == 16 && reverse_page.query == GetTranscript{20, 64},
+          "backward byte limit mismatch");
+    const auto start_page = sized.transcript_page({0, 4, true});
+    check(start_page.begin == 0 && start_page.end == 4 && start_page.entries.front().text == "a",
+          "forward zero cursor did not select start");
 }
 
 RuntimeIncarnation crash_at(const std::filesystem::path& path, const std::string& kind, unsigned occurrence = 1,
@@ -414,6 +495,9 @@ void compaction_recovery() {
     Journal journal(temp.session, [&](const Json& event) { state.apply(event); });
     check(journal.diagnostic().empty() && state.epoch.id.starts_with("compact_1_") && state.history.size() == 7 &&
           state.history[1].text("type") == "compaction", "compacted window did not survive Done");
+    const auto page = state.transcript_page({});
+    check(page.total == 4 && page.entries[0].text == "fixture" && page.entries[2].text == "fixture",
+          "compaction erased transcript");
 }
 
 void compaction_failure() {

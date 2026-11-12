@@ -446,6 +446,40 @@ void transport() {
     check(std::holds_alternative<Error>(SiwcProvider{}.generate(env.request, "fake-token", stop.get_token())), "provider cancellation admission");
     check(std::holds_alternative<Error>(decode_offline(env.request, {200, {"text/event-stream"}}, {body}, {}, MimePolicy::strict, stop.get_token())), "offline cancellation");
 }
+void streaming_preview() {
+    const auto env = environment();
+    auto es = events(fixture("round2.sse"));
+    es[3] = set(es[3], "delta", Json::string("Привет"));
+    es[4] = set(es[4], "text", Json::string("Привет"));
+    auto first = set(es[5].at("part"), "text", Json::string("Привет"));
+    es[5] = set(es[5], "part", first);
+    const auto second = Json::parse(R"({"type":"refusal","refusal":"!"})");
+    auto added = set(second, "refusal", Json::string(""));
+    es.insert(es.begin() + 6, {
+        Json::object({{"type", Json::string("response.content_part.added")}, {"item_id", Json::string("msg_a")}, {"output_index", number(0)}, {"content_index", number(1)}, {"part", added}}),
+        Json::object({{"type", Json::string("response.refusal.delta")}, {"item_id", Json::string("msg_a")}, {"output_index", number(0)}, {"content_index", number(1)}, {"delta", Json::string("!")}}),
+        Json::object({{"type", Json::string("response.refusal.done")}, {"item_id", Json::string("msg_a")}, {"output_index", number(0)}, {"content_index", number(1)}, {"refusal", Json::string("!")}}),
+        Json::object({{"type", Json::string("response.content_part.done")}, {"item_id", Json::string("msg_a")}, {"output_index", number(0)}, {"content_index", number(1)}, {"part", second}})});
+    auto item = set(es[10].at("item"), "content", Json::array({first, second}));
+    es[10] = set(es[10], "item", item);
+    es[11] = set(es[11], "response", set(es[11].at("response"), "output", Json::array({item})));
+    std::vector<std::string> previews;
+    ResponseStream stream(env.request, {}, {}, [&](std::string_view text) { previews.emplace_back(text); });
+    const auto before_terminal = wire(std::vector<Json>(es.begin(), es.end() - 1));
+    stream.feed(before_terminal);
+    check(previews == std::vector<std::string>({"Привет", "Привет!"}), "ordered UTF-8 preview before terminal");
+    stream.feed(wire({set(es.back(), "sequence_number", number(es.size() - 1))}, false));
+    check(std::holds_alternative<CompletedResponse>(stream.finish()), "preview response completed");
+    auto bad = es; bad.back() = set(bad.back(), "type", Json::string("response.failed"));
+    previews.clear();
+    const auto result = decode_offline(env.request, {200, {"text/event-stream"}}, {wire(bad)}, {}, MimePolicy::strict, {},
+        [&](std::string_view text) { previews.emplace_back(text); });
+    check(!previews.empty() && std::holds_alternative<Error>(result), "preview followed by failed terminal");
+    std::stop_source stop;
+    auto cancelled = decode_offline(env.request, {200, {"text/event-stream"}}, {wire(es)}, {}, MimePolicy::strict, stop.get_token(),
+        [&](std::string_view) { stop.request_stop(); });
+    check(std::holds_alternative<Error>(cancelled), "preview cancellation stops stream");
+}
 void contracts() {
     static_assert(!std::is_default_constructible_v<CompletedResponse>);
     static_assert(!std::is_copy_constructible_v<PreparedBatch>);
@@ -474,7 +508,7 @@ int main(int argc, char** argv) {
         const std::string suite = argv[1];
         if (suite == "dependencies") dependencies();
         else if (suite == "sse") sse();
-        else if (suite == "reducer") reducer();
+        else if (suite == "reducer") { reducer(); streaming_preview(); }
         else if (suite == "replay") replay();
         else if (suite == "tools") tools();
         else if (suite == "transport") transport();

@@ -242,6 +242,7 @@ std::map<std::string, std::string> callback(int listener, std::string_view state
 class AuthManager::Impl {
     const std::filesystem::path path_;
     const HttpExchange exchange_;
+    const StreamingExchange streaming_;
     const std::function<std::uint64_t()> clock_;
     const AuthStoreObserver observe_;
     Fd directory_;
@@ -396,8 +397,13 @@ class AuthManager::Impl {
     }
 
 public:
-    Impl(std::filesystem::path path, HttpExchange exchange, std::function<std::uint64_t()> clock, AuthStoreObserver observe)
+    Impl(std::filesystem::path path, HttpExchange exchange, std::function<std::uint64_t()> clock, AuthStoreObserver observe, StreamingExchange streaming)
         : path_(std::filesystem::absolute(std::move(path))), exchange_(std::move(exchange)),
+          streaming_(streaming ? std::move(streaming) : (exchange_.target<HttpReply(*)(const HttpRequest&, std::stop_token)>() &&
+              *exchange_.target<HttpReply(*)(const HttpRequest&, std::stop_token)>() == &http_exchange
+              ? StreamingExchange([](const Json& request, std::string_view bearer, const auto& sink, std::stop_token stop) {
+                    return CurlTransport{}.post(request, bearer, sink, stop, MimePolicy::allow_missing_siwc_responses);
+                }) : StreamingExchange{})),
           clock_(clock ? std::move(clock) : [] { return static_cast<std::uint64_t>(std::time(nullptr)); }),
           observe_(std::move(observe)),
           directory_((private_directory(path_), ::open(path_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW))) {
@@ -595,11 +601,30 @@ public:
         auto catalog = json_reply(reply);
         return catalog;
     }
-    Result<CompletedResponse> generate(const Request& request, std::stop_token stop, std::string_view expected_session) {
+    Result<CompletedResponse> generate(const Request& request, std::stop_token stop, std::string_view expected_session, TextPreview preview) {
         return capture([&] {
             const auto lease = access(stop, false);
             auth_require(request.binding().account == lease.account, "auth_account_mismatch");
             auth_require(expected_session.empty() || lease.session == expected_session, "auth_required");
+            if (streaming_) {
+                if (observe_) observe_(AuthStorePoint::before_dispatch, "request");
+                StoreLock lock(directory_.get(), stop);
+                const auto record = read("credentials.json");
+                auth_require(record && !logged_out() && record->at("refresh_pending") == Json::parse("false") &&
+                             plan_enabled(record->text("scope")) && account_id(*record) == lease.account &&
+                             record->text("session") == lease.session, "auth_required");
+                std::stop_source operation;
+                std::stop_callback bridge(stop, [&] { operation.request_stop(); });
+                auto watcher = watch_logout(operation);
+                ResponseStream stream(request, {}, operation.get_token(), std::move(preview));
+                auto transfer = streaming_(request.json(), record->text("access_token"),
+                    [&](std::string_view bytes) { stream.feed(bytes); }, operation.get_token());
+                if (const auto* error = std::get_if<Error>(&transfer)) throw *error;
+                auth_require(!logged_out(), "auth_required");
+                auto result = stream.finish();
+                if (const auto* error = std::get_if<Error>(&result)) throw *error;
+                return std::get<CompletedResponse>(std::move(result));
+            }
             auto reply = authorized({"POST", std::string(responses_endpoint), request.json().dump(),
                 "application/json", {}, 16 * 1024 * 1024, 75000}, lease, stop);
             if (reply.head.status != 200) {
@@ -608,7 +633,7 @@ public:
                 if (reply.head.status == 429) fail(ErrorCode::transport, Stage::http, "provider_usage_limit");
                 fail(ErrorCode::transport, Stage::http, "provider_http_failure");
             }
-            auto result = decode_offline(request, reply.head, {reply.body}, {}, MimePolicy::allow_missing_siwc_responses, stop);
+            auto result = decode_offline(request, reply.head, {reply.body}, {}, MimePolicy::allow_missing_siwc_responses, stop, std::move(preview));
             if (auto* error = std::get_if<Error>(&result)) throw *error;
             return std::get<CompletedResponse>(std::move(result));
         });
@@ -616,8 +641,8 @@ public:
 };
 
 AuthManager::AuthManager(std::filesystem::path path, HttpExchange exchange, std::function<std::uint64_t()> clock,
-    AuthStoreObserver observe)
-    : impl_(std::make_unique<Impl>(std::move(path), std::move(exchange), std::move(clock), std::move(observe))) {}
+    AuthStoreObserver observe, StreamingExchange streaming)
+    : impl_(std::make_unique<Impl>(std::move(path), std::move(exchange), std::move(clock), std::move(observe), std::move(streaming))) {}
 AuthManager::~AuthManager() = default;
 void AuthManager::login(const std::function<void(std::string_view)>& browser, std::stop_token stop, bool consent) {
     impl_->login(browser, stop, consent);
@@ -633,8 +658,8 @@ AuthExecutionLease AuthManager::hold_execution(std::string_view session, std::st
     return impl_->hold_execution(session, stop);
 }
 Json AuthManager::models(std::stop_token stop) { return impl_->models(stop); }
-Result<CompletedResponse> AuthManager::generate(const Request& request, std::stop_token stop, std::string_view expected) {
-    return impl_->generate(request, stop, expected);
+Result<CompletedResponse> AuthManager::generate(const Request& request, std::stop_token stop, std::string_view expected, TextPreview preview) {
+    return impl_->generate(request, stop, expected, std::move(preview));
 }
 std::filesystem::path default_auth_directory() {
     const auto* home = std::getenv("HOME");

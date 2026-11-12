@@ -28,14 +28,25 @@ std::optional<Line> read_command_line(std::istream& input) {
 RuntimeCommand decode_command(std::string_view line) {
     const auto json = Json::parse(line, max_command_line, 16, 64);
     require(json.index("schema_version") == 1, "command_version", Stage::frontend, ErrorCode::contract);
-    require(json.keys().size() == 7, "command_fields", Stage::frontend, ErrorCode::contract);
     const auto type = json.text("type");
+    const auto fields = type == "transcript" ? (json.has("forward") ? 9U : 8U) :
+        (type == "submit" && json.has("mode") ? 8U : 7U);
+    require(json.keys().size() == fields, "command_fields", Stage::frontend, ErrorCode::contract);
     RuntimeCommand command{1, {json.text("session")}, {json.text("turn")}, {json.text("incarnation")},
                            {json.text("command_id")}, GetSnapshot{0}};
-    if (type == "submit") command.payload = Submit{json.text("text")};
+    if (type == "submit") {
+        const auto mode = json.has("mode") ? json.text("mode") : "basic";
+        require(mode == "basic" || mode == "plan", "submit_mode", Stage::frontend);
+        command.payload = Submit{json.text("text"), mode == "plan" ? AgentMode::plan : AgentMode::basic};
+    }
     else if (type == "cancel") command.payload = Cancel{{json.text("target")}};
     else if (type == "resume") command.payload = Resume{{json.text("target")}};
     else if (type == "snapshot") command.payload = GetSnapshot{json.index("after_sequence")};
+    else if (type == "transcript") {
+        if (json.has("forward")) require(json.at("forward").is_boolean(), "transcript_direction", Stage::frontend);
+        command.payload = GetTranscript{json.index("before"), json.index("limit"),
+            json.has("forward") && json.at("forward") == Json::parse("true")};
+    }
     else fail(ErrorCode::contract, Stage::frontend, "command_type");
     return command;
 }
@@ -85,6 +96,10 @@ Json encode_event(const RuntimeEvent& event) {
         {"incarnation", Json::string(event.incarnation.value)}, {"request_id", nullable_id(event.request)}};
     auto field = [&](const char* key, Json value) { fields.emplace_back(key, std::move(value)); };
     auto type = [&](const char* name) { field("type", Json::string(name)); };
+    auto encode_preview = [](const PreviewText& preview) {
+        return Json::object({{"generation", number(preview.generation)}, {"text", Json::string(preview.text)},
+            {"state", Json::string(preview.state)}});
+    };
     if (const auto* snapshot = std::get_if<FrontendSnapshot>(&event.payload)) {
         type("snapshot");
         field("through_sequence", number(snapshot->through_sequence));
@@ -104,6 +119,25 @@ Json encode_event(const RuntimeEvent& event) {
         field("storage_failed", Json::parse(snapshot->storage_failed ? "true" : "false"));
         field("durable", Json::parse(snapshot->durable ? "true" : "false"));
         field("resume_available", Json::parse(snapshot->resume_available ? "true" : "false"));
+        field("mode", Json::string(snapshot->mode == AgentMode::plan ? "plan" : "basic"));
+        field("transcript_size", number(snapshot->transcript_size));
+        field("preview", snapshot->preview ? encode_preview(*snapshot->preview) : Json::parse("null"));
+    } else if (const auto* preview = std::get_if<PreviewText>(&event.payload)) {
+        type("text_preview");
+        field("generation", number(preview->generation));
+        field("text", Json::string(preview->text));
+        field("state", Json::string(preview->state));
+    } else if (const auto* page = std::get_if<TranscriptPage>(&event.payload)) {
+        type("transcript");
+        field("begin", number(page->begin)); field("end", number(page->end)); field("total", number(page->total));
+        field("query", Json::object({{"before", number(page->query.before)}, {"limit", number(page->query.limit)},
+            {"forward", Json::parse(page->query.forward ? "true" : "false")}}));
+        std::vector<Json> entries;
+        for (const auto& entry : page->entries)
+            entries.push_back(Json::object({{"turn", Json::string(entry.turn.value)}, {"request_id", Json::string(entry.request.value)},
+                {"role", Json::string(entry.role)}, {"text", Json::string(entry.text)}, {"state", Json::string(entry.state)},
+                {"mode", Json::string(entry.mode == AgentMode::plan ? "plan" : "basic")}}));
+        field("entries", Json::array(entries));
     } else if (const auto* resync = std::get_if<ResyncRequired>(&event.payload)) {
         type("resync_required");
         field("oldest_available", number(resync->oldest_available));

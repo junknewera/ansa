@@ -6,6 +6,7 @@
 
 namespace omh {
 using Generate = std::function<Result<CompletedResponse>(const Request&, std::stop_token)>;
+using StreamingGenerate = std::function<Result<CompletedResponse>(const Request&, std::stop_token, TextPreview)>;
 enum class PostStatus { accepted, queue_full, closed, stale_target, stale_incarnation, duplicate, command_id_limit,
                         command_conflict };
 struct RuntimeLimits {
@@ -25,6 +26,7 @@ struct SessionOptions {
     std::size_t keep_recent_turns = 0;
     std::function<void(std::uint64_t resume_epoch, std::stop_token)> check_dispatch;
     std::function<ToolLease(std::stop_token)> tool_guard;
+    StreamingGenerate stream_generate;
 };
 
 // One session, one turn at a time. Submits wait in FIFO order while the worker is busy.

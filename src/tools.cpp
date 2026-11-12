@@ -100,6 +100,11 @@ Json save_invocation(const ToolInvocation& invocation) {
 ToolInvocation load_invocation(const Json& value) {
     return {value.text("operation"), value.text("call"), value.text("name"), value.text("revision"), value.at("arguments")};
 }
+std::shared_ptr<const ToolSnapshot> ToolSnapshot::read_only() const {
+    std::vector<ToolDefinition> subset;
+    for (const auto& tool : definitions_) if (tool.read_only) subset.push_back(tool);
+    return std::shared_ptr<const ToolSnapshot>(new ToolSnapshot(std::move(subset)));
+}
 bool ToolSnapshot::requires_journal() const {
     return std::any_of(definitions_.begin(), definitions_.end(), [](const auto& tool) { return tool.requires_journal; });
 }
@@ -212,6 +217,6 @@ Result<std::vector<ToolResult>> PreparedBatch::execute(std::stop_token stop, con
 }
 ToolDefinition test_value_tool() {
     return {{"get_test_value", "Return a fixed test JSON value without side effects", "1",
-        Json::parse(R"({"type":"object","properties":{},"required":[],"additionalProperties":false})")}, empty_args, fixed_value};
+        Json::parse(R"({"type":"object","properties":{},"required":[],"additionalProperties":false})")}, empty_args, fixed_value, {}, {}, false, true};
 }
 } // namespace omh

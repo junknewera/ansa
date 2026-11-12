@@ -195,10 +195,10 @@ struct Mock {
             ::close(connection);
         });
     }
-    std::unique_ptr<AuthManager> manager(const std::filesystem::path& path, AuthStoreObserver observer = {}) {
+    std::unique_ptr<AuthManager> manager(const std::filesystem::path& path, AuthStoreObserver observer = {}, StreamingExchange streaming = {}) {
         return std::make_unique<AuthManager>(path,
             [this](const HttpRequest& request, std::stop_token stop) { return exchange(request, stop); },
-            [this] { return now; }, std::move(observer));
+            [this] { return now; }, std::move(observer), std::move(streaming));
     }
     void login(AuthManager& manager) {
         manager.login([this](std::string_view url) { open(url); });
@@ -336,6 +336,33 @@ void dispatch_logout() {
     }
     worker.join();
     check(rejected && mock.inference == 0, "request dispatched after completed logout");
+}
+void streaming_logout() {
+    Temp temp; Mock mock;
+    std::atomic<bool> delivered = false, stopped = false, rejected = false;
+    auto manager = mock.manager(temp.path, {}, [&](const Json&, std::string_view, const auto& sink, std::stop_token stop) -> Result<std::monostate> {
+        sink("data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r\",\"model\":\"gpt-6.1-sol\",\"status\":\"in_progress\",\"output\":[]}}\n\n");
+        sink("data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n");
+        sink("data: {\"type\":\"response.content_part.added\",\"sequence_number\":2,\"item_id\":\"m\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n");
+        sink("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"m\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n");
+        delivered = true;
+        while (!stop.stop_requested()) std::this_thread::sleep_for(1ms);
+        stopped = true;
+        return std::monostate{};
+    });
+    mock.login(*manager);
+    const auto lease = manager->access();
+    Request request({"openai-siwc", lease.account, "gpt-6.1-sol", "gpt-6.1-sol"},
+        {"fixture", "fixture", Json::parse("{}")}, {"empty", {}}, {});
+    std::atomic<bool> preview = false;
+    std::jthread worker([&] { rejected = std::holds_alternative<Error>(manager->generate(request, {}, {},
+        [&](std::string_view text) { preview = text == "hi"; })); });
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!delivered && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    check(delivered && preview, "stream preview before completion");
+    check(manager->logout(), "stream logout");
+    worker.join();
+    check(stopped && rejected, "logout cancels active stream");
 }
 void wait_flag(const std::atomic<bool>& flag) {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
@@ -567,7 +594,7 @@ int main(int argc, char** argv) {
         else if (suite == "permission") permissions();
         else if (suite == "refresh-crash") refresh_crash();
         else if (suite == "pending-cleanup") pending_cleanup();
-        else if (suite == "dispatch-logout") dispatch_logout();
+        else if (suite == "dispatch-logout") { dispatch_logout(); streaming_logout(); }
         else if (suite == "logout-login") logout_login();
         else if (suite == "logout-refresh") logout_refresh();
         else if (suite == "logout-crash") logout_crash();

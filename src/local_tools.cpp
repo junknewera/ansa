@@ -210,7 +210,7 @@ std::shared_ptr<const ToolSnapshot> local_tools(const AgentSettings& settings, c
                 try { return action(arguments, stop); }
                 catch (const Error& failure) { return error(failure.diagnostic.c_str()); }
                 catch (const std::filesystem::filesystem_error&) { return error("file_access_failed"); }
-            }});
+            }, {}, {}, false, true});
     };
     add("list_directory", "List up to 128 directory entries. instruction_token identifies applicable AGENTS.md instructions.",
         schema({{"path", "string"}}), [](const Json& args) { return path_argument(args, "path"); },

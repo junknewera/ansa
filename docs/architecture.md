@@ -27,7 +27,7 @@ Core - статическая CMake library `omh_core`. Сторонние runti
 
 `SiwcProvider::generate` создаёт `ResponseStream`, передаёт ему decoded HTTP bytes и вызывает `finish` только после успешного libcurl transfer и проверки финальных headers. Offline adapter использует те же framer, reducer и request builder. Ни curl callback, ни `output_item.done` не дают разрешения на tools.
 
-Live AuthManager удерживает lease профиля во время HTTP, получает bounded body и затем вызывает общий decoder. Это сохраняет EOF/terminal gate; streaming text в frontend пока не публикуется. SIWC `response.metadata` допускается только с явным совпадающим response ID и объектом metadata, проходит общие sequence/size проверки и не добавляется в executable output.
+Live AuthManager удерживает lease профиля и logout watcher во время HTTP и передаёт проверенные транспортом chunks в общий decoder. Reducer может выдавать накопленный упорядоченный preview текста, ограниченный 64 KiB. Preview не является admission: EOF/terminal gate и полная проверка batch сохраняются. SIWC `response.metadata` допускается только с явным совпадающим response ID и объектом metadata, проходит общие sequence/size проверки и не добавляется в executable output.
 
 Reducer требует created identity/model, последовательных sequence numbers, уникальных item/call IDs и согласованных output indices. Added/delta/done/terminal representations сверяются. Function arguments проверяются и при final-only delivery. Item order должен совпадать в done events и completed response. Для text/summary parts отдельно проверяются IDs, indices, deltas и final values. Unknown executable types и unknown events приводят к отказу.
 
@@ -116,10 +116,22 @@ Worker проверяет auth до provider callback и до durable tool inten
 
 401 требует входа, 403 обозначает policy denial, 429 - usage limit. Автоматического переключения аккаунта, model, billing route и повторной отправки ambiguous refresh нет. Credentials других агентов не используются.
 
+## Carbon, transcript и режимы
+
+`Submit.mode` закрепляет basic/plan за turn; старые записи без mode означают basic. Plan создаёт отдельную exact epoch с политикой и revision read-only snapshot. Base epoch и общая native history сохраняются, compact использует base context и затем восстанавливает режим текущего turn. Compiled tool явно объявляет `read_only`; provider получает filtered descriptors, подготовка всего batch проверяет тот же filtered snapshot. Инструкции модели не заменяют backend-проверку.
+
+Transcript является производной проекцией проверенных canonical records: accepted добавляет user, done добавляет итоговый assistant. Cancel/pause меняют статус незавершённого запроса. Summary, opaque reasoning и tool payloads не становятся репликами. Неизменяемые блоки по 64 записи позволяют обновлять конец проекции без копирования всех текстов. `GetTranscript` выдаёт bounded страницы до 64 записей и 256 KiB текста; frontend хранит окно страниц. Сам canonical journal по-прежнему восстанавливается полным replay.
+
+Runtime публикует transcript только из последнего успешно синхронизированного состояния. При fsync failure candidate может сохранить известные outcomes для snapshot, но его несохранённый assistant не становится завершённой репликой. Первая страница истории загружается до первого интерактивного prompt.
+
+Worker передаёт cumulative preview через один заменяемый mailbox slot. Serialized owner проверяет incarnation/request/resume identity и отдельный номер generation для каждого provider round. Только owner публикует `PreviewText` с состоянием preview/committed/discarded. Snapshot содержит тот же prefix и состояние для resync. Cancel и ошибка закрывают preview; поздний callback не изменяет следующую попытку. Итоговый текст snapshot доступен только для durable completed turn. Preview не записывается в journal и не используется как model context.
+
+Терминальный frontend редактирует ввод в noncanonical режиме и перерисовывает ограниченную область основного буфера отдельным writer. Заблокированный stdout не задерживает input/control. RAII восстанавливает termios; job control временно возвращает исходные настройки. Рендерер обрабатывает ширину UTF-8 символов и обезвреживает terminal controls в пользовательском и model тексте. Pipe, one-shot и JSONL используют общий typed runtime без интерактивного рендера.
+
 ## Следующая граница
 
 Неизвестные эффекты требуют явного reconciliation workflow. File replacement отдельным compiled tool должен определить rename/preimage/conflict semantics без обещания atomic CAS с внешними writers; произвольная команда таких гарантий не даёт.
 
-Расширение auth включает несколько профилей и системный secret store. Streaming frontend, token-aware context budget, MCP, hooks, Ask, интерактивный sudo и TUI остаются в TODO.
+Расширение auth включает несколько профилей и системный secret store. Orchestrate, token-aware context budget, MCP, hooks, Ask, интерактивный sudo и отдельный TUI остаются в TODO.
 
 Исходные audit/P0 reports из `/home/gusevsaint/harness-research/` использованы read-only. Python probes не запускаются и не становятся dependency. Репозиторий содержит только синтетические fixture data.

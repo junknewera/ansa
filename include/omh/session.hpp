@@ -15,6 +15,7 @@ struct SubmitReceipt {
     RequestId request;
     std::shared_ptr<const std::string> text;
     std::string state;
+    AgentMode mode = AgentMode::basic;
 };
 struct SavedTurn {
     SubmitReceipt receipt;
@@ -32,10 +33,29 @@ struct SavedTurn {
     std::size_t resume_round = 0, resume_operation = 0;
 };
 
+// Persistent blocks keep snapshots cheap while preserving owning entries.
+class TranscriptIndex {
+    struct Block {
+        std::shared_ptr<const Block> previous;
+        std::vector<std::shared_ptr<const TranscriptEntry>> entries;
+    };
+    std::shared_ptr<const Block> tail_;
+    std::size_t size_ = 0;
+    friend class SessionState;
+    void append(TranscriptEntry);
+    void set_last_state(const std::string&);
+    const TranscriptEntry& back() const;
+public:
+    std::size_t size() const { return size_; }
+    TranscriptPage page(GetTranscript) const;
+};
+
 // Reducer for the canonical journal. apply() commits an owning state only after
 // the complete event has validated; runtime uses the same reducer as recovery.
 class SessionState {
     void reduce(const Json&);
+    ToolAdvertisement plan_tools_;
+    std::shared_ptr<const TranscriptIndex> transcript_ = std::make_shared<const TranscriptIndex>();
 public:
     SessionId session;
     Request configuration;
@@ -46,7 +66,10 @@ public:
     std::optional<SavedTurn> turn;
     std::size_t next_request = 0, compactions = 0;
     bool initialized = false;
-    SessionState(SessionId, Request);
+    SessionState(SessionId, Request, ToolAdvertisement plan_tools = {});
+    Request request_for(const std::string&, AgentMode mode = AgentMode::basic) const;
+    std::shared_ptr<const TranscriptIndex> transcript() const { return transcript_; }
+    TranscriptPage transcript_page(GetTranscript) const;
     void apply(const Json&);
     Json initialization() const;
     std::optional<OperationId> unknown_operation() const;

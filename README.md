@@ -15,7 +15,15 @@
 ./result/bin/ansa --cwd ~/Downloads 'Найди большие файлы и объясни результат'
 ```
 
-Без аргумента задачи CLI читает обычный текст со stdin. `/status` показывает состояние, `/cancel` отменяет текущий запрос, `/resume` явно продолжает прерванный turn, `/exit` завершает процесс. Ctrl+C отменяет работу, повторный Ctrl+C завершает CLI; Ctrl+D даёт принятой задаче закончиться. Одновременно выполняется одна задача. Следующая строка во время работы отклоняется с диагностикой и ненулевым exit code; для pipeline передавай одну задачу. Ответ выводится после проверки terminal response. TUI и показ полного старого диалога отложены.
+Без аргумента задачи в терминале работает Carbon CLI: диалог над строкой ввода, компактный статус tools и мятный акцент. Основной буфер терминала сохраняется; отдельное окно и alternate screen не используются. `NO_COLOR` и `TERM=dumb` отключают цвета.
+
+При открытии видны три последних обмена и незавершённый запрос. `Ctrl+F` раскрывает и скрывает историю, `PgUp`/`PgDn` листают текст и подгружают страницы canonical journal. Compact не удаляет отображаемый диалог. Просмотр не вызывает provider или tools, набранный запрос сохраняется.
+
+`Tab` и `Shift+Tab` переключают basic/plan между задачами; `/basic` и `/plan` делают то же. Basic выполняет задачу. Plan читает и ищет файлы, задаёт вопросы и составляет план: backend выдаёт только compiled tools с признаком `read_only`; произвольный запуск команд недоступен. Режим сохраняется с принятым turn и используется при Resume. История обоих режимов общая. Orchestrate с дочерними агентами относится к следующему спринту.
+
+Текст live ответа появляется по мере генерации как предварительный. Полная проверка HTTP/Responses и batch по-прежнему предшествует tools; итог подтверждается после durable Done. При ошибке или отмене фрагмент остаётся с отметкой незавершённого ответа. После restart история содержит сохранённые сообщения пользователя и завершённые итоговые ответы, без временных preview, reasoning и результатов tools.
+
+`/status` показывает состояние, `/cancel` отменяет текущий запрос, `/resume` явно продолжает прерванный turn, `/exit` завершает процесс. Ctrl+C отменяет работу, повторный Ctrl+C завершает CLI; Ctrl+D даёт принятой задаче закончиться. Одновременно выполняется одна задача. Ввод без TTY остаётся построчным; для pipeline передавай одну задачу. Перенаправленный stdout и one-shot получают проверенный итоговый ответ без интерактивного оформления.
 
 Новая сессия создаётся при каждом запуске. `--continue` выбирает последнюю сессию текущего каталога и того же live/offline профиля; `--session` принимает её ID из стартового сообщения. Журналы находятся в `~/.ansa/sessions/`. После crash незавершённый turn ждёт `/resume`; неизвестный эффект блокирует продолжение. `--offline` проверяет CLI на фиксированном mock/get_test_value, он не эмулирует универсальную модель.
 
@@ -104,16 +112,19 @@ Live JSONL использует команды из таблицы ниже и `
 
 ## Команды JSONL
 
-`ansa --offline-jsonl` читает одну команду на строку и отдаёт события в stdout. Первый snapshot сообщает `session` (`offline`), `incarnation` и `stream_sequence`. В каждой команде передай `schema_version: 1`, эти `session` и `incarnation`, а также `turn`, `command_id`, `type` и одно поле payload.
+`ansa --offline-jsonl` читает одну команду на строку и отдаёт события в stdout. Первый snapshot сообщает `session` (`offline`), `incarnation` и `stream_sequence`. В каждой команде передай `schema_version: 1`, эти `session` и `incarnation`, а также `turn`, `command_id`, `type` и поля payload.
 
 | `type` | Поле payload | Поведение |
 |---|---|---|
-| `submit` | `text` | Ставит turn в FIFO. `command_accepted` сообщает его `request_id`. Повтор той же команды даёт `command_replayed` с состоянием исходного turn. Изменённый payload с тем же ID даёт ошибку. |
+| `submit` | `text`, необязательный `mode` | Режим basic по умолчанию или plan. Ставит turn в FIFO. `command_accepted` сообщает его `request_id`. Повтор той же команды даёт `command_replayed`; другой текст или mode с тем же ID даёт ошибку. |
 | `cancel` | `target` | Используй `request_id` активного turn. Отмена проходит и при заполненном FIFO. |
 | `resume` | `target` | Используй `request_id` приостановленного turn и новый `command_id`. Продолжение начинается после сохранённой безопасной границы. |
 | `snapshot` | `after_sequence` | Передай последний известный cursor или `0`. Ответ содержит актуальное состояние turn и `through_sequence`. |
+| `transcript` | `before`, `limit`, необязательный `forward` | До 64 записей и 256 KiB текста. По умолчанию читает назад до exclusive before, 0 означает конец. При forward:true читает вперёд начиная с before, 0 означает начало. Ответ возвращает begin/end/total, entries и исходный query. |
 
 При разрыве `stream_sequence` или `resync_required` запроси snapshot и продолжи чтение после `through_sequence`. Читай stderr отдельно от событий. Туда идут ошибки разбора и постановки команды в очередь. EOF закрывает ввод и даёт runtime завершить текущую работу. Приостановленный turn остаётся ждать Resume.
+
+Snapshot дополнительно содержит mode, transcript_size и nullable preview с generation/text/state. Событие text_preview имеет те же поля; state принимает preview/committed/discarded. Legacy text_delta сохраняет полный подтверждённый финальный ответ. Проекция transcript содержит только пользовательский текст и durable итоговые ответы. JSONL не включает предварительный streaming по умолчанию; эти типы общие с интерактивным frontend.
 
 ## Сохранённая сессия
 
@@ -145,7 +156,7 @@ Runtime накапливает контекст между завершённы�
 
 CLI предоставляет self-check, offline round trip и live SIWC. Mock строит финальный response из фактического результата tool в continuation.
 
-Сетевой adapter проверяет TLS, ограничивает размер и длительность transfer и не следует redirects. Политика MIME по умолчанию строгая; отсутствие MIME разрешается явно только для точного `POST https://api.openai.com/v1/responses`, `stream:true`, `store:false`, HTTP 200. Неверный или повторный MIME всегда приводит к отказу. Текущий live путь буферизует ограниченный HTTP body и применяет общий SSE reducer после успешного transfer; frontend пока получает текст после admission.
+Сетевой adapter проверяет TLS, ограничивает размер и длительность transfer и не следует redirects. Политика MIME по умолчанию строгая; отсутствие MIME разрешается явно только для точного `POST https://api.openai.com/v1/responses`, `stream:true`, `store:false`, HTTP 200. Неверный или повторный MIME всегда приводит к отказу. Production live путь подаёт chunks в общий SSE reducer во время transfer. Preview предварительный; `CompletedResponse` появляется только после successful transfer, terminal и EOF. Тестовый injectable buffered adapter сохраняется.
 
 Поддерживается закрытое подмножество Responses events: lifecycle, function arguments, message text/refusal, reasoning summary и неисполняемый `response.metadata` с явным matching response ID. Неизвестные events/items отклоняются. Требуются `response.created`, непрерывные unsigned sequence numbers с нуля и точное совпадение returned model с явно выбранной policy. Для reasoning обязательно непустое `encrypted_content`. Это консервативный adapter, а не полная реализация всех Responses capabilities.
 
