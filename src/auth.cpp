@@ -527,7 +527,7 @@ public:
         const auto now = clock_(), expiry = record->index("expires_at"), earliest = record->index("earliest_refresh_at");
         const bool pending = record->at("refresh_pending") == Json::parse("true");
         return {!pending && !logged_out(), pending, plan_enabled(record->text("scope")), account_id(*record),
-            expiry > now ? expiry - now : 0, earliest > now ? earliest - now : 0};
+            expiry > now ? expiry - now : 0, earliest > now ? earliest - now : 0, record->text("session")};
     }
     bool current(const AuthLease& lease) {
         StoreLock lock(directory_.get(), {});

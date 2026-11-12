@@ -128,6 +128,10 @@ Worker передаёт cumulative preview через один заменяем�
 
 Терминальный frontend редактирует ввод в noncanonical режиме и перерисовывает ограниченную область основного буфера отдельным writer. Заблокированный stdout не задерживает input/control. RAII восстанавливает termios; job control временно возвращает исходные настройки. Рендерер обрабатывает ширину UTF-8 символов и обезвреживает terminal controls в пользовательском и model тексте. Pipe, one-shot и JSONL используют общий typed runtime без интерактивного рендера.
 
+Структурированный `TerminalEntry` отделяет роль от содержимого. Markdown и fences разбираются для assistant, а пользовательский текст сохраняется буквально. Высота растёт и сокращается по содержимому; writer очищает прежние хвостовые строки. Word wrapping и стили учитывают ширину glyphs. Подтверждённый финальный preview остаётся до получения transcript page без дублирования; committed tool-response не считается завершённым turn.
+
+Запуск live CLI строит binding из локального `AuthStatus`, включая opaque auth session ID без bearer. `AgentAuthorization` откладывает access/refresh и каталог моделей до serialized dispatch worker. Он проверяет account/session до generation и tools, принимает смену session только при явном Resume и кеширует успешную проверку model catalog на auth epoch. `AuthManager::generate` и execution lease продолжают независимо проверять допуск. Сетевые запросы больше не предшествуют первому кадру.
+
 ## Следующая граница
 
 Неизвестные эффекты требуют явного reconciliation workflow. File replacement отдельным compiled tool должен определить rename/preimage/conflict semantics без обещания atomic CAS с внешними writers; произвольная команда таких гарантий не даёт.

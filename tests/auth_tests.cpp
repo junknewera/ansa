@@ -1,5 +1,6 @@
 #include "omh/auth.hpp"
 #include "omh/tools.hpp"
+#include "../src/agent_authorization.hpp"
 #include <curl/curl.h>
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
@@ -109,7 +110,8 @@ struct Mock {
     Key key;
     std::uint64_t now = 1800000000;
     std::string nonce, challenge, redirect, host;
-    std::atomic<unsigned> refreshes{0}, inference{0}, revokes{0}, grants{0};
+    std::atomic<unsigned> refreshes{0}, inference{0}, revokes{0}, grants{0}, catalogs{0};
+    bool available_model = false;
     std::vector<std::string> issued_refresh, revoked_refresh;
     bool permission = true, revoke_failure = false, crash_refresh = false, block_refresh = false;
     std::atomic<bool> refresh_entered = false;
@@ -161,7 +163,10 @@ struct Mock {
             return {{revoke_failure ? 503 : 200, {}}, {}};
         }
         if (request.url.ends_with("/responses")) { ++inference; return {{500, {"application/json"}}, "{}"}; }
-        if (request.url.ends_with("/models")) return reply(Json::parse(R"({"models":[]})"));
+        if (request.url.ends_with("/models")) {
+            ++catalogs;
+            return reply(Json::parse(available_model ? R"({"models":[{"slug":"fixture-model","visibility":"list"}]})" : R"({"models":[]})"));
+        }
         throw std::runtime_error("unexpected fixture endpoint");
     }
     void open(std::string_view url) {
@@ -252,6 +257,32 @@ void lifecycle() {
     rejects([&] { manager->access(); });
     mock.login(*manager);
     check(manager->status().logged_in && manager->access().session != first.session, "reauthorization failed");
+}
+void lazy_authorization() {
+    Temp temp; Mock mock;
+    std::shared_ptr<AuthManager> manager = mock.manager(temp.path);
+    mock.login(*manager);
+    const auto original = manager->status();
+    mock.now += 3601;
+    const auto expired = manager->status();
+    check(expired.logged_in && expired.expires_in == 0 && expired.session == original.session &&
+          mock.refreshes == 0 && mock.catalogs == 0, "status performed network or lost expired session");
+    AgentAuthorization auth(manager, expired, "fixture-model");
+    rejects([&] { auth.check_dispatch(0, {}); });
+    check(mock.refreshes == 1 && mock.catalogs == 1 && mock.inference == 0, "missing model did not fail closed");
+    mock.available_model = true;
+    auth.check_dispatch(0, {});
+    auth.check_dispatch(0, {});
+    check(mock.catalogs == 2 && auth.session() == original.session, "catalog was not cached after refresh");
+    auto wrong = expired; wrong.account = "other";
+    AgentAuthorization mismatch(manager, wrong, "fixture-model");
+    rejects([&] { mismatch.check_dispatch(0, {}); });
+    (void)manager->logout();
+    rejects([&] { auth.check_dispatch(0, {}); });
+    mock.login(*manager);
+    rejects([&] { auth.check_dispatch(0, {}); });
+    auth.check_dispatch(1, {});
+    check(auth.session() != original.session && mock.catalogs == 3, "resume did not revalidate session and model");
 }
 void permissions() {
     Temp temp;
@@ -590,7 +621,7 @@ int main(int argc, char** argv) {
         check(argc == 2, "suite required");
         const std::string_view suite = argv[1];
         if (suite == "jwt") jwt_validation();
-        else if (suite == "lifecycle") lifecycle();
+        else if (suite == "lifecycle") { lifecycle(); lazy_authorization(); }
         else if (suite == "permission") permissions();
         else if (suite == "refresh-crash") refresh_crash();
         else if (suite == "pending-cleanup") pending_cleanup();

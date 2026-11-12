@@ -24,6 +24,7 @@ struct AuthStatus {
     bool logged_in = false, refresh_pending = false, plan_enabled = false;
     std::string account;
     std::uint64_t expires_in = 0, refresh_wait = 0;
+    std::string session;
 };
 struct AuthExecutionLease { std::shared_ptr<void> ownership; std::stop_token stop; };
 enum class AuthStorePoint { temporary_synced, replaced, before_dispatch, tokens_removed };

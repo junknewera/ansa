@@ -74,7 +74,7 @@ void frontend(std::string_view suite) {
     check(WEXITSTATUS(status) == (backpressure ? 130 : (suite == "busy" || suite == "input-size") ? 1 : 0),
           "frontend reported wrong acceptance status");
 }
-void terminal_frontend() {
+void terminal_frontend(bool plain) {
     const GetTranscript latest{0, 16, false}, forward{10, 16, true};
     const TranscriptPage page{10, 12, 12, {{{"turn"}, {"request"}, "user", "task", "pending"}}, forward};
     check(history_page_current(page, forward, 12), "forward page correlation");
@@ -85,6 +85,12 @@ void terminal_frontend() {
     check(preview_visible(page.entries, page.end, page.total, request, draft), "current preview");
     check(!preview_visible(page.entries, 10, 12, request, draft), "preview on older page");
     check(!preview_visible(page.entries, page.end, page.total, RequestId{"other"}, draft), "preview request identity");
+    const std::optional<PreviewText> committed = PreviewText{1, "final", "committed"};
+    check(!preview_visible(page.entries, page.end, page.total, request, committed), "tool-round commitment is not final text");
+    check(preview_visible(page.entries, page.end, page.total, request, committed, true), "keep confirmed text until transcript arrives");
+    auto recorded = page.entries;
+    recorded.push_back({{"turn"}, {"request"}, "assistant", "final", "completed"});
+    check(!preview_visible(recorded, page.end + 1, page.total + 1, request, committed, true), "confirmed text must not duplicate transcript");
     char name[] = "/tmp/ansa-pty-XXXXXX";
     const auto directory = ::mkdtemp(name); check(directory, "mkdtemp");
     struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); } } cleanup{directory};
@@ -92,9 +98,13 @@ void terminal_frontend() {
     check(master >= 0 && ::grantpt(master) == 0 && ::unlockpt(master) == 0, "pty");
     const int slave = ::open(::ptsname(master), O_RDWR | O_NOCTTY); check(slave >= 0, "pty slave");
     termios original{}; check(::tcgetattr(slave, &original) == 0, "pty termios");
+    winsize initial{}; initial.ws_row = 24; initial.ws_col = 35;
+    check(::ioctl(master, TIOCSWINSZ, &initial) == 0, "pty initial size");
     const auto child = ::fork(); check(child >= 0, "fork");
     if (!child) {
         (void)::setenv("LC_ALL", "C", 1); (void)::unsetenv("LOCALE_ARCHIVE");
+        if (plain) (void)::setenv("NO_COLOR", "1", 1); else (void)::unsetenv("NO_COLOR");
+        (void)::setenv("TERM", "xterm", 1);
         (void)::dup2(slave, STDIN_FILENO); (void)::dup2(slave, STDOUT_FILENO);
         const int null = ::open("/dev/null", O_WRONLY); (void)::dup2(null, STDERR_FILENO);
         ::close(master); ::close(slave); ::close(null);
@@ -104,13 +114,13 @@ void terminal_frontend() {
             Runtime seed({"cli"}, {"cli", "test", Json::parse("{}")}, registry.snapshot(),
                 [](const Request& request, std::stop_token) -> Result<CompletedResponse> { return final_response(request); },
                 {}, {options.directory});
-            const auto accepted = seed.post({1, {"cli"}, {"previous"}, seed.incarnation(), {"previous"}, Submit{"EARLIER_CONTEXT"}});
+            const auto accepted = seed.post({1, {"cli"}, {"previous"}, seed.incarnation(), {"previous"}, Submit{"EARLIER_CONTEXT **bold** `code` alpha bravo charlie delta \x1b[31m"}});
             check(std::holds_alternative<PostStatus>(accepted) && std::get<PostStatus>(accepted) == PostStatus::accepted, "seed submit");
             while (auto event = seed.next_event()) if (std::holds_alternative<Done>(event->payload)) break;
             seed.close_input(); while (seed.next_event()) {}
         }
         options.stream_generate = [](const Request& request, std::stop_token stop, TextPreview preview) -> Result<CompletedResponse> {
-            std::string text = "draft";
+            std::string text = "```cpp\ndraft\n```\nassistant manager\n**bold alpha bravo charlie delta echo foxtrot** `code` ";
             for (int i = 0; i < 300 && !stop.stop_requested(); ++i) { text += 'x'; preview(text); }
             for (int i = 0; i < 300 && !stop.stop_requested(); ++i) std::this_thread::sleep_for(10ms);
             if (stop.stop_requested()) return Error{ErrorCode::cancelled, Stage::admission, "cancelled"};
@@ -135,7 +145,14 @@ void terminal_frontend() {
         if (output.find(text) == std::string::npos) throw std::runtime_error("pty expected: " + std::string(text));
     };
     wait_for("basic");
-    check(output.find("user: EARLIER_CONTEXT") < output.find("> "), "history must precede first input prompt");
+    check(output.find("> EARLIER_CONTEXT") < output.rfind("> "), "history must precede first input prompt");
+    check(output.find("**bold**") != std::string::npos, "user markdown must remain literal");
+    check(output.find("\033[31m") == std::string::npos, "untrusted escape sanitized");
+    if (plain) check(output.find("\033[38;") == std::string::npos && output.find("\033[0m") == std::string::npos, "NO_COLOR styling");
+    check(output.find("charlie") != std::string::npos && output.find("delta") != std::string::npos, "word wrapping");
+    std::size_t clears = 0, position = 0, prompt_at = output.rfind("> ");
+    while ((position = output.find("\033[2K", position)) < prompt_at) { ++clears; position += 4; }
+    check(clears < 10, "initial layout must be compact");
     std::string overflow(max_submit_bytes * 2 + 100, 'x');
     overflow.append(max_submit_bytes, '\177'); overflow += '\r';
     std::size_t sent = 0;
@@ -147,7 +164,7 @@ void terminal_frontend() {
         pollfd ready{master, POLLIN | POLLOUT, 0}; (void)::poll(&ready, 1, 10); drain();
     }
     check(sent == overflow.size(), "pty overflow input"); wait_for("submit_size");
-    local::write_all(master, "\xc0\xaf"); wait_for("> ??");
+    local::write_all(master, "\xc0\xaf"); wait_for("??");
     local::write_all(master, "\177");
     local::write_all(master, "e\xcc\x81😀"); wait_for("e\xcc\x81😀");
     wait_for("\033[5C");
@@ -155,12 +172,19 @@ void terminal_frontend() {
     local::write_all(master, "\t"); wait_for("plan");
     local::write_all(master, "\x06\033[5~\033[6~привет\177т"); wait_for("привет");
     local::write_all(master, "\033[Z\r");
-    wait_for("user: привет");
-    wait_for("assistant: draft");
-    local::write_all(master, "next\r"); wait_for("busy"); wait_for("> next");
+    wait_for("> привет");
+    wait_for("draft");
+    wait_for("assistant manager");
+    wait_for("bold");
+    wait_for("foxtrot");
+    check(output.find("```cpp") == std::string::npos, "preview fence must be rendered");
+    check(plain ? output.find("\033[1mbold") == std::string::npos : output.find("\033[1mbold") != std::string::npos, "assistant markdown styling");
+    if (!plain) check(output.find("\033[1mecho") != std::string::npos, "bold survives wrapping");
+    local::write_all(master, "next\r"); wait_for("busy"); wait_for("next");
     winsize narrow{}; narrow.ws_row = 10; narrow.ws_col = 20;
     check(::ioctl(master, TIOCSWINSZ, &narrow) == 0, "pty resize");
     (void)::kill(child, SIGWINCH);
+    wait_for("\0337\033[1B");
     (void)::kill(child, SIGINT);
     std::this_thread::sleep_for(100ms);
     (void)::kill(child, SIGTERM);
@@ -176,6 +200,6 @@ void terminal_frontend() {
 }
 }
 int main(int argc, char** argv) {
-    try { check(argc == 2, "suite required"); if (std::string_view(argv[1]) == "terminal") terminal_frontend(); else frontend(argv[1]); return 0; }
+    try { check(argc == 2, "suite required"); if (std::string_view(argv[1]) == "terminal") { terminal_frontend(false); terminal_frontend(true); } else frontend(argv[1]); return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

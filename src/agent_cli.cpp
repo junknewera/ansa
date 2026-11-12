@@ -4,6 +4,7 @@
 #include "omh/local_tools.hpp"
 #include "omh/offline.hpp"
 #include "omh/runtime.hpp"
+#include "agent_authorization.hpp"
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
@@ -89,11 +90,13 @@ bool history_page_current(const TranscriptPage& page, const GetTranscript& query
     return page.query == query && page.total >= known_total;
 }
 bool preview_visible(const std::vector<TranscriptEntry>& entries, std::size_t end, std::size_t total,
-                     const std::optional<RequestId>& request, const std::optional<PreviewText>& preview) {
+                     const std::optional<RequestId>& request, const std::optional<PreviewText>& preview,
+                     bool completed = false) {
     return end == total && !entries.empty() && entries.back().role == "user" && request &&
-        entries.back().request == *request && preview && !preview->text.empty() && preview->state != "committed";
+        entries.back().request == *request && preview && !preview->text.empty() &&
+        (preview->state != "committed" || completed);
 }
-int text_frontend(Runtime& runtime, const SessionId& session, const std::optional<std::string>& prompt) {
+int text_frontend(Runtime& runtime, const SessionId& session, const std::optional<std::string>& prompt, std::string_view context = {}) {
     Interrupts interrupts;
     std::atomic<bool> abort = false, output_failed = false, ended = false;
     Output output(STDOUT_FILENO, abort), diagnostics(STDERR_FILENO, abort);
@@ -150,7 +153,11 @@ int text_frontend(Runtime& runtime, const SessionId& session, const std::optiona
                       transcript_begin = page->begin; transcript_end = page->end; transcript_total = page->total; }
                     wake();
                 } else if (const auto* update = std::get_if<PreviewText>(&event->payload)) {
-                    { std::lock_guard lock(mutex); preview = *update; preview_request = event->request; }
+                    // Apply committed text together with its next snapshot phase:
+                    // tool-round commitment alone does not complete the turn.
+                    if (update->state != "committed") {
+                        std::lock_guard lock(mutex); preview = *update; preview_request = event->request;
+                    }
                     wake();
                 } else if (const auto* started = std::get_if<ToolStarted>(&event->payload)) {
                     if (terminal) report("tool: " + (started->name.empty() ? "running" : started->name));
@@ -257,8 +264,10 @@ int text_frontend(Runtime& runtime, const SessionId& session, const std::optiona
                 }
             }
             if (terminal && ready && history_ready) {
-                std::vector<std::string> lines;
+                std::vector<TerminalEntry> lines;
+                std::string render_state;
                 { std::lock_guard lock(mutex);
+                  render_state = current.state;
                   std::size_t begin = 0, users = 0, candidate = 0;
                   const std::size_t visible_users = !transcript.empty() && transcript.back().role == "user" && transcript.back().state != "completed" ? 4 : 3;
                   if (!expanded) for (std::size_t i = transcript.size(); i > 0; --i) {
@@ -267,18 +276,17 @@ int text_frontend(Runtime& runtime, const SessionId& session, const std::optiona
                           candidate = i - 1;
                       }
                   }
-                  for (auto i = begin; i < transcript.size(); ++i) {
-                      std::string text = transcript[i].role + ": " + transcript[i].text;
-                      std::size_t at = 0, end;
-                      while ((end = text.find('\n', at)) != std::string::npos) { lines.push_back(text.substr(at, end - at)); at = end + 1; }
-                      lines.push_back(text.substr(at));
-                  }
-                  if (preview_visible(transcript, transcript_end, transcript_total, preview_request, preview))
-                      lines.push_back("assistant: " + preview->text + (preview->state == "discarded" ? " (незавершённый ответ)" : ""));
-                  if (!terminal_status.empty()) lines.push_back(terminal_status);
+                  for (auto i = begin; i < transcript.size(); ++i)
+                      lines.push_back({transcript[i].role, transcript[i].text});
+                  if (preview_visible(transcript, transcript_end, transcript_total, preview_request, preview,
+                                      current.state == "completed" && current.durable))
+                      lines.push_back({"assistant", preview->text + (preview->state == "discarded" ? " (незавершённый ответ)" : "")});
+                  if (!terminal_status.empty()) lines.push_back({"status", terminal_status});
                 }
-                const auto status = std::string(mode == AgentMode::plan ? "plan" : "basic") + "  " + view.state;
-                scroll_limit = screen->render(lines, line, cursor, status, expanded, scroll);
+                const auto phase = render_state == "idle" || render_state == "completed" ? "готов" :
+                    render_state == "cancelled" ? "отменено" : render_state == "paused" ? "пауза" : "в работе";
+                const auto status = std::string(mode == AgentMode::plan ? "plan" : "basic") + "  " + phase;
+                scroll_limit = screen->render(lines, line, cursor, status, expanded, scroll, context);
             }
             pollfd waiting[]{{!prompt && ready && (!terminal || history_ready) && !eof ? STDIN_FILENO : -1, POLLIN | POLLHUP, 0},
                 {interrupts.fd(), POLLIN, 0}, {wake_read.get(), POLLIN, 0}};
@@ -417,18 +425,13 @@ int agent_cli(int argc, char** argv) {
     if (options.returned_model) settings.returned_model = *options.returned_model;
     if (options.print_config) { std::cout << settings.effective().dump() << '\n'; return 0; }
     std::shared_ptr<AuthManager> auth;
-    struct Authorization { AuthLease lease; std::uint64_t epoch = 0; };
-    auto authorization = std::make_shared<Authorization>();
+    std::shared_ptr<AgentAuthorization> authorization;
     Binding binding;
     binding.requested_model = settings.model; binding.returned_model = settings.returned_model;
     if (!options.offline) {
         auth = std::make_shared<AuthManager>(options.auth);
-        authorization->lease = auth->access();
-        binding.account = authorization->lease.account;
-        const auto models = auth->models().at("models").elements();
-        require(std::any_of(models.begin(), models.end(), [&](const Json& model) {
-            return model.text("slug") == settings.model && model.text("visibility") == "list";
-        }), "model_not_available", Stage::frontend);
+        authorization = std::make_shared<AgentAuthorization>(auth, auth->status(), settings.model);
+        binding.account = authorization->account();
     }
     auto epoch = agent_epoch(settings);
     const auto selected = select_session(settings, options.resume, options.session, options.offline ? "offline" : "live");
@@ -438,21 +441,17 @@ int agent_cli(int argc, char** argv) {
     std::function<void(std::uint64_t, std::stop_token)> guard;
     std::function<ToolLease(std::stop_token)> tool_guard;
     if (auth) {
-        const auto account = binding.account;
-        guard = [auth, authorization, account](std::uint64_t number, std::stop_token stop) {
-            const auto current = auth->access(stop);
-            require(current.account == account, "auth_account_mismatch", Stage::frontend);
-            if (number != authorization->epoch) { authorization->epoch = number; authorization->lease = current; }
-            require(current.session == authorization->lease.session, "auth_required", Stage::frontend);
+        guard = [authorization](std::uint64_t number, std::stop_token stop) {
+            authorization->check_dispatch(number, stop);
         };
         generate = [auth, authorization](const Request& request, std::stop_token stop) {
-            return auth->generate(request, stop, authorization->lease.session);
+            return auth->generate(request, stop, authorization->session());
         };
         stream_generate = [auth, authorization](const Request& request, std::stop_token stop, TextPreview preview) {
-            return auth->generate(request, stop, authorization->lease.session, std::move(preview));
+            return auth->generate(request, stop, authorization->session(), std::move(preview));
         };
         tool_guard = [auth, authorization](std::stop_token stop) {
-            auto lease = auth->hold_execution(authorization->lease.session, stop);
+            auto lease = auth->hold_execution(authorization->session(), stop);
             return ToolLease{std::move(lease.ownership), lease.stop};
         };
     } else generate = offline_generate;
@@ -467,6 +466,6 @@ int agent_cli(int argc, char** argv) {
         {.compact_bytes = settings.compact_bytes, .tool_rounds = settings.tool_rounds, .tool_calls = settings.tool_calls},
         {selected.directory, compact, {}, binding, 2, guard, tool_guard, stream_generate});
     std::cerr << "ansa session " << selected.id.value << " (full access, sudo disabled)\n";
-    return text_frontend(runtime, selected.id, options.prompt);
+    return text_frontend(runtime, selected.id, options.prompt, settings.cwd.string() + "  " + settings.model);
 }
 }
