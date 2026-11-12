@@ -1,6 +1,21 @@
 # Состояние ansa
 
-Обновлено 2026-11-12. Milestone **Carbon CLI: история, streaming и basic/plan закрыт**. Last known good для кода - [93393ab](https://github.com/junknewera/oh-my-harness/commit/93393ab9e4316faabad931e23676b8a61c41f67a) на `main`. Пройдены Debug, Release Nix, ASan/UBSan, независимые reviews и live приёмка на Terra в каталоге без Git. Предыдущие baselines - локальный агент `66250f7`, SIWC `e2f8e1c`, persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Отчёт о проверках](implementation-report.md#carbon-cli).
+Обновлено 2026-11-12. **Carbon UI и быстрый live-старт проверены**. Last known good для кода - [28eb41f](https://github.com/junknewera/oh-my-harness/commit/28eb41f0af449e943811cfbf9a4053f2dd7983ee) на `main`. Пройдены Debug, Release Nix, ASan/UBSan, независимый review, визуальная проверка фактического PTY и live dispatch. Предыдущие baselines - история/streaming/basic-plan `93393ab`, локальный агент `66250f7`, SIWC `e2f8e1c`, persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Новая проверка](implementation-report.md#carbon-ui), [предыдущий milestone](implementation-report.md#carbon-cli).
+
+## Carbon UI и запуск
+
+Пользовательская приёмка выявила недостаток `93393ab`: функциональные тесты не подтверждали соответствие оформления выбранному Carbon. Этот разрыв закрыт отдельной визуальной проверкой фактического production frontend в PTY.
+
+- Компактная высота под содержимое, word wrapping, безопасное базовое оформление Markdown для assistant, буквальный пользовательский текст. Заголовок с cwd/model, мятные акценты, широкое поле ввода и читаемый footer. Структурированные роли не извлекаются из содержимого сообщения; preview и transcript используют один renderer.
+- Проверены PNG кадров 100×32 и 80×24 на пользовательском примере CPU, а также сокращение области после длинной истории. Старые строки очищаются; лишняя пустота перед вводом убрана. Подтверждённый финальный preview сохраняется до transcript page без мерцания; tool-bearing commit не отображается как завершённый turn.
+- Live-старт больше не вызывает access/refresh и каталог моделей до первого кадра: binding берётся из локального статуса. `AgentAuthorization` выполняет сетевые проверки в dispatch worker после Submit, сохраняет account/session/model policy, logout и явный Resume.
+- PTY-замеры отдельного бинарника: прежний live **3,608/3,136 с**, новый **0,020/0,017 с** до кадра; offline **0,015 с**. Генерации и tools в этих замерах не было. Это замер открытия интерфейса; первый ответ продолжает зависеть от сети. Задержка запуска не была свидетельством memory leak.
+
+## Проверка `28eb41f`
+
+`x13s`, NixOS/aarch64, GCC 16.2.0: Debug **87/87**, Nix Release **87/87**, ASan/UBSan **85/85** с detect_leaks=1 и halt_on_error=1. UI и auth-lifecycle прошли по 20 повторов, **40/40**. Установленный executable проходит self-check и offline roundtrip.
+
+Независимый Terra low review завершён без открытых подтверждённых замечаний. Исправления покрывают multiline fences в preview, literal `assistant manager`, перенос bold, NO_COLOR, динамическую высоту и auth dispatch/session boundaries. Реальный первый запрос после быстрого открытия вернул STARTUP_OK; проверка каталога и авторизации выполнялась на пути dispatch. `git diff --check` чистый. Следующий согласованный спринт остаётся orchestrate.
 
 ## Carbon CLI
 

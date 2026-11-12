@@ -122,3 +122,22 @@ Power-cut hardware tests, TSan, x86_64-linux, длительные сессии,
 | Git | Working и staged diff проверены, diff --check чистый. Пользовательский designs/ сохранён вне checkpoint. Credentials и synthetic live journal вне репозитория. |
 
 Открыты прежние hardware power loss, TSan, x86_64-linux и длительные сессии; основной reducer всё ещё копирует submit map. Ручной reconciliation неизвестного эффекта, качество длинных summary и token-aware budget остаются отдельными задачами. Plan намеренно не допускает произвольные команды; preview хранится только в живом frontend state, после restart доступен подтверждённый transcript.
+
+## Carbon UI
+
+Проверенный код `28eb41f`, 2026-11-12. Пользовательская приёмка показала, что прежняя проверка `93393ab` закрывала функциональность, но недостаточно проверяла визуальное соответствие Carbon. Исправлены оформление и синхронный сетевой путь перед первым кадром.
+
+| Gate | Результат |
+|---|---|
+| Native Debug / Nix Release | **87/87** в каждой конфигурации, `x13s`, NixOS/aarch64, GCC 16.2.0. Release derivation `0xpi8sq81g7iqib28c5nc133w4gqvvk9-ansa-0.1.0.drv`; self-check и offline roundtrip установленного executable успешны. |
+| ASan/UBSan | **85/85**, detect_leaks=1, halt_on_error=1. Утечек в проверенных сценариях не обнаружено; это не утверждение обо всех возможных сценариях. |
+| Повторные прогоны | PTY terminal и auth-lifecycle по 20 повторов, **40/40** на финальной версии. |
+| Визуальная приёмка | Основной агент просмотрел PNG из фактического PTY production frontend в 100×32 и 80×24 на примере пользователя. Дополнительно проверено уменьшение после длинного ответа до трёх коротких обменов: остаточных строк нет, input сразу под диалогом. Снимки получены эмуляцией ANSI-кадров, без генерации изображения моделью. |
+| Renderer | Word wrapping, безопасные bold/inline code/fences, literal user Markdown, multiline preview, буквальная строка assistant manager, сохранение стиля после wrap, NO_COLOR. Структурированная роль отделена от данных. Финальный preview сохраняется до transcript page; tool-bearing commit не становится final. |
+| Startup | Старый result/bin: offline 0,026/0,017 с, live 3,608/3,136 с до кадра. Новый build: live 0,020028/0,016639 с, offline 0,015121 с. PTY, отдельные временные cwd, без model generation/tools. |
+| Auth | Локальный AuthStatus для binding, access/refresh и model catalog в dispatch worker, cache на auth epoch. Проверены session/account mismatch, logout, unknown model, refresh и явный Resume; guard и execution lease сохранены. Helper не удерживает bearer. |
+| Live dispatch | Интерфейс открылся до сетевых проверок. Первый Submit на Terra вернул STARTUP_OK без tools, подтверждая рабочий отложенный guard. |
+| Independent review | Native Terra low: проверены renderer/resource/TTY и auth/session boundaries. Подтверждённые findings исправлены; финальный source review закрыт. Визуальную проверку основной агент выполнил отдельно от review. |
+| Git | Diff и diff --check проверены. Пользовательский designs/ сохранён; credentials и временные captures не включены в Git. |
+
+Первый ответ по-прежнему требует сети; ускорено открытие CLI и просмотр сохранённого диалога. Полный Markdown/CommonMark и работа со всеми grapheme clusters не заявляются. Прежние ограничения hardware power loss, TSan, x86_64 и длительного replay сохраняются.
