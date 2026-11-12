@@ -1,0 +1,6 @@
+[package]
+name = "ansa-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true

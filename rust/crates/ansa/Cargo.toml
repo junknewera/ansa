@@ -1,0 +1,13 @@
+[package]
+name = "ansa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ansa-rs"
+path = "src/bin/ansa.rs"
+
+[dependencies]
+ansa-linux = { path = "../ansa-linux" }

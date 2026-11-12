@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "status": "PENDING_NATIVE_BASELINE",
+  "target": "NixOS/aarch64 ThinkPad X13s",
+  "budgets": null,
+  "reason": "No native measurements were available when M0 was implemented. Fix budgets after repeated same-profile C++ baseline measurements and before Rust comparison.",
+  "method": "Record source and executable hashes, build profile, toolchain, warm/cold condition, sample count, elapsed time and peak RSS. A single capture elapsed_seconds value is diagnostic, not a performance acceptance result.",
+  "production_first_frame": "PENDING until M7/M8 supplies a controlled synthetic filesystem/OS environment for both unchanged production bootstraps. Safe --self-check/--offline-demo or injected frontend timings do not measure this.",
+  "rust_scaffold": "No runtime or performance parity claim. The M0 perf command is explicitly unimplemented."
+}
