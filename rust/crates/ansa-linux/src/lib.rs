@@ -2,5 +2,6 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod auth_store;
 pub mod fs;
 pub mod process;

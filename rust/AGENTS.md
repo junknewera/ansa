@@ -3,7 +3,22 @@
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
 docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
 
-## M2 boundary
+## M3 boundary
+
+- M2 is GO. M3 authorizes auth/OIDC and v1 store compatibility using synthetic
+  fixtures, explicit private fixture directories and injected exchanges only.
+- Preserve registration/credential paths, identities, pending markers, shared
+  process locks, atomic replace/fsync and lease/logout ordering. Test both
+  C++ to Rust and Rust to C++ read/write/reopen.
+- Verify signature and all claims explicitly. Keep one ring TLS provider;
+  oauth2 has default features disabled and supplies narrow PKCE primitives.
+- Keep secrets out of Debug, ordinary diagnostics, events and journals.
+  Never open existing agents' profiles, real credentials or environment files.
+- No live login/refresh/logout, keychain migration, multi-profile, journal,
+  owner loop, automatic retries or production cutover. One final PR after
+  native differential/fault gates and independent review.
+
+## Historical M2 boundary
 
 - M1 is GO. M2 authorizes full offline protocol/SSE/Responses/replay and pure
   tool-batch admission, with C++ remaining the production default.

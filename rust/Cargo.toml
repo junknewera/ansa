@@ -12,6 +12,9 @@ publish = false
 serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = { version = "1", default-features = false, features = ["std", "raw_value"] }
 ring = "0.17"
+oauth2 = { version = "5", default-features = false }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "thread", "pipe", "event"] }
 libc = "0.2"
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "io-util", "sync", "macros"] }

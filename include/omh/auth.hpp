@@ -13,6 +13,7 @@ std::string base64url(std::string_view);
 std::string unbase64url(std::string_view);
 std::string pkce_challenge(std::string_view);
 std::string form_encode(const std::vector<std::pair<std::string, std::string>>&);
+Json auth_callback_fields(std::string_view request, std::string_view state, std::uint16_t port);
 Json verify_id_token(std::string_view jwt, const Json& jwks, std::string_view client,
     std::string_view nonce, std::uint64_t now, bool refresh = false);
 
@@ -27,7 +28,7 @@ struct AuthStatus {
     std::string session;
 };
 struct AuthExecutionLease { std::shared_ptr<void> ownership; std::stop_token stop; };
-enum class AuthStorePoint { temporary_synced, replaced, before_dispatch, tokens_removed };
+enum class AuthStorePoint { temporary_synced, replaced, before_dispatch, tokens_removed, logout_marked };
 using StreamingExchange = std::function<Result<std::monostate>(const Json&, std::string_view,
     const std::function<void(std::string_view)>&, std::stop_token)>;
 using AuthStoreObserver = std::function<void(AuthStorePoint, std::string_view name)>;
