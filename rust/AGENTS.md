@@ -3,7 +3,20 @@
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
 docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
 
-## M4 boundary
+## M5 boundary
+
+- M4 is GO. M5 authorizes the synthetic owned runtime, cancellation, summary
+  loop and typed frontend. Preserve v1 journals and all existing codec gates.
+- One Tokio current-thread owner controls state. Journal, provider, tool and
+  auth blocking work have explicit owners, bounded queues and joined threads.
+- Full batch admission precedes durable intent; recheck authorization and exact
+  work identity before dispatch. Cancel bypasses Submit and stops future work.
+- Preserve late known outcomes, reject stale previews/completions, pause on
+  unknown effects/storage failure and require explicit Resume after restart.
+- Reuse existing dependencies and evidence helpers. One final PR; no real
+  providers/credentials/tools, process runner, UI, orchestrate or cutover.
+
+## Historical M4 boundary
 
 - M3 is GO. M4 authorizes synthetic journal/session v1, exact context epochs,
   reader then writer, bidirectional C++/Rust append/reopen and crash recovery.

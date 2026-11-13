@@ -60,6 +60,30 @@ pub struct RuntimeCommand {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventPayload {
+    CommandAccepted {
+        command: CommandId,
+        request: Option<RequestId>,
+    },
+    CommandReplayed {
+        command: CommandId,
+        state: String,
+    },
+    TextDelta {
+        text: String,
+    },
+    ToolStarted(crate::frontend::protocol_v1::Started),
+    ToolFinished(crate::frontend::protocol_v1::Finished),
+    Cancelled {
+        command: CommandId,
+    },
+    Done,
+    RuntimeError {
+        command: Option<CommandId>,
+        diagnostic: String,
+    },
+    FrontendSnapshot(Box<crate::frontend::protocol_v1::Snapshot>),
+    TranscriptPage(crate::frontend::protocol_v1::TranscriptPage),
+    Preview(crate::frontend::protocol_v1::Preview),
     Snapshot {
         through_sequence: u64,
         state: String,
@@ -132,6 +156,11 @@ pub fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
         through_sequence, ..
     } = event.payload
         && through_sequence > event.stream_sequence
+    {
+        return Err("snapshot_sequence");
+    }
+    if let EventPayload::FrontendSnapshot(snapshot) = &event.payload
+        && snapshot.through_sequence > event.stream_sequence
     {
         return Err("snapshot_sequence");
     }

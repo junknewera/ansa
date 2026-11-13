@@ -17,7 +17,7 @@ fn scaffold_does_not_claim_to_execute_runtime_commands() {
         assert!(
             String::from_utf8(output.stderr)
                 .expect("UTF-8 diagnostic")
-                .contains("Rust runtime is not implemented")
+                .contains("Rust CLI is not implemented")
         );
     }
 }

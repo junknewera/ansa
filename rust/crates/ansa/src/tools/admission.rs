@@ -50,6 +50,25 @@ pub struct PreparedBatch {
     pending: Option<Vec<(String, String, String, Json)>>,
 }
 impl PreparedBatch {
+    /// Consumes the validated batch without exposing an executor capability.
+    /// Runtime dispatch still requires an independently durable intent receipt.
+    pub(crate) fn into_plan(mut self) -> Result<Vec<super::invocation::Invocation>, &'static str> {
+        self.pending
+            .take()
+            .ok_or("batch_already_consumed")?
+            .into_iter()
+            .map(|(operation, call, name, arguments)| {
+                let definition = self.snapshot.definition(&name).ok_or("unknown_tool")?;
+                Ok(super::invocation::Invocation {
+                    operation,
+                    call,
+                    name,
+                    revision: definition.descriptor.revision.clone(),
+                    arguments,
+                })
+            })
+            .collect()
+    }
     pub fn prepare(
         response: &AdmittedResponse,
         snapshot: Arc<Snapshot>,
@@ -89,7 +108,17 @@ impl PreparedBatch {
     pub fn execute(self, cancelled: bool) -> KnownBatchResults {
         self.execute_with_cancel(|| cancelled)
     }
-    pub fn execute_with_cancel(mut self, mut cancelled: impl FnMut() -> bool) -> KnownBatchResults {
+    pub fn execute_with_cancel(self, mut cancelled: impl FnMut() -> bool) -> KnownBatchResults {
+        self.execute_checked(&mut cancelled, &crate::auth::Cancel::default())
+    }
+    pub fn execute_with_token(self, token: &crate::auth::Cancel) -> KnownBatchResults {
+        self.execute_checked(&mut || token.cancelled(), token)
+    }
+    fn execute_checked(
+        mut self,
+        cancelled: &mut dyn FnMut() -> bool,
+        token: &crate::auth::Cancel,
+    ) -> KnownBatchResults {
         let pending = self.pending.take().expect("consume-once batch");
         let mut results = Vec::with_capacity(pending.len());
         for (operation_id, call_id, _, _) in &pending {
@@ -101,6 +130,22 @@ impl PreparedBatch {
                 Effects::NotStarted,
             ))
         }
+        if pending.iter().any(|(_, _, name, _)| {
+            self.snapshot
+                .policy(name)
+                .is_some_and(|p| p.requires_journal)
+        }) {
+            for result in &mut results {
+                *result = ToolResult::new(
+                    result.operation_id().into(),
+                    result.call_id().into(),
+                    r#"{"error":"durable_checkpoint_required"}"#.into(),
+                    Execution::Denied,
+                    Effects::NotStarted,
+                );
+            }
+            return KnownBatchResults::new(self.request_fingerprint, results);
+        }
         for (index, (operation_id, call_id, name, args)) in pending.into_iter().enumerate() {
             if cancelled() {
                 break;
@@ -110,7 +155,20 @@ impl PreparedBatch {
                     .snapshot
                     .definition(&name)
                     .expect("immutable validated snapshot");
-                (definition.executor)(&args)
+                if let Some(invoke) = self.snapshot.policy(&name).and_then(|p| p.invoke.as_ref()) {
+                    invoke(
+                        &super::invocation::Invocation {
+                            operation: operation_id.clone(),
+                            call: call_id.clone(),
+                            name: name.clone(),
+                            revision: definition.descriptor.revision.clone(),
+                            arguments: args.clone(),
+                        },
+                        token,
+                    )
+                } else {
+                    (definition.executor)(&args)
+                }
             }));
             let result = match outcome {
                 Ok(mut value) => {

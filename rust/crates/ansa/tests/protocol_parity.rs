@@ -14,7 +14,18 @@ pub mod http_impl;
 #[path = "../src/provider/mod.rs"]
 pub mod provider;
 #[path = "../src/tools/mod.rs"]
+#[allow(dead_code)] // Source copy intentionally exercises M2 without the M5 owner.
 pub mod tools;
+pub use ansa::auth;
+#[path = "../src/frontend/mod.rs"]
+#[allow(dead_code)]
+pub mod frontend;
+#[path = "../src/session/transcript.rs"]
+#[allow(dead_code)]
+pub mod transcript;
+mod session {
+    pub use crate::transcript;
+}
 mod transport {
     pub use crate::http_impl as http;
 }
