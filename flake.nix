@@ -31,6 +31,7 @@
           cargoTestFlags = [ "--workspace" ];
           doCheck = true;
           ANSA_PARITY_ROOT = ./tests/parity;
+          ANSA_PROTOCOL_FIXTURES = ./tests/fixtures;
           preBuild = ''
             python3 ${./tests/parity/check_toolchain.py} --workspace .
           '';

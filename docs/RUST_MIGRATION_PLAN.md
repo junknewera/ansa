@@ -673,7 +673,7 @@ python3 tests/parity/run.py fault --suite risk --cpp-build build-ansa --rust-tar
 **Fault tests.** Раздробленный UTF-8, trailing partial event после completed, duplicate/out-of-order sequence, final-only overflow, invalid second call, metadata spoofing, unknown event/item, huge number lexeme, MIME trailer, transfer truncation после terminal. Изменение acceptance допускается только как отдельно объяснённая correction с independent safety assertion.
 
 ```sh
-ctest --test-dir build-ansa --output-on-failure --no-tests=error -R '^(sse|reducer|replay|tools|transport|contracts|mutation-)'
+ctest --test-dir build-ansa --output-on-failure --no-tests=error -R '^(dependencies|sse|reducer|replay|tools|transport|contracts|mutation-)'
 cargo test --manifest-path rust/Cargo.toml -p ansa --locked --test protocol_parity
 python3 tests/parity/run.py compare --suite protocol --cpp-build build-ansa --rust-target rust/target --output build-migration/M2
 python3 tests/parity/run.py fault --suite protocol --cpp-build build-ansa --rust-target rust/target --output build-migration/M2-fault

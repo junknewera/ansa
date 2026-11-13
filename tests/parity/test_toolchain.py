@@ -20,6 +20,7 @@ class ToolchainTests(unittest.TestCase):
         source = Path(check_toolchain.__file__).resolve().parents[2] / "rust"
         for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
                      "crates/ansa/Cargo.toml", "crates/ansa/src/lib.rs",
+                     "crates/ansa/examples/protocol_adapter.rs",
                      "crates/ansa/src/bin/ansa.rs", "crates/ansa-linux/Cargo.toml",
                      "crates/ansa-linux/src/lib.rs"):
             target = self.workspace / name

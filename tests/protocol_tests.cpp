@@ -130,6 +130,23 @@ void dependencies() {
     check(binary_key.at(std::string_view("x\0y", 3)) == number(2), "length-aware JSON keys");
     auto value = [] { std::string temporary = R"({"a":[{"text":"λ"}],"opaque":"a\u0000b"})"; return Json::parse(temporary).at("a"); }();
     check(value.elements()[0].text("text") == "λ", "owning JSON lifetime");
+    auto large_child = [] {
+        std::string source = "{\"a\":[\"" + std::string(16 * 1024 * 1024, 'x') + "\"]}";
+        auto parent = Json::parse(source, 17 * 1024 * 1024, 64, 8);
+        return parent.at("a").elements().at(0);
+    }();
+    check(large_child.text() == std::string(16 * 1024 * 1024, 'x'), "custom JSON limits survive at/elements after parent destruction");
+    std::string deep(65, '['); deep += "0"; deep.append(65, ']');
+    const auto deep_root = Json::parse(deep, 1024, 66, 100);
+    check(deep_root.elements().at(0).is_array() && std::holds_alternative<Error>(capture([&] { return Json::parse(deep); })),
+          "custom JSON depth survives accessor while default remains bounded");
+    std::string many = "{\"a\":[";
+    for (std::size_t i = 0; i < 131072; ++i) { if (i) many += ","; many += "0"; }
+    many += "]}";
+    const auto nodes_root = Json::parse(many, 1024 * 1024, 64, 131074);
+    check(nodes_root.at("a").elements().size() == 131072 &&
+          std::holds_alternative<Error>(capture([&] { return Json::parse(many); })),
+          "custom JSON node limit survives accessor while default remains bounded");
     const auto error = Json::parse(diagnostic_json(Error(ErrorCode::protocol, Stage::admission, "fixed_code")).dump());
     check(error.text("diagnostic") == "fixed_code" && error.index("schema_version") == 1, "structured diagnostics");
 }
@@ -155,6 +172,9 @@ void sse() {
         check(parse_sse(chunks).size() == 3, "SSE bytewise");
     }
     check(parse_sse({"unknown: ignored\nid: 1\nretry: 10\ndata:  two spaces\n\n"})[0].data == " two spaces", "SSE fields");
+    const auto bare_fields = parse_sse({"id\nretry\nevent\ndata: value\n\n"});
+    check(bare_fields.size() == 1 && bare_fields[0].name == "message" && bare_fields[0].data == "value",
+          "SSE bare id/retry/event fields");
     for (const std::string bytes : {"data: unclosed", "data: no boundary\n", "event: unfinished\n", "data: x\r", "\xef\xbb", "\xf0\x9f"})
         rejects([&] { (void)parse_sse({bytes}); });
     for (const std::string bad : {"\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\x80", "\xe2\x28\xa1", "\xf5\x80\x80\x80"})

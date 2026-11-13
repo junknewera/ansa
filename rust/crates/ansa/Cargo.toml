@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+protocol-test-adapter = []
+
+[[example]]
+name = "protocol_adapter"
+required-features = ["protocol-test-adapter"]
+
 [[bin]]
 name = "ansa-rs"
 path = "src/bin/ansa.rs"
