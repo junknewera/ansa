@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import tomllib
 
 
@@ -65,6 +66,19 @@ def check(workspace: Path) -> dict:
         ]
         if any(p["edition"] != "2024" or p["rust_version"] != channel for p in packages):
             raise ValueError("Cargo package metadata disagrees with workspace pins")
+        # Cargo may select a different compiler through env/config or wrappers.
+        # Use a fresh target directory so a cached artifact cannot skip the probe.
+        with tempfile.TemporaryDirectory(prefix="ansa-rustc-probe-") as target:
+            compiler = subprocess.run(
+                ["cargo", "rustc", "--offline", "--locked", "--package", "ansa-linux",
+                 "--lib", "--target-dir", target, "--", "--version"],
+                cwd=workspace, check=True, capture_output=True, text=True, timeout=30,
+                env=tool_environment,
+            ).stdout.strip()
+        report["cargo_rustc"] = {"output": compiler}
+        match = re.match(r"rustc (\d+\.\d+\.\d+)(?:\s|$)", compiler)
+        if match is None or match[1] != channel:
+            raise ValueError("Cargo-selected rustc does not match rust-toolchain.toml")
         report["status"] = "PASS"
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         report["diagnostic"] = str(error)

@@ -19,6 +19,8 @@ python3 tests/parity/run.py check --milestone M0 --evidence build-migration/cpp-
 
 `capture` сам собирает отдельные Linux и toolchain preflight результаты. Неудача одного не отменяет второй. Standalone `preflight` удобен до полного CTest: Linux probe проверяет реальные syscalls и принадлежащие ему temporary files/children; `check_toolchain.py` проверяет declarations и фактически запущенные rustc/Cargo. Отсутствующие возможности или tools сохраняются как failure/unsupported, а не PASS. Probe не входит в CTest, поэтому не меняет baseline 87 cases.
 
+Toolchain checker также запрашивает версию через `cargo rustc --offline --locked --package ansa-linux --lib -- --version` в новом временном target directory. Проверяется компилятор, фактически выбранный Cargo через environment/config и wrappers; `cargo metadata` само по себе этого не доказывает. Проверка не запускает scaffold/runtime и не использует прежние build artifacts.
+
 **`--run-ctest` обязателен для evidence gate.** Без флага capture запускает только `ansa --self-check`, `ansa --offline-demo`, version queries и CTest inventory. Он записывает `ctest.status = NOT_RUN`; `check` отвергает такой bundle как незавершённый. С флагом выполняется полный `ctest --output-on-failure --no-tests=error --output-junit ...`, без фильтра исключений. Неудачный case остаётся в результатах. Harness не собирает и не исправляет C++ автоматически.
 
 Для sanitizer profile:
@@ -31,6 +33,8 @@ python3 tests/parity/run.py check --milestone M0 --evidence build-migration/cpp-
 ```
 
 Manifest перечисляет все **87** зарегистрированных baseline IDs. `OMH_MUTATION_CHILD=ON` исключает только `mutation-drop` и `mutation-reorder`, оставляя **85**; `check` допускает такой набор только для `OMH_SANITIZERS=ON`. Пустая registration, missing/duplicate ID, skipped/disabled case, timeout, ошибка CTest или неисполненный mutant не проходят проверку. Nix Release 87/87 и сохранение executable/Nix closure остаются отдельными gates: сохранить output/log `nix build --no-update-lock-file` вместе с checkpoint. Одного Debug bundle для M0 недостаточно.
+
+Булевы значения cache трактуются как в CMake: `TRUE`, `YES`, `1` и другие истинные значения включают те же sanitizer/mutation gates, что и `ON`. Регистр обычных boolean keywords не влияет; `NOTFOUND` и суффикс `-NOTFOUND` проверяются с учётом регистра. Для любого включённого sanitizer profile обязательны записанные `ASAN_OPTIONS=detect_leaks=1` и `UBSAN_OPTIONS=halt_on_error=1`.
 
 `--output` capture — **новая** директория. Standalone preflight требует новый JSON path и создаёт рядом `<имя>.logs/`. Повторный запуск не перезаписывает evidence предыдущего запуска. `--probe` можно указать явно; default capture использует `<cpp-build>/ansa_preflight`, standalone preflight — `build-ansa/ansa_preflight`.
 

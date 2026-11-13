@@ -58,6 +58,46 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(child), 85)
         self.assertEqual(set(full) - set(child), {"mutation-drop", "mutation-reorder"})
 
+    def test_cmake_true_aliases_cannot_bypass_sanitizer_options(self):
+        manifest = json.loads(RUN.MANIFEST.read_bytes())
+        options = {"ASAN_OPTIONS": "detect_leaks=1", "UBSAN_OPTIONS": "halt_on_error=1"}
+        for value in ("ON", "TRUE", "YES", "Y", "1", "2", "true", "notfound", "probe-notfound", "falſe", "ıgnore"):
+            with self.subTest(value=value):
+                cache = {"OMH_SANITIZERS": value, "OMH_MUTATION_CHILD": "OFF"}
+                self.assertTrue(RUN.sanitizer_errors(cache, {}))
+                self.assertTrue(RUN.sanitizer_errors(cache, {"ASAN_OPTIONS": "detect_leaks=1"}))
+                self.assertEqual(RUN.sanitizer_errors(cache, options), [])
+                self.assertEqual(len(RUN.expected_ids(manifest, cache)), 87)
+                cache["OMH_MUTATION_CHILD"] = value
+                self.assertEqual(len(RUN.expected_ids(manifest, cache)), 85)
+                cache["OMH_SANITIZERS"] = "OFF"
+                self.assertTrue(RUN.sanitizer_errors(cache, options))
+
+    def test_cmake_false_aliases_keep_both_mutation_tests(self):
+        manifest = json.loads(RUN.MANIFEST.read_bytes())
+        for value in ("OFF", "FALSE", "NO", "N", "0", "", "IGNORE", "NOTFOUND", "probe-NOTFOUND", "false"):
+            with self.subTest(value=value):
+                cache = {"OMH_SANITIZERS": value, "OMH_MUTATION_CHILD": value}
+                self.assertEqual(RUN.sanitizer_errors(cache, {}), [])
+                self.assertEqual(len(RUN.expected_ids(manifest, cache)), 87)
+
+    def test_boolean_values_match_actual_cmake_if(self):
+        values = ("ON", "off", "YES", "false", "1", "0", "2", "0.0", "-0", "",
+                  "IGNORE", "ignore", "NOTFOUND", "notfound", "probe-NOTFOUND", "probe-notfound", "falſe", "ıgnore")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            output = path / "values.txt"
+            script = path / "booleans.cmake"
+            script.write_text("\n".join(
+                f'set(PROBE [=[{value}]=])\nif(PROBE)\n'
+                f'  file(APPEND "{output}" "1\\n")\nelse()\n'
+                f'  file(APPEND "{output}" "0\\n")\nendif()'
+                for value in values
+            ))
+            subprocess.run(["cmake", "-P", script], check=True, capture_output=True)
+            actual = [line == "1" for line in output.read_text().splitlines()]
+        self.assertEqual([RUN.cmake_enabled({"flag": value}, "flag") for value in values], actual)
+
 
 if __name__ == "__main__":
     unittest.main()

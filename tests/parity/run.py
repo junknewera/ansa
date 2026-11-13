@@ -148,9 +148,29 @@ def fixture_errors(manifest):
 
 def expected_ids(manifest, cache):
     ids = manifest["ctest_cases"]
-    if cache.get("OMH_MUTATION_CHILD") == "ON":
+    if cmake_enabled(cache, "OMH_MUTATION_CHILD"):
         ids = [name for name in ids if name not in manifest["mutation_cases"]]
     return ids
+
+
+def cmake_enabled(cache, name):
+    # Boolean keywords fold ASCII only; NOTFOUND and its suffix are case-sensitive.
+    value = cache.get(name, "")
+    false_keyword = value.isascii() and value.upper() in ("", "0", "OFF", "NO", "FALSE", "N", "IGNORE")
+    return (not false_keyword
+            and value != "NOTFOUND"
+            and not value.endswith("-NOTFOUND"))
+
+
+def sanitizer_errors(cache, options):
+    errors = []
+    enabled = cmake_enabled(cache, "OMH_SANITIZERS")
+    if cmake_enabled(cache, "OMH_MUTATION_CHILD") and not enabled:
+        errors.append("non-sanitized baseline must include both mutation tests")
+    if enabled and (options.get("ASAN_OPTIONS") != "detect_leaks=1"
+                    or options.get("UBSAN_OPTIONS") != "halt_on_error=1"):
+        errors.append("required ASan/UBSan runtime options were not recorded")
+    return errors
 
 
 def junit_cases(path):
@@ -275,15 +295,10 @@ def check(directory, manifest):
     errors += preflight_errors(report["preflight"], directory, manifest)
     errors += cli_errors(report["commands"], directory)
     cache = build["cache"]
-    if (cache.get("BUILD_TESTING") != "ON" or cache.get("CMAKE_BUILD_TYPE") not in ("Debug", "Release")
+    if (not cmake_enabled(cache, "BUILD_TESTING") or cache.get("CMAKE_BUILD_TYPE") not in ("Debug", "Release")
             or Path(cache.get("CMAKE_HOME_DIRECTORY", "")).resolve() != ROOT):
         errors.append("CMake source/profile/testing is not an eligible baseline")
-    if cache.get("OMH_MUTATION_CHILD") == "ON" and cache.get("OMH_SANITIZERS") != "ON":
-        errors.append("non-sanitized baseline must include both mutation tests")
-    if cache.get("OMH_SANITIZERS") == "ON" and (
-            report["sanitizer_options"].get("ASAN_OPTIONS") != "detect_leaks=1"
-            or report["sanitizer_options"].get("UBSAN_OPTIONS") != "halt_on_error=1"):
-        errors.append("required ASan/UBSan runtime options were not recorded")
+    errors += sanitizer_errors(cache, report["sanitizer_options"])
     expected = expected_ids(manifest, cache)
     inventory = output_json(report["commands"]["ctest-inventory"], directory)
     errors += case_errors([{"id": test["name"], "status": "passed"} for test in inventory.get("tests", [])], expected)
