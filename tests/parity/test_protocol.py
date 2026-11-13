@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 import protocol
 
+CPP_BUILD = os.environ.get('ANSA_PARITY_CPP_BUILD', 'build-m2')
+
 
 class ProtocolOracleTests(unittest.TestCase):
     def test_run_cli_dispatches_protocol_compare_and_m2_check(self):
@@ -227,7 +229,7 @@ class ProtocolOracleTests(unittest.TestCase):
 
     def _write_bundle(self, directory, case, output_factory=None, mutate=None):
         directory.mkdir()
-        paths = protocol.binaries('build-m2', 'rust/target')
+        paths = protocol.binaries(CPP_BUILD, 'rust/target')
         binaries = protocol.binary_info(paths)
         for mode in ('compare', 'fault'):
             mode_dir = directory / mode
@@ -256,7 +258,7 @@ class ProtocolOracleTests(unittest.TestCase):
                     error_path.write_bytes(b'')
                     commands[label] = {
                         'argv': ['cmake', '-DSOURCE=' + str(protocol.common.ROOT),
-                                 '-DBINARY=' + str(Path('build-m2').resolve()), '-DMODE=' + mutant,
+                                 '-DBINARY=' + str(Path(CPP_BUILD).resolve()), '-DMODE=' + mutant,
                                  '-P', str(protocol.common.ROOT / 'tests/rust_mutation.cmake')],
                         'cwd': '/tmp/protocol-harness-test', 'exit_code': 0, 'timed_out': False,
                         'stdout': protocol.raw(output_path), 'stderr': protocol.raw(error_path)}

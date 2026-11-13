@@ -12,6 +12,7 @@ pub enum StorePoint {
     Replaced,
     BeforeDispatch,
     TokensRemoved,
+    LogoutMarked,
 }
 pub type Observer = Arc<dyn Fn(StorePoint, &str) -> Result<()> + Send + Sync>;
 #[derive(Clone)]
@@ -93,7 +94,8 @@ impl Store {
     pub(crate) fn request_logout(&self) -> Result<()> {
         self.directory
             .request_logout()
-            .map_err(|_| "auth_logout_state")
+            .map_err(|_| "auth_logout_state")?;
+        self.observe(StorePoint::LogoutMarked, "signed-out")
     }
     pub(crate) fn remove(&self, name: &str) -> Result<()> {
         self.directory.remove(name).map_err(|_| "auth_store_remove")

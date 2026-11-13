@@ -76,7 +76,7 @@ public:
 };
 
 void private_directory(const std::filesystem::path& path) {
-    auth_require(path.is_absolute(), "auth_directory_path");
+    auth_require(path.is_absolute() && path.native().find('\0') == std::string::npos, "auth_directory_path");
     std::vector<std::filesystem::path> missing;
     auto parent = path;
     while (!std::filesystem::exists(parent)) {
@@ -335,6 +335,7 @@ class AuthManager::Impl {
         auth_require(marker.get() >= 0 && logged_out(), "auth_logout_state");
         sync_fd(marker.get());
         sync_fd(directory_.get());
+        if (observe_) observe_(AuthStorePoint::logout_marked, "signed-out");
     }
     std::jthread watch_logout(std::stop_source& operation) const {
         return std::jthread([this, &operation](std::stop_token stop) {

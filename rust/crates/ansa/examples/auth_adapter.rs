@@ -44,7 +44,43 @@ fn store(request: &Json) -> Result<Json> {
             Ordering::Release,
         );
     }
-    let manager = server.manager(None, None)?;
+    let observer = if request.has("fault") {
+        use ansa::auth::store_v1::{Observer, StorePoint};
+        let fault = request.field("fault")?;
+        let point = fault.text_field("point")?.to_owned();
+        let name = fault.text_field("name")?.to_owned();
+        let nth = fault.usize_field("nth")?;
+        if !(1..=8).contains(&nth)
+            || !["registration.json", "credentials.json", "signed-out"].contains(&name.as_str())
+            || ![
+                "temporary_synced",
+                "replaced",
+                "tokens_removed",
+                "logout_marked",
+            ]
+            .contains(&point.as_str())
+        {
+            return Err("fixture_fault");
+        }
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let callback: Observer = std::sync::Arc::new(move |actual, file| {
+            let actual = match actual {
+                StorePoint::TemporarySynced => "temporary_synced",
+                StorePoint::Replaced => "replaced",
+                StorePoint::TokensRemoved => "tokens_removed",
+                StorePoint::LogoutMarked => "logout_marked",
+                StorePoint::BeforeDispatch => "before_dispatch",
+            };
+            if actual == point && file == name && count.fetch_add(1, Ordering::AcqRel) + 1 == nth {
+                std::process::exit(71);
+            }
+            Ok(())
+        });
+        Some(callback)
+    } else {
+        None
+    };
+    let manager = server.manager(observer, None)?;
     let mut out = vec![("accepted", flag(true)?)];
     match request.text_field("action")? {
         "login" => server.login(&manager)?,
@@ -98,6 +134,12 @@ fn evaluate(r: &Json) -> Result<Json> {
                 ("accepted", flag(true)?),
                 ("field_count", fixture::number(fields.len() as u64)?),
                 ("code_present", flag(fields.contains_key("code"))?),
+                (
+                    "code_sha256",
+                    Json::string(&sha256(
+                        fields.get("code").ok_or("fixture_code")?.as_bytes(),
+                    ))?,
+                ),
             ])
         }
         "pkce" => Json::object(vec![
@@ -131,9 +173,60 @@ fn evaluate(r: &Json) -> Result<Json> {
             auth::registration::discover(r.field("discovery")?)?;
             Json::object(vec![("accepted", flag(true)?)])
         }
+        "ancestor" => {
+            let temp = fixture::Temp::new()?;
+            let server = fixture::Server::new(&temp.root)?;
+            let real = temp.root.join("real/auth");
+            let manager = server.manager_at(&real, None, None)?;
+            server.login(&manager)?;
+            let before = manager.status()?;
+            let posts =
+                server.grants.load(Ordering::Acquire) + server.refreshes.load(Ordering::Acquire);
+            std::os::unix::fs::symlink(temp.root.join("real"), temp.root.join("alias"))
+                .map_err(|_| "fixture_symlink")?;
+            let accepted = server
+                .manager_at(&temp.root.join("alias/auth"), None, None)
+                .and_then(|m| m.status())
+                .is_ok();
+            Json::object(vec![
+                ("accepted", flag(accepted)?),
+                (
+                    "zero_posts",
+                    flag(
+                        posts
+                            == server.grants.load(Ordering::Acquire)
+                                + server.refreshes.load(Ordering::Acquire),
+                    )?,
+                ),
+                ("real_path_compatible", flag(manager.status()? == before)?),
+            ])
+        }
         "scenario" => fixture::run_case(r.text_field("case")?),
         "store" => store(r),
         _ => Err("fixture_unknown_operation"),
+    }
+}
+fn bounded_line(reader: &mut impl BufRead, bytes: &mut Vec<u8>) -> io::Result<bool> {
+    bytes.clear();
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if bytes.is_empty() {
+                Ok(false)
+            } else {
+                Err(io::Error::other("unterminated_input"))
+            };
+        }
+        let end = buffer.iter().position(|b| *b == b'\n');
+        let take = end.unwrap_or(buffer.len());
+        if bytes.len().saturating_add(take) > 4 * 1024 * 1024 {
+            return Err(io::Error::other("oversized_input"));
+        }
+        bytes.extend_from_slice(&buffer[..take]);
+        reader.consume(take + usize::from(end.is_some()));
+        if end.is_some() {
+            return Ok(true);
+        }
     }
 }
 fn main() -> std::process::ExitCode {
@@ -160,10 +253,21 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         };
     }
-    for line in io::stdin().lock().lines() {
-        let result = line
-            .map_err(|_| "fixture_read")
-            .and_then(|s| Json::parse_with_limits(&s, 4 * 1024 * 1024, 64, 131072))
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut bytes = Vec::new();
+    loop {
+        match bounded_line(&mut input, &mut bytes) {
+            Ok(false) => break,
+            Ok(true) => (),
+            Err(_) => {
+                eprintln!("auth_adapter: invalid or oversized input");
+                return std::process::ExitCode::from(2);
+            }
+        }
+        let result = std::str::from_utf8(&bytes)
+            .map_err(|_| "fixture_utf8")
+            .and_then(|s| Json::parse_with_limits(s, 4 * 1024 * 1024, 64, 131072))
             .and_then(|r| evaluate(&r));
         let out = match result {
             Ok(value) => value,

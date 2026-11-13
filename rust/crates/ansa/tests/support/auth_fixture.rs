@@ -189,10 +189,18 @@ impl Server {
         observer: Option<Observer>,
         streaming: Option<StreamExchange>,
     ) -> Result<Arc<AuthManager>> {
+        self.manager_at(&self.root.join("auth"), observer, streaming)
+    }
+    pub fn manager_at(
+        self: &Arc<Self>,
+        path: &Path,
+        observer: Option<Observer>,
+        streaming: Option<StreamExchange>,
+    ) -> Result<Arc<AuthManager>> {
         let exchange = self.clone();
         let clock = self.clone();
         Ok(Arc::new(AuthManager::new(
-            &self.root.join("auth"),
+            path,
             Arc::new(move |r, c| exchange.exchange(r, c)),
             Arc::new(move || clock.now.load(Ordering::Acquire)),
             observer,
@@ -250,15 +258,7 @@ impl Server {
         ))
     }
     fn log(&self, event: &str) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(self.root.join("exchanges.log"))
-            .map_err(|_| "fixture_events")?;
-        file.write_all(format!("{event}\n").as_bytes())
-            .map_err(|_| "fixture_events")?;
-        file.sync_all().map_err(|_| "fixture_events")
+        ansa_linux::auth_store::fixture_event(&self.root, event).map_err(|_| "fixture_events")
     }
     pub fn exchange(&self, request: &HttpRequest, cancel: &Cancel) -> Result<HttpReply> {
         use auth::registration::*;
@@ -306,6 +306,12 @@ impl Server {
                     .ok_or("fixture_store")?;
                 let record =
                     Json::parse(std::str::from_utf8(&bytes).map_err(|_| "fixture_store")?)?;
+                ensure(
+                    record.field("refresh_pending")?.boolean()?
+                        && fields.get("refresh_token").map(String::as_str)
+                            == Some(record.text_field("refresh_token")?),
+                    "fixture_refresh_intent",
+                )?;
                 *self.nonce.lock().unwrap() = record.text_field("nonce")?.to_owned();
             } else {
                 self.grants.fetch_add(1, Ordering::AcqRel);
@@ -329,9 +335,10 @@ impl Server {
                 return Err("fixture_exchange_ambiguous");
             }
             let token = format!(
-                "fixture_refresh_{}_{}",
+                "fixture_refresh_{}_{}_{}",
                 self.grants.load(Ordering::Acquire),
-                self.refreshes.load(Ordering::Acquire)
+                self.refreshes.load(Ordering::Acquire),
+                self.now.load(Ordering::Acquire)
             );
             self.issued.lock().unwrap().push(token.clone());
             let mut claims = self.claims(&self.nonce.lock().unwrap())?;

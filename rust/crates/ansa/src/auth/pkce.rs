@@ -35,6 +35,13 @@ pub fn random_token(bytes: usize) -> Result<String> {
     base64url(&value)
 }
 pub fn challenge(verifier: &str) -> String {
+    // The legacy C++ hashing helper is total over strings. oauth2 asserts its
+    // RFC length precondition, so keep that assertion away from untrusted
+    // compatibility inputs. Login always generates a 43-byte verifier.
+    if !(43..=128).contains(&verifier.len()) {
+        return URL_SAFE_NO_PAD
+            .encode(ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes()).as_ref());
+    }
     oauth2::PkceCodeChallenge::from_code_verifier_sha256(&oauth2::PkceCodeVerifier::new(
         verifier.to_owned(),
     ))

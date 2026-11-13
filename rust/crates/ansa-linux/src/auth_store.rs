@@ -32,6 +32,34 @@ pub fn fixture_owner(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub fn fixture_event(path: &Path, event: &str) -> io::Result<()> {
+    if !matches!(
+        event,
+        "refresh" | "code" | "revoke" | "models" | "inference"
+    ) {
+        return Err(io::Error::other("fixture_event"));
+    }
+    fixture_owner(path)?;
+    let directory = crate::fs::private_directory(path)?;
+    let mut file = File::from(fs::openat(
+        &directory,
+        "exchanges.log",
+        OFlags::WRONLY
+            | OFlags::APPEND
+            | OFlags::CREATE
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC,
+        PRIVATE,
+    )?);
+    guard(&file, false)?;
+    if file.metadata()?.len() > 1024 * 1024 {
+        return Err(io::Error::other("fixture_event_limit"));
+    }
+    file.write_all(format!("{event}\n").as_bytes())?;
+    file.sync_all()
+}
+
 #[derive(Clone)]
 pub struct Directory(Arc<File>);
 pub struct Lock {

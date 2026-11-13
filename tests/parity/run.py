@@ -58,20 +58,25 @@ def source_info():
             "worktree_status": git("status", "--short").decode(), "files": files}
 
 
-def command(argv, cwd, output, label, timeout=60, input_file=None):
+def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=None):
     """Keep exact output bytes; kill/reap our process group on a timeout."""
     stdout = output / (label + ".stdout")
     stderr = output / (label + ".stderr")
     result = {"argv": [str(a) for a in argv], "cwd": str(cwd), "exit_code": None,
               "timed_out": False}
     start = time.monotonic()
+    child_environment = None
+    if fixture_root is not None:
+        # A single non-secret fixture input, never an environment dump.
+        child_environment = dict(os.environ, ANSA_AUTH_FIXTURES=str(fixture_root))
+        result["fixture_root"] = str(fixture_root)
     with ExitStack() as resources:
         out = resources.enter_context(stdout.open("wb"))
         err = resources.enter_context(stderr.open("wb"))
         stdin = resources.enter_context(Path(input_file).open("rb")) if input_file else subprocess.DEVNULL
         try:
             child = subprocess.Popen(result["argv"], cwd=cwd, stdin=stdin,
-                                     stdout=out, stderr=err, start_new_session=True)
+                                     stdout=out, stderr=err, start_new_session=True, env=child_environment)
             try:
                 result["exit_code"] = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -337,7 +342,7 @@ def main():
     cap.add_argument("--output", type=Path, required=True)
     cap.add_argument("--run-ctest", action="store_true")
     chk = sub.add_parser("check", help="validate native M0, M1 risk or M2 protocol evidence")
-    chk.add_argument("--milestone", choices=["M0", "M1", "M2"], required=True)
+    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3"], required=True)
     chk.add_argument("--evidence", type=Path, required=True)
     chk.add_argument("--fault-evidence", type=Path)
     for name, description in (("compare", "capture native parity rows for risk or protocol"),
@@ -354,6 +359,9 @@ def main():
         if args.action in ("compare", "fault") and args.suite == "protocol":
             import protocol
             return protocol.capture(args)
+        if args.action in ("compare", "fault") and args.suite == "auth":
+            import auth
+            return auth.capture(args)
         print(args.action + ": suite not implemented in M0", file=sys.stderr)
         return 2
     try:
@@ -363,6 +371,9 @@ def main():
         if args.action == "check" and args.milestone == "M2":
             import protocol
             return protocol.check(args.evidence.resolve(), args.fault_evidence)
+        if args.action == "check" and args.milestone == "M3":
+            import auth
+            return auth.check(args.evidence.resolve(), args.fault_evidence)
         manifest = json.loads(MANIFEST.read_bytes())
         if args.action == "preflight":
             args.output.parent.mkdir(parents=True, exist_ok=True)

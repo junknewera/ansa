@@ -156,7 +156,7 @@ struct Mock {
                 check(fields.at("code") == "fixture_code" && fields.at("redirect_uri") == redirect &&
                       pkce_challenge(fields.at("code_verifier")) == challenge, "PKCE/code/redirect mismatch");
             }
-            const auto renewable = "fixture_refresh_" + std::to_string(grants.load()) + "_" + std::to_string(refreshes.load());
+            const auto renewable = "fixture_refresh_" + std::to_string(grants.load()) + "_" + std::to_string(refreshes.load()) + "_" + std::to_string(now);
             issued_refresh.push_back(renewable);
             return reply(Json::object({{"access_token", Json::string("fixture_access_" + std::to_string(refreshes.load()))},
                 {"refresh_token", Json::string(renewable)},
@@ -307,6 +307,7 @@ void permissions() {
     check(manager->status().logged_in && !manager->status().plan_enabled, "identity-only grant not preserved");
     rejects([&] { manager->access(); });
     check(mock.inference == 0, "missing grant reached inference");
+    rejects([&]{ (void)mock.manager(std::filesystem::path(temp.path.string()+std::string("\0suffix",7))); });
     const auto credentials=temp.path/"credentials.json", held=temp.root/"held.json", alias=temp.root/"alias";
     check(::chmod(credentials.c_str(),0644)==0,"fixture chmod");
     rejects([&]{ (void)manager->status(); });

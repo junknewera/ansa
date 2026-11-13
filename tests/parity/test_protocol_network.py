@@ -8,11 +8,12 @@ import unittest
 
 import protocol_network
 import protocol
+import os
 
 
 class ProtocolNetworkPeerTests(unittest.TestCase):
     def test_native_adapters_reject_url_userinfo_before_connect(self):
-        for adapter, binary in protocol.binaries('build-m2', 'rust/target').items():
+        for adapter, binary in protocol.binaries(os.environ.get('ANSA_PARITY_CPP_BUILD', 'build-m2'), 'rust/target').items():
             with self.subTest(adapter=adapter), socket.socket() as trap:
                 trap.bind(('127.0.0.1', 0))
                 trap.listen(1)

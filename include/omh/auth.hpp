@@ -28,7 +28,7 @@ struct AuthStatus {
     std::string session;
 };
 struct AuthExecutionLease { std::shared_ptr<void> ownership; std::stop_token stop; };
-enum class AuthStorePoint { temporary_synced, replaced, before_dispatch, tokens_removed };
+enum class AuthStorePoint { temporary_synced, replaced, before_dispatch, tokens_removed, logout_marked };
 using StreamingExchange = std::function<Result<std::monostate>(const Json&, std::string_view,
     const std::function<void(std::string_view)>&, std::stop_token)>;
 using AuthStoreObserver = std::function<void(AuthStorePoint, std::string_view name)>;

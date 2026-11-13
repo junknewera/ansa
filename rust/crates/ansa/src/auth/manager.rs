@@ -222,8 +222,9 @@ impl AuthManager {
         observer: Option<Observer>,
         streaming: Option<StreamExchange>,
     ) -> Result<Self> {
+        let path = std::path::absolute(path).map_err(|_| "auth_directory_path")?;
         Ok(Self {
-            store: Store::open(path, observer)?,
+            store: Store::open(&path, observer)?,
             exchange,
             clock,
             streaming,
