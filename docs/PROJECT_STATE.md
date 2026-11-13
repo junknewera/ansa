@@ -40,7 +40,7 @@ Live/cutover/performance parity этим этапом не закрываютс�
 
 Проверки LE0: исходные bytes восьми прочитанных repository files совпали с Git blob identities; whitespace/fences/reference checks, 52 относительные ссылки и три JSON blocks прошли. Два независимых scoped design reviews и targeted re-review закрыли замечания о pending transition после crash, evaluator эксперимента, invalidation final review и сравнимости eval arms. Это review агентов, не formal GitHub approval и не runtime acceptance. В design включены 22 будущих acceptance cases.
 
-Точный Git checkpoint документационного пакета фиксируется в сопровождающем PR. Runtime/Nix/native suites для этого docs-only изменения не исполняются и не объявляются пройденными. Следующий migration шаг по-прежнему M5; следующий шаг этого proposal — review предложенного решения и последующая отдельная feature implementation по gates, без автоматического старта.
+Проверенный docs checkpoint — [4f64aa2](https://github.com/junknewera/ansa/commit/4f64aa290604aab1b31c2e2c410c25e2706cf78e). Remote blobs семи изменённых Markdown-файлов совпали с проверенными локальными bytes; остальные repository blobs не изменены. Эта handoff-запись добавляет ссылку на checkpoint отдельным documentation commit. Runtime/Nix/native suites для docs-only изменения не исполнялись и не объявляются пройденными. Следующий migration шаг по-прежнему M5; следующий шаг proposal — review решения и последующая отдельная feature implementation по gates, без автоматического старта.
 
 ## Rust migration: M3 закрыт (GO)
 
