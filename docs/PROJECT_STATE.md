@@ -1,8 +1,10 @@
 # Состояние ansa
 
-## Rust migration: M1 implementation checkpoint
+## Rust migration: M1 закрыт (GO)
 
-Реализованы synthetic JSON/hash, private early-exec supervisor и localhost HTTP/TLS/proxy spikes в `migration/m1-risk-spikes`. Debug и Nix Release CTest **87/87**, compare **602/602**, fault **286/286**, replay checker, Rust **4/4**, harness **20/20**, fmt/clippy и Nix Rust package прошли на X13s/aarch64. Independent JSON/process/transport review закрыт. Полный ASan/UBSan closeout ещё выполняется; Rust last verified milestone пока M0. Production executable/default остаются C++20. Scope, stricter design corrections и команды - в [M1 report](migration/M1.md).
+**Rust last verified milestone - M1 GO, 2026-11-13**, code checkpoint [5324d2a](https://github.com/junknewera/ansa/commit/5324d2ad8235f636f0b5865d9384c0ba101d1208), tag `migration/m1-risk-spikes`. Реализованы synthetic JSON/hash, private early-exec supervisor и localhost HTTP/TLS/proxy spikes. На X13s/NixOS/aarch64: Debug и Nix Release CTest **87/87**, ASan/UBSan **85/85**, sanitized C++ oracle compare **602/602**, clean compare **602/602**, fault **286/286** и raw replay checker PASS. Cargo **4/4** integration functions включают 11 process и 7 H2 cases; harness **20/20**, Linux preflight **11/11**, fmt/clippy и Nix Rust package прошли.
+
+Independent JSON/process/transport review закрыт без открытых findings; три stricter transport corrections зафиксированы явно. Evidence, binaries, logs и GC-rooted Release closures сохранены в `~/Workspace/pet/ansa-baselines/m1-5324d2a/`. C++ executable SHA-256 совпадает с M0 baseline, production/default остаются C++20, budgets сохранены. Scope, ограничения и команды - в [M1 report](migration/M1.md). Следующий шаг - M2: полный protocol, Responses/replay и batch admission; M1 не является Rust runtime или performance parity.
 
 ## Rust migration: M0 закрыт (GO)
 
