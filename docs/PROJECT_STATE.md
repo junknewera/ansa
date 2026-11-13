@@ -1,5 +1,34 @@
 # Состояние ansa
 
+## Rust migration: M5 закрыт (GO)
+
+**Rust last verified milestone - M5 GO, 2026-11-13**, code checkpoint
+[`2eb480b`](https://github.com/junknewera/ansa/commit/2eb480b23060dd9bf918fcbfcdbb358c52527de1),
+tag `migration/m5-runtime-owner`. Реализованы owned current-thread runtime,
+четыре bounded workers, durable dispatch, cancellation, restart/Resume,
+summary loop и общие typed frontend events. Production/default - C++20.
+
+X13s/NixOS/aarch64: C++ Debug/Release **87/87**, ASan/UBSan **85/85**;
+M5 compare **66/66**, fault **114/114**, sanitized compare **66/66**, raw checker
+PASS. Runtime **24/24** integration + **1/1** Cancel-slot unit; Nix Rust workspace
+**72/72** integration + **1/1** unit + **9/9** compile-fail doctests. Harness
+**76/76**, preflight **11/11**, fmt/clippy PASS. M1-M4 regression checkers PASS;
+Cargo.lock и 146 external packages не изменены.
+
+Независимые reviews закрыты. Исправлена обнаруженная compare гонка потери
+ToolStarted при быстром completion; 64 batch по три tools проверяют порядок.
+Restart не выполняет unresolved intent, Resume не повторяет известный prefix.
+Оба направления C++/Rust append сохраняют исходные journal bytes.
+
+CPP matrix не повторялась после Rust-only race fix: 65 native inputs совпадают
+с Nix C++ source. Для переиспользованных M1-M4 adapters совпадают 59 inputs;
+изменён только не вызываемый ими M5 owner. Final M5 и Nix Rust - `2eb480b`.
+Evidence, binaries, source proofs, bundle и GC roots:
+`~/Workspace/pet/ansa-baselines/m5-2eb480b/`. Подробности - [M5 report](migration/M5.md).
+
+Следующая отдельная задача - M6: config/AGENTS, file tools и ProcessRunner.
+Автоматически не начинать. Live pilot и cutover остаются закрыты.
+
 ## Rust migration: M4 закрыт (GO)
 
 **Rust last verified milestone - M4 GO, 2026-11-13**, code checkpoint
