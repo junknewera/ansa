@@ -1,6 +1,7 @@
 //! Exact v1 result/invocation codec. Responses use the M2 production admission.
 use super::{Result, need, num};
 pub use crate::provider::native::{load as load_response, save as save_response};
+pub use crate::tools::invocation::Invocation;
 use crate::{
     protocol::json::Json,
     provider::{
@@ -11,34 +12,6 @@ use crate::{
         responses::AdmittedResponse,
     },
 };
-#[derive(Clone, Debug, PartialEq)]
-pub struct Invocation {
-    pub operation: String,
-    pub call: String,
-    pub name: String,
-    pub revision: String,
-    pub arguments: Json,
-}
-impl Invocation {
-    pub fn load(value: &Json) -> Result<Self> {
-        Ok(Self {
-            operation: value.text_field("operation")?.into(),
-            call: value.text_field("call")?.into(),
-            name: value.text_field("name")?.into(),
-            revision: value.text_field("revision")?.into(),
-            arguments: value.field("arguments")?.clone(),
-        })
-    }
-    pub fn save(&self) -> Result<Json> {
-        Json::object(vec![
-            ("operation", Json::string(&self.operation)?),
-            ("call", Json::string(&self.call)?),
-            ("name", Json::string(&self.name)?),
-            ("revision", Json::string(&self.revision)?),
-            ("arguments", self.arguments.clone()),
-        ])
-    }
-}
 #[derive(Clone, Debug)]
 pub struct SavedResult {
     pub result: ToolResult,

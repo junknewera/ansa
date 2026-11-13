@@ -2,6 +2,26 @@
 
 `run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1`; M2 - `--suite protocol` и `--milestone M2`; M3 - `--suite auth` и `--milestone M3`. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
 
+## M5 runtime suite
+
+Из clean checkpoint собери C++ targets и Rust examples с `--all-features`.
+Внутри `nix develop --no-update-lock-file`:
+
+```sh
+cargo test --manifest-path rust/Cargo.toml -p ansa --locked --test runtime_parity
+cargo build --manifest-path rust/Cargo.toml --workspace --locked --all-features --examples
+python tests/parity/run.py compare --suite runtime --cpp-build build-ansa --rust-target rust/target --output build-migration/M5
+python tests/parity/run.py fault --suite runtime --cpp-build build-ansa --rust-target rust/target --output build-migration/M5-fault
+python tests/parity/run.py check --milestone M5 --evidence build-migration/M5
+```
+
+Compare проверяет production requests, typed events, transcript, context и точные
+journal events; interop сохраняет исходные bytes при append другим runtime.
+Fault включает native assertions, 48 crash boundaries и 20 stress schedules.
+Checker повторяет семантические проверки по raw stdin/stdout и journal frames.
+Source/binary hashes, clean status и NixOS/aarch64 обязательны. Неподдерживаемый
+или пустой suite не считается PASS. Production CLI остаётся C++.
+
 ## M4 session suite
 
 M4 добавляет `compare/fault --suite sessions` и `check --milestone M4`.

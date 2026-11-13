@@ -28,6 +28,7 @@ struct CancelState {
     wake: Condvar,
     mutex: Mutex<()>,
     parent: Option<Cancel>,
+    second_parent: Option<Cancel>,
 }
 impl Cancel {
     pub fn cancel(&self) {
@@ -37,10 +38,18 @@ impl Cancel {
     pub fn cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
             || self.0.parent.as_ref().is_some_and(Cancel::cancelled)
+            || self.0.second_parent.as_ref().is_some_and(Cancel::cancelled)
     }
     pub(crate) fn linked(parent: &Cancel) -> Self {
         Self(Arc::new(CancelState {
             parent: Some(parent.clone()),
+            ..CancelState::default()
+        }))
+    }
+    pub(crate) fn combined(first: &Cancel, second: &Cancel) -> Self {
+        Self(Arc::new(CancelState {
+            parent: Some(first.clone()),
+            second_parent: Some(second.clone()),
             ..CancelState::default()
         }))
     }
