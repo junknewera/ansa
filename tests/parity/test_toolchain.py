@@ -22,6 +22,7 @@ class ToolchainTests(unittest.TestCase):
                      "crates/ansa/Cargo.toml", "crates/ansa/src/lib.rs",
                      "crates/ansa/examples/protocol_adapter.rs",
                      "crates/ansa/examples/auth_adapter.rs",
+                     "crates/ansa/examples/session_adapter.rs",
                      "crates/ansa/src/bin/ansa.rs", "crates/ansa-linux/Cargo.toml",
                      "crates/ansa-linux/src/lib.rs"):
             target = self.workspace / name

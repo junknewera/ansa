@@ -4,6 +4,13 @@
 
 ## M3 auth suite
 
+M4 добавляет `compare/fault --suite sessions` и `check --milestone M4`.
+Собери `ansa_session_oracle` и `cargo build --manifest-path rust/Cargo.toml
+--locked --example session_adapter --features session-test-adapter`, затем
+выполни capture в новые directories. Commands и scope - в
+[M4 report](../../docs/migration/M4.md). Existing C++ journals используются
+только в виде synthetic fixtures.
+
 В pinned Nix shell собери оба adapters и выполни:
 
 ```sh

@@ -160,7 +160,7 @@ class Journal::Impl {
 public:
     Impl(const std::filesystem::path& path, const std::function<void(const Json&)>& replay, JournalOptions options)
         : options_(std::move(options)) {
-        storage_require(!path.empty(), "journal_path");
+        storage_require(!path.empty() && path.native().find('\0') == std::string::npos, "journal_path");
         storage_require(::mkdir(path.c_str(), 0700) == 0 || errno == EEXIST, "journal_directory_create");
         directory_.reset(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
         storage_require(directory_.get() >= 0, "journal_directory_open");
@@ -168,8 +168,10 @@ public:
         Fd parent(::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         storage_require(parent.get() >= 0, "journal_parent_open");
         sync_fd(parent.get());
-        lock_.reset(::openat(directory_.get(), "lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600));
+        lock_.reset(::openat(directory_.get(), "lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600));
         storage_require(lock_.get() >= 0, "journal_lock_open");
+        struct stat lock_status{};
+        storage_require(::fstat(lock_.get(), &lock_status) == 0 && S_ISREG(lock_status.st_mode) && lock_status.st_nlink == 1, "journal_lock_type");
         storage_require(::flock(lock_.get(), LOCK_EX | LOCK_NB) == 0, "session_busy");
 
         std::vector<std::string> parts;
@@ -185,10 +187,10 @@ public:
         try {
             for (std::size_t index = 0; index < parts.size(); ++index) {
                 storage_require(parts[index] == part_name(index), "journal_part_sequence");
-                file_.reset(::openat(directory_.get(), parts[index].c_str(), O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW));
+                file_.reset(::openat(directory_.get(), parts[index].c_str(), O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
                 storage_require(file_.get() >= 0, "journal_part_open");
                 struct stat status{};
-                storage_require(::fstat(file_.get(), &status) == 0 && S_ISREG(status.st_mode), "journal_part_type");
+                storage_require(::fstat(file_.get(), &status) == 0 && S_ISREG(status.st_mode) && status.st_nlink == 1, "journal_part_type");
                 scan(file_.get(), index, replay);
                 expected_size_ = status.st_size;
                 previous_part_ = file_digest(file_.get());
@@ -215,7 +217,7 @@ public:
             const auto name = part_name(part_);
             storage_require(::fstat(file_.get(), &status) == 0 &&
                             ::fstatat(directory_.get(), name.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0 &&
-                            S_ISREG(named.st_mode) && status.st_dev == named.st_dev && status.st_ino == named.st_ino &&
+                            S_ISREG(named.st_mode) && status.st_nlink == 1 && status.st_dev == named.st_dev && status.st_ino == named.st_ino &&
                             status.st_size == expected_size_, "journal_write_conflict");
             storage_require(sequence_ < std::numeric_limits<std::uint64_t>::max(), "journal_sequence_limit");
             const auto body = Json::object({{"schema_version", number(1)}, {"sequence", number(sequence_ + 1)},

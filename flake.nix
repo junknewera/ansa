@@ -33,6 +33,7 @@
           ANSA_PARITY_ROOT = ./tests/parity;
           ANSA_PROTOCOL_FIXTURES = ./tests/fixtures;
           ANSA_AUTH_FIXTURES = ./tests/fixtures/auth;
+          ANSA_SESSION_FIXTURES = ./tests/fixtures/sessions;
           preBuild = ''
             python3 ${./tests/parity/check_toolchain.py} --workspace .
           '';
