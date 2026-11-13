@@ -94,3 +94,7 @@ async fn unresolved_restart() {
 async fn multi_round() {
     fixture::multi_round().await;
 }
+#[tokio::test(flavor = "current_thread")]
+async fn fast_events() {
+    fixture::fast_events().await;
+}

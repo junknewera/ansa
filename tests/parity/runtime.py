@@ -15,7 +15,7 @@ MAX=64*1024*1024
 MANIFEST=common.ROOT/'tests/parity/fixtures/runtime.json'
 NATIVE=('roundtrip','cancel','priority','admission','resync','invalid-response','tool-cancel','shutdown',
         'durable','auth-cancel','auth-drop','preview-flood','durable-bypass','mixed-registry',
-        'restart-limit','storage-failure','summary','summary-cancel','checkpoints','restart-resume','plan-admission','unknown-restart','unresolved-restart','multi-round')
+        'restart-limit','storage-failure','summary','summary-cancel','checkpoints','restart-resume','plan-admission','unknown-restart','unresolved-restart','multi-round','fast-events')
 CPP={'runtime':('cancel','priority','admission','resync','invalid-response','tool-cancel','roundtrip','shutdown'),
      'summary':('codec','runtime','cancel'), 'frontend':('streaming','recovery','adversarial','modes','overflow'),
      'session':('blocked-disk','late-outcome','intent-cancel','batch-recovery','dispatch-guard')}

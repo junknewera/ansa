@@ -513,6 +513,7 @@ impl Owner {
     }
     fn cancel(&mut self, command: CommandId) {
         self.gate.cancel();
+        self.drain_started();
         self.turn_stop.cancel();
         self.finish_preview("discarded", false);
         self.cancelling = Some(command);
@@ -1030,6 +1031,13 @@ impl Owner {
         Ok(())
     }
     fn completed(&mut self, workers: &Workers, done: Completion) -> Result<()> {
+        // A biased select is only priority at poll time. Started can be sent
+        // after that poll but before Completion becomes ready. Every executor
+        // sends Started before its completion, so consume it while the exact
+        // active tool identity is still owned here.
+        if matches!(done, Completion::Tool { .. }) {
+            self.drain_started();
+        }
         match done {
             Completion::Stored(value) => self.stored(value)?,
             Completion::Provider { identity, result } => {
@@ -1258,6 +1266,21 @@ impl Owner {
             self.snapshot(None);
         }
     }
+    fn started(&mut self, identity: Identity, value: Started) {
+        if self
+            .tool
+            .as_ref()
+            .is_some_and(|(active, task)| active == &identity && *task == ToolTask::Execute)
+        {
+            self.activity.push(Activity::Started(value.clone()));
+            self.emit(EventPayload::ToolStarted(value));
+        }
+    }
+    fn drain_started(&mut self) {
+        while let Ok((identity, value)) = self.starts.try_recv() {
+            self.started(identity, value);
+        }
+    }
     pub async fn run(
         mut self,
         mut boot: oneshot::Receiver<Result<Ready>>,
@@ -1354,12 +1377,7 @@ impl Owner {
                 Action::Command(Some(value)) => self.admit(value),
                 Action::Command(None) => Err("runtime_mailbox_closed"),
                 Action::Start(Some((identity, value))) => {
-                    if self.tool.as_ref().is_some_and(|(active, task)| {
-                        active == &identity && *task == ToolTask::Execute
-                    }) {
-                        self.activity.push(Activity::Started(value.clone()));
-                        self.emit(EventPayload::ToolStarted(value));
-                    }
+                    self.started(identity, value);
                     Ok(())
                 }
                 Action::Start(None) => Err("tool_worker_closed"),

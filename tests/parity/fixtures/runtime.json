@@ -92,6 +92,7 @@
     "rust-unknown-restart",
     "rust-unresolved-restart",
     "rust-multi-round",
+    "rust-fast-events",
     "cpp-runtime-cancel",
     "cpp-runtime-priority",
     "cpp-runtime-admission",

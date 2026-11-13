@@ -1608,3 +1608,41 @@ pub async fn multi_round() {
         finish(&mut runtime).await;
     }
 }
+
+pub async fn fast_events() {
+    for _ in 0..64 {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut runtime = setup(
+            count.clone(),
+            None,
+            generator(3),
+            Limits::default(),
+            Options::default(),
+        )
+        .await;
+        let handle = runtime.handle();
+        submit(&handle, "submit", "fixture", "turn").await;
+        let mut started = vec![];
+        let mut finished = vec![];
+        loop {
+            let e = event(&handle).await;
+            match e.payload {
+                EventPayload::ToolStarted(v) => {
+                    assert_eq!(started.len(), finished.len());
+                    started.push(v.operation);
+                }
+                EventPayload::ToolFinished(v) => {
+                    assert_eq!(started.last(), Some(&v.operation));
+                    finished.push(v.operation);
+                }
+                EventPayload::Done => break,
+                EventPayload::RuntimeError { diagnostic, .. } => panic!("{diagnostic}"),
+                _ => {}
+            }
+        }
+        assert_eq!(started, finished);
+        assert_eq!(started.len(), 3);
+        finish(&mut runtime).await;
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+}

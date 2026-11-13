@@ -326,6 +326,7 @@ async fn run(row: &Json) -> Result<Json> {
         "unknown-restart" => fixture::unknown_restart().await,
         "unresolved-restart" => fixture::unresolved_restart().await,
         "multi-round" => fixture::multi_round().await,
+        "fast-events" => fixture::fast_events().await,
         _ => return Err("runtime_fixture_suite"),
     }
     Ok(object(vec![
