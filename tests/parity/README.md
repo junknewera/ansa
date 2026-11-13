@@ -2,6 +2,26 @@
 
 `run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1`; M2 - `--suite protocol` и `--milestone M2`; M3 - `--suite auth` и `--milestone M3`. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
 
+## M6 local tools/process suite
+
+Собери C++ targets и Rust examples с `--all-features`, затем из clean checkpoint
+внутри `nix develop --no-update-lock-file`:
+
+```sh
+cargo test --manifest-path rust/Cargo.toml --workspace --locked
+python tests/parity/run.py compare --suite tools --cpp-build build-ansa --rust-target rust/target --output build-migration/M6
+python tests/parity/run.py fault --suite tools --cpp-build build-ansa --rust-target rust/target --output build-migration/M6-fault
+python tests/parity/run.py check --milestone M6 --evidence build-migration/M6
+```
+
+Проверяются config/AGENTS, schema/revision/read-only snapshots, byte-limited
+file/search и process results. Request/started/result records сверяются с exact
+v1 hashes; другой binary читает и переиспользует outcome без повторного launch.
+Crash controller привязывает pidfds к actual Popen и ancestry всей fixture tree.
+Known cleanup проверяется до обязательной очистки harness; guardian death даёт
+unknown. Partial publication и неверный spec не допускают повторного эффекта.
+Native Linux tests дополнительно проверяют wait-error ownership и закрытые stdio.
+
 ## M5 runtime suite
 
 Из clean checkpoint собери C++ targets и Rust examples с `--all-features`.

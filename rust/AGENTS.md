@@ -3,7 +3,19 @@
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
 docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
 
-## M5 boundary
+## M6 boundary
+
+- M5 is GO. M6 authorizes config/AGENTS, local file/search tools, process
+  execution and legacy process evidence, using synthetic owned workspaces.
+- Preserve exact defaults, instructions/tokens, tool revisions and v1 hashes.
+  Reuse the M4 catalog and M5 runtime; plan advertises only read-only tools.
+- Reexec the supervisor before Tokio. Keep unsafe narrowly in ansa-linux,
+  justify child setup and test native cleanup, crashes and detached descendants.
+- Never retry a consumed operation or report known cleanup without evidence.
+  One final PR after differential/fault gates and independent review.
+- No live credentials/providers, frontend redesign, orchestrate or cutover.
+
+## Historical M5 boundary
 
 - M4 is GO. M5 authorizes the synthetic owned runtime, cancellation, summary
   loop and typed frontend. Preserve v1 journals and all existing codec gates.

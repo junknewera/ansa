@@ -10,6 +10,11 @@ protocol-test-adapter = []
 auth-test-adapter = []
 session-test-adapter = []
 runtime-test-adapter = []
+tools-test-adapter = []
+
+[[example]]
+name = "tools_adapter"
+required-features = ["tools-test-adapter"]
 
 [[example]]
 name = "runtime_adapter"

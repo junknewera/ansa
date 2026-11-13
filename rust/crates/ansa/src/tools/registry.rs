@@ -66,6 +66,12 @@ impl Outcome {
     pub fn effects(&self) -> Effects {
         self.effects
     }
+    pub fn execution(&self) -> Execution {
+        self.execution
+    }
+    pub fn output(&self) -> &[u8] {
+        &self.output
+    }
 }
 #[derive(Clone)]
 pub struct Definition {

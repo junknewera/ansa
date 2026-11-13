@@ -5,4 +5,7 @@
 pub mod auth_store;
 pub mod fs;
 pub mod journal;
+pub mod local;
+pub mod managed;
 pub mod process;
+pub mod supervisor;

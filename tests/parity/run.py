@@ -58,7 +58,7 @@ def source_info():
             "worktree_status": git("status", "--short").decode(), "files": files}
 
 
-def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=None, process_env=None):
+def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=None, process_env=None, started=None):
     """Keep exact output bytes; kill/reap our process group on a timeout."""
     stdout = output / (label + ".stdout")
     stderr = output / (label + ".stderr")
@@ -82,6 +82,15 @@ def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=
         try:
             child = subprocess.Popen(result["argv"], cwd=cwd, stdin=stdin,
                                      stdout=out, stderr=err, start_new_session=True, env=child_environment)
+            if started is not None:
+                result.update(pid=child.pid,parent_pid=os.getpid())
+                try:
+                    started(child.pid)
+                except BaseException:
+                    try:os.killpg(child.pid,signal.SIGKILL)
+                    except ProcessLookupError:pass
+                    child.wait()
+                    raise
             try:
                 result["exit_code"] = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -347,7 +356,7 @@ def main():
     cap.add_argument("--output", type=Path, required=True)
     cap.add_argument("--run-ctest", action="store_true")
     chk = sub.add_parser("check", help="validate native M0, M1 risk, M2 protocol or M3 auth evidence")
-    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3", "M4", "M5"], required=True)
+    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3", "M4", "M5", "M6"], required=True)
     chk.add_argument("--evidence", type=Path, required=True)
     chk.add_argument("--fault-evidence", type=Path)
     for name, description in (("compare", "capture native parity rows for risk, protocol or auth"),
@@ -373,6 +382,9 @@ def main():
         if args.action in ("compare", "fault") and args.suite == "runtime":
             import runtime
             return runtime.capture(args)
+        if args.action in ("compare", "fault") and args.suite == "tools":
+            import tools
+            return tools.capture(args)
         print(args.action + ": suite not implemented in M0", file=sys.stderr)
         return 2
     try:
@@ -391,6 +403,9 @@ def main():
         if args.action == "check" and args.milestone == "M5":
             import runtime
             return runtime.check_evidence(args.evidence.resolve(), args.fault_evidence)
+        if args.action == "check" and args.milestone == "M6":
+            import tools
+            return tools.check_evidence(args.evidence.resolve(), args.fault_evidence)
         manifest = json.loads(MANIFEST.read_bytes())
         if args.action == "preflight":
             args.output.parent.mkdir(parents=True, exist_ok=True)
