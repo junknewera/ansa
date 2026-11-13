@@ -72,7 +72,7 @@ fn cancelled() -> io::Result<bool> {
     }
 }
 
-fn capability_probe(executable: &Path) -> io::Result<()> {
+pub(crate) fn capability_probe(executable: &Path) -> io::Result<()> {
     let mut child = Command::new(executable)
         .arg("--m1-capability-child")
         .stdin(Stdio::null())

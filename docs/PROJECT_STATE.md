@@ -1,5 +1,35 @@
 # Состояние ansa
 
+## Rust migration: M6 закрыт (GO)
+
+**Rust last verified milestone - M6 GO, 2026-11-14**, code checkpoint
+[`5886e3e`](https://github.com/junknewera/ansa/commit/5886e3ecce9f246fa4aed354d10adcf39b3a1408),
+tag `migration/m6-local-tools`. Перенесены config/AGENTS, bounded file/search
+tools, ProcessRunner и совместимые v1 process evidence. Используются M4 catalog
+и M5 runtime. Production/default остаётся C++20.
+
+X13s/NixOS/aarch64: C++ Debug/Release **87/87**, ASan/UBSan **85/85**;
+M6 compare **32/32**, fault **102/102**, sanitized compare **32/32**, raw checker
+PASS. Nix Rust workspace **86 integration + 5 unit + 9 doctests**, M6 native
+**14/14**, harness **89/89**, Linux preflight **11/11**, fmt/clippy PASS.
+M1-M5 regression checkers PASS; Cargo.lock и 146 external packages не изменены.
+Оба клиента выдержали по 65 команд без FD/child leaks. Установленный Rust Release
+private worker сохраняет known exit 7 и consume-once при повторном запуске.
+
+Два независимых review закрыты. Исправлены adoption cleanup race, wait-error
+ownership, closed-stdio CLOEXEC и future auth-root canonicalization. Crash harness
+доказывает actual Popen/ancestry и проверяет cleanup до своего вмешательства.
+Missing procfs/pidfd denial переиспользуют M1 shared-wrapper regressions;
+отдельная детерминированная M6 PDEATHSIG-window injection не выполнялась.
+
+Все captures - clean `5886e3e`. Nix source proof сверяет 103 C++/harness и 88 Rust
+inputs; 55 native Debug/SAN inputs неизменны. C++ fallback executable SHA-256
+сохранён. Evidence, binaries, source/handoff bundles, reviews и GC roots:
+`~/Workspace/pet/ansa-baselines/m6-5886e3e/`. Подробности - [M6 report](migration/M6.md).
+
+Следующая отдельная задача - M7: Carbon, typed JSONL и CLI compatibility.
+Автоматически не начинать. Live pilot и cutover остаются закрыты.
+
 ## Rust migration: M5 закрыт (GO)
 
 **Rust last verified milestone - M5 GO, 2026-11-13**, code checkpoint
