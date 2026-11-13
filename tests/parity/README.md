@@ -2,6 +2,15 @@
 
 `run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1`; M2 - `--suite protocol` и `--milestone M2`; M3 - `--suite auth` и `--milestone M3`. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
 
+## M4 session suite
+
+M4 добавляет `compare/fault --suite sessions` и `check --milestone M4`.
+Собери `ansa_session_oracle` и `cargo build --manifest-path rust/Cargo.toml
+--locked --example session_adapter --features session-test-adapter`, затем
+выполни capture в новые directories. Commands и scope - в
+[M4 report](../../docs/migration/M4.md). Existing C++ journals используются
+только в виде synthetic fixtures.
+
 ## M3 auth suite
 
 В pinned Nix shell собери оба adapters и выполни:

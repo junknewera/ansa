@@ -795,7 +795,7 @@ def binary_info(paths):
     return {name: {'path': str(path), 'sha256': binary_digest(path, name)} for name, path in paths.items()}
 
 
-def owned_bytes(path, maximum, executable=False):
+def owned_bytes(path, maximum, executable=False, single_link=False):
     path = Path(path)
     if any(part == '.env' or part.startswith('.env.') for part in path.parts):
         raise ValueError('forbidden evidence path')
@@ -804,7 +804,7 @@ def owned_bytes(path, maximum, executable=False):
     with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK), 'rb') as stream:
         info = os.fstat(stream.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_size > maximum
-                or (not executable and info.st_nlink != 1)
+                or ((not executable or single_link) and info.st_nlink != 1)
                 or (executable and not info.st_mode & 0o111)):
             raise ValueError('evidence file type/size differs')
         value = stream.read(maximum + 1)

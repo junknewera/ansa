@@ -3,7 +3,19 @@
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
 docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
 
-## M3 boundary
+## M4 boundary
+
+- M3 is GO. M4 authorizes synthetic journal/session v1, exact context epochs,
+  reader then writer, bidirectional C++/Rust append/reopen and crash recovery.
+- Preserve OMHJ1 bytes, all eleven event kinds, IDs, native items and hashes.
+  Reuse production saved-response admission. Unsupported state stays read-only.
+- One canonical append-only journal; shared flock; durable intent before effects.
+  Recovery never executes a tool or automatically resumes a turn. Keep known
+  outcomes after storage failure without publishing an undurable assistant.
+- Use existing dependencies/tests; no real user sessions, credentials, live,
+  runtime owner loop, UI, schema change, fsync batching or cutover. One final PR.
+
+## Historical M3 boundary
 
 - M2 is GO. M3 authorizes auth/OIDC and v1 store compatibility using synthetic
   fixtures, explicit private fixture directories and injected exchanges only.

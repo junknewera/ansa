@@ -1,5 +1,35 @@
 # Состояние ansa
 
+## Rust migration: M4 закрыт (GO)
+
+**Rust last verified milestone - M4 GO, 2026-11-13**, code checkpoint
+[`453ba6f`](https://github.com/junknewera/ansa/commit/453ba6f2213a82deb968c5b783f8eb256ef4d475),
+tag `migration/m4-session-v1`. Реализованы OMHJ1 journal reader/writer, reducer
+11 событий, exact epochs, legacy summary/native compact, persistent transcript,
+private session catalog и bounded storage worker. Production/default - C++20.
+
+X13s/NixOS/aarch64: C++ Debug/Release **87/87**, ASan/UBSan **85/85**; clean M4
+compare **407/407**, fault **829/829**, sanitized compare **407/407**, raw checker
+PASS. Cargo/Nix Rust **48/48** integration functions + **7/7** compile-fail
+doctests, harness **59/59**, preflight **11/11**, fmt/clippy PASS. M1-M3 regression
+checkers PASS; Cargo.lock и 146 external packages не изменены.
+
+Проверены оба направления append/reopen, 16 C++ golden traces, 320 byte cuts,
+88 crash cases, 22 actual syscall faults, file aliases/FIFO и общий process lock.
+Unresolved intent не исполняется повторно; known outcome сохраняется при ошибке
+записи, undurable assistant не публикуется. Дополнительный linked-tail test
+сохраняет обе исходные parts. Два независимых reviews закрыты без findings.
+
+Полная C++ matrix не повторялась после M4 test-only правок: 55 native inputs
+совпадают с Nix source; CMake delta - только test DSO. M1-M3 regressions сняты на
+`46c091e`, 56 Rust production/config inputs неизменны. Final M4 и Nix Rust -
+`453ba6f`. Proof и команды - в [M4 report](migration/M4.md).
+
+Evidence, binaries, failed attempts, reviews, Git bundle и GC-rooted Release
+outputs - `~/Workspace/pet/ansa-baselines/m4-453ba6f/`. Следующая отдельная задача -
+M5: owned runtime, cancellation и summary loop; автоматически не начинать.
+Live/cutover/performance parity этим этапом не закрываются.
+
 ## Rust migration: M3 закрыт (GO)
 
 **Rust last verified milestone - M3 GO, 2026-11-13**, code checkpoint

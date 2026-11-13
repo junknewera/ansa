@@ -3,9 +3,11 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod context;
 pub mod process;
 pub mod protocol;
 pub mod provider;
+pub mod session;
 pub mod tools;
 pub mod transport;
 

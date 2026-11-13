@@ -8,6 +8,11 @@ publish.workspace = true
 [features]
 protocol-test-adapter = []
 auth-test-adapter = []
+session-test-adapter = []
+
+[[example]]
+name = "session_adapter"
+required-features = ["session-test-adapter"]
 
 [[example]]
 name = "protocol_adapter"

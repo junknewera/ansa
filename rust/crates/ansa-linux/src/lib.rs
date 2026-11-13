@@ -4,4 +4,5 @@
 
 pub mod auth_store;
 pub mod fs;
+pub mod journal;
 pub mod process;

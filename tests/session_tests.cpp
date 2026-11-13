@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stdexcept>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -203,6 +204,21 @@ void journal_conflict() {
     const auto file = parts(temp.session).front();
     { std::ofstream append(file, std::ios::app); append << "external writer"; }
     rejects([&] { journal.append(record(2)); }, "journal_write_conflict");
+    Temp aliases;
+    {Journal first(aliases.session, [&](const Json&){});first.append(record(1));}
+    const auto original=parts(aliases.session).front();const auto before=bytes(original);
+    std::filesystem::create_hard_link(original,aliases.root/"alias");
+    {Journal linked(aliases.session,[&](const Json&){});check(linked.diagnostic()=="journal_part_type","hardlinked part accepted");rejects([&]{linked.append(record(2));},"journal_read_only");}
+    check(bytes(original)==before,"hardlink guard changed original");
+    Temp locks;std::filesystem::create_directory(locks.session);
+    {std::ofstream file(locks.session/"lock");}
+    std::filesystem::create_hard_link(locks.session/"lock",locks.root/"alias");
+    rejects([&]{Journal linked(locks.session,[&](const Json&){});},"journal_lock_type");
+    Temp fifo;std::filesystem::create_directory(fifo.session);
+    check(::mkfifo((fifo.session/"lock").c_str(),0600)==0,"lock FIFO create");
+    rejects([&]{Journal linked(fifo.session,[&](const Json&){});},"journal_lock_type");
+    const auto nul=std::filesystem::path(fifo.root.string()+std::string("\0ignored",8));
+    rejects([&]{Journal invalid(nul,[&](const Json&){});},"journal_path");
 }
 
 void history_and_dedup() {
