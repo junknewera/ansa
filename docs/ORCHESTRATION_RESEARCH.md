@@ -1,29 +1,31 @@
-# ANSA — self-hosted orchestration без зависимости от ChatGPT Pro
+# ANSA — native self-hosted orchestration через direct SIWC Responses
 
-Дата исследования: **13 ноября 2026, Europe/Moscow**. Статус архитектуры: **PROPOSED / для независимого review**. Это исследование и контракты, не реализация и не разрешение на live inference или Rust cutover.
+Дата исходного исследования и обязательной архитектурной коррекции: **13 ноября 2026, Europe/Moscow**. Product decision принят пользователем; interfaces, lifecycle additions и roadmap ниже — **PROPOSED**, implementation отсутствует. Это исправление существующего docs-only PR #3, не новый аудит и не изменение Rust migration M0–M10.
 
-## Решение
+## Обязательное решение
 
-**Выбрать hybrid: собственный deterministic control plane ansa, собственные read-only SIWC sessions для planning/review и официальный Codex app-server по stdio как основной coding executor.** Платный OpenAI API — явно выбираемый дополнительный inference route. Native ansa coding executor — последующая альтернатива за тем же узким контрактом, если evals подтвердят достаточное качество. Обычный basic/plan loop ansa сохраняет независимость от Codex.
+**DECISION: Native ANSA multi-agent orchestration via direct SIWC Responses. No Codex runtime dependency.**
 
-MVP: один coordinator, один builder, свежий reviewer context и обычный VerificationRunner. Одновременных builders — **один**, вложенных Codex agents — **ноль**. Integrator, scheduler, recovery и acceptance — код, а не отдельные LLM-персоны. Planner также делает bounded research и failure analysis.
+Все роли — Planner, Builder, Reviewer и Researcher — исполняются собственными native ANSA sessions. Каждая использует обычный ANSA agent loop, собственные ToolRegistry/ToolSnapshot и process/file tools, свой session journal и reasoning continuity. Inference проходит только через собственную auth subsystem ANSA и официальный direct SIWC Responses route с ChatGPT plan usage. Coordinator, verification и integration — deterministic code.
 
-Production implementation по умолчанию начинается **после подтверждённого `migration/m10-rust-production` GO**, отдельным feature milestone. Сейчас полезны ADR и contracts; после M6 возможен отдельный non-production lifecycle spike. M0–M10 не изменяются. Удаление C++ не является техническим условием orchestration; эта последовательность выбрана для сохранения уже принятого parity/cutover scope.
+**Codex отвергнут как компонент runtime продукта.** Он допустим исключительно как внешний инструмент разработчика для написания исходников ANSA либо необязательный внешний development baseline. Его installation, runtime interfaces, agent state и credentials не требуются ни одному этапу O1–O4. Альтернативный платный inference backend в этот product scope не входит; смена billing route автоматически запрещена.
 
-Почему это самый короткий надёжный путь: ansa повторно использует собственные owner/journal/auth/recovery contracts, Codex приносит готовую coding execution capability, а новая часть ограничена task lifecycle, evidence gates и Git integration. Ни перенос всего Codex runtime в ansa, ни передача Codex права принимать milestone не нужны.
+MVP: один coordinator, один native builder в `basic`, fresh native reviewer в `plan`, read-only planner/researcher и обычный VerificationRunner. Активная role session одна за раз; builders одновременно — **один**. Дочерним sessions не предоставляются orchestration/delegation tools. После eval возможно максимум два builders; рекурсивное создание агентов не входит в MVP.
 
-### Как читать статусы
+Default production implementation — отдельная feature после verified M10 GO. Реальные зависимости: Rust protocol/admission, auth, session journal/replay, runtime owner, process/file tools, command/event bridge и их offline/live gates. Внешний coding runtime не является prerequisite. M0–M10 остаются неизменными; narrow non-production composition spike после M6 возможен отдельным scope.
 
-| Метка | Значение в этом отчёте |
+### Статусы и deliverables
+
+| Метка | Значение |
 |---|---|
-| CONFIRMED | Проверено чтением actual repository code, GitHub metadata или официального контракта. Историческое сообщение о тестах обозначается отдельно. |
-| TESTED | Выполнено в этой исследовательской сессии; платформа и предел проверки указаны. |
-| PROPOSED | Новое архитектурное решение; ещё не реализовано и не измерено. |
-| UNKNOWN | Доказательств недостаточно; указана будущая проверка. |
+| CONFIRMED | Проверено repository code, GitHub metadata или официальным SIWC contract. |
+| TESTED | Проверено запуском; платформа и предел результата указаны. |
+| PROPOSED | Новое решение/контракт; не существующее API и не выполненный runtime. |
+| UNKNOWN | Требует будущего допуска/измерения; не подменяется предположением. |
 
-Все новые Rust types, CLI команды и файловые схемы ниже — **PROPOSED**. Имена моделей в архитектуру не зашиты. Текущие модели аккаунта, quota и native X13s поведение Codex не проверялись: реальные credentials не открывались, inference не запускался. Вымышленных результатов evals нет.
+Все новые Rust types и CLI shapes ниже — sketches. Здесь нет live model discovery, inference, чтения реальных credentials, native X13s orchestration acceptance или измеренного выигрыша multi-agent. Сохранён исходный repository audit; повторная проверка correction подтвердила прежние main/PR #2 refs.
 
-Пакет: этот отчёт — D1–D5, D7–D8; [четыре prompts](ORCHESTRATION_PROMPTS.md) — D6; [ADR 0002](adr/0002-self-hosted-orchestration.md) — короткий decision record.
+Пакет: этот отчёт — D1–D5, D7–D8; [четыре prompts](ORCHESTRATION_PROMPTS.md) — D6; [ADR 0002](adr/0002-self-hosted-orchestration.md) — обязательное product decision и предложенные implementation contracts.
 
 ## D1. Current State Audit
 
@@ -47,7 +49,7 @@ Rust scaffold содержит два local packages и ноль external crates
 
 M0 report сообщает x86_64 Debug/Release CTest **86/87**, failure `process-detached`, preflight **10 PASS / 1 UNSUPPORTED**, незакрытый sanitizer/native/performance gate. Исторический C++ отчёт сообщает native **87/87** Debug/Release и **85/85** ASan/UBSan. Это разные checkpoints и среды; старые числа не закрывают M0.[A4][A10]
 
-**TESTED в этом исследовании:** неизменённые пять Python regression tests M0 harness, полученные с PR #2 head, прошли **5/5** на Linux/x86_64, Python 3.12.14; Git blob hashes трёх файлов сверены. Это проверяет anti-false-green assertions harness, не Rust runtime и не native M0. Также выполнены только offline `codex --version`/help и генерация app-server JSON Schema установленным `0.167.0-alpha.4`; ни auth, ни inference не запускались.[A12]
+**TESTED в этом исследовании:** неизменённые пять Python regression tests M0 harness, полученные с PR #2 head, прошли **5/5** на Linux/x86_64, Python 3.12.14; Git blob hashes трёх файлов сверены. Это проверяет anti-false-green assertions harness, не Rust runtime и не native M0. Ни auth, ни inference не запускались; native orchestration этим результатом не проверяется.[A12]
 
 ### Что уже можно переиспользовать
 
@@ -57,9 +59,9 @@ M0 report сообщает x86_64 Debug/Release CTest **86/87**, failure `proces
 | Commands/events v1 | Session/Turn/Request/Operation IDs, incarnation, cursor, Submit/Cancel/Resume. | Отдельные orchestration commands/events с feature/version negotiation. |
 | Responses admission | Успешный terminal, EOF/transport admission, native replay, whole-batch validation до tools. | Validation `PlanProposal` и `ReviewReport`; они не меняют task state сами. |
 | Session journal | Append-only framing/hash chain, flock, fsync barriers, exact epochs, corruption fail-closed. | Отдельный versioned orchestration aggregate с тем же storage machinery. |
-| Process supervision | Fresh supervisor/subreaper, consumed marker, durable evidence, stop/reconcile. | Streaming adapter и OS lifecycle для долгого внешнего coding worker. |
-| Own SIWC | Своя registration, refresh/leases, account binding, официальный model catalog. | Capability-aware routing, безопасная передача своего access token app-server. |
-| basic/plan | Многошаговый loop; plan получает read-only tools без shell. | Planner/reviewer могут использовать отдельные native sessions. |
+| Process supervision | Fresh supervisor/subreaper, consumed marker, durable evidence, stop/reconcile. | Связать owned native child lifecycle с существующим process cleanup/recovery; не создавать внешний coding runtime. |
+| Own SIWC | Своя registration, refresh/leases, account binding, официальный model catalog. | Общая auth subsystem, per-session account/epoch binding и доступ к direct SIWC только через provider. |
+| basic/plan | Многошаговый loop; plan получает read-only tools без shell. | Builder использует тот же basic loop; planner/reviewer — отдельные plan sessions. |
 | M0 harness | Hashes, argv, raw logs, actual test inventory, запрет пустого/skip PASS. | Версионированные acceptance manifests и runner receipts на конкретный SHA. |
 
 Основания: actual contracts и implementation, не предполагаемая функциональность.[A5][A6][A7][A8][A9][A12]
@@ -68,132 +70,71 @@ M0 report сообщает x86_64 Debug/Release CTest **86/87**, failure `proces
 
 Особенно важно: C++ `ProcessRunner` может вернуть `Execution::succeeded + Effects::known_result` при nonzero exit, timeout или cancellation, если исход процесса и cleanup известны. Эти признаки находятся внутри output. Код orchestrator не должен превращать такое значение в инженерный success.[A8]
 
-Текущий `run_command` ограничен десятью минутами и 16 KiB сохранённого вывода; он не является двунаправленным потоковым Codex protocol host. Переиспользуются supervision/evidence principles и будущие Rust низкоуровневые primitives, а не вызов `run_command("codex ...")` внутри prompt loop.[A8]
+Текущий `run_command` ограничен десятью минутами и 16 KiB сохранённого вывода. Builder использует этот собственный compiled process tool; запуск дочернего AgentRuntime не является shell command. VerificationRunner может использовать те же process primitives с отдельными timeout/output limits и root-owned evidence.[A8]
 
 Отсутствуют TaskId/AttemptId, task dependencies, budgets across sessions, Git worktree ownership, integration queue, independent reviewer gate, acceptance evidence на code SHA, automated selection следующего milestone и общий reconciliation workflow. Текстовое «следующий спринт — orchestrate» в старом PROJECT_STATE/README не отменяет merged migration gates.[A3][A4][A6]
 
 ## D2. Integration Decision
 
-### Разделить orchestration backend, executor и способ оплаты
+### Единственный product execution path
 
-| Слой | Основной выбор | Альтернатива / условие |
-|---|---|---|
-| Task control | Rust owner ansa, reducer, journal, policy | Другого control plane в MVP нет. |
-| Planner/reviewer inference | Собственный SIWC Responses adapter после Rust parity | Paid OpenAI API при explicit configuration и budget. |
-| Coding execution | `codex app-server --listen stdio://`, pinned binary/schema | NativeAnsaExecutor после eval; `codex exec --json` как более простой ограниченный adapter. |
-| Authentication | Собственный SIWC grant ansa, поддерживаемый app-server provider config | Отдельный официальный Codex sign-in или API credential, выбранные пользователем; не чтение чужих token files. |
-| Storage | Локальные journals/artifacts и Git | Ни Redis, ни PostgreSQL, ни distributed queue. |
+| Слой | Решение |
+|---|---|
+| Task control | Собственный Rust orchestration owner/reducer, bounded queues и durable task journal. |
+| Planner / Researcher | Native `plan` session, read-only ToolSnapshot и отдельный journal. |
+| Builder | Native `basic` session с own process/file tools и отдельным worktree. |
+| Reviewer | Новая native `plan` session, scoped immutable evidence, без builder conversation. |
+| Model inference | Только direct SIWC Responses через собственную auth subsystem ANSA. |
+| Verification / integration | Обычные host jobs; LLM не создаёт PASS или merge authority. |
+| Storage | Существующие native session journals + отдельный task aggregate + Git/evidence. |
 
-Codex владеет внутренним coding loop **одной попытки**. ANSA владеет выбором задачи, worktree, лимитами, отменой, retry, проверкой, review, integration и следующим milestone. Такой subloop не делает Codex обязательной частью native loop ansa.
+Это композиция существующего engine. Orchestrator не реализует второй model/tool loop и не выбирает между внешними execution backends. Узкая native child factory нужна только для создания/открытия обычного runtime, владения lifecycle и receipt correlation; пустая framework abstraction под отвергнутые backend не нужна.
 
-### Что SIWC действительно разрешает
+### SIWC contract и reasoning continuity
 
-**CONFIRMED:** официальная документация описывает ChatGPT plan usage для open-source и locally hosted apps, собственный OAuth grant и inference через public `https://api.openai.com/v1/responses`. Это не доступ к старым ChatGPT conversations. Permission `chatgpt.tokens.use.direct`, eligibility и workspace policy проверяются отдельно.[O1][O4]
+**CONFIRMED:** собственный разрешённый OAuth grant допускает ChatGPT plan usage через официальный `https://api.openai.com/v1/responses`. Требуются eligibility, workspace policy и permission `chatgpt.tokens.use.direct`; чужие credential stores не используются.[O1][O4]
 
-Для HTTP SIWC нужны `store:false`, `stream:true` и явный input history. `previous_response_id`, background/conversation и ряд обычных API options не поддержаны. В частности, нельзя рассчитывать на `max_output_tokens`, `max_tool_calls`, `multi_agent`, hosted MCP, file search, Code Interpreter или Responses `tool_search`. Локальные function/custom tools и Codex local tools — другая граница; они допускаются предусмотренным профилем. Web search зависит от модели/account policy.[O2][O3]
+Сохраняются `store:false`, `stream:true` и explicit input history. Для HTTP не применяется `previous_response_id`; серверное conversation storage не заменяет local journal. Серверный `multi_agent` не требуется и не поддержан этим SIWC profile. Unsupported поля, включая `background`, `conversation`, `max_output_tokens`, `max_tool_calls`, не добавляются. В MVP модель получает только разрешённые local tools; hosted effectful tools отсутствуют.[O2][O3]
 
-**Вывод PROPOSED:** вся минимальная meta-orchestration может использовать SIWC для inference: план, coding и review не требуют запрещённых hosted primitives. Task persistence, scheduling, tools и budgets выполняет ansa. Однако нынешний C++ adapter не реализует orchestration и не expose-ит, например, reasoning effort или generic API backend; их наличие в официальном API не означает наличие в ansa.[A9]
+Каждая session сохраняет provider-native items **полностью и в порядке**, encrypted reasoning, call/result IDs, requested/returned model и exact ContextEpoch. Существующий strict Responses admission требует допустимый terminal, корректные EOF/transport и полную batch validation до tools. Незавершённый, отвергнутый или malformed response запускает ноль tools из этого response. Root не синтезирует fake tool outputs для удобного resume и не переносит opaque reasoning между ролями.[A5][A9]
 
-**UNKNOWN:** entitlement конкретного пользователя сегодня, точные модели/efforts и совместимость выбранной Codex configuration с этим route. Проверка без обращения к credentials невозможна; она намеренно не проводилась. Это deployment gate, а не основание тайно использовать другой endpoint или платёжный путь.
+Различие recovery: потерянный direct model response сам по себе не означает неизвестный локальный tool effect — admission мог не разрешить ни одного executor. Повтор generation допустим только из подтверждённого durable state, после завершения прежнего transport, без pending unknown tool intent и в бюджете. Такой retry может повторно расходовать quota; exactly-once inference billing не обещается. Если tool уже был admitted и dispatched, применяется native intent/outcome recovery, а не повтор model call вместо reconciliation.
 
-### Реальная model discovery, без статического списка
+Structured output — только после route-specific capability validation. Даже schema-valid plan/review остаётся недоверенным proposal. При неподтверждённой feature достаточно bounded JSON/text и строгого local validator; максимум одна corrective generation в общем budget. Второй agent SDK/managed harness не добавляется.[O8]
 
-При первом разрешённом live deployment ansa должна:
+### Model discovery и расходы
 
-1. Проверить собственный grant/account/workspace binding, без чтения credentials другого приложения.
-2. Взять catalog через официальный `GET /v1/models` **тем же route и account**, которые будут использоваться для inference. Для SIWC это `models[]`, `slug`, `display_name`, `visibility`; API-key catalog имеет собственный API contract.
-3. Записать безопасные capability metadata, route, timestamp и requested model; не token. `model/list` Codex может быть bundled/cache catalog и не подтверждает account access.
-4. Разрешённый smoke request считать успешным только после `response.completed` / `turn.status=completed`. Сохранить requested/returned model и actual supported settings. Нельзя подменять модель в старой context epoch.
-5. Не определять поддержку features методом бесконечных проб. Unsupported capability — bounded configuration failure; выбрать заранее разрешённый профиль или остановиться. Обновлять catalog при account/auth epoch change и policy TTL, а также после соответствующего отказа.
+При разрешённом live deployment auth subsystem запрашивает account-specific `GET /v1/models` тем же grant/route: SIWC `models[]`, `slug`, `display_name`, `visibility`. Runtime выбирает capability profile и при разрешённом smoke request требует admitted successful terminal. Catalog/успешный inference подтверждают разные вещи; model/effort не угадываются по статическому списку.[A9][O2]
 
-Model listing и successful inference проверяют разные вещи. Собственная model-list проверка уже есть в ansa; её нужно сохранить, а не заменить static model enum.[A9][O2][O5]
+**UNKNOWN:** actual model entitlement пользователя, supported effort/settings и quota. Реальные credentials здесь не читались. Это O4 deployment gate.
 
-### Billing и usage
+ChatGPT subscription и SIWC plan usage не являются обычным API-key billing. В данной архитектуре API-key fallback отсутствует. При `subscription_sharing_usage_limit_exceeded` новые calls приостанавливаются; error code не определяет reset time и не доказывает исчерпание всей подписки. Transient unavailable допускает bounded backoff; unsupported body, account mismatch и invalid grant требуют остановки/диагностики без циклического login.[O4]
 
-Различать **ChatGPT subscription**, **SIWC plan usage**, **Codex sign-in usage** и **API-key billing/quota**. Совпадающий URL Responses не объединяет их бюджеты. Ошибка SIWC не разрешает автоматический переход на API billing. Для `subscription_sharing_usage_limit_exceeded` нужно остановить новые запросы; код сам по себе не доказывает исчерпание всей подписки или конкретное время reset. `503` допускает bounded backoff; invalid grant/unsupported body не требуют циклического login.[O4]
-
-Современные docs также описывают отдельно активируемые API-credit benefits для некоторых подписок. Это отдельная привязка API organization, eligibility и ограничения; нельзя считать такие credits автоматически доступными или строить на Pro обязательный runtime. На дату исследования benefit прямо не покрывает Codex usage через API keys и не повышает signed-in Codex limits. Архитектура рассчитана на самостоятельную оплату API, если этот route выбран.[O6]
-
-Платный API оправдан, когда нужны предсказуемая отдельная capacity, поддержанные конкретной моделью output limits, background/retrieval, API observability или модель/feature вне доступного SIWC профиля. API background mode допускает polling/cancel и continuation stream; он не делает локальные filesystem effects транзакционными. В MVP background mode не нужен.[O7]
-
-### Современные primitives — почему не добавлять framework
-
-Responses function calls/streaming дают model-tool boundary; structured outputs помогают синтаксической форме, но не доказывают правильность плана. Где route-specific schema support не подтверждён, использовать bounded text/JSON и строгий local validation с одной разрешённой corrective attempt.[O8]
-
-Agents SDK предоставляет agent loop, handoffs, agents-as-tools, local run state и guardrails в Python/TypeScript. Для Rust ansa это дополнительные language/runtime и дублирование уже существующего loop. Manager-style calls полезны как концепция, но библиотека не решает Git ownership и durable external effects за ansa.[O9]
-
-Текущий Responses Multi-agent — beta; docs описывают model-directed дерево без фиксированного ограничения depth/total created agents. В SIWC `multi_agent` не поддержан. Для минимального deterministic control plane эта возможность не нужна; позже допустима только внутри ограниченного read-only analysis job с измеряемой ценностью.[O3][O10]
-
-### Codex execution interfaces
-
-| Interface | CONFIRMED возможности и зрелость | Решение для ansa |
-|---|---|---|
-| `codex exec` | Документированный noninteractive execution; JSONL, cwd/model/config, output schema, resume конкретной session. `--full-auto` удалён. Stable command. | Хороший offline protocol spike и simple optional backend. Нужно отдельно нормализовать interruption и process cleanup. |
-| app-server stdio | Bidirectional JSONL RPC, thread/turn IDs, streamed items, approvals, history, resume и interrupt. Официально описан SIWC provider setup. CLI reference всё ещё маркирует app-server experimental/may change. | Основной adapter при pinned binary/schema и conformance suite. Использовать только stable API subset; experimental fields выключены. |
-| app-server WebSocket | Docs явно называют transport experimental/unsupported. | Не нужен: локальный stdio, без сетевого listener/reconnect service в MVP. |
-| TypeScript Codex SDK | Local thread API поверх subprocess `codex exec`, Node runtime. | Не добавлять Node только ради adapter. |
-| Python Codex SDK | Текущие docs описывают stable `openai-codex`, app-server JSON-RPC и pinned CLI dependency. | Полезен для отдельного tooling, но production Rust может говорить с тем же протоколом напрямую. |
-| Codex cloud tasks | Документированный cloud/CLI workflow, environment и account requirements; отдельный удалённый execution lifecycle. | Не требуется для self-hosted MVP; не предполагать универсальный SIWC REST tasks API. |
-| Agents API + self-hosted sandbox | Managed harness остаётся у OpenAI, даже если sandbox собственный. | Не основной путь при требовании собственного управляющего runtime. |
-
-Основания: официальные CLI/SDK/app-server docs и pinned source.[O5][O11][O12][O13][O14][O15][O16][C1][C2][C3][C4]
-
-На момент проверки latest stable release — **Codex `0.168.0`**, source commit `9480ec100c3edee9fc69172e8e80a4730444094d`, опубликован 13 ноября 2026. Есть Linux aarch64 musl assets. Локально стоял другой binary — `0.167.0-alpha.4`; его offline schema test не подтверждает поведение stable release или NixOS/X13s. Для production pinned Nix derivation/closure, exact binary hash и native acceptance обязательны. Совместимость NixOS не следует только из наличия Linux binary.[C1]
+Собственный loop позволяет считать реальные provider dispatches, retries, compaction calls и tool rounds. Текущий `CompletedResponse` не предоставляет полноценную usage accounting structure; optional admitted usage observation — отдельное небольшое расширение telemetry, не выдуманное существующее поле. Отсутствующая token/quota метрика остаётся `unknown`. SIWC расход не пересчитывается по API dollar tariffs.[A9][N3]
 
 ## D3. Minimal Target Architecture
 
-### Владение и роли
+### Ownership и reuse одного loop
 
-```mermaid
-flowchart TD
-  U["Goal and policy"] --> O["ANSA owner and reducer"]
-  O <--> J["Canonical orchestration journal"]
-  O --> P["Planner session"]
-  P --> O
-  O --> E["Coding executor"]
-  E --> V["Verification runner"]
-  V --> R["Fresh reviewer session"]
-  R --> O
-  O --> I["Integration and publication"]
-  I --> V
-```
+Один orchestration owner меняет task/attempt/budget/acceptance state. Каждый native AgentRuntime имеет **своего единственного session owner**, который меняет только собственную SessionState. Parent общается commands/events и импортирует durable receipts; он не пишет child journal и не вызывает child reducer напрямую. Auth subsystem общая, mutable conversation state не общий.
 
-Стрелки обозначают jobs/results. Ни builder, ни reviewer не пишет task state напрямую. Owner выполняет validation и durable transition перед дальнейшим dispatch.
+В проверенном C++ API класс называется `Runtime`: constructor уже получает `SessionId`, `ContextEpoch`, immutable `ToolSnapshot`, `Generate`, `RuntimeLimits` и `SessionOptions`. Он поддерживает Submit/Cancel/Resume, event stream и shutdown. Термин `AgentRuntime` ниже означает этот engine после Rust parity, а не объявляет новый существующий класс.[N1][N2]
 
-| Роль | MVP | Ограничение |
-|---|---|---|
-| Planner/Architect | Native read-only session; plan + research + failure analysis | Не запускает shell, не принимает задачи, не выдаёт себе permissions. |
-| Implementer | Один Codex attempt, один выделенный worktree | Только утверждённый scope; внутренние subagents выключены. |
-| Reviewer | Новая native read-only session | Original requirements + actual diff/source + runner evidence; не наследует builder conversation. |
-| Verification | Deterministic runner | Реальные exit/status, test inventory, artifacts, exact SHA. |
-| Integrator | Deterministic code | Serialized queue, Git operations, повтор gates на интегрированном SHA. |
-| Recovery analyst | Вызов planner только после deterministic reconciliation | LLM объясняет найденные факты, не определяет, жив ли процесс или был ли side effect. |
-
-Один owner на repository orchestration namespace. Repository lock исключает конкурирующие root runs, даже если их RunId различны. Внутри процесса один reducer владеет tasks/attempts; блокирующие journal/fs/Git operations выполняют уже предусмотренные migration bounded workers. Live completion применим только к совпадающим `run/task/attempt/owner_epoch` и expected revision. После restart reconciliation сверяет старый receipt с **сохранённым owner_epoch его AttemptRecord**, а текущий owner импортирует его отдельным transition со своей новой epoch. Валидный known outcome не отбрасывается только из-за смены owner; старый completion не получает права продолжить dispatch напрямую. Lease expiry само по себе не выдаёт второму worker право писать.
-
-MVP хранит bounded список последовательных tasks и explicit dependencies. Runtime проверяет отсутствие cycle, неизвестных parents, дублированных IDs и превышения лимитов. Не нужен общий workflow engine. Parent-child relationship — связь work units, а не разрешение дочерней модели создавать descendants. Для одной цели верхний уровень может быть одним Task с build/verify/review phases.
+Builder выбирает ordinary `basic` mode; Planner/Researcher/Reviewer — `plan` и read-only tools. Parent не делает самостоятельно generate→prepare tools→continue. Этот код остаётся в native runtime и тестируется теми же basic/plan suites. Новая часть — session preparation, ownership, parent-child correlation, root budgets, handoff и acceptance. Роль не требует нового agent engine или отдельного crate.
 
 ### Минимальные typed contracts
 
-Ниже semantic sketch, не compile-ready implementation. `Validated*` и durable receipts имеют private constructors; identifiers задаёт runtime. Строки LLM не превращаются напрямую в пути или команды.
+Semantic sketches; private constructors для validated/durable values. Native ID semantics и legacy codecs сохраняются.
 
 ```rust
-struct RunId([u8; 16]);
-struct TaskId([u8; 16]);
-struct AttemptId([u8; 16]);
-struct OwnerEpoch(u64);
-struct ArtifactDigest([u8; 32]);
-struct GitOid { algorithm: GitHashAlgorithm, hex: String }
-
 struct TaskSpec {
     run: RunId,
     id: TaskId,
     parent: Option<TaskId>,
-    depends_on: Vec<TaskId>,       // bounded; validated before acceptance
-    source: SourceBinding,         // repo identity + immutable base SHA
+    depends_on: Vec<TaskId>,        // bounded; cycles rejected
+    source: SourceBinding,          // repository + immutable base SHA
     requirements: ArtifactDigest,
-    acceptance: ArtifactDigest,    // immutable manifest for this revision
-    write_scope: WriteScope,
+    acceptance: ArtifactDigest,
     policy: PolicyRevision,
     budget: BudgetReservation,
 }
@@ -201,53 +142,63 @@ struct TaskSpec {
 struct AttemptSpec {
     id: AttemptId,
     task: TaskId,
-    owner: OwnerEpoch,
+    owner_epoch: OwnerEpoch,
     expected_task_revision: u64,
+    role: NativeRole,
     base: GitOid,
     worktree: OwnedWorktreeId,
-    executor: ExecutorProfile,
-    prompt: ArtifactDigest,
+    child: ChildSessionBinding,
+    handoff: ArtifactDigest,
+    tool_snapshot: ToolSnapshotRevision,
     deadline: Deadline,
+}
+
+struct ChildSessionBinding {
+    session: SessionId,
+    store: OwnedSessionStoreId,
+    submit: CommandId,
+    turn: TurnId,
+    request: Option<RequestId>,     // assigned by native runtime at acceptance
+    payload: ArtifactDigest,
+    configuration: ArtifactDigest,
+    initial_context_epoch: ContextEpoch,
+    incarnation: Option<RuntimeIncarnation>, // current live handle; changes on reopen
 }
 
 enum TaskState {
     Queued, Planning, Ready,
     Executing(AttemptId), Reconciling(AttemptId),
     Verifying(GitOid), Reviewing(GitOid), Integrating(GitOid),
-    Publishing(GitOid),
-    Paused(PauseReason), Blocked(BlockReason),
+    Publishing(GitOid), Paused(PauseReason), Blocked(BlockReason),
     Accepted(AcceptanceReceipt), Cancelled(CancellationReceipt),
 }
 
-enum ProtocolTerminal { Completed, Interrupted, Failed, Missing }
-enum EffectKnowledge { NotStarted, Reconciled, Unknown }
+enum ChildTerminal { Completed, Cancelled, Paused, Failed, Missing }
 enum CleanupState { ConfirmedStopped, Uncertain }
 
-struct ExecutionEvidence {
-    attempt: AttemptId,
-    protocol: ProtocolTerminal,
-    process: ProcessTermination,
-    effects: EffectKnowledge,
+struct ChildReceipt {
+    binding: ChildSessionBinding,
+    current_context_epoch: ContextEpoch, // reconstructed by native replay/compaction
+    terminal: ChildTerminal,
+    durable: SessionReceiptRef,    // verified journal receipt, not frontend cursor
+    effects: Effects,             // reuse native not_started/known_result/unknown
+    pending_operations: Vec<OperationId>,
     cleanup: CleanupState,
-    thread_turn: Option<ExternalTurnId>,
-    raw_events: ArtifactDigest,
-    file_inventory: Option<ArtifactDigest>,
-    candidate: Option<GitOid>,
+    artifacts: Vec<ArtifactDigest>,
 }
 
-trait CodingExecutor {
-    // Return job ownership immediately; never run a model on the owner thread.
-    fn start(&mut self, permit: DurableLaunchPermit,
-             spec: ValidatedAttempt) -> Result<OwnedJob, StartFailure>;
-    fn cancel(&mut self, job: &OwnedJob, reason: CancelReason);
-    fn reconcile(&mut self, saved: &AttemptRecord) -> OwnedReconcileJob;
+impl NativeChildSessions {
+    fn create_new(&mut self, spec: ValidatedChildSpec,
+                  tools: Arc<ToolSnapshot>) -> Result<OwnedChild, ChildError>;
+    fn open_existing(&mut self, binding: &ChildSessionBinding,
+                     permit: ReconcilePermit) -> Result<OwnedChild, ChildError>;
 }
 
 struct VerificationReceipt {
     candidate: GitOid,
     manifest: ArtifactDigest,
     toolchain: ArtifactDigest,
-    outcomes: Vec<CommandOutcome>, // exact IDs/counts; bounded
+    outcomes: Vec<CommandOutcome>,
     logs: ArtifactDigest,
     source_unchanged: bool,
 }
@@ -263,132 +214,105 @@ struct ReviewReport {
 }
 ```
 
-`OwnedJob` содержит join/result ownership, bounded event receiver и nonblocking cancellation latch. Drop не объявляет worker остановленным. Для recovery используется сохранённый AttemptRecord, не прежний PID без birth/boot identity. Второй backend нужен только когда появится реальная NativeAnsaExecutor implementation; не создавать множество пустых traits/crates заранее. Разумное размещение после миграции — `ansa::orchestrate/{state,owner,executor,git,verify}`, узкие process wrappers в `ansa-linux`.
+`OwnedChild` owns обычный runtime handle, bounded event drain, join/result lifecycle и cancellation linkage. Он предоставляет существующие typed command operations, не второй execution engine. Не блокировать orchestration owner на `next_event()` или join: их обслуживает bounded native job/event bridge. Drop не является receipt о quiescence. Размер task graph, children, queues и artifacts ограничен policy.
 
-### State transitions и принятие результата
+Initial configuration/epoch в binding неизменны. Текущую epoch после native compaction восстанавливает session reducer; receipt отдельно содержит её и durable checkpoint. Reopen проверяет исходный init и всю допустимую цепочку переходов, а не ошибочно требует равенства текущей compacted epoch исходной. Замороженные instructions/settings/tool revision сохраняются как approved inputs; подмена их свежим содержимым изменённого worktree не является compatible resume.
 
-| Переход | Обязательное доказательство / действие |
+**Identity precision:** native `RequestId` сейчас принадлежит accepted Submit и может иметь значение `request_1` в разных sessions; это не глобальный ID и не ID каждого HTTP round. Parent key включает SessionId + CommandId + TurnId + RequestId. Provider exchanges учитываются отдельным local ordinal/try + input/epoch digest без переопределения v1 RequestId. Native OperationId и provider call_id сохраняют разные роли.[A9][N1][N2]
+
+### A. Native child lifecycle
+
+1. **Prepare task.** Parent валидирует plan, dependencies, scope, policy и budget. Записывает TaskSpec/AttemptSpec и заранее выделенные SessionId/TurnId/Submit CommandId. Для builder выделяет owned worktree от exact base; для read-only роли — immutable source/evidence view.
+2. **Prepare native configuration.** Через те же ANSA settings/instruction builders формирует per-child cwd, role instructions, model/account binding, exact ContextEpoch и ToolSnapshot. Не передаёт модельный TaskSpec напрямую как filesystem path/command. Submit text содержит bounded handoff и artifact references; текущий Submit ограничен 16 KiB.[A9][N4]
+3. **CreateNew.** Создаёт own child store вне writable worktree, durable session init/configuration и binding receipt. Только root-owned path, новый ID, один holder session lock. Constructor/creation не получает разрешения самостоятельно отправить goal до parent intent.
+4. **Durable submit intent.** После child init parent sync-ит `ChildSubmitIntent` с полным binding и exact payload digest. Затем отправляет обычный RuntimeCommand Submit с текущей child incarnation. `post(...)=accepted` означает только queue admission; оно ещё не доказательство durable acceptance.
+5. **Native acceptance.** Child assigns RequestId, sync-ит native `accepted`, затем публикует CommandAccepted. Parent durably импортирует этот receipt. Child может начать loop до root import: root pre-recorded intent уже содержит точную session/command identity, поэтому lost ACK не оставляет неидентифицируемого execution. Продолжение child проверяет выданный revocable dispatch permit и root budget.
+6. **Observe and wait.** Event bridge независимо дренирует events; previews служат UI. Done/Paused/RecoveryRequired — observations, которые parent проверяет через durable receipt и tool evidence. `ResyncRequired` вызывает snapshot/receipt reconciliation; frontend sequence не journal offset.
+7. **Close and reconcile.** Completed/Cancelled закрывают дальнейший Submit/Resume для attempt; parent ожидает join/cleanup и сохраняет полный inventory. Paused/Missing приостанавливают dispatch и требуют reconciliation: только после gates parent может выдать новый bounded Resume permit той же attempt. Для проверки partial candidate child сначала закрывается и writers останавливаются; после freeze в этот candidate больше не пишут. Только quiescent known state может стать frozen candidate. Worker text «Done» не меняет acceptance.
+
+Предлагаемый durable receipt query использует existing session reducer/receipt data; это небольшой post-migration typed read/export contract, а не парсинг UI/Markdown. Existing CommandReplayed и snapshot помогают correlation, но root должен иметь verified durable identity/configuration/outcomes, включая случаи потерянного event stream.[N1][N2]
+
+### B. Разные контексты, инструменты и общая auth subsystem
+
+У builder и reviewer разные SessionId, journal directory, history, instructions, exact epoch, role ToolSnapshot и owned job. Reviewer никогда не продолжает builder session, не получает её encrypted reasoning и не наследует свободную tool authority. Первый review pass получает requirements/diff/source/evidence без builder summary; summary можно передать вторым материалом.
+
+Per-child ToolRegistry/ToolSnapshot создаётся собственными ANSA factories. Копировать parent closures нельзя: нынешние local tools захватывают settings/cwd, session operations directory, instruction epoch и ProcessRunner. Нужны correct child-specific instances и read-only projection. Все пути задаются явно; изменение process-global cwd ради child запрещено. Exact config включает cwd/instructions/model/tool revision, поэтому изменённый worktree/role не может молча открыть старый context.[N4]
+
+CONFIRMED: текущие tools включают file reads/search и `run_command`; отдельного compiled write-file tool в проверенном baseline нет. Builder уже может менять файлы через собственный process tool обычного basic loop. Дополнительный typed write tool не является условием MVP; если вводится, он обязан иметь native durable intent/recovery contract. Current full-access path resolver допускает absolute paths вне cwd: worktree не становится enforceable write scope автоматически.[N4]
+
+Native reviewer не получает shell/process/write tools. Host экспортирует scoped evidence либо предоставляет узкий `ReadEvidence(ArtifactId)` с host-validated IDs, byte bounds и immutable source snapshot. Read-only flag сам по себе не даёт permission читать protected journals/credentials; этот export позволяет не расширять reviewer до full access.
+
+Auth subsystem разделяет только grant/account lifecycle, catalog и transport access. У каждой session собственный authorization binding; токены не входят в TaskSpec, prompt, journal, ToolSnapshot descriptor или output. Только native provider берёт short-lived access lease. Модель и process/file tools не получают OAuth token API; shell environment фильтруется от secrets.
+
+Текущий auth contract сериализует store/refresh и удерживает leases на время HTTP/tool execution. Это необходимо сохранить при Rust parity. **MVP выполняет roles последовательно**, не обещает concurrent inference с сегодняшней lock discipline. Не брать outer auth lease на всю child session, не ждать root/child permit под auth lock и не запускать дочерний runtime как tool при удерживаемом tool lease. Provider dispatch получает budget permit **до** auth lease; зависимость locks должна быть ацикличной.[N5]
+
+Refresh existing grant остаётся централизованным. Invalid grant/account switch закрывает affected dispatch; login/logout/new grant требует соответствующей policy. Смена account/model/provider/role/epoch не подменяет старую history: explicit new session/handoff либо существующий строго разрешённый native resume. Совпадение auth account не объединяет contexts.
+
+### C. Durable recovery и отсутствие повторных effects
+
+**Два domain authority:** root task journal хранит delegation intent/binding/budget; child session journal хранит accepted Submit, native responses, per-tool intent/outcome, continuation и terminal. Между ними нет притворной atomic transaction. Root импортирует `ChildReceipt`/evidence по exact binding и digest после проверки; повтор import идемпотентен по receipt identity.
+
+Recovery сначала берёт repository/root lock, закрывает new dispatch и проверяет outstanding children. Порядок:
+
+1. Проверить оригинальный child store, session init/configuration и сохранённые Task/Attempt/Command/Turn IDs. Использовать **OpenExisting**, который никогда не создаёт missing/empty store. Existing C++ constructor может создать init для empty journal; такой fallback запрещён recovery wrapper. Отсутствие или конфликт старого store — Blocked, не новая session.
+2. Подтвердить, что прежний runtime/локальные writers остановлены; session lock не доказывает остановку всех process descendants. Не полагаться на прежний PID без boot/start identity.
+3. Открыть native journal тем же reducer и ToolSnapshot revision. Reopen восстанавливает durable receipts/outcomes и делает unfinished turn paused. Root не посылает Resume при открытии автоматически.
+4. Найти accepted Submit по сохранённому CommandId и exact payload/turn/mode. Lost CommandAccepted восстанавливается из того же store. Нельзя выдавать новый CommandId/SessionId как workaround. Существующая dedup exact Submit действует только в этом session store; повторить тот же Submit можно лишь после reconciliation, установив отсутствие acceptance либо получив replay receipt, без конфликтующего active turn.[N1][N2]
+5. Native tool recovery проверяет исходный OperationId, invocation/spec hash и evidence. Known outcome сохраняется child runtime до продолжения; root импортирует его отдельно. Полный known result не превращается в новый tool execution. `effect_unknown`, missing/conflicting evidence или неподтверждённый cleanup блокируют Resume и новую write attempt.
+6. Если native state paused, effects известны, resources stopped и budgets/policy/config совпадают, parent durably записывает разрешение на **bounded Resume** того же RequestId с новой command ID и текущей incarnation. Completed/Cancelled turn не resubmit-ится как restart. Repair — новый AttemptId и fresh native session только после reconciliation старого.
+
+У native loop уже есть per-tool durable intent→execution→outcome и whole-batch validation. После crash между intent и outcome доказательство ищется через recover; отсутствие доказательства не означает «tool не запускался». Session reducer запрещает continuation при unknown operation. Эти contracts сохраняются, а не дублируются root engine.[A7][A8][N1][N2]
+
+Late known outcome относится к исходным session/attempt/operation и сохраняется, даже если parent cancellation уже принята. Новый owner сверяет старую receipt с **сохранённой epoch исходного AttemptRecord**, затем делает import под своей epoch. Старый callback не может запустить следующее действие; valid outcome не отбрасывается просто из-за смены owner.
+
+Raw HTTP timeout без admitted response допускает ограниченный regeneration только если journal подтверждает отсутствие pending tool effect; уже исполненные tools предыдущих rounds replay-ятся как recorded outputs. Partial SSE previews никогда не записываются как completed response. Corruption/storage failure закрывает новые effects, а не исправляется overwrite. Exactly-once произвольного shell или remote publication не обещается.
+
+### Cancellation, child crash и machine restart
+
+Parent Cancel немедленно закрывает root dispatch latch, затем persist-ит cancellation intent. Связанный child guard прекращает новые generate/tool dispatch, включая окно до durable RequestId. Когда RequestId известен, используется обычный native Cancel с текущими SessionId/TurnId/incarnation. До этого owned-child startup/shutdown path завершает queued submit безопасно и reconciles acceptance; отсутствие RequestId не даёт права оставить child без отмены.
+
+Cancel → stop token → native ProcessRunner cleanup → join → verified receipt. Native Done/Cancelled/frontend snapshot сами по себе не доказывают, что writer quiescent. Известные поздние результаты записываются, но больше не вызывают continuation. При disk failure latch действует немедленно, durable ACK не выдумывается.
+
+Native child живёт как owned runtime job внутри ANSA process, не как внешний agent executable. При parent process crash in-process roles прекращаются; их shell tools обслуживает существующий supervisor/evidence механизм. Current control-pipe EOF baseline — stop-and-reconcile. Supervisor death и detached descendants могут оставить cleanup unknown: тогда worktree/repository write access остаётся quarantined для всех root runs, включая новый RunId.[A8]
+
+После machine reboot используются original journals, durable binding и boot identities. Reopen не равен Resume. Terminal disconnect либо отсоединяет UI от обычного owner service, либо приводит к foreground shutdown с тем же recovery path; непрерывная работа после parent crash не обещается. Дополнительный systemd/cgroup containment возможен после migration, но не является искусственным prerequisite native composition и не добавляется в M6 parity. Его гарантии требуют native tests; cgroup не доказывает rollback remote effects.[L1][L2]
+
+### State transitions, budgets и backpressure
+
+| Переход | Обязательное условие |
 |---|---|
-| Queued → Planning | Durable goal/source/policy/budget; repository lock. |
-| Planning → Ready | Validated plan; requirements и acceptance manifest заморожены; scope разрешён. |
-| Ready → Executing | Worktree lease + durable attempt intent + launch permit + auth admission. |
-| Executing → Reconciling | Worker terminal, crash, timeout или потеря канала; terminal text не принимается как кодовый результат. |
-| Reconciling → Verifying | Worker quiescent, эффект классифицирован, полный inventory проверен, immutable candidate создан. |
-| Verifying → Reviewing | Все required mechanical gates прошли; no empty/skipped required suite; SHA совпадает. |
-| Reviewing → Integrating | Нет blocking findings/gaps; behavioral requirements покрыты; trusted reducer принял report. |
-| Integrating → Publishing | На итоговом branch SHA повторены required tests/review gates; integration conflicts закрыты. |
-| Publishing → Accepted | PR/patch receipt и final-SHA evidence durable. Accepted означает accepted deliverable, не merged main. |
-| Любой active → Paused/Blocked | Quota, permissions, unknown effect, missing platform, corruption или exhausted repair budget. |
-| Active → Reconciling с cancel_requested | Новые dispatch запрещены; cleanup ещё не подтверждён. |
-| Reconciling → Cancelled | Локальные writers подтверждённо остановлены; receipt перечисляет known effects и оставшиеся external unknowns. |
+| Planning → Ready | Validated plan/dependencies, frozen requirements/manifest, approved scope/budget. |
+| Ready → Executing | Durable child init/binding + ChildSubmitIntent + owned native session admission. |
+| Executing → Reconciling | Native terminal, cancellation, crash, timeout, transport/storage failure. |
+| Reconciling → Verifying | Known/reconciled effects, confirmed local quiescence, full inventory и immutable candidate. |
+| Verifying → Reviewing | Required tests реально прошли на exact candidate SHA; no required skip/empty PASS. |
+| Reviewing → Integrating | Нет blocking findings/gaps; validator принимает ReviewReport, не строку «approved». |
+| Integrating → Publishing | Required tests/review evidence относятся к final integration SHA. |
+| Publishing → Accepted | Durable PR/patch receipt и final-SHA acceptance. Accepted не означает main merge. |
+| Active → Paused/Blocked | Quota/auth, missing evidence, effect_unknown, cleanup uncertainty, corruption или budget exhaustion. |
+| Reconciling → Cancelled | Local writers остановлены; receipt сохраняет known effects и явные external unknowns. |
 
-Repair не отдельный бесконечный state: rejection сохраняет finding IDs и возвращает задачу в Ready с новым AttemptId/manifest revision только в пределах budget. Failed protocol может оставить полезный patch; сначала reconciliation, затем отдельно записанное решение о проверке partial candidate. Его нельзя молча представить как успешный worker run.
+MVP defaults: initial build + максимум две repairs, максимум одна replan и один заранее разрешённый model escalation, bounded transient retries, один builder. Для повторного failure signature без прогресса — stop. Все Resume, provider calls, compaction и retries учитываются root ledger across sessions/restarts; нативные segment limits сами по себе недостаточны, поскольку Resume может начать новый segment.[N1][N2]
 
-MVP defaults **PROPOSED**, не оптимум: одна initial build attempt + максимум две repair attempts; максимум одна replan; один automatic model escalation из разрешённого списка; bounded transient provider retry schedule; один write-capable worker. После двух одинаковых неустранённых findings/неизменного failure signature без доказанного прогресса — stop. Эти пределы действуют на run, не сбрасываются новой session или restart. Владелец может явно выдать новый budget; модель не может.
+Parent выдаёт child ограниченный execution permit; native dispatch hook проверяет отмену/identity и получает durable provider-call reservation до HTTP. Этот guard оборачивает существующий generate/dispatch boundary, не реализует новый loop. Reserve, потерянный из-за crash до достоверного usage, не возвращается автоматически. Tool intent/outcome authority остаётся child journal; root не создаёт вторую запись истинности каждого tool.
 
-Внутренние лимиты native agent rounds сохраняются. Они не заменяют общий root budget, поскольку несколько новых turns иначе обошли бы turn cap. Codex outer turns можно считать точно; число его внутренних HTTP retries/tool rounds считать точным только при наличии соответствующей telemetry.
+Owner не блокируется на network, auth I/O, journal fsync, filesystem, event drain или join. Bounded jobs/queues сохраняют reserved Cancel. Text previews coalesce-ятся; durable receipts не теряются в UI queue. Event stream resync восстанавливается из native snapshots/receipts, а не повторным execution. Native SSE parser и process stdout/stderr caps сохраняются; отдельные bounded artifacts для verification logs не требуют отключать общий tool cap. Oversized/malformed обязательный evidence — явный failure, не silent truncation с PASS.
 
-### Persistence: отдельный task aggregate, один источник истины
+### Canonical persistence и migration contract
 
-**Решение:** отдельный canonical orchestration journal, с reuse Rust append/fsync/framing primitives. Не добавлять task records в legacy `OMHJ1` session v1. Его reducer принимает закрытый список event kinds и отвергает неизвестные; прозрачная совместимость была бы ложным обещанием.[A7]
-
-Предлагаемый каталог вне worktree: `~/.ansa/orchestrations/<repo-id>/<run-id>/`. Нужны explicit magic/schema version для нового domain, repository/run locks, events, immutable artifacts и derived snapshots. Реализация format/header выбирается O1; строка `OMHO1` допустима как новое имя, но не как фиктивное существующее API. Per-repo root lock хранится выше per-run directories.
+Предлагается отдельный versioned orchestration journal namespace поверх будущих Rust framing/fsync primitives. Legacy `OMHJ1` session reducer имеет закрытый набор records; task events не вставляются в него под видом совместимого расширения.[A7]
 
 | Данные | Единственный authority |
 |---|---|
-| Task status, attempt allocation, budgets, approvals, acceptance, publication intent | Orchestration reducer + его journal |
-| Native session input/output, exact epochs, admitted tool outcomes | Existing session reducer + session journal |
-| Codex conversation | Codex-owned rollout/history; ansa не редактирует private DB/files |
-| Фактический код | Git objects и сверенный worktree inventory |
-| Supervisor/test evidence | Immutable artifacts, импортированные по digest; не самостоятельный task state |
-| PROJECT_STATE, dashboard, task index | Восстанавливаемые проекции/engineering handoff |
+| Tasks, attempts, dependency graph, policy, budgets, publication/acceptance | Orchestration owner + task journal. |
+| Child accepted Submit, native history/reasoning, tool intents/outcomes, session terminal | Native session owner + собственный session journal. |
+| Source code | Git objects и проверенный inventory. |
+| Mechanical evidence | Trusted runner artifacts; root импортирует immutable receipt. |
+| PROJECT_STATE, UI, indexes | Derived handoff/projection, не coordination database. |
 
-Нативная session не пишет `TaskAccepted`; root не переписывает session history. Между journals нет мнимой распределённой транзакции: child receipt становится usable только после durable append root `EvidenceImported` с digest/session/attempt identity. Crash между publication artifact и append оставляет orphan evidence для reconciliation; missing artifact при уже записанной ссылке блокирует переход. Index можно удалить и построить заново.
+Per-repository lock находится выше run directories и относится к Git common-dir. Один root владеет tasks; каждый native journal имеет свой lock. Parent хранит ссылки на child stores вне writable worktree; не объединяет их bytes и не редактирует SessionState. Crash между child append и root import оставляет recoverable orphan receipt; missing artifact при записанной ссылке блокирует acceptance. Frontend cursor не является journal offset/hash.
 
-Перед append reducer строит ValidatedTransition; storage worker sync-ит frame, затем owner публикует durable event. Временный known outcome при disk failure остаётся явно nondurable, новые effects не стартуют. Не хранить full logs в каждом journal record; references bounded, logs имеют quota/retention.
-
-**Миграционный контракт:** этот namespace появляется отдельным post-migration feature. Legacy session v1 bytes и semantics не меняются; C++ fallback не обязан понимать новый task domain и никогда не продолжает его автоматически. Rollback отключает Orchestrate, останавливает/reconciles workers и сохраняет свежие evidence. Нельзя восстановить старый journal backup после effects или старые rotating credentials. Это не введение второго canonical session store в M4.[A3][A7]
-
-### Launch protocol: два независимых окна неопределённости
-
-Один durable process intent недостаточен: внешний процесс может стартовать, а app-server ещё не принять coding turn. Нужны два receipts.
-
-1. Root sync-ит `AttemptPrepared`: task/source/spec/policy/budget/worktree/executable/schema hashes. Supervisor получает launch permit, создаёт consume-once marker до запуска Codex. Повтор consumed attempt не запускает process заново.
-2. App-server проходит initialize и thread/start. Thread ID и effective configuration фиксируются. Crash создания пустого thread без `turn/start` не даёт права считать coding запущенным.
-3. До отправки `turn/start` сохраняется `TurnDispatchIntent`: точный request ID/body digest/thread ID. Request ID JSON-RPC — correlation, **не обещание server-side idempotency**. Supervisor protocol pump сохраняет доступные responses/events в bounded spool; receipt хранит actual turn ID.
-4. Потерянный ответ после send означает uncertain dispatch. Нельзя снова отправить `turn/start` «на всякий случай». Сначала stop/quiesce, read/history correlation по exact IDs, artifacts и filesystem. Если факт не доказан — `Unknown` и Blocked.
-5. Terminal event, process exit, cleanup и Git snapshot фиксируются отдельно. Только после reconcile owner может создать Verification job.
-
-Это гарантирует отсутствие **слепого автоматического повторения** известных/неизвестных attempts; не обещает exactly-once произвольного shell/remote API. Внешние effects должны быть запрещены policy либо проходить через отдельные idempotent/reconcilable operations.
-
-### Связь ansa ↔ Codex: минимальный adapter
-
-Adapter запускает executable через argv, без shell interpolation. Один app-server process на write attempt, контролируемый Codex state directory отдельной thread lineage, exact cwd выделенного worktree. ANSA создаёт worktree сама; не поручает его allocation второму runtime. Для `thread/resume` сохраняется и повторно подключается тот же controlled state directory соответствующей lineage, с одним live owner. Новый пустой directory не восстановит прежний thread ID: это local history, не серверное conversation storage. Новая независимая session получает отдельную lineage; перед resume новой попытки проверяются cwd/base/policy, иначе создаётся новый thread с handoff. Используются отдельные stdout protocol и stderr diagnostic pipes; stdin не TTY.
-
-Для собственного SIWC применяется официальный provider recipe: public API base URL, Responses wire, access token из собственной auth subsystem в child environment, `requires_openai_auth=false`, HTTP/SSE configuration. Token не попадает в argv, prompt или journal; refresh token app-server не нужен. Refresh остаётся у ansa, по официальному контракту после обновления access token app-server перезапускается и thread может быть resumed.[O5]
-
-Это **не** вызов Codex внутри native `run_command`, удерживающий native ToolLease до конца внешней сессии. Auth manager сериализует refresh короткой lease своего профиля; executor хранит только account/auth generation и ограниченный credential handoff. Перед стартом проверяется срок access token. Если runtime достигает renewal boundary, он прекращает новую работу, делает bounded interrupt/cleanup/reconcile, обновляет свой token и лишь затем продолжает разрешённой новой попыткой. Refresh между native planner и Codex не должен брать взаимно ожидающие locks. Terminal refresh failure → AuthRequired; автоматического browser login нет.[A8][A9][O17]
-
-Свой isolated Codex profile не должен подхватить пользовательские MCP servers/plugins/hooks/permissions из другого проекта. ANSA сохраняет разрешённые engineering instructions, но фиксирует effective config, tool permissions, executable и schema. Не выключать существующие user security rules ради удобства. Неподдержанный override или невозможно доказать effective policy → Blocked. Linux sandbox capability проверяется на target; отсутствие sandbox не превращается автоматически в full access.[O18]
-
-Минимальный RPC subset:
-
-| Стадия | Interface | Обязанность ansa |
-|---|---|---|
-| Handshake | `initialize`, затем `initialized` | Стабильная app identity, explicit version, `experimentalApi=false`. |
-| Setup | `thread/start` | Cwd/model/provider, explicit sandbox/approval policy, task instructions; записать returned thread ID. |
-| Dispatch | `turn/start` | Text/handoff, поддержанный `effort`; output schema только после capability check; durable request intent. |
-| Observation | `item/*`, token usage, `turn/completed` | Correlation, bounded parser, terminal status и evidence; text/diff notifications — вспомогательные. |
-| Server → client requests | Pinned approval/permission/user-input RPC schemas | Deterministic policy response, bounded control lane; не разрешение от модели. |
-| Cancellation | `turn/interrupt` | Вне очереди noisy output; затем отдельное process-tree stop/reap. |
-| Recovery | `thread/read`, pinned history methods, `thread/resume` | Сначала reconciliation; только exact saved thread/turn, без `--last`. |
-
-Unattended profile заранее задаёт поддержанный `approvalPolicy=never` в пределах approved sandbox: выход за permissions отклоняется, а не автоматически повышается. Для server-initiated approval/user-input requests adapter обязан отправить schema-valid denial либо перейти в Paused(ApprovalRequired/NeedsUserInput) с bounded deadline и cleanup при завершении ожидания. Неизвестный request method получает поддержанную protocol error и fail-closed обработку; его нельзя молча оставить без ответа. Ни модель, ни общий auto-accept handler не выдают grant. O2 fixtures включают interactive requests, unknown methods, overload и timeout этой control lane.
-
-RPC details и поля сверяются с generated schema pinned release. Не требуется весь app-server API: config editor, remote listeners, account GUI, cloud queue, experimental terminal RPC и internal DB manipulation не входят в adapter.[O11][C2]
-
-Для `exec` альтернативный shape — `codex exec --json -C <worktree> -m <resolved-model> ... -`, где prompt поступает через stdin, policy/effort задаются документированными configuration overrides, при необходимости используется `--output-schema`. Resume — только сохранённый ID. Не использовать `--ephemeral` при обещанном resume и не копировать старые примеры с `--full-auto`. Развивать сразу app-server и exec adapters в MVP не нужно.[O12]
-
-### Terminal status не является acceptance
-
-| Наблюдение | Что известно | Чего оно не доказывает |
-|---|---|---|
-| `turn.status=completed` | Codex turn завершён | Tests passed, требования выполнены, background processes остановлены. |
-| `failed` | Protocol terminal failure | Что файловые/remote effects отсутствуют. |
-| `interrupted` | Turn прерван | Rollback файлов или всех descendants. |
-| EOF/timeout/no terminal | Потеря связи/дедлайн | Ни completion, ни safe retry. До reconciliation — Unknown. |
-| Process exit 0 | Завершился process | Наличие валидного terminal и инженерный результат. |
-| History показывает interrupted | Состояние/нормализация conversation | Фактический cleanup shell. |
-
-На stable source `exec --json` не публикует симметричный отдельный interrupted terminal в соответствующей ветке. В app-server восстановленная inactive history может переводить stale in-progress turns в interrupted. Эти детали — причины явно сохранять transport/protocol/process/effect dimensions.[C3][C5]
-
-**Что происходит с Codex subagents при остановке parent.** Source разделяет interrupt текущей session, cleanup background terminals и shutdown agent tree. Graceful app-server shutdown пытается закрыть threads, но имеет bounded wait, включая failure/timeout. `SIGKILL` вообще не выполняет этот cleanup. Внутренние in-memory agents погибшего процесса прекращают работу этого runtime; уже запущенные shell processes и внешние действия могут пережить его. Публичного rollback/exactly-once контракта для shell/filesystem нет.[C4][C6][C7]
-
-Поэтому **MVP устанавливает `agents.enabled=false`**. На следующем этапе нельзя путать max concurrent threads с лимитом общего числа/глубины agents. Если pinned version не позволяет enforce total/depth, внутренние agents остаются выключенными. При сознательном full access prompt/setting всё равно не препятствует shell запускать другой agent executable; это предел security policy, не повод заявлять абсолютную гарантию.[O19]
-
-### Cancellation, terminal disconnect и machine restart
-
-Если local cleanup не подтверждён, состояние остаётся Reconciling/BlockedCleanup, а worktree и repository write access quarantined. Это durable факт исходного run journal; новый root обязан проверить незакрытые runs и не обходит запрет новым RunId. Derived index можно перестроить, но его отсутствие не разрешает dispatch. Release lock/terminal Cancelled не являются доказательством quiescence.
-
-Cancellation состоит из трёх разных фактов: request принят owner; новые dispatch запрещены; старые локальные writers действительно остановлены. UI должен показывать все три, не мгновенно «отменено» после первого ACK.
-
-Порядок: immediate in-memory dispatch latch при admission Cancel, затем asynchronous durable cancellation intent/ACK, `turn/interrupt`, bounded grace, stop attempt process group/cgroup, reap, receipt о cleanup, inventory/diff, durable final outcome. Если журнал завис, latch всё равно останавливает новый dispatch, но durable cancellation ACK не выдумывается. Прерывание не возвращает потраченный quota и не отзывает уже созданный PR.
-
-Существующий ansa supervisor по EOF control pipe останавливает child. Этот контракт сохраняется как baseline **stop-and-reconcile**, а не необоснованное «worker продолжает жить после crash owner». Lease recovery не является восстановлением старых FDs.[A8]
-
-Для unattended Linux deployment предлагается небольшой systemd user service profile для owner и отдельная контролируемая cgroup/transient unit попытки. Lifecycle attempt привязывается к owner unit; stop должен завершать всю cgroup, не один PID. PID/start-time/boot-id и unit/cgroup identity сохраняются. Проверка `populated=0` полезна для доказательства отсутствия локальных writers внутри известного cgroup subtree; cgroups также ограничивают memory/process/CPU resources. Она не доказывает отсутствие remote effects или невозможность побега привилегированного процесса.[L1][L2]
-
-Это новая post-migration deployment capability, **не требование добавить cgroups в M6 parity**. Конкретный unit launch/FD protocol требует native tests. Пока containment недоступен, interactive/synthetic запуск возможен по existing supervisor contract, но supervisor death/неподтверждённый cleanup блокирует автоматическое продолжение. Для unattended write acceptance O4 рекомендуется требовать проверенный cgroup profile; не повышать привилегии автоматически.
-
-CLI может подключаться к owner service и отсоединяться, не завершая workflow. При foreground запуске terminal loss может остановить execution; это тоже recoverable путь. После boot owner service загружает journal, но не делает dispatch, пока не проверены old attempts, policy и budget. Стандартный systemd механизм достаточен; собственный daemon cluster не нужен. Все предлагаемые `orchestrate` CLI flags пока отсутствуют в ansa.
-
-### Backpressure и resource limits
-
-Stdout и stderr должны дренироваться независимо от UI, reviewer и journal latency. Bounded queues хранят typed control events; текстовые deltas coalesce-ятся, durable receipts не теряются. Raw stream spool имеет byte/disk caps. Frame слишком велик, JSON malformed или required event потерян — это protocol/evidence failure; нельзя обрезать JSON и продолжить как с полным протоколом.
-
-Control/cancel lane имеет отдельную capacity. Медленный fsync не блокирует возможность stop; невозможность durably записать новый intent запрещает effects. При заполнении обязательного evidence spool adapter прекращает работу контролируемым способом и фиксирует неполноту. Неограниченные stderr arrays и вывод в терминал не подходят.
-
-Параметры policy: wall deadline, idle/progress timeout, grace/kill timeout, max log bytes, max JSON frame, max artifact bytes, memory/pids/CPU, max root tasks/attempts, лимит суммарных reserves. Начальные значения выбираются после измерения на X13s; generic десятиминутный tool cap не нужно молча повышать для всех shell commands. Compilers и test runner имеют отдельные бюджеты; два builder на X13s могут замедлять друг друга.
+Новый task namespace появляется отдельной feature; M4 legacy session schema не переписывается и второй canonical session store не появляется. Старый C++ не продолжает новые orchestration tasks. Rollback отключает orchestration dispatch, reconciles children и сохраняет наиболее свежие journals/credentials/evidence; rollback старого journal после effects или rotating credentials запрещён. Migration parity tests сохраняются.[A3]
 
 ### Git, ownership и integration
 
@@ -430,49 +354,44 @@ Reviewer получает scoped immutable evidence packet: исходную ц�
 
 Repair loop ограничен: finding → regression/обоснованный fix → новое frozen candidate → проверки → fresh review. После повторяющегося failure без прогресса, истечения quota или максимума attempts — Blocked с artifact links. Нельзя бесконечно менять одновременно код, критерии и тесты, пока они не станут зелёными.
 
-### Memory и continuation без старого чата
+### Memory, handoff и compaction
 
-| Слой | Где хранится | Кто обновляет и когда |
-|---|---|---|
-| Engineering instructions | Versioned `AGENTS.md`, ADR, security policy | Человек/отдельно reviewed docs change; worker не меняет свой authority. |
-| Project state | Git + `PROJECT_STATE.md`, roadmap | Integrator после принятого checkpoint; записывает verified/WIP/blocked отдельно. |
-| Task state | Canonical orchestration journal | Только owner после validated durable transitions. |
-| Agent context | Native session journal или Codex thread | Соответствующий backend; root держит ID/digest, не редактирует чужой rollout. |
-| Handoff | Immutable TaskSpec/evidence packet | Owner перед каждой session/attempt; версия связана с source/policy. |
-| Execution artifacts | Bounded event/test/process logs, patch/inventory | Supervisor/runner; root импортирует receipts. |
-| Historical logs | Immutable archives с retention | Runtime policy; summary/index всегда derived. |
+| Слой | Где хранится / кто обновляет |
+|---|---|
+| Engineering instructions | Versioned AGENTS/ADR; отдельный reviewed change, модель не расширяет policy. |
+| Project state | Git + PROJECT_STATE; integrator после принятого checkpoint, verified/WIP/blocked отдельно. |
+| Task state | Только root task journal/reducer. |
+| Native agent context | Свой child session journal; exact items/reasoning/epoch не копируются в sibling. |
+| Handoff | Immutable goal/TaskSpec/requirements/evidence packet от owner. |
+| Tool/process/verification artifacts | Bounded durable evidence от native tool supervisor/runner; импорт root. |
+| Historical summaries/indexes | Derived data; не замена исходных receipts. |
 
-Новая session читает repository snapshot, instructions, original goal, current plan revision, unresolved findings, budgets, последние durable receipts и pending approvals. Полный старый ChatGPT/Codex conversation ей не нужен. Critical constraints не должны существовать только в model summary.
+Новая orchestration session читает repository snapshot, original goal, plan revision, unresolved findings, budgets, pending approvals и последние receipts. Старый ChatGPT conversation не требуется. Продолжение child возможно только с исходными native binding/history/epoch; fresh session получает explicit handoff с facts и limitations, не чужую chain-of-thought.
 
-Compaction текущего ansa уменьшает active context и сохраняет exact epoch и последние turns; весь journal остаётся. Это JSON-byte budget, не доказанный token-aware optimum. Новая orchestration session обычно проще и дешевле бесконечного восстановления одного разговора.[A5]
-
-**PROPOSED policy:** короткие per-role/per-task contexts; pinned requirements/invariants/evidence references никогда не удаляются summary. Compaction запускается по измерению active input size, observed usage, context rejection/latency и eval сохранения constraints, с reserve для следующего tool batch/output. Нет произвольного «40%». Любой compact — отдельный accounted request; epoch durable до следующего inference. Ошибка/невалидная summary не меняет canonical task facts. Native API compaction доступен как отдельный primitive, но его поддержка конкретным SIWC профилем и строгим reducer требует собственной проверки; MVP на него не опирается.[O20]
+Используется обычный native compaction path: сохранение exact epoch и recent tail, durable compact result до следующих calls. Текущий budget измеряется JSON bytes; token-aware optimum не доказан. Pinned requirements/invariants/evidence references сохраняются вне summary. Policy compaction выбирается по input/usage/latency/context errors и regression eval, с reserve на tools/output, без произвольного процента. Compaction calls расходуют root budget; failure не меняет task facts. Серверная compaction feature не становится обязательной зависимостью.[A5]
 
 ### Security и approvals
 
-Разрешение задаётся один раз для run profile и конкретной цели, а не на каждый `cargo test`. Signed/persisted policy revision определяет allowed paths, commands/resources, network destinations, budget и publication scope. LLM может **запросить** изменение policy, но не создать себе grant. Instructions из repository/logs/URLs — данные и engineering guidance, не новая authority.
+Один approved run profile задаёт пути, process/network permissions, root budgets и publication scope. Обычные чтения, worktree edits и разрешённые tests выполняются автономно. Модель может предложить изменение authority, но не выдать себе grant.
 
-| Действие | Default policy для Orchestrate |
+| Действие | Default policy |
 |---|---|
-| Читать source/docs; планировать и ревьюить | Autonomous, в scoped inputs. |
-| Изменять код в owned worktree | Autonomous в approved scope. |
-| Запускать build/lint/tests | Autonomous по approved verification/tool profile, с timeout/resource caps. Tests являются кодом и исполняются с теми же filesystem/network ограничениями. |
-| Создать candidate commit/integration branch | Autonomous в namespace ansa, вне main/release. |
-| Push feature branch / draft PR | Autonomous только когда goal/policy явно разрешает именно этот repo/remote/action; иначе patch готовится локально, публикация ждёт approval. |
-| Изменить main/release, merge PR | Explicit action-bound approval или заранее конкретно утверждённая protected-branch policy; MVP auto-merge выключен. |
-| Force-push/history rewrite | Запрещено MVP; отдельное разовое разрешение не подразумевается обычной coding задачей. |
-| Удалить пользовательские данные | Explicit approval; routine cleanup только собственных доказанно ненужных artifacts по заранее принятой retention policy. |
-| Live login/logout, новые credential grants/account switch | Explicit approval; normal refresh существующего grant — runtime lifecycle в пределах исходного разрешения, не новая полномочность. |
-| Security/credential configuration | Отдельный reviewed change; проектный AGENTS не снимает user restrictions. |
-| Новые платные external services или смена billing route | Explicit opt-in и budget; quota failure не разрешает платный fallback. |
-| Несовместимая persistent storage migration | Отдельный migration plan, backups/rollback limits и approval. |
-| Deploy, публикация данных, irreversible remote effects | Отдельная operation policy и reconcilable receipt; default deny. |
+| Read-only planning/review/research | Scoped native tools, без shell/credential reads. |
+| Builder edits/tests | Native basic tools в owned worktree по approved execution profile. |
+| Candidate/integration branch | Autonomous в namespace ANSA, вне main/release. |
+| Feature push/draft PR | Только если исходный goal/policy уже разрешает repo/remote/action. |
+| Main/release merge, force-push | Auto-merge/force-push выключены MVP; explicit separate policy. |
+| Удаление данных | Explicit approval; routine cleanup только своих quiescent сохранённых artifacts по retention policy. |
+| Login/logout, новые grants/account switch | Explicit approval; normal refresh existing own grant — runtime lifecycle. |
+| Security/credential configuration | Отдельное reviewed change; AGENTS не снимает ограничения пользователя. |
+| Paid route/services | Вне product scope; quota failure не разрешает новый billing path. |
+| Несовместимая storage migration/deploy/irreversible effects | Отдельная operation policy и recovery/approval. |
 
-Для ansa full access остаётся осознанным пользовательским режимом. Для Codex builder предлагается заранее настроенный `workspace-write`/ограниченный execution profile; превышающие его actions должны завершаться отказом или policy gate. Это не вводит Ask для каждой команды и не меняет нынешний basic default.
+Full access ANSA остаётся сознательной политикой владельца. Native ToolSnapshot отделяет advertised tools и loop authority, но **не sandbox для произвольного shell**. Собственные process/file tools должны проверять scope там, где это технически возможно; полный inventory обнаруживает нарушения, но не отменяет их. Current path resolver не обеспечивает ограничение одним cwd. Same-UID full-access process может обратиться к другим worktrees, journals, сети/credentials и запустить ещё ANSA process. Нельзя обещать запрет только настройками prompts/registry.[A8][N4]
 
-**Предел enforcement:** произвольный full-access shell под тем же UID может обращаться к другим файлам, shared Git metadata, credentials, сети и запускать ещё процессы. File ownership table, no_new_privs, prompts, hashes и `agents.enabled=false` не превращают его в sandbox. Независимые host tests защищают от self-reporting, но evidence не становится криптографически доверенным против hostile same-UID writer. Для строгого запрета нужны реально проверенный sandbox/отдельная OS authority, закрытые credentials/network и mediated Git publication. Cgroup помогает ресурсам/cleanup, не аутентичности evidence. Не обещать запрет опасных действий, оставив технически неограниченный shell.[A3][A8][G1][L1]
+Строгие guarantees требуют реально enforced OS/filesystem/network/credential boundary. Без неё модель остаётся доверенным full-access coding actor; mechanical evidence защищает от self-reporting, но не от hostile same-UID tampering. Worktree/hash/no_new_privs/cgroup не дают всех этих гарантий. Каждый тест — тоже executable code под утверждённой policy.
 
-Access token app-server может утечь через inherited shell environment или `/proc` при широкой same-UID видимости. O2/O4 должны проверить child environment policy и token redaction, не передавать refresh token/GitHub token/SSH agent/прочие secrets worker. Refresh/auth requests не проходят через модель. Если выбранный profile не обеспечивает требуемую credential boundary, live unattended gate остаётся закрытым. Нельзя устранять это чтением credential files другого приложения.[O17][O18]
+Только центральная auth subsystem читает собственные OAuth credentials. Никаких token values в journals/logs/prompts, child specs или tool process environment; credentials других приложений не используются. Если выбранный profile не обеспечивает требуемую boundary, live unattended gate остаётся закрытым. Synthetic sentinel leakage tests возможны без реальных credentials.[N5][O17]
 
 ## D4. End-to-End Workflow
 
@@ -482,7 +401,7 @@ Access token app-server может утечь через inherited shell environ
 
 1. Owner получает goal и выбранный policy profile. Читает фактические Git refs/dirty state, AGENTS, PROJECT_STATE, roadmap и evidence gates. Создаёт durable RunId. Нельзя считать milestone ready по одной свободной фразе Markdown.
 2. Planner в read-only session выдаёт bounded plan, requirements mapping, scope и предложения tests. Deterministic code проверяет зависимости/лимиты/permissions. Неподтверждённая native gate превращается в blocker.
-3. Owner фиксирует base SHA, requirements и test manifest, выделяет worktree и budget. Один builder получает задачу через app-server; ручного переноса сообщений нет.
+3. Owner фиксирует base SHA, requirements и test manifest, выделяет worktree и budget. Один native builder получает durable child Submit через обычный ANSA command bridge; ручного переноса сообщений нет.
 4. Builder редактирует код и может запускать разрешённые проверки для собственной обратной связи. Его сообщение «готово» только завершает attempt. Root выполняет cleanup/reconcile и снимает actual candidate.
 5. VerificationRunner выполняет обязательные команды на exact candidate; source mutation, отсутствующий test suite или timeout дают failure. Результаты пишет runner.
 6. Fresh reviewer читает actual diff/source/requirements/evidence. Blocking finding становится новым bounded attempt; acceptance criteria не ослабляются.
@@ -496,7 +415,7 @@ Access token app-server может утечь через inherited shell environ
 
 ### Первая будущая полезная coding-задача
 
-После готовности Orchestrate выбрать маленький реальный кусок уже обозначенной границы unknown-effect reconciliation: **read-only report незавершённых process intents**, без разрешения повторять их. Предлагаемый UX — `ansa session inspect --unresolved --json`; имя команды ещё не принято.
+В O4 после offline готовности Orchestrate выбрать маленький реальный кусок уже обозначенной границы unknown-effect reconciliation: **read-only report незавершённых process intents**, без разрешения повторять их. Предлагаемый UX — `ansa session inspect --unresolved --json`; имя команды ещё не принято.
 
 Acceptance: отчёт показывает session/turn/operation identity, известный dispatch/cleanup/evidence status, причину блокировки и необходимые действия; не читает secrets; не изменяет journal; не запускает process. Cases: missing evidence, conflicting spec hash, known late outcome, corrupt/torn evidence, cancelled-before-dispatch и повторный inspect. Добавить integration regression, что получение отчёта не увеличивает счётчик исполненных synthetic effects. Это реальная работа с recovery contracts и отрицательными сценариями, а не косметический README benchmark.[A5][A8]
 
@@ -510,245 +429,169 @@ Acceptance: отчёт показывает session/turn/operation identity, и�
 | Reviewer отклонил | Записать finding IDs и requirement gaps. | Максимум оставшихся repairs; новый SHA и повтор gates. |
 | Tests повторно fail | Сверить signature и прогресс; не менять expected PASS. | Один bounded diagnosis/escalation, затем Blocked; счётчики не обнуляются. |
 | Integration conflict | Оставить working branches, запретить publish. | Отдельная repair attempt на actual integration base; новый review/tests. |
-| Provider недоступен | Приостановить new dispatch, сохранить состояние. | Bounded backoff только для transient/read-only request; не слепой повтор неизвестного coding turn. |
-| Parent перезапустился | Repository lock/new epoch, dispatch закрыт, old-attempt reconciliation. | Pure reads/verification повторяемы в budget; write attempt только после доказанной остановки и выбора checkpoint. |
+| Provider недоступен | Приостановить new dispatch, сохранить состояние. | Bounded direct generation retry только из known durable native state; unknown tool intent не replay-ится. |
+| Parent перезапустился | Repository lock/new epoch, dispatch закрыт, old-attempt reconciliation. | Reopen original child store; known native outcomes импортируются; bounded Resume только после quiescence и проверки effects/config/budget. |
 | Budget exhausted | Stop new model/worker dispatch; orderly cancellation активного по policy. | Сохранить partial patch/evidence; explicit budget extension, не скрытая смена model/account/API. |
 | Cancel после external side effect | Записать уже совершённое действие и unknown часть. | Отдельное reconciliation/compensating action при разрешении; cancellation не rollback. |
-| Terminal completed получен, journal append упал | Сохранить volatile result, прекратить effects. | Сопоставить spool/history/Git после восстановления; не запускать builder заново автоматически. |
+| Terminal completed получен, journal append упал | Сохранить volatile result, прекратить effects. | Сопоставить child journal/tool evidence/Git после восстановления; не создавать новую child session автоматически. |
 | Lost push/PR response | Publication остаётся pending/uncertain. | Query exact remote head/PR marker; импортировать существующий результат либо Blocked при неоднозначности. |
 | Machine reboot | Не полагаться на прежние PID; boot ID изменился. | Reopen newest journal/evidence, проверить файловую целостность; power-loss assumptions не заменять обычным SIGKILL test. |
 
 ## Model routing и экономическая модель
 
-**PROPOSED:** routing выбирает capability profile, а не hardcoded GPT name. Его версия входит в AttemptSpec; смена model/provider/account не продолжается незаметно в прежней exact epoch. Каталог и фактический доступ разрешаются по процедуре D2.
+**PROPOSED:** native role profile выбирает доступную SIWC capability, а не hardcoded model name. Account/model/effort/config revision входят в child binding; смена не происходит незаметно в старой exact epoch.
 
-| Profile | Требуемое качество | Когда использовать |
+| Profile | Критерий выбора |
+|---|---|
+| High-reasoning planning/research | Зависимости, ownership, архитектура, разделение evidence и uncertainty. |
+| Everyday native coding | Accepted-task качество на собственных process/file tools и небольших diffs. |
+| Cheap bounded | Проверяемая extraction/classification, без security/acceptance authority. |
+| Independent native review | Контрпримеры, actual source/diff, invariants; fresh session обязательна. |
+| Escalation | Один разрешённый переход к доступной модели с измеренным преимуществом на данном failure family. |
+
+Разные модели не обязательны: стартовый eval использует одну сильную доступную модель в отдельных contexts. Same-model review сохраняет correlated blind spots; другой model profile полезен по paired eval, не по названию роли. Researcher/recovery analyst — тот же planner в новом bounded task, только после deterministic recovery facts.
+
+| Native конфигурация | Когда полезна | Когда overhead лишний |
 |---|---|---|
-| High-reasoning planning | Длинные зависимости, разделение доказанного/неизвестного, понимание ownership и failure semantics | Новый milestone, архитектурные изменения, diagnosis после повторной ошибки. |
-| Everyday coding | Работа с repo/tools, небольшой diff, исправление тестов без ослабления критериев | Default builder; выбор по accepted-task eval. |
-| Cheap bounded | Надёжная короткая extraction/classification по schema | Summary evidence metadata, grouping logs, документационные подзадачи; не security approval. |
-| Independent review | Поиск контрпримеров, чтение actual diff и invariants | По риску не слабее необходимого уровня builder; отдельный контекст. |
-| Escalation | Лучше baseline на конкретном failure family | Один разрешённый переход при доказанном непрогрессе; не бесконечная лестница моделей. |
+| Один native basic agent | Ясная локальная задача и готовые acceptance criteria. | Не выполняет весь project-level integration/handoff сам по себе. |
+| Planner + один native builder | Необходимо выделить bounded scope и зависимости milestone. | План уже полностью задан. |
+| Coordinator + builder + fresh reviewer | Важны negative cases, independent acceptance и recovery. | Тривиальная правка с исчерпывающим mechanical oracle. |
+| Planner + два native builders | Реально независимые scope и достаточные CPU/RAM/quota. | Shared contracts/lockfiles, auth serialization, X13s contention. |
 
-Несколько имён моделей не обязательны. Начать с одной доступной сильной coding/reasoning модели, разных contexts и поддержанных effort settings. Вторую модель для review вводить только если paired eval снижает пропуски дефектов или затраты. Для high-risk kernel/process/journal changes полезнее сначала улучшить независимые fault tests, чем оплатить третий почти одинаковый отзыв.
+Главная метрика — все planning/build/review/repair/verification расходы на одну принятую задачу. Непринятые попытки не исключаются из суммарного расхода. Для SIWC сохраняются actual dispatched calls, provider retries, native tool rounds, resumes, compaction calls, wall time, throttling/errors и optional admitted usage. Usage отсутствует → unknown, не zero. Shared usage других приложений отмечается как confounder; API tariffs не применяются.[O4][O17]
 
-| Конфигурация | Когда оправдана | Когда overhead преобладает |
-|---|---|---|
-| Один обычный Codex | Маленькая ясная задача с готовыми критериями | Не автоматизирует project-level acceptance/recovery/handoff сама по себе. |
-| Planner + один worker | Milestone нужно превратить в проверяемый scope | План заранее полностью определён; planner только пересказывает текст. |
-| Planner + два workers | Независимые scope и отдельные tests, достаточные CPU/RAM/quota | Общие contracts/lockfiles, последовательная зависимость или X13s contention. |
-| Coordinator + worker + reviewer | Ошибка acceptance дороже review; важны regressions/recovery | Тривиальные изменения; можно применять risk-based review policy после eval. |
-| Несколько уровней + Codex children | Read-only exploration разных областей с ограниченной глубиной | Общий write cwd, трудно учесть расход и ownership; MVP исключает. |
-
-Главная экономическая метрика: **суммарный расход всех попыток, planning, review, repair и verification на одну принятую задачу**. Не средняя цена токена успешного последнего ответа. Снижение human interventions и regression rate может оправдать дополнительные model calls; «больше агентов» не является результатом.
-
-Для API учитывать actual usage по provider/model, cached/reasoning breakdown где доступен, ratecard revision, tool charges и quota errors. Для SIWC сохранять observed input/output/total tokens, number of submitted outer turns, wall time, throttle/errors, доступные rate-limit observations и settings usage interval. Поле отсутствует → `unknown`, не ноль. Не переводить SIWC tokens в доллары API и не объединять разные reset windows/accounts в одно число. Если shared ChatGPT usage нельзя отделить от других приложений, отметить confounding и измерять local telemetry.[O4][O17]
-
-Локально жёстко ограничиваются attempts, deadline, queue size, requests ansa и resource usage. Полный расход уже выполняющегося Codex turn может выясниться только после terminal. На SIWC нет нужного API output cap, поэтому **hard dollar/token ceiling в полёте не обещается**. Планировщик резервирует консервативный бюджет, не запускает новую работу без reserve, отменяет по deadline/observed limit и отдельно записывает overrun. Перезапуск не обнуляет ledger. API route может улучшить per-request caps, но root всё равно считает повторные запросы и tools.
+Parent ledger ограничивает attempts, requests/resumes, deadlines, queue/resources и общий reserve. Retry или новая session не обнуляет counters. SIWC не предоставляет нужного per-request output cap; hard in-flight token/dollar ceiling не обещается. Runtime прекращает новые calls при исчерпании reserve, отменяет текущую работу по policy, сохраняет overrun/unknown charge. Возможности собственного loop дают лучший dispatch accounting, но не позволяют выдумывать quota reset или фактическую стоимость.
 
 ## D5. Executable Roadmap
 
-### Где добавить Orchestrate относительно Rust migration
+### Реальные зависимости от Rust migration
 
-| Вариант | Оценка для ansa |
+| Module/gate migration | Что переиспользуется native orchestration |
 |---|---|
-| A — после полного Rust cutover/M10 | **Основной путь.** Не переносим новый layer второй раз; не смешиваем product expansion с parity/cutover. Минус — coding autonomy появляется позже. |
-| B — Rust runtime готов, C++ ещё сохранён | Технический фундамент есть после M8, live prerequisite — M9. Допустимо отдельной feature branch/release, если M10 задержан только организационно. Требует explicit decision о приоритете; это не текущий default и не изменение scope M0–M10. |
-| C — независимый narrow spike | Сейчас docs/contracts/offline protocol inspection; после M6 можно отдельно проверить streaming executor lifecycle. Никаких production hooks/defaults/new journal schema в migration milestone. |
+| M2 | Responses codec/admission, provider-native reasoning/items, exact replay. |
+| M3 | Собственный SIWC auth, shared lifecycle/leases, account/model binding. |
+| M4 | Canonical native session journal, init/accepted/tool intent/outcome/reopen. |
+| M5 | Runtime owner, commands/events, bounded jobs и targeted Cancel. |
+| M6 | Own process/file tools, ToolRegistry/ToolSnapshot, supervision/recovery. |
+| M7 | Headless command/frontend boundary; Orchestrate не требует нового TUI. |
+| M8 | Полный offline E2E parity и отрицательные сценарии. |
+| M9 | Отдельно разрешённый live/cutover gate. |
+| M10 | Rust production checkpoint и завершённый cutover, после которого начинается отдельная feature. |
 
-Actual зависимости плана: M2 protocol/admission, M3 auth, M4 journal/session, M5 owner, M6 process/tools, M7 frontend, M8 полный offline E2E, M9 live/cutover, M10 Rust production. M5 прямо запрещает Orchestrate, M6 исключает cgroups из parity scope, M10 запрещает расширять продукт одновременно с cutover.[A3]
+Эти modules — технический фундамент. Удаление C++ не нужно для создания child session само по себе; **default implementation после verified M10 GO** — sequencing, сохраняющий принятый migration scope. M5 исключает Orchestrate; M6 parity не расширяется cgroups; M10 не совмещает cutover с новой продуктовой функцией.[A3]
 
-**Точная выбранная точка:** implementation O1 стартует от verified code tree milestone `migration/m10-rust-production` после закрытия required gates и отдельного завершения cutover, а не по одному имени tag. O1 не дописывается в M10 PR. Само нынешнее docs-only предложение эту зависимость не закрывает.
+| Вариант | Решение |
+|---|---|
+| A — отдельная feature после M10 | Default: не переносим orchestration дважды и не размываем parity. |
+| B — после M8/M9, C++ ещё сохранён | Технически возможен отдельным product decision, если M10 задержан организационно; не подразумевается текущим ADR. |
+| C — narrow non-production spike | После M6 можно проверить native composition/reopen на synthetic transport, вне production/defaults/migration PR. Сейчас — только docs/contracts. |
 
-### Минимальные этапы
+Ни один этап не зависит от установки внешнего coding runtime. O1 стартует от подтверждённого code/evidence checkpoint `migration/m10-rust-production` или его явно принятого преемника, а не от наличия одного tag. M0–M10 и PR #2 не изменяются.
 
-| Этап | Scope и dependency | Acceptance и meaningful tests | Stop / rollback |
+### O1–O4: только Rust ANSA, native sessions и direct SIWC
+
+| Этап | Scope | Acceptance / meaningful tests | Stop / rollback |
 |---|---|---|---|
-| O0 — decision record | Сейчас: ADR, audit, typed contracts, prompts, eval plan. | Все claims имеют source/status; no production changes; независимый design review. | Unknown claims остаются открытыми; docs не разрешают live/cutover. |
-| O1 — durable sequential workflow | После M10 GO: task reducer/journal, repository owner lock, bounded budget, fake CodingExecutor. | One goal → fake build → scripted fake VerificationReceipt/ReviewReport → accepted/blocked; completion executor сам по себе не даёт acceptance; crash на durable boundaries, duplicate command/attempt, stale epoch, filled queues, restart сохраняет exhausted budget. | Любой double dispatch/unknown replay — NO-GO. Удалить feature selection, сохранить evidence; basic/plan проходят unchanged suites. |
-| O2 — один Codex worker | После O1: pinned stdio adapter, worktree allocator, narrow auth handoff, cancellation/cleanup, scoped environment. Fake protocol сначала; native no-inference process fixtures. | Schema conformance; lost turn/start ACK; valid completed+failed exit; missing terminal; stdout/stderr flood; parent/supervisor death; escaped descendants; renewal no deadlock; zero credential leakage на synthetic sentinel tokens, без реальных credentials. | Unknown cleanup, unsupported schema/target или credential leak блокирует live. Disable adapter, не переписывать журналы. |
-| O3 — verified PR workflow | После O2: trusted VerificationRunner, immutable evidence reader, native planner/reviewer, sequential integration и publication ledger. | Frozen manifest; ноль/skip required tests fail; out-of-scope diff rejected; reviewer не видит builder context; conflict repair bound; stale-SHA receipt rejected; crash after push/PR reconciles single publication. Offline fake models/Git remote. | Любой false acceptance/publish replay — NO-GO. Retain patch, disable publication. |
-| O4 — ограниченный live pilot | После O3 и отдельно разрешённого profile/model/quota/publish plan на X13s. | Actual route discovery; один useful task end-to-end; 3 evidence levels; native cancellation/restart; no manual message copying; documented usage/latency/RSS; independent review. | Native capability/quota/permission failure — Blocked, не обход. Сохранить результаты/временные ветки и вернуться к обычному basic/plan. |
+| O1 — durable task control | После M10: root reducer/journal, repository lock, Task/Attempt/child identity binding, budgets; deterministic fake native-child port и scripted verification/review receipts. | Goal→fake child→scripted gates→accepted/blocked; queue acceptance не equal durable acceptance; crash на root boundaries, duplicate/stale receipts, filled queues, cancel latch, restart сохраняет exhausted budget; child completion не даёт Accepted. | Double dispatch или false acceptance — NO-GO. Отключить feature, сохранить state; basic/plan unchanged suites. |
+| O2 — native child composition | Reuse Rust AgentRuntime basic/plan, own per-child ToolSnapshot/settings/worktree/journal, shared auth subsystem, native receipt bridge, CreateNew/OpenExisting, cancellation/recovery. Synthetic direct Responses transport; реальные native process/file fixtures без live credentials. | Exact child ID binding; lost CommandAccepted; original missing store blocks; no cross-context reasoning; malformed/incomplete SSE запускает ноль tools; known outcomes replay without execution; effect_unknown blocks Resume/new attempt; parent/child/supervisor death; no auth lease cycle; synthetic secret redaction. | Missing store/identity mismatch, duplicate effects, unconfirmed cleanup или credential leak — NO-GO. Close permits/reconcile, retain child journals/worktrees. |
+| O3 — verified native workflow | Native planner/builder/fresh reviewer, host VerificationRunner, frozen manifest, scoped evidence export, serial integration, recoverable publication. Tests используют тот же runtime и deterministic model fixtures/local Git remote. | Required suite zero/skip не PASS; wrong-SHA/modified-source receipt rejected; fresh reviewer has no shell/builder history; bounded repair/Resume and provider calls; conflict/stale-base tests; crash after push/PR reconciles single publication. | False PASS/publish replay — NO-GO. Disable publication, retain patch/evidence, basic/plan fallback. |
+| O4 — ограниченный native live pilot | После O3: отдельно разрешённый собственный SIWC profile/model/quota и X13s run/publication policy. Actual route discovery, один useful end-to-end task, native eval и target recovery. | Ни одного ручного message handoff; exact-SHA mechanical/behavioral/integration receipts; native cancellation/restart; measured calls/time/RSS/quota observations; все роли работают без внешнего coding executable. | Unsupported SIWC/native cleanup/security capability или quota exhaustion → Blocked; no route/credential bypass. Retain artifacts, обычный native basic/plan остаётся доступен. |
 
-В O1 выполняются fake reducer/executor tests; в O2 — synthetic native process/protocol tests, без inference; обновление app-server протокола не требует account login. O4 разрешает конкретные model calls, а не автоматическую бесконечную эксплуатацию. Уже данная пользователем рабочая policy впоследствии может покрывать новые задачи; не просить её повторно без изменения scope.
+O1 fake port не превращается в второй engine; O2 подключает существующий runtime через owned composition. O1–O3 полностью offline: fixtures эмулируют тот же direct Responses contract. O4 впервые допускает real SIWC calls по отдельному разрешению. Во всех этапах recovery tests — обязательные gates, не отложенное hardening.
 
-Recovery tests — часть O1–O3, а не «production hardening потом». Для MVP не нужны scheduler fairness, arbitrary DAG optimizer, plugin marketplace, distributed locks или embeddings memory.
+### После MVP
 
-### После доказанной ценности
+O5 — максимум два native builders после eval и проверки auth contention, independent ToolSnapshots/worktrees, root-wide request/resource caps и serial integration. Если throughput упирается в текущую auth serialization, сначала измерить её; не ослаблять grant/refresh guarantees ради параллельности. Отдельные OS child processes или более сильный sandbox — самостоятельное решение по измеренной необходимости, не второй agent loop.
 
-O5: максимум два builders, write-scope admission и integration queue; сначала отдельный eval на действительно независимых задачах. O6: NativeAnsaExecutor, только если уменьшает dependencies/cost или даёт лучший task quality. API route, richer review routing, native compaction, Codex internal subagents и remote/cloud workers — независимые возможности, не условия MVP.
-
-Условие остановки роста: если single-agent baseline даёт тот же accepted rate и меньше cost/human intervention, оставить простой coordinator либо выполнять такие задачи напрямую. Архитектура должна позволять этот вывод.
+Если orchestration не улучшает accepted rate/human interventions/regressions относительно одного native agent, оставить простой native path. Нет отложенной «замены основного executor»: native builder обязателен с первого работающего MVP.
 
 ## Evals: воспроизводимо проверить пользу
 
-**PROPOSED эксперимент; ни одного live eval run здесь не проводилось.** Сначала pilot из четырёх задач и четырёх serial конфигураций — 16 runs по одному повтору. Это screening, не статистическое доказательство. При полезном сигнале расширить до восьми задач × четыре конфигурации × два повторения = 64 runs; parallel subset отдельно. До начала задать общий quota/time cap и разрешённый route.
+**PROPOSED; live runs здесь не проводились.** Минимальный pilot: четыре реальные задачи × три native serial configurations = **12 runs**. При полезном сигнале восемь задач × три конфигурации × два повторения = 48 runs; parallel subset отдельно. Общий quota/time cap выбирается до начала.
 
-### Конфигурации
-
-| ID | Что сравнивается |
+| ID | Product-native конфигурация |
 |---|---|
-| B0 | Обычный Codex agent, один bounded task prompt, собственные checks. |
-| B1 | Один native ansa agent с теми же permissions/model quality tier. |
-| H1 | ANSA planner + Codex executor, host verification, без отдельного reviewer. |
-| H2 | ANSA coordinator + executor + fresh independent reviewer + host verification. |
-| P2 | Только для подходящих tasks: два sibling builders, тот же H2 acceptance. |
+| N0 | Один ordinary native ANSA basic agent; bounded self-checks/repairs. |
+| N1 | Native planner + один native builder + host verification. |
+| N2 | Native coordinator + builder + fresh native reviewer + host verification. |
+| P2 | Только для подходящих tasks: два native builders с теми же N2 gates. |
 
-Final evaluation для **всех** arms выполняет один независимый external harness/adjudicator, иначе H2 несправедливо оценивается по более строгой шкале. B0/B1 тоже могут применять свои инструменты и лимитированные self-repairs в том же budget; не ухудшать baseline искусственно. Separate measures: benefit planning H1−B0, benefit review H2−H1, benefit parallel P2−H2.
+Codex может участвовать только как **необязательный внешний development baseline**, запускаемый разработчиком вне ANSA orchestration. Он не является backend, prerequisite, dependency или обязательным arm acceptance этого продукта. Product eval полностью исполним без его установки.
 
-### Задачи из реального ansa
+Одинаковый внешний final harness/adjudicator оценивает все arms: base SHA, acceptance criteria, tool permissions, model/effort и общий budget совпадают; baseline может делать собственные bounded repairs. Fresh sessions/worktrees, pinned toolchain/resources/cache policy, randomized order, решения между arms не передаются. Benefit planning — N1−N0, review — N2−N1, parallelism — P2−N2.
 
-Candidate corpus ниже привязан к actual source/открытым ограничениям. На старте эксперимента curator фиксирует точные base SHAs, Rust path mapping после migration, acceptance manifests и hidden regressions; если задача уже решена, она заменяется до рандомизации, не после просмотра результатов.[A4][A5][A8][A12]
+### Реальные задачи ANSA
 
-| Case | Реальная область | Сложность и ожидаемая проверка |
-|---|---|---|
-| E1 | Read-only unresolved process intents report | Missing/conflicting evidence, zero dispatch, corruption; первый useful end-to-end candidate. |
-| E2 | Long-session/compaction evaluation corpus из TODO | Constraint retention, exact tail/epoch, restart, no fake token claims; достаточно сложнее простой правки текста. |
-| E3 | Journal/replay negative case из существующих session tests | Seeded regression или historical fix replay; заранее обозначить, что это controlled fault task, а не найденный сегодня production bug. |
-| E4 | Targeted Cancel при blocked output/storage | Concurrency, late outcome, bounded responsiveness; strong independent negative assertion. |
-| E5 | Process evidence identity/consumed marker | Duplicate launch mutation; no double effect after restart. |
-| E6 | M0 harness anti-false-green extension | Missing/duplicate/skipped inventory, semantic assertion несмотря на exit 0. Не подменять M0 GO. |
-| E7 | Terminal transcript pagination/restart boundary | Source-backed frontend regression и actual rendered/event behavior. |
-| E8 | Две независимые additions к fixture/evidence tooling | Parallel subset только при разных write scopes, без общего manifest/contract editing. |
-
-E3–E5 могут быть reproducible fault injection в реальный код ansa; результат отдельно от open feature tasks. Это позволяет одинаково проверять recovery и не выдумывать нерешённый дефект. Не делать весь корпус из seeded trivial mutations.
-
-Контроль: одинаковые base SHA/goal/requirements/tool permissions, выбранный route/model/effort, warmed dependency caches по одной политике, pinned compiler/Nix closure, одинаковые бюджет и machine resources. Порядок runs рандомизировать; fresh worktrees/sessions, не передавать решения между arms. Записать включённость Codex subagents; в базовом сравнении выключить во всех arms. Human final judge не знает arm, если это practically possible.
-
-### Метрики и решение
-
-| Метрика | Операционное определение |
+| Case | Область и проверка |
 |---|---|
-| Accepted task rate | Задачи с final-SHA mechanical/behavioral/integration PASS / все назначенные coding tasks. Correct blocked reports считаются отдельно. |
-| Cost/quota per accepted | Все planning/build/review/repair расходы arm / accepted tasks. При нуле accepted — неопределённо/бесконечно, не 0. |
-| Wall-clock | Goal admission → durable accepted deliverable; provider wait, active model, build и human waiting отдельно. |
-| Retries | Dispatch attempts, repairs, replan, transport retries; не объединять их в один красивый счётчик. |
-| Review findings | Confirmed actionable findings, false positives, escaped defects; dedup по root cause. |
-| Conflicts | Текстовые и semantic integration conflicts / integrated tasks. |
-| Human interventions | Ручная передача сообщений, diagnosis, scope clarifications, approvals; отдельно initial policy setup и required approvals. |
-| Regression rate | Defects в final evaluation/последующем интеграционном corpus, а не оценка самого builder. |
-| Recovery success | После заранее заданного crash workflow продолжился без duplicate effect/false acceptance или корректно blocked; эти исходы раздельны. |
-| Overhead | Startup, parent/child peak RSS, CPU, FDs, disk/artifacts, shutdown latency, aarch64 build contention. |
+| E1 | Unresolved process intents diagnostic: missing/conflicting evidence, zero effects; первый useful O4 candidate. |
+| E2 | Long-session compaction corpus: сохранение constraints, exact reasoning/tail/epoch и restart. |
+| E3 | Journal/replay negative case: controlled fault или historical fix с явно указанным статусом. |
+| E4 | Targeted Cancel при blocked output/storage: late known result, bounded responsiveness. |
+| E5 | Process identity/consumed marker: отсутствие duplicate effect после reopen. |
+| E6 | M0 harness anti-false-green extension: missing/duplicate/skipped inventory; не подмена M0 GO. |
+| E7 | Native transcript pagination/restart boundary. |
+| E8 | Независимые fixture/evidence additions: parallel subset только при непересекающихся scope. |
 
-Добавить deterministic fault suite без paid calls: kill на launch/dispatch/terminal/publish boundaries, full stdout/stderr, corrupted evidence, stale lease, cancelled worker, exhausted budget. «Поймал Unknown и остановился» — safety success, но не automatic-recovery success. Для wall-time и ресурсов сравнивать median/p95/raw distribution; при маленьком n не объявлять statistical significance.
+Corpus привязан к actual source/TODO; post-migration paths и exact SHAs фиксируются до runs. Если feature уже реализована, её заменяют до рандомизации. Seeded faults не объявляются новыми production bugs; весь корпус не должен состоять из trivial mutations.[A4][A5][A8][A12]
 
-До runs задать практический threshold: например, H2 должен снизить human interventions или escaped defects без неприемлемого роста cost/time, а hard safety violations должны оставаться нулём. Численный допустимый рост выбирается владельцем по baseline, не постфактум. Если H2 не лучше, не включать его повсеместно; если P2 не даёт выигрыша на X13s, оставить concurrency=1.
+Метрики: accepted task rate; все calls/observable quota на accepted task; wall-clock; provider retries/repairs/resumes/replans; confirmed findings/false positives/escaped defects; integration conflicts; human interventions; regression rate; recovery success и correct blocked outcomes отдельно; startup/RSS/CPU/FDs/disk/cleanup latency. При zero accepted cost per accepted не равен нулю. UI disconnect и parent restart считаются разными faults.
 
-## D6. Codex prompts
+Offline fault suite: kill на submit acceptance/tool intent/outcome/root import/publication boundaries, full queues, corrupt/missing child store, mismatched scope/epoch, cancelled child, exhausted budgets. Поймать unknown и остановиться — safety success, но не automatic continuation success. При малом n результаты screening, не statistical proof. Если N2 не даёт пользы, не включать его повсеместно; если P2 ухудшает X13s latency, concurrency остаётся 1.
 
-Полные четыре готовых шаблона находятся в [ORCHESTRATION_PROMPTS.md](ORCHESTRATION_PROMPTS.md): первый O1 implementation, independent review, continuation в новой session и автоматически формируемое задание worker. Это текст будущих задач. Они не запускались и не заменяют typed policy/state machine.
+## D6. Prompts
+
+[ORCHESTRATION_PROMPTS.md](ORCHESTRATION_PROMPTS.md) сохраняет имя файла для совместимости ссылок. В нём четыре полных текста: первый O1 implementation для внешнего разработчика; fresh native review; continuation из native state; автоматически составляемый native builder task. Имя файла не означает runtime dependency. Prompts не заменяют typed state/policy и не запускались.
 
 ## D7. Project Documentation
 
-Предлагаемые изменения в отдельной docs-only ветке:
+В существующем docs-only PR #3 исправлены research, ADR, prompts, AGENTS и связанные README/TODO/PROJECT_STATE. Активное product decision везде native-only direct SIWC; historical development notes не используются как product requirements. Обязательный ADR literal приведён в начале отчёта и ADR. Production source, main, PR #2 и RUST_MIGRATION_PLAN не меняются.
 
-- `AGENTS.md`: отдельная будущая Orchestrate граница, один task authority, unknown-effect discipline, fresh review и versioned executor contract; явно не разрешать implementation в текущем C++/M0.
-- `PROJECT_STATE.md`: верхний current decision block с точными main/PR2 SHA, M0 NO-GO и следующим native validation шагом. Сохранить historical results и last known good, не выдавать workspace из PR #2 за merged.
-- `TODO.md`: связать Orchestrate с ADR/O1–O4 и post-M10 dependency; parallel builders не входят в MVP.
-- `README.md`: убрать устаревшее обещание «следующий спринт» и дать ссылку на proposed roadmap; не рекламировать отсутствующую команду.
-- Новый ADR 0002, этот research report и prompts. `RUST_MIGRATION_PLAN.md`, PR #2 и production source не меняются.
+Consistency acceptance: прочитать все семь файлов и полный diff; проверить отсутствие отвергнутых runtime dependencies в active recommendations, одинаковый O1–O4, native identity semantics, CreateNew/OpenExisting distinction, effect_unknown gates, fresh reviewer, direct SIWC и unchanged migration scope. Независимый reviewer проверяет фактический обновлённый diff. Docs checks не являются доказательством реализованного runtime или native M0 GO.
 
-Сборка C++/Rust для таких prose-only changes не доказывала бы новую runtime функциональность. Нужны diff scope, whitespace/link consistency и independent architecture review. Branch/PR сохраняет статус draft; принятие архитектуры пользователем и implementation authorization не выводятся из факта публикации.
+## D8. Risks, Non-Goals и открытые вопросы
 
-## D8. Risks, Non-Goals и оставшиеся неизвестные
-
-| Риск | Мера и предел |
+| Риск / вопрос | Ограничение и будущая проверка |
 |---|---|
-| App-server evolution | Pin binary+schema, narrow adapter, offline conformance/fault fixtures; API experimental label не скрывается. |
-| SIWC preview / eligibility drift | Account-specific discovery и allowlisted capability profile; no silent paid fallback. |
-| Same-model blind spots | Fresh context, actual source/evidence, independent negative tests; diversity модели только по eval. |
-| Full-access effects/credential exposure | Explicit trust policy; sandbox/OS boundary для строгих гарантий; no claim, что prompt предотвращает shell bypass. |
-| Crash между process и turn dispatch | Два durable intents, correlation, no blind replay. |
-| Lost side effect receipt | Reconciliation по external identity; неизвестное действие блокирует retry. |
-| Test gaming или stale PASS | Frozen manifest, test inventory, actual runner status, final SHA, out-of-scope rejection. |
-| Resource pressure X13s | Concurrency=1, bounded logs/memory/processes; реальные measurements до P2. |
-| Ненадёжная summary | Canonical facts вне model memory, short role contexts, compaction eval и exact epoch. |
-| Scope creep в migration | Orchestrate отдельной feature после M10; M0–M10 без изменений. |
+| Child receipt bridge отсутствует как orchestration API | O2 typed durable read/export поверх existing reducer; очередь/preview cursor не evidence. |
+| Потеря original child store | OpenExisting fail-closed; не воссоздавать journal и не повторять Submit. |
+| Cross-context/config leakage | Per-session journal/instructions/epoch/ToolSnapshot; shared auth не shared history. |
+| Auth contention / lock cycles | Последовательный MVP, bounded leases; O2 synthetic cancel/refresh tests, O5 measurements. |
+| Unknown tool/process effects | Native recovery и durable quarantine, без обхода через новую attempt. |
+| Full-access shell | Логическая scope policy не sandbox; строгий enforcement требует отдельной проверенной OS boundary. |
+| Usage gaps | Реальные dispatch counters; usage optional/unknown; in-flight hard token cap не обещается. |
+| Same-model review | Fresh context + independent negative tests; model diversity по eval. |
+| Scope creep migration | Post-M10 default; реальные modules перечислены; M0–M10 unchanged. |
+| Disk power loss / supervisor death | Native fault acceptance отдельно; SIGKILL не доказывает power-loss durability. |
 
-**Explicit non-goals:** большие swarms; unbounded recursive delegation; self-modifying skills; framework ради framework; microservices; Redis/PostgreSQL; неофициальные ChatGPT endpoints; browser automation Pro; зависимость от этого разговора; автоматическое расширение permissions; автоматический main merge/force-push; exactly-once произвольного shell; uninterrupted/adopted live stdio worker после parent crash; remote/cloud executor в MVP; automatic destructive cleanup; non-Git write orchestration в MVP.
+UNKNOWN до implementation/live gates: точная Rust child factory/receipt API форма; original-store integrity/retention scheme; behavior всех tools на restart и native X13s cleanup; permit/budget durability overhead; shared auth fairness при двух builders; account model/effort eligibility; safe process environment; token/usage telemetry; long-context quality; measured N2 benefit. Product choice native-only не является открытым вопросом.
 
-UNKNOWN до будущего допуска: актуальные модели и efforts пользователя; actual SIWC app-server task на X13s; native sandbox/cgroup behavior; quota overhead; token leakage tests; recovery с killed supervisor; disk power-loss durability; эффективность H2 против B0/B1; качество long-context summary. Ни один из этих пунктов не маскируется словом TESTED.
+**Explicit non-goals:** внешние coding runtimes; большие swarms; recursive unbounded delegation; self-modifying skills; второй agent engine/framework; microservices/Redis/PostgreSQL; неофициальные endpoints/browser automation; зависимость от Pro/старого чата; automatic policy expansion; платный fallback; automatic main merge/force-push/destructive cleanup; exactly-once произвольного shell; неограниченный native Resume; non-Git write orchestration в MVP.
 
-### Независимый review проекта архитектуры
+### Однозначные ответы
 
-В этом исследовании отдельный reviewer run проверил design против реальных contracts ansa. В текст включены существенные уточнения: двойная launch boundary; отсутствие long-lived native auth lease вокруг Codex; repository-level lock; честные full-access пределы; frozen verification manifest; полный diff inventory; scoped evidence для read-only reviewer; publication reconciliation. Финальный pass также уточнил recovery старой owner epoch, repository quarantine до cleanup, сохранение Codex thread lineage и ответы на server-initiated requests. Это review архитектуры, не proof реализованного runtime и не полностью независимая статистическая оценка model family.
-
-## Однозначные ответы на десять вопросов
-
-| Вопрос | Ответ |
+| Вопрос | Обязательный ответ |
 |---|---|
-| 1. Codex CLI или native sessions? | Собственный ansa control plane + native read-only planner/reviewer; основной builder через app-server stdio. Не shell tool с правом самому принять milestone. Native coding backend позже по eval. |
-| 2. Всё inference через SIWC? | Да для минимального workflow по официальному поддержанному профилю; при фактической eligibility. Persistence/tools/scheduler локальные. Не все Responses/SDK features доступны; actual account access здесь UNKNOWN. |
-| 3. Когда платный API? | При нужной capability/capacity/модели вне SIWC или желании отдельного бюджета/observability. Только explicit route и cost policy. |
-| 4. Разные модели обязательны? | Нет. Одной сильной модели в отдельных contexts достаточно для стартового eval. Routing и effort выбираются по capabilities/accepted-task results. |
-| 5. Review без Pro? | Fresh native session, actual diff/source/runner evidence, independent assertions; более сильная/другая доступная модель опциональна. |
-| 6. Durable child без double effects? | Durable launch и turn intents, consume-once process start, owner fencing, stop/quiesce/reconcile. Unknown не повторяется; общей exactly-once гарантии нет. |
-| 7. Parallel conflicts? | В MVP concurrency=1. Затем два worktrees, frozen bases/contracts, scope admission и serialized integration с final-SHA tests. |
-| 8. Продолжение между sessions? | Versioned goal/requirements/policy, task journal, Git checkpoint, process/test evidence, budgets и handoff packet; чат не canonical state. |
-| 9. Когда Rust Orchestrate? | Production отдельным feature после M10 GO. Narrow non-production spike возможен после M6; B после M8/M9 только отдельным обоснованным решением. |
-| 10. Первая доказательная задача? | Сейчас — корректный blocker по native M0. В live pilot O4 — read-only unresolved-effects diagnostic с negative tests, fresh review и verified PR; сравнить с single-agent baseline. |
+| Product execution | Только native ANSA sessions/loop/tools. Внешний coding tool допустим лишь для разработки ANSA. |
+| Inference | Только собственный direct SIWC Responses; local child sessions, без серверного multi_agent. |
+| Paid API | Не входит в принятое решение и не является fallback. |
+| Разные модели | Не обязательны; доступные SIWC profiles и fresh contexts. |
+| Review без Pro | Fresh native reviewer на actual diff/source/runner evidence. |
+| Durable child | Original native session, exact binding, known outcome recovery, no replay effect_unknown. |
+| Parallel workers | Сначала 1, затем максимум 2 после eval. |
+| Continuation | Task journal + original child journals + Git/evidence/budgets/handoff. |
+| Migration | Собственные Rust modules M2–M7, gates M8/M9; default feature после M10. |
+| Первый E2E | Сейчас корректный M0 blocker; в O4 useful native diagnostic → verified PR. |
 
 ## Источники
 
-### ANSA: immutable repository evidence
+Repository evidence сохранено из исходного исследования; correction использует те же immutable SHAs. Нового полного аудита не выполнялось.
 
-- **A1** GitHub branches, main commit и metadata: [source](https://github.com/junknewera/ansa/commit/ca851c99d4887a121300f0bcee8687ed9d055071) . Ветки считаны через `/repos/junknewera/ansa/branches?per_page=100`.
-- **A2** PR #1 [source](https://github.com/junknewera/ansa/pull/1) ; PR #2 [source](https://github.com/junknewera/ansa/pull/2) . Reviews/checks прочитаны отдельно; snapshots могут измениться после даты аудита.
-- **A3** AGENTS и Rust migration plan на inspected main: [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/AGENTS.md) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/RUST_MIGRATION_PLAN.md) .
-- **A4** PROJECT_STATE и implementation report: [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/PROJECT_STATE.md) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/implementation-report.md) .
-- **A5** Architecture: [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/architecture.md) .
-- **A6** TODO/README: [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/TODO.md) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/README.md) .
-- **A7** Session/journal reducers: [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/session.cpp) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/journal.cpp) .
-- **A8** ProcessRunner и tests: [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/process.cpp) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/tests/process_tests.cpp) .
-- **A9** Runtime/contracts/Responses/auth: [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/include/omh/contracts.hpp) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/runtime.cpp) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/responses.cpp) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/agent_authorization.hpp) ; [source](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/auth.cpp) .
-- **A10** M0 closeout на PR #2 head: [source](https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/docs/migration/M0.md) .
-- **A11** Rust scaffold: [source](https://github.com/junknewera/ansa/tree/c06b1a839695e0690ead1db88c5e2a2df9a198db/rust) ; Nix: [source](https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/flake.nix) .
-- **A12** M0 harness: [source](https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/tests/parity/run.py) ; [source](https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/tests/parity/test_run.py) ; [source](https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/tests/parity/fixtures/manifest.json) .
-
-### Официальные OpenAI contracts, прочитанные 2026-11-13
-
-- **O1** SIWC overview: [source](https://developers.openai.com/siwc/token-sharing-open-source) .
-- **O2** Models and inference: [source](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference) .
-- **O3** Preview limitations: [source](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) .
-- **O4** Errors and recovery: [source](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery) .
-- **O5** SIWC Codex app-server: [source](https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server) .
-- **O6** API-credit benefits, отдельные eligibility/billing limitations: [source](https://developers.openai.com/api/docs/guides/chatgpt-api-credits) .
-- **O7** Responses background: [source](https://developers.openai.com/api/docs/guides/background) .
-- **O8** Structured outputs: [source](https://developers.openai.com/api/docs/guides/structured-outputs) .
-- **O9** Agents SDK и orchestration: [source](https://developers.openai.com/api/docs/guides/agents/sdk) ; [source](https://developers.openai.com/api/docs/guides/agents/orchestration) ; [source](https://developers.openai.com/api/docs/guides/agents/results) .
-- **O10** Responses Multi-agent beta: [source](https://developers.openai.com/api/docs/guides/responses-multi-agent) .
-- **O11** App-server protocol: [source](https://learn.chatgpt.com/docs/app-server) .
-- **O12** Noninteractive execution: [source](https://learn.chatgpt.com/docs/non-interactive-mode) .
-- **O13** CLI commands/maturity: [source](https://learn.chatgpt.com/docs/developer-commands) ; [source](https://learn.chatgpt.com/docs/cli/reference) .
-- **O14** Codex TypeScript/Python SDK: [source](https://learn.chatgpt.com/docs/codex-sdk) .
-- **O15** Cloud: [source](https://learn.chatgpt.com/docs/cloud) .
-- **O16** Agents API self-hosted execution: [source](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted) .
-- **O17** SIWC profiles, refresh, credential security, usage: [source](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions) .
-- **O18** Codex sandbox: [source](https://learn.chatgpt.com/docs/sandboxing) .
-- **O19** Codex subagent configuration: [source](https://learn.chatgpt.com/docs/agent-configuration/subagents) .
-- **O20** Responses compaction: [source](https://developers.openai.com/api/docs/guides/compaction) .
-
-### Codex source: pinned stable release
-
-- **C1** Release `rust-v0.168.0`: [source](https://github.com/openai/codex/releases/tag/rust-v0.168.0) ; commit [source](https://github.com/openai/codex/commit/9480ec100c3edee9fc69172e8e80a4730444094d) .
-- **C2** Protocol schema: [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server-protocol/schema/json/v2/TurnStartParams.json) .
-- **C3** exec JSONL terminal mapping: [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/exec/src/event_processor_with_jsonl_output.rs) .
-- **C4** Interrupt/session/cleanup handlers: [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server/src/request_processors/turn_processor.rs) ; [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/core/src/session/mod.rs) ; [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/core/src/session/handlers.rs) .
-- **C5** History normalization: [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server/src/request_processors/thread_lifecycle.rs) .
-- **C6** Tree shutdown: [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/core/src/thread_manager/shutdown.rs) ; [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/core/tests/suite/abort_tasks.rs) .
-- **C7** App-server EOF/shutdown: [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server/src/lib.rs) ; [source](https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server/src/request_processors/thread_processor.rs) .
-
-### Git и Linux
-
-- **G1** Git worktree: [source](https://git-scm.com/docs/git-worktree) .
-- **L1** Linux cgroup v2: [source](https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html) .
-- **L2** systemd kill policy: [official source](https://github.com/systemd/systemd/blob/main/man/systemd.kill.xml) (раздел KillMode прочитан через GitHub connector); [manual](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html). Конкретный unit lifecycle ещё не реализован и требует native target acceptance.
-
-
+### ANSA
 
 [A1]: https://github.com/junknewera/ansa/commit/ca851c99d4887a121300f0bcee8687ed9d055071
 [A2]: https://github.com/junknewera/ansa/pull/1
-[A3]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/AGENTS.md
+[A3]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/RUST_MIGRATION_PLAN.md
 [A4]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/PROJECT_STATE.md
 [A5]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/architecture.md
 [A6]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/TODO.md
@@ -758,33 +601,32 @@ UNKNOWN до будущего допуска: актуальные модели 
 [A10]: https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/docs/migration/M0.md
 [A11]: https://github.com/junknewera/ansa/tree/c06b1a839695e0690ead1db88c5e2a2df9a198db/rust
 [A12]: https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/tests/parity/run.py
+[N1]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/runtime.cpp
+[N2]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/include/omh/session.hpp
+[N3]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/include/omh/responses.hpp
+[N4]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/local_tools.cpp
+[N5]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/auth.cpp
+
+- [Main commit][A1], [PR #1][A2], [PR #2](https://github.com/junknewera/ansa/pull/2), [AGENTS](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/AGENTS.md), [migration plan][A3], [PROJECT_STATE][A4], [architecture][A5], [TODO][A6].
+- [Session reducer][A7], [journal](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/journal.cpp), [ProcessRunner][A8], [contracts][A9], [Responses](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/responses.cpp).
+- [Runtime][N1], [native runtime interface](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/include/omh/runtime.hpp), [SessionState/SubmitReceipt][N2], [CompletedResponse][N3], [ToolRegistry/ToolSnapshot](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/include/omh/tools.hpp), [local tools][N4], [settings/epoch](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/agent_config.cpp), [auth][N5], [authorization](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/agent_authorization.hpp).
+- [M0][A10], [Rust scaffold][A11], [harness][A12], [harness tests](https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/tests/parity/test_run.py), [implementation report](https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/docs/implementation-report.md).
+
+### Официальный direct SIWC contract
+
 [O1]: https://developers.openai.com/siwc/token-sharing-open-source
 [O2]: https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference
 [O3]: https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations
 [O4]: https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery
-[O5]: https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server
-[O6]: https://developers.openai.com/api/docs/guides/chatgpt-api-credits
-[O7]: https://developers.openai.com/api/docs/guides/background
 [O8]: https://developers.openai.com/api/docs/guides/structured-outputs
-[O9]: https://developers.openai.com/api/docs/guides/agents/sdk
-[O10]: https://developers.openai.com/api/docs/guides/responses-multi-agent
-[O11]: https://learn.chatgpt.com/docs/app-server
-[O12]: https://learn.chatgpt.com/docs/non-interactive-mode
-[O13]: https://learn.chatgpt.com/docs/developer-commands
-[O14]: https://learn.chatgpt.com/docs/codex-sdk
-[O15]: https://learn.chatgpt.com/docs/cloud
-[O16]: https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted
 [O17]: https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions
-[O18]: https://learn.chatgpt.com/docs/sandboxing
-[O19]: https://learn.chatgpt.com/docs/agent-configuration/subagents
-[O20]: https://developers.openai.com/api/docs/guides/compaction
-[C1]: https://github.com/openai/codex/releases/tag/rust-v0.168.0
-[C2]: https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server-protocol/schema/json/v2/TurnStartParams.json
-[C3]: https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/exec/src/event_processor_with_jsonl_output.rs
-[C4]: https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server/src/request_processors/turn_processor.rs
-[C5]: https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
-[C6]: https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/core/src/thread_manager/shutdown.rs
-[C7]: https://github.com/openai/codex/blob/9480ec100c3edee9fc69172e8e80a4730444094d/codex-rs/app-server/src/lib.rs
+
+- [Own registration/plan usage][O1], [models and inference][O2], [SIWC limitations][O3], [errors/recovery][O4], [accounts/refresh][O17]. Общий [structured outputs contract][O8] не доказывает route-specific entitlement.
+
+### Git и Linux
+
 [G1]: https://git-scm.com/docs/git-worktree
 [L1]: https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
 [L2]: https://github.com/systemd/systemd/blob/main/man/systemd.kill.xml
+
+- [Git worktree][G1], [cgroup v2][L1], [systemd kill policy][L2]. Дополнительный containment profile — optional post-migration capability с собственными tests.
