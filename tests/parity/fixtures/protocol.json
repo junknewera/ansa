@@ -214,7 +214,7 @@
     "request_array_order_exact": true
   },
   "case_requirements": {
-    "compare_total": 7292,
+    "compare_total": 7303,
     "compare_stable_ids": [
       "dependencies-json-empty",
       "dependencies-json-trailing-data",
@@ -405,7 +405,18 @@
       "reducer-preview-rejects-invalid-model",
       "reducer-preview-rejects-invalid-response-id",
       "reducer-preview-rejects-invalid-item-order",
-      "reducer-completion-order-follows-native-output"
+      "reducer-completion-order-follows-native-output",
+      "reducer-review-orphan-arguments-done",
+      "reducer-review-orphan-arguments-done-with-id",
+      "reducer-review-arguments-done-missing-item-id",
+      "reducer-review-arguments-target-message",
+      "reducer-review-arguments-delta-after-arguments-done",
+      "reducer-review-arguments-delta-after-item-done",
+      "reducer-review-added-arguments-conflict",
+      "reducer-review-terminal-omits-unfinished-item",
+      "reducer-review-final-omits-unfinished-part",
+      "reducer-review-response-id-bound-before-preview",
+      "reducer-review-added-call-limit-before-preview"
     ],
     "generated_prefix_counts": {
       "sse-round1-production-split-": 1923,
@@ -604,7 +615,18 @@
       "reducer-preview-rejects-invalid-missing-created",
       "reducer-preview-rejects-invalid-model",
       "reducer-preview-rejects-invalid-response-id",
-      "reducer-preview-rejects-invalid-item-order"
+      "reducer-preview-rejects-invalid-item-order",
+      "reducer-review-orphan-arguments-done",
+      "reducer-review-orphan-arguments-done-with-id",
+      "reducer-review-arguments-done-missing-item-id",
+      "reducer-review-arguments-target-message",
+      "reducer-review-arguments-delta-after-arguments-done",
+      "reducer-review-arguments-delta-after-item-done",
+      "reducer-review-added-arguments-conflict",
+      "reducer-review-terminal-omits-unfinished-item",
+      "reducer-review-final-omits-unfinished-part",
+      "reducer-review-response-id-bound-before-preview",
+      "reducer-review-added-call-limit-before-preview"
     ]
   },
   "historical_cpp_inventory": {

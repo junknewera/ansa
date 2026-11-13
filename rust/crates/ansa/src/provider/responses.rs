@@ -361,7 +361,7 @@ impl Reducer {
                     let response = value.field("response")?;
                     response_id = response.text_field("id")?.to_owned();
                     created_model = response.text_field("model")?.to_owned();
-                    if response_id.is_empty()
+                    if !nonempty(&response_id)
                         || created_model != self.request.binding.returned_model
                         || response.text_field("status")? != "in_progress"
                         || !response.field("output")?.elements()?.is_empty()
@@ -396,32 +396,34 @@ impl Reducer {
                         return Err("duplicate_item");
                     }
                 }
-                "response.function_call_arguments.delta" => {
+                "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done" => {
                     let i = value.usize_field("output_index")?;
                     let item_id = value.text_field("item_id")?;
-                    if added
-                        .get(&i)
-                        .is_none_or(|v| v.text_field("id").ok() != Some(item_id))
+                    let prior = added.get(&i).ok_or("orphan_argument_target")?;
+                    if prior.text_field("id")? != item_id
+                        || prior.text_field("type")? != "function_call"
+                        || done.contains_key(&i)
+                        || arg_final.contains_key(&i)
                     {
-                        return Err("orphan_argument_delta");
+                        return Err("argument_target_or_lifecycle");
                     };
-                    let delta = value.text_field("delta")?;
-                    let slot = arg_delta.entry(i).or_default();
-                    if slot.len().saturating_add(delta.len()) > self.limits.arguments {
-                        return Err("arguments_limit");
-                    };
-                    slot.push_str(delta);
-                }
-                "response.function_call_arguments.done" => {
-                    let i = value.usize_field("output_index")?;
-                    let final_value = value.text_field("arguments")?.to_owned();
-                    if final_value.len() > self.limits.arguments {
-                        return Err("arguments_limit");
-                    };
-                    if arg_final.insert(i, final_value.clone()).is_some()
-                        || arg_delta.get(&i).is_some_and(|d| d != &final_value)
-                    {
-                        return Err("arguments_delta_conflict");
+                    if ty.ends_with(".delta") {
+                        let delta = value.text_field("delta")?;
+                        let slot = arg_delta.entry(i).or_default();
+                        if slot.len().saturating_add(delta.len()) > self.limits.arguments {
+                            return Err("arguments_limit");
+                        };
+                        slot.push_str(delta);
+                    } else {
+                        let final_value = value.text_field("arguments")?.to_owned();
+                        if final_value.len() > self.limits.arguments {
+                            return Err("arguments_limit");
+                        };
+                        if arg_delta.get(&i).is_some_and(|d| d != &final_value) {
+                            return Err("arguments_delta_conflict");
+                        }
+                        arg_final.insert(i, final_value);
                     }
                 }
                 "response.output_item.done" => {
@@ -445,7 +447,9 @@ impl Reducer {
                             }
                         }
                         let args = item.text_field("arguments")?;
-                        if arg_final.get(&i).is_some_and(|a| a != args)
+                        let initial = prior.text_field("arguments")?;
+                        if (!initial.is_empty() && initial != args)
+                            || arg_final.get(&i).is_some_and(|a| a != args)
                             || arg_delta.get(&i).is_some_and(|a| a != args)
                         {
                             return Err("arguments_final_conflict");
@@ -482,6 +486,10 @@ impl Reducer {
                         if !initial.is_empty() && initial != finals {
                             return Err("added_content_conflict");
                         };
+                        let part_count = parts.keys().filter(|(index, _)| *index == i).count();
+                        if part_count != 0 && part_count != finals.len() {
+                            return Err("content_part_count");
+                        }
                         for (j, part) in finals.iter().enumerate() {
                             if parts.keys().any(|(index, _)| *index == i)
                                 && (part_done.get(&(i, j)) != Some(part))
@@ -533,7 +541,8 @@ impl Reducer {
                         }
                         let p = value.field("part")?.clone();
                         let kind = p.text_field("type")?;
-                        if !["summary_text", "output_text", "refusal"].contains(&kind)
+                        if (summary && kind != "summary_text")
+                            || !["summary_text", "output_text", "refusal"].contains(&kind)
                             || !p
                                 .text_field(if kind == "refusal" { "refusal" } else { "text" })?
                                 .is_empty()
@@ -596,7 +605,8 @@ impl Reducer {
         let mut call_ids = HashSet::new();
         for item in added.values() {
             if item.text_field("type")? == "function_call"
-                && !call_ids.insert(item.text_field("call_id")?)
+                && (!call_ids.insert(item.text_field("call_id")?)
+                    || call_ids.len() > self.limits.calls)
             {
                 return Err("duplicate_call_id");
             }
@@ -620,7 +630,7 @@ impl Reducer {
         };
         let mut items = Vec::new();
         let output = terminal.field("output")?.elements()?;
-        if output.len() != done.len() {
+        if output.len() != added.len() || output.len() != done.len() {
             return Err("terminal_item_count");
         };
         for (i, item) in output.iter().enumerate() {
@@ -737,6 +747,9 @@ fn validate_item(
             }
         }
         "reasoning" => {
+            if item.has("encrypted_content") {
+                item.text_field("encrypted_content")?;
+            }
             for p in item.field("summary")?.elements()? {
                 if p.text_field("type")? != "summary_text" {
                     return Err("reasoning_summary_type");

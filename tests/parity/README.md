@@ -14,7 +14,7 @@ python3 tests/parity/run.py fault --suite protocol --cpp-build build-ansa --rust
 python3 tests/parity/run.py check --milestone M2 --evidence build-migration/M2
 ```
 
-Матрицы требуют 7292 compare и 184 fault cases, обе SSE fixtures, реальные
+Матрицы требуют 7303 compare и 195 fault cases, обе SSE fixtures, реальные
 localhost HTTP transfer failures и pure counter executors. Fault запускает
 drop/reorder mutants production Rust replay builder. Checker заново проверяет
 retained requests/responses, полный continuation и нулевое число executors при

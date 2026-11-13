@@ -7,6 +7,7 @@ replay builder.
 from dataclasses import dataclass
 from contextlib import ExitStack
 from datetime import datetime, timezone
+import copy
 import hashlib
 import json
 import math
@@ -667,7 +668,6 @@ def cases(data, mode):
                  if event['type'] == 'response.output_text.delta').__setitem__('response_id', 'wrong-response')),
             ('item-order', lambda events: next(event for event in events
                  if event['type'] == 'response.output_item.added').__setitem__('output_index', NumberToken('1', True)))):
-        import copy
         altered = copy.deepcopy(preview_events)
         mutate(altered)
         name = 'reducer-preview-rejects-invalid-' + suffix
@@ -686,6 +686,63 @@ def cases(data, mode):
                                        'body': encode_events(reordered)},
                  'expected': {'accepted': True, 'batch_accepted': True, 'executor_count': 2,
                               'expected_items': items, 'expected_calls_value': calls, 'replay': 'multi'}})
+
+    # Independent review regressions: complete the original valid response
+    # after each malformed event, so a skipped guard would authorize execution.
+    regressions = []
+    for suffix, event in (
+            ('orphan-arguments-done', {'type': 'response.function_call_arguments.done',
+                                      'output_index': NumberToken('999', True), 'arguments': '{}'}),
+            ('orphan-arguments-done-with-id', {'type': 'response.function_call_arguments.done',
+                      'output_index': NumberToken('999', True), 'item_id': 'fc_a', 'arguments': '{}'})):
+        altered = copy.deepcopy(original)
+        altered.insert(1, event)
+        regressions.append((suffix, altered, []))
+    altered = copy.deepcopy(original)
+    next(e for e in altered if e['type'] == 'response.function_call_arguments.done').pop('item_id')
+    regressions.append(('arguments-done-missing-item-id', altered, []))
+    altered = copy.deepcopy(preview_events)
+    altered.insert(2, {'type': 'response.function_call_arguments.delta',
+                       'output_index': NumberToken('0', True), 'item_id': 'msg_a', 'delta': '{}'})
+    regressions.append(('arguments-target-message', altered, []))
+    for suffix, anchor in (('arguments-delta-after-arguments-done', 'response.function_call_arguments.done'),
+                           ('arguments-delta-after-item-done', 'response.output_item.done')):
+        altered = copy.deepcopy(original)
+        index = next(i for i, e in enumerate(altered) if e['type'] == anchor
+                     and (anchor != 'response.output_item.done' or e['item']['type'] == 'function_call'))
+        altered.insert(index + 1, {'type': 'response.function_call_arguments.delta',
+                                  'output_index': NumberToken('1', True), 'item_id': 'fc_a', 'delta': ''})
+        regressions.append((suffix, altered, []))
+    altered = copy.deepcopy(original)
+    next(e for e in altered if e['type'] == 'response.output_item.added'
+         and e['item']['type'] == 'function_call')['item']['arguments'] = '[1]'
+    regressions.append(('added-arguments-conflict', altered, []))
+    altered = copy.deepcopy(original)
+    altered.insert(len(altered) - 1, {'type': 'response.output_item.added',
+        'output_index': NumberToken('2', True),
+        'item': {'type': 'reasoning', 'id': 'rs_extra', 'summary': [], 'status': 'in_progress'}})
+    regressions.append(('terminal-omits-unfinished-item', altered, []))
+    altered = copy.deepcopy(preview_events)
+    altered.insert(len(altered) - 2, {'type': 'response.content_part.added',
+        'output_index': NumberToken('0', True), 'item_id': 'msg_a', 'content_index': NumberToken('1', True),
+        'part': {'type': 'output_text', 'text': ''}})
+    regressions.append(('final-omits-unfinished-part', altered, ['OMH_TOOL_OK:OMH_FIXED_VALUE_42']))
+    altered = copy.deepcopy(preview_events)
+    altered[0]['response']['id'] = altered[-1]['response']['id'] = 'r' * 257
+    regressions.append(('response-id-bound-before-preview', altered, []))
+    altered = copy.deepcopy(preview_events)
+    for index in range(1, 18):
+        altered.insert(index + 1, {'type': 'response.output_item.added',
+            'output_index': NumberToken(str(index), True), 'item': {'type': 'function_call',
+            'id': 'extra_' + str(index), 'call_id': 'call_extra_' + str(index),
+            'name': 'get_test_value', 'namespace': 'omh', 'arguments': '', 'status': 'in_progress'}})
+    regressions.append(('added-call-limit-before-preview', altered, []))
+    for suffix, altered, previews in regressions:
+        name = 'reducer-review-' + suffix
+        rows.append({'id': name, 'request': {'id': name, 'status': 200, 'mime': 'text/event-stream',
+                                           'body': encode_events(altered), 'preview': True},
+                     'expected': {'accepted': False, 'batch_accepted': None, 'executor_count': 0,
+                                  'preview_texts': previews}})
 
     if mode == 'fault':
         controls = {'fixture-round1', 'fixture-round2', 'fixture-two-calls',
