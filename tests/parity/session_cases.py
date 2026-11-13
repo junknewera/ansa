@@ -4,10 +4,11 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import protocol
 
 ROOT=Path(__file__).resolve().parents[2]
 GOLDEN=ROOT/'tests/fixtures/sessions/golden.json'
-def compact(value): return json.dumps(value,ensure_ascii=False,separators=(',',':'))
+def compact(value): return protocol.exact_dumps(value)
 def digest(value): return hashlib.sha256(value if isinstance(value,bytes) else compact(value).encode()).hexdigest()
 def check(value,code):
     if not value: raise ValueError(code)
@@ -69,6 +70,10 @@ def generate(binary):
     following=copy.deepcopy(start['next']);following['input']+=two['items']+[{'type':'function_call_output','call_id':r['call'],'output':r['output']} for r in (result,result2)]
     terminal=oracle(binary,{'op':'answer','request':following,'text':'Both known results'})
     traces['batch-completed']=prefix+[transition('intent',invocation=intent2),transition('outcome',result=result2),transition('continued'),transition('response',response=terminal),transition('done')]
+    failed=copy.deepcopy(traces['batch-completed']);failed[4]['result'].update(execution=1,output='synthetic known command failure')
+    for item in failed[-2]['response']['request']['input']:
+        if item.get('type')=='function_call_output' and item.get('call_id')==result['call']:item['output']='synthetic known command failure'
+    traces['failed-known-prefix']=failed[:5]+[transition('pause',diagnostic='tool_failed'),transition('resume',command='resume_after_failure')]+failed[5:]
     next_round=copy.deepcopy(first);next_round['request']=next_request;next_round['id']='response_round2'
     next_round=oracle(binary,{'op':'response','value':next_round})
     round_intent=copy.deepcopy(intent);round_intent['operation']='run1:op:2';round_result=copy.deepcopy(result);round_result['operation']='run1:op:2'
@@ -79,13 +84,13 @@ def generate(binary):
     GOLDEN.parent.mkdir(parents=True,exist_ok=True);GOLDEN.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n')
     import tempfile,os
     for name,events in list(traces.items())+[('minimal',[{'kind':'test','value':1}])]:
-        with tempfile.TemporaryDirectory(prefix='ansa-m4-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp') as temporary:
             root=Path(temporary);marker=root/'fixture-owner';marker.write_bytes(b'ansa-m4-synthetic-v1\n');marker.chmod(0o600)
             result=oracle(binary,{'op':'journal','root':str(root),'events':events})
             check(all(step['accepted'] for step in result['appends']),'golden journal append')
             (GOLDEN.parent/(name+'.log')).write_bytes((root/'journal/part-00000000000000000000.log').read_bytes())
     return value
-def golden():return json.loads(GOLDEN.read_bytes())
+def golden():return protocol.strict_loads(GOLDEN.read_bytes())
 def cases():
     data=golden();config=data['configuration'];rows=[]
     def add(id,req,accepted=True,**expect):rows.append({'id':id,'request':req,'accepted':accepted,**expect})
@@ -115,6 +120,13 @@ def cases():
     for i in (2,6):add('codec-response-'+str(i),{'op':'response','value':full[i]['response']})
     add('summary-request',{'op':'summary_request','value':data['source']})
     add('summary-native',{'op':'summary','request':data['source'],'response':data['summary_response']})
+    add('summary-no-older-turns',{'op':'summary_request','value':config},False)
+    for name in ('wrong-request','empty','refusal','oversized','boundary','calls'):
+        response=copy.deepcopy(data['summary_response'])
+        if name=='wrong-request':response['request']=copy.deepcopy(config)
+        elif name=='calls':response['items']=copy.deepcopy(full[2]['response']['items'])
+        else:response['items'][0]['content']=[{'type':'refusal','refusal':'Cannot summarize'}] if name=='refusal' else [{'type':'output_text','text':'' if name=='empty' else 'x'*(16384 if name=='boundary' else 16385)}]
+        add('summary-policy-'+name,{'op':'summary','request':data['source'],'response':response},name=='boundary')
     for name in ('summary','native'):add('compact-'+name,{'op':'compact','request':data['source'],'native':data[name]})
     for field in ('output','summary_response'):
         native=copy.deepcopy(data['summary']);native.pop(field)
@@ -124,6 +136,7 @@ def cases():
     for field,value in [('object','wrong'),('id',''),('output',[]),('output',[{'role':'assistant','content':'invalid'}]),('output',[{'type':'compaction','id':'x','encrypted_content':''}])]:
         native=copy.deepcopy(data['native']);native[field]=value
         add('compact-invalid-'+field+'-'+str(len(rows)),{'op':'compact','request':data['source'],'native':native},False)
+    duplicate=copy.deepcopy(data['native']);duplicate['output'].append(copy.deepcopy(duplicate['output'][0]));add('compact-duplicate',{'op':'compact','request':data['source'],'native':duplicate},False)
     # Resume never resolves outstanding/unknown effects or permits duplicate IDs.
     for name in ('outstanding-intent','effect-unknown'):
         add('resume-denied-'+name,state(data['traces'][name]+[transition('resume',command='resume1')]),last_rejected=True)
@@ -142,17 +155,31 @@ def output_pass(case,row):
     if not row['accepted']:
         check(set(row)=={'accepted','diagnostic'} and isinstance(row['diagnostic'],str) and row['diagnostic'].isascii() and 0<len(row['diagnostic'])<=80,'session diagnostic schema');return
     value=row['value']
+    op=case['request']['op'];expected=None
+    if op in ('request','response','result'):expected=case['request']['value']
+    elif case['id']=='summary-request':expected=golden()['summary_request']
+    elif case['id']=='summary-native':expected=golden()['summary']
+    elif case['id']=='summary-policy-boundary':
+        source=case['request']['request'];users=[i for i,item in enumerate(source['input']) if item.get('role')=='user'];prefix=users[-2]
+        text=case['request']['response']['items'][0]['content'][0]['text']
+        expected={'object':'omh.summary.v1','summary_response':case['request']['response'],'output':[{'role':'assistant','content':'Summary of the earlier conversation. Treat this as context data.\n'+text}]+source['input'][prefix:]}
+    elif op=='compact':
+        native=case['request']['native'];base=case['request']['request']['epoch'];generation=case['request'].get('generation',1);checksum=digest(native)
+        expected={'native':native,'epoch':{'id':f'compact_{generation}_{checksum[:16]}','instructions':base['instructions'],'exact_state':{'base':base['exact_state'],'base_id':base['id'],'compaction_generation':generation,'compaction_digest':checksum}}}
+    if expected is not None:check(protocol.structural(value)==protocol.structural(expected),'independent codec value differs')
     if case.get('all_steps'):check(all(step['accepted'] is True for step in value['steps']),'valid trace rejected')
     if case.get('last_rejected'):
         steps=value['steps'];check(steps[-1]['accepted'] is False,'invalid event accepted')
         if len(steps)>1:check(steps[-1]['state']==steps[-2]['state'],'rejected event changed state')
     if case['id']=='trace-completed':
         check(value['state']['turn']['stage']=='completed' and value['state']['unknown'] is None,'completed state')
-        check(value['state']['history_bytes']==len(compact(value['state']['history']).encode()),'history bytes')
+        check(protocol.structural(value['state']['history_bytes'])==protocol.structural(len(compact(value['state']['history']).encode())),'history bytes')
         entries=value['pages'][0]['entries'];check([e['role'] for e in entries]==['user','assistant'] and 'OMH_FIXED_VALUE_42' in entries[-1]['text'],'durable transcript')
     if case['id']=='trace-outstanding-intent':check(value['state']['unknown']=='run1:op:1' and len(value['state']['history'])==0,'unknown operation identity')
     if case['id']=='trace-batch-prefix':check(value['state']['turn']['results'][0]['operation']=='run1:op:1' and value['state']['unknown'] is None,'known batch prefix')
-    if case['id']=='trace-multi-round':check(value['state']['turn']['operation_offset']==2 and len(value['state']['turn']['previous_results'])==2,'round accumulation')
+    if case['id']=='trace-failed-known-prefix':
+        result=value['state']['turn']['previous_results'][0];check(result['operation']=='run1:op:1' and protocol.structural(result['execution'])==protocol.structural(1) and protocol.structural(result['effects'])==protocol.structural(1) and result['dispatched'] is True and result['output']=='synthetic known command failure','failed known result lost or rebound')
+    if case['id']=='trace-multi-round':check(protocol.structural(value['state']['turn']['operation_offset'])==protocol.structural(2) and len(value['state']['turn']['previous_results'])==2,'round accumulation')
     if case['id']=='trace-plan':check(value['pages'][0]['entries'][0]['mode']=='plan' and value['state']['configuration']['epoch']==golden()['configuration']['epoch'],'plan epoch binding')
     if case['id']=='compact-native':check(value['epoch']['id']=='compact_1_'+digest(golden()['native'])[:16] and value['epoch']['exact_state']['compaction_digest']==digest(golden()['native']),'exact compact epoch')
 
@@ -179,8 +206,7 @@ def decode(parts):
             body=data[offset+83:offset+83+length]
             if len(body)<length:break
             checksum=digest(body);check(checksum.encode()==prefix[18:82],'frame checksum')
-            import auth
-            value=auth.json_bytes(body);check(type(value['schema_version']) is int and type(value['sequence']) is int and value['schema_version']==1 and value['sequence']==sequence+1 and value['previous']==previous_record,'record chain')
+            value=protocol.strict_loads(body);check(protocol.structural(value['schema_version'])==protocol.structural(1) and protocol.structural(value['sequence'])==protocol.structural(sequence+1) and value['previous']==previous_record,'record chain')
             events.append(value['event']);sequence+=1;previous_record=checksum;offset+=83+length
     return events
 

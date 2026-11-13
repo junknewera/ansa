@@ -413,3 +413,116 @@ fn catalog_identity_and_latest() {
         Err("session_workspace_mismatch")
     ));
 }
+
+#[test]
+fn transcript_block_boundaries_and_byte_cap() {
+    use ansa::provider::contracts::AgentMode;
+    fn accept(state: &State, index: usize, text: &str) -> Json {
+        Json::object(vec![
+            ("kind", Json::string("accepted").unwrap()),
+            ("command", Json::string(&format!("c{index}")).unwrap()),
+            ("turn", Json::string(&format!("t{index}")).unwrap()),
+            ("request", Json::string(&format!("r{index}")).unwrap()),
+            ("request_number", Json::parse(&index.to_string()).unwrap()),
+            ("text", Json::string(text).unwrap()),
+            (
+                "operation_run",
+                Json::string(&format!("run{index}")).unwrap(),
+            ),
+            (
+                "next",
+                state
+                    .request_for(text, AgentMode::Basic)
+                    .unwrap()
+                    .save()
+                    .unwrap(),
+            ),
+            ("compact", Json::parse("false").unwrap()),
+        ])
+        .unwrap()
+    }
+    let mut long = state();
+    long.apply(&long.initialization().unwrap()).unwrap();
+    let mut early = None;
+    for index in 1..=300 {
+        let event = accept(&long, index, &format!("item {index}"));
+        long.apply(&event).unwrap();
+        if index == 64 {
+            early = Some(long.transcript());
+        }
+        long.apply(
+            &Json::parse(&format!("{{\"kind\":\"cancel\",\"turn\":\"t{index}\"}}")).unwrap(),
+        )
+        .unwrap();
+    }
+    let early = early.unwrap();
+    assert_eq!(early.len(), 64);
+    assert_eq!(
+        early
+            .page(GetTranscript {
+                before: 0,
+                limit: 64,
+                forward: false
+            })
+            .entries
+            .last()
+            .unwrap()
+            .state,
+        "generating"
+    );
+    let page = long.transcript().page(GetTranscript {
+        before: 130,
+        limit: 64,
+        forward: false,
+    });
+    assert_eq!((page.begin, page.end, page.total), (66, 130, 300));
+    assert_eq!(page.entries[0].text, "item 67");
+    assert_eq!(page.entries.last().unwrap().text, "item 130");
+    let page = long.transcript().page(GetTranscript {
+        before: 61,
+        limit: 8,
+        forward: true,
+    });
+    assert_eq!((page.begin, page.end), (61, 69));
+    assert_eq!(page.entries[0].text, "item 62");
+    assert_eq!(page.entries.last().unwrap().text, "item 69");
+    let page = long.transcript().page(GetTranscript {
+        before: 2,
+        limit: 16,
+        forward: false,
+    });
+    assert_eq!(page.begin, 0);
+    assert_eq!(page.entries[0].text, "item 1");
+    let mut sized = state();
+    sized.apply(&sized.initialization().unwrap()).unwrap();
+    for index in 1..=24 {
+        let text = char::from(b'a' + index as u8 - 1)
+            .to_string()
+            .repeat(if index <= 4 { 1 } else { 16 * 1024 });
+        sized.apply(&accept(&sized, index, &text)).unwrap();
+        sized
+            .apply(&Json::parse(&format!("{{\"kind\":\"cancel\",\"turn\":\"t{index}\"}}")).unwrap())
+            .unwrap();
+    }
+    let page = sized.transcript().page(GetTranscript {
+        before: 4,
+        limit: 64,
+        forward: true,
+    });
+    assert_eq!((page.begin, page.end, page.entries.len()), (4, 20, 16));
+    assert!(page.entries[0].text.starts_with('e'));
+    assert!(page.entries.last().unwrap().text.starts_with('t'));
+    let next = sized.transcript().page(GetTranscript {
+        before: page.end,
+        limit: 64,
+        forward: true,
+    });
+    assert_eq!((next.begin, next.end), (20, 24));
+    assert!(next.entries[0].text.starts_with('u'));
+    let page = sized.transcript().page(GetTranscript {
+        before: 20,
+        limit: 64,
+        forward: false,
+    });
+    assert_eq!((page.begin, page.end, page.entries.len()), (4, 20, 16));
+}

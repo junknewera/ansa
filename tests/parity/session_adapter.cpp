@@ -40,7 +40,7 @@ Json page(const SessionState& state,const Json& query) { const GetTranscript q{q
 SessionState state_for(const Json& row) {const auto config=load_request(row.at("configuration"));return SessionState({row.text("session")},config,row.has("plan_tools")?load_request(row.at("plan_tools")).tools():ToolAdvertisement{});}
 std::filesystem::path fixture_root(const Json& row) {
     const auto text=row.text("root");const std::filesystem::path path(text);
-    require(text.find('\0')==std::string::npos && path.is_absolute() && path.lexically_normal()==path && path.parent_path()==std::filesystem::temp_directory_path() && path.filename().string().starts_with("ansa-m4-"),"fixture_root");
+    require(text.find('\0')==std::string::npos && path.is_absolute() && path.lexically_normal()==path && path.parent_path()==std::filesystem::path("/tmp") && path.filename().string().starts_with("ansa-m4-"),"fixture_root");
     const auto fd=::open(path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);struct stat meta{};
     const bool valid=fd>=0 && ::fstat(fd,&meta)==0 && meta.st_uid==::geteuid() && (meta.st_mode&077)==0;
     const auto marker=valid?::openat(fd,"fixture-owner",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC):-1;char bytes[32]{};

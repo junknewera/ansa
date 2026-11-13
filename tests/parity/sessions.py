@@ -23,7 +23,17 @@ def check(value,code): v.check(value,code)
 def fixtures():
     names=['golden.json','minimal.log']+[name+'.log' for name in v.golden()['traces']]
     return {str((v.GOLDEN.parent/name).relative_to(common.ROOT)):common.sha(v.GOLDEN.parent/name) for name in names}
-def binary_info(paths):return {name:{'path':str(path),'sha256':common.sha(path)} for name,path in paths.items()}
+def binary_info(paths):
+    check(set(paths)=={'cpp','rust'},'binary inventory')
+    expected={'cpp':'ansa_session_oracle','rust':'session_adapter'}
+    result={}
+    for name,path in paths.items():
+        path=Path(path);check(path.name==expected[name],'session binary name')
+        result[name]={'path':str(path),'sha256':hashlib.sha256(protocol.owned_bytes(path,256*1024*1024,executable=True,single_link=True)).hexdigest()}
+    return result
+def shim_info(path):
+    path=Path(path);check(path.name=='libansa_journal_fault.so','fault shim name')
+    return {'path':str(path),'sha256':hashlib.sha256(protocol.owned_bytes(path,16*1024*1024,executable=True,single_link=True)).hexdigest()}
 def parts(snapshot):
     check(isinstance(snapshot,list) and len(snapshot)<=4096,'snapshot inventory')
     result={}
@@ -45,35 +55,42 @@ def snapshot(root):
     return result
 class Context:
     def __init__(self,bundle,row,live):
-        self.bundle=bundle;self.row=row;self.live=live;self.command_index=0;self.snapshot_index=0
+        self.bundle=bundle;self.row=row;self.live=live;self.command_index=0;self.snapshot_index=0;self.artifact_used=set()
         if live:
-            self.temporary=tempfile.TemporaryDirectory(prefix='ansa-m4-');self.root=Path(self.temporary.name)
+            self.temporary=tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp');self.root=Path(self.temporary.name)
             marker=self.root/'fixture-owner';marker.write_bytes(b'ansa-m4-synthetic-v1\n');marker.chmod(0o600)
             row.update(root=str(self.root),snapshots=[])
         else:
-            self.root=Path(row['root']);check(self.root.parent==Path(tempfile.gettempdir()) and self.root.name.startswith('ansa-m4-') and str(self.root)==str(self.root.resolve()),'fixture root identity')
+            self.root=Path(row['root']);check(self.root.parent==Path('/tmp') and self.root.name.startswith('ansa-m4-') and str(self.root)==row['root'],'fixture root identity')
     def close(self):
         if self.live:self.temporary.cleanup()
-        else:check(self.command_index==len(self.row['commands']) and self.snapshot_index==len(self.row['snapshots']),'unreferenced case evidence')
-    def call(self,adapter,request,exit=0):
+        else:check(self.command_index==len(self.row['commands']) and self.snapshot_index==len(self.row['snapshots']) and self.artifact_used==set(self.row.get('artifacts',{})),'unreferenced case evidence')
+    def artifact(self,suffix,payload=None):
+        label=self.row['id']+'-'+suffix+'.raw';check(suffix not in self.artifact_used,'duplicate artifact');self.artifact_used.add(suffix)
+        if self.live:
+            path=self.bundle.directory/label;path.write_bytes(payload);self.row.setdefault('artifacts',{})[suffix]=protocol.raw(path)
+        return protocol.retained_bytes(self.bundle.directory,self.row['artifacts'][suffix],label,4096)
+    def call(self,adapter,request,exit=0,fault=None):
         request=copy.deepcopy(request)
         if request.get('op') in ('journal','store','catalog','hold'):request['root']=str(self.root)
         label=self.row['id']+'-'+str(self.command_index);self.command_index+=1
         raw=(v.compact(request)+'\n').encode()
+        environment={'LD_PRELOAD':str(self.bundle.shim),'ANSA_JOURNAL_FAULT_ROOT':str(self.root/'journal'),'ANSA_JOURNAL_FAULT':fault} if fault else None
         if self.live:
             self.row.setdefault('commands',[]).append(label);path=self.bundle.directory/(label+'.stdin');path.write_bytes(raw)
-            command=common.command([self.bundle.paths[adapter]],common.ROOT,self.bundle.directory,label,timeout=45,input_file=path)
-            command['stdin']={'path':path.name,'sha256':common.sha(path)};self.bundle.commands[label]=command
+            command=common.command([self.bundle.paths[adapter]],common.ROOT,self.bundle.directory,label,timeout=45,input_file=path,process_env=environment)
+            command['stdin']=protocol.raw(path);self.bundle.commands[label]=command
         else:check(self.row['commands'][self.command_index-1]==label,'command order differs')
         check(label not in self.bundle.used,'duplicate command reference');self.bundle.used.add(label)
         command=self.bundle.commands[label]
         check(auth.command_ok(command,exit) and command['argv']==[str(self.bundle.paths[adapter])] and command['cwd']==str(common.ROOT),'command identity/exit/timeout')
+        check(command.get('process_env')==environment,'synthetic fault environment differs')
         retained={stream:protocol.retained_bytes(self.bundle.directory,command.get(stream),label+'.'+stream,MAX) for stream in ('stdin','stdout','stderr')}
         check(retained['stdin']==raw,'command input differs')
         if exit:check(not retained['stdout'],'crashed writer returned admission');return None
         lines=retained['stdout'].splitlines()
         if request.get('op')=='hold':check(len(lines)==2 and json.loads(lines[0])=={'ready':True},'lock readiness');lines=lines[1:]
-        check(len(lines)==1,'adapter output inventory');value=auth.json_bytes(lines[0])
+        check(len(lines)==1,'adapter output inventory');value=protocol.strict_loads(lines[0])
         check(isinstance(value,dict) and type(value.get('accepted')) is bool,'adapter output schema');return value
     def shot(self):
         if self.live:self.row['snapshots'].append(snapshot(self.root))
@@ -88,10 +105,10 @@ class Context:
 def accepted(row):check(row.get('accepted') is True,'required adapter operation rejected');return row['value']
 def state_request(events):return {'op':'state','session':'fixture','configuration':v.golden()['configuration'],'plan_tools':v.golden()['configuration'],'events':events,'queries':[]}
 def store_request(events=()):return dict(state_request(list(events)),op='store')
-def normalized(value):
-    if isinstance(value,dict):return {k:normalized(x) for k,x in value.items() if k!='diagnostic'}
-    if isinstance(value,list):return [normalized(x) for x in value]
-    return value
+def comparable(case,value):
+    if case['request']['op']=='state':
+        value=dict(value);value['steps']=[{k:x for k,x in step.items() if k!='diagnostic' or step.get('accepted') is not False} for step in value['steps']]
+    return protocol.structural(value)
 def trace_interop(c,name,writer):
     other='rust' if writer=='cpp' else 'cpp';events=v.golden()['traces'][name]
     written=accepted(c.call(writer,{'op':'journal','events':events}));check(all(e['accepted'] is True for e in written['appends']),'fixture write')
@@ -104,14 +121,14 @@ def trace_interop(c,name,writer):
         event=v.accepted(config,expected['history'],2)
         result=accepted(c.call(other,store_request([event])));check(result['appends']==[{'accepted':True}],'cross append')
         after=parts(c.shot());check(all(after[n].startswith(value) for n,value in before.items()),'append changed original bytes')
-        reopened=accepted(c.call(writer,store_request()));check(reopened['state']==result['state'] and reopened['events']==events+[event],'reverse reopen')
+        reopened=accepted(c.call(writer,store_request()));check(reopened['state']==result['state'] and protocol.structural(reopened['events'])==protocol.structural(events+[event]),'reverse reopen')
 def truncation(c,cut):
     raw=(v.GOLDEN.parent/'minimal.log').read_bytes()[:cut];c.prepare({PART:raw});check(parts(c.shot())=={PART:raw},'truncation setup')
     for writer in ('cpp','rust'):
         value=accepted(c.call(writer,{'op':'journal'}));check(value['diagnostic']=='' and value['events']==[],'torn tail read')
     result=accepted(c.call('rust',{'op':'journal','events':[{'kind':'test','value':2}]}));check(result['appends']==[{'accepted':True}],'torn append')
-    after=parts(c.shot());check(after[PART].startswith(raw) and len(after)==(1 if cut==92 else 2) and (cut==92 or after[PART]==raw),'torn tail overwritten');check(v.decode(after)==[{'kind':'test','value':2}],'linked torn tail framing')
-    value=accepted(c.call('cpp',{'op':'journal'}));check(value['events']==[{'kind':'test','value':2}] and value['diagnostic']=='','C++ linked recovery')
+    after=parts(c.shot());check(after[PART].startswith(raw) and len(after)==(1 if cut==92 else 2) and (cut==92 or after[PART]==raw),'torn tail overwritten');check(protocol.structural(v.decode(after))==protocol.structural([{'kind':'test','value':2}]),'linked torn tail framing')
+    value=accepted(c.call('cpp',{'op':'journal'}));check(protocol.structural(value['events'])==protocol.structural([{'kind':'test','value':2}]) and value['diagnostic']=='','C++ linked recovery')
 def crash_specs():
     found={}
     for events in v.golden()['traces'].values():
@@ -154,27 +171,29 @@ def malformed(c,kind):
 GUARDS=('part-hardlink','part-symlink','part-fifo','lock-hardlink','lock-symlink','lock-fifo','marker-hardlink','marker-fifo')
 def guard(c,kind):
     sentinel=b'owned M4 sentinel';directory=c.root/'journal';alias=c.root/'sentinel'
+    fd=None
     if c.live:
-        alias.write_bytes(sentinel);directory.mkdir(mode=0o700)
+        fd=os.open(alias,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);os.write(fd,sentinel);directory.mkdir(mode=0o700)
         target=directory/PART if kind.startswith('part-') else directory/'lock' if kind.startswith('lock-') else c.root/'fixture-owner'
         if target.exists():target.unlink()
         if kind.endswith('hardlink'):os.link(alias,target)
         elif kind.endswith('symlink'):target.symlink_to(alias)
         else:os.mkfifo(target,0o600)
-    before=c.shot()
-    for adapter in ('cpp','rust'):
-        row=c.call(adapter,{'op':'journal','events':[{'kind':'test','value':2}]})
-        if row['accepted']:check(row['value']['diagnostic'] and row['value']['appends'][0]['accepted'] is False,'unsafe part accepted')
-    check(c.shot()==before,'guard changed part')
-    if c.live:c.row['sentinel_sha256']=v.digest(alias.read_bytes())
-    check(c.row['sentinel_sha256']==v.digest(sentinel),'guard changed owned sentinel')
+    try:
+        check(c.artifact('sentinel-before',os.pread(fd,1025,0) if c.live else None)==sentinel,'owned sentinel setup');before=c.shot()
+        for adapter in ('cpp','rust'):
+            row=c.call(adapter,{'op':'journal','events':[{'kind':'test','value':2}]})
+            if row['accepted']:check(row['value']['diagnostic'] and row['value']['appends'][0]['accepted'] is False,'unsafe part accepted')
+        check(c.shot()==before,'guard changed part');check(c.artifact('sentinel-after',os.pread(fd,1025,0) if c.live else None)==sentinel,'guard changed owned sentinel')
+    finally:
+        if fd is not None:os.close(fd)
 def catalog(c,writer):
     other='rust' if writer=='cpp' else 'cpp';created=accepted(c.call(writer,{'op':'catalog'}));id=created['id'];check(id.startswith('s_') and len(id)<=64 and all(ch.isascii() and (ch.isalnum() or ch in '_-') for ch in id),'created session ID')
     opened=accepted(c.call(other,{'op':'catalog','id':id}));check(opened==created,'catalog cross reopen')
     if c.live:
         directory=c.root/'sessions'/id;metadata=(directory/'info.json').read_bytes();c.row['metadata_hex']=metadata.hex()
         (directory/PART).write_bytes((v.GOLDEN.parent/'minimal.log').read_bytes())
-    metadata=json.loads(bytes.fromhex(c.row['metadata_hex']));check(metadata=={'schema_version':1,'id':id,'cwd':str(c.root/'workspace'),'profile':'offline'},'catalog metadata binding')
+    metadata=protocol.strict_loads(bytes.fromhex(c.row['metadata_hex']));check(protocol.structural(metadata)==protocol.structural({'schema_version':1,'id':id,'cwd':str(c.root/'workspace'),'profile':'offline'}),'catalog metadata binding')
     check(accepted(c.call(other,{'op':'catalog','resume':True}))==created,'latest selection')
     rejected=c.call(other,{'op':'catalog','resume':True,'id':id});check(rejected['accepted'] is False,'selection conflict accepted')
 def process_lock(c,writer):
@@ -188,12 +207,38 @@ def process_lock(c,writer):
             denied=c.call(other,{'op':'journal'});held=future.result()
     else:held=c.call(writer,{'op':'hold'});denied=c.call(other,{'op':'journal'})
     check(held['accepted'] is True and denied=={'accepted':False,'diagnostic':'session_busy'},'cross-process lock failed')
+SYSCALLS={
+ 'write-short':('write:1:short',True,b'short\n'),
+ 'write-eintr':('write:3:eintr',True,b'eintr\n'),
+ 'write-enospc':('write:3:enospc',False,b'enospc\n'),
+ 'write-eio':('write:3:eio',False,b'eio\n'),
+ 'write-zero':('write:3:zero',False,b'zero\n'),
+ 'partial-enospc':('write:3:partial_enospc',False,b'partial_enospc\nenospc\n'),
+ 'header-fsync-eio':('file_sync:1:eio',False,b'eio\n'),
+ 'directory-fsync-eio':('directory_sync:1:eio',False,b'eio\n'),
+ 'directory-fsync-eintr':('directory_sync:1:eintr',True,b'eintr\n'),
+ 'done-fsync-eio':('file_sync:1:eio',False,b'eio\n'),
+ 'outcome-fsync-eio':('file_sync:1:eio',False,b'eio\n'),
+}
+def syscall_fault(c,name,writer):
+    other='rust' if writer=='cpp' else 'cpp';spec,success,marker=SYSCALLS[name]
+    if name in ('done-fsync-eio','outcome-fsync-eio'):
+        events=v.golden()['traces']['completed'];index=7 if name.startswith('done') else 4;accepted(c.call(writer,store_request(events[1:index])));request=store_request([events[index]])
+    else:request={'op':'journal','events':[{'kind':'test','value':1}]}
+    before=parts(c.shot());value=accepted(c.call(writer,request,fault=spec));check(value['appends'][0]['accepted'] is success,'actual syscall fault admission')
+    if name in ('done-fsync-eio','outcome-fsync-eio'):check(value['state']['turn']['stage']!='completed' and not any(e.get('role')=='assistant' for e in value['state']['history']),'failed fsync published assistant')
+    fired=protocol.owned_bytes(c.root/'journal/fault-fired',4096) if c.live else None;check(c.artifact('fault-fired',fired)==marker,'syscall injection did not fire')
+    after=parts(c.shot());check(all(after[n].startswith(value) for n,value in before.items()),'syscall fault overwrote prefix')
+    reopened=accepted(c.call(other,store_request() if request['op']=='store' else {'op':'journal'}));check(reopened['diagnostic']=='','syscall fault cross reopen')
+    if success:check(protocol.structural(v.decode(after))==protocol.structural([{'kind':'test','value':1}]),'retry/short write changed record')
+    elif request['op']=='journal':
+        result=accepted(c.call(other,{'op':'journal','events':[{'kind':'test','value':2}]}));check(result['appends']==[{'accepted':True}],'safe append after syscall fault');final=parts(c.shot());check(all(final[n].startswith(data) for n,data in after.items()),'recovery overwrote failed bytes')
 def inventory(mode):
     result=[case['id'] for case in v.cases()]
     if mode=='compare':return result+[f'interop-{name}-{writer}' for name in v.golden()['traces'] for writer in ('cpp','rust')]+['catalog-cpp','catalog-rust']
-    return result+[f'torn-{cut}' for cut in range((v.GOLDEN.parent/'minimal.log').stat().st_size)]+['bad-'+name for name in BAD]+['guard-'+name for name in GUARDS]+[f'crash-{kind}-{point}-{writer}' for kind in crash_specs() for point in POINTS for writer in ('cpp','rust')]+[f'io-{kind}-{writer}' for kind in ('outcome','done') for writer in ('cpp','rust')]+['lock-cpp','lock-rust']
+    return result+[f'torn-{cut}' for cut in range((v.GOLDEN.parent/'minimal.log').stat().st_size)]+['bad-'+name for name in BAD]+['guard-'+name for name in GUARDS]+[f'crash-{kind}-{point}-{writer}' for kind in crash_specs() for point in POINTS for writer in ('cpp','rust')]+[f'io-{kind}-{writer}' for kind in ('outcome','done') for writer in ('cpp','rust')]+['lock-cpp','lock-rust']+[f'syscall-{name}-{writer}' for name in SYSCALLS for writer in ('cpp','rust')]
 class Bundle:
-    def __init__(self,directory,paths,commands):self.directory=directory;self.paths=paths;self.commands=commands;self.used=set()
+    def __init__(self,directory,paths,commands,shim=None):self.directory=directory;self.paths=paths;self.commands=commands;self.used=set();self.shim=shim
 def execute_cases(bundle,mode,rows,live):
     expected=inventory(mode);check(live or [row.get('id') for row in rows]==expected,'case inventory differs')
     cases=v.cases();requests=[case['request'] for case in cases];outputs={}
@@ -201,12 +246,12 @@ def execute_cases(bundle,mode,rows,live):
     for adapter in ('cpp','rust'):
         label='pure-'+adapter;raw=b''.join((v.compact(r)+'\n').encode() for r in requests)
         if live:
-            path=bundle.directory/(label+'.stdin');path.write_bytes(raw);command=common.command([bundle.paths[adapter]],common.ROOT,bundle.directory,label,timeout=90,input_file=path);command['stdin']={'path':path.name,'sha256':common.sha(path)};bundle.commands[label]=command
+            path=bundle.directory/(label+'.stdin');path.write_bytes(raw);command=common.command([bundle.paths[adapter]],common.ROOT,bundle.directory,label,timeout=90,input_file=path);command['stdin']=protocol.raw(path);bundle.commands[label]=command
         command=bundle.commands[label];check(auth.command_ok(command) and command['argv']==[str(bundle.paths[adapter])] and command['cwd']==str(common.ROOT),'pure command identity');bundle.used.add(label)
-        retained={stream:protocol.retained_bytes(bundle.directory,command.get(stream),label+'.'+stream,MAX) for stream in ('stdin','stdout','stderr')};check(retained['stdin']==raw,'pure input differs');outputs[adapter]=[auth.json_bytes(line) for line in retained['stdout'].splitlines()];check(len(outputs[adapter])==len(cases),'pure output inventory')
+        retained={stream:protocol.retained_bytes(bundle.directory,command.get(stream),label+'.'+stream,MAX) for stream in ('stdin','stdout','stderr')};check(retained['stdin']==raw,'pure input differs');outputs[adapter]=[protocol.strict_loads(line) for line in retained['stdout'].splitlines()];check(len(outputs[adapter])==len(cases),'pure output inventory')
     for i,case in enumerate(cases):
         for adapter in outputs:v.output_pass(case,outputs[adapter][i])
-        if outputs['cpp'][i]['accepted']:check(normalized(outputs['cpp'][i]['value'])==normalized(outputs['rust'][i]['value']),'pure values differ: '+case['id'])
+        if outputs['cpp'][i]['accepted']:check(comparable(case,outputs['cpp'][i]['value'])==comparable(case,outputs['rust'][i]['value']),'pure values differ: '+case['id'])
         if live:rows.append({'id':case['id'],'status':'pass'})
     jobs=[]
     if mode=='compare':
@@ -219,6 +264,7 @@ def execute_cases(bundle,mode,rows,live):
         jobs += [(f'crash-{kind}-{point}-{writer}',lambda c,k=kind,p=point,w=writer:crash(c,k,p,w)) for kind in crash_specs() for point in POINTS for writer in ('cpp','rust')]
         jobs += [(f'io-{kind}-{writer}',lambda c,k=kind,w=writer:crash(c,k,'before_sync',w,'fail')) for kind in ('outcome','done') for writer in ('cpp','rust')]
         jobs += [('lock-'+writer,lambda c,w=writer:process_lock(c,w)) for writer in ('cpp','rust')]
+        jobs += [(f'syscall-{name}-{writer}',lambda c,n=name,w=writer:syscall_fault(c,n,w)) for name in SYSCALLS for writer in ('cpp','rust')]
     for offset,(id,job) in enumerate(jobs,len(cases)):
         row={'id':id,'status':'pass'} if live else rows[offset];context=Context(bundle,row,live)
         try:job(context);context.close()
@@ -238,7 +284,8 @@ def verify(report,directory):
         check(report.get('source',{}).get('files')==common.source_info()['files'] and report['source'].get('worktree_status')=='','source snapshot differs/dirty')
         host=report['platform'];check(host['system']=='Linux' and host['machine']=='aarch64' and host['os_release']['ID']=='nixos','native platform')
         identities=report['binaries'];check(set(identities)=={'cpp','rust'},'binary inventory');paths={key:Path(value['path']) for key,value in identities.items()};check(identities==binary_info(paths),'binary identities')
-        execute_cases(Bundle(directory,paths,report['commands']),report['mode'],report['cases'],False)
+        shim=Path(report['fault_shim']['path']);check(report['fault_shim']==shim_info(shim),'fault shim identity')
+        execute_cases(Bundle(directory,paths,report['commands'],shim),report['mode'],report['cases'],False)
         check(report.get('status')=='PASS' and report.get('errors')==[],'report failed')
     except (OSError,ValueError,KeyError,TypeError,IndexError,AttributeError,OverflowError,subprocess.SubprocessError) as error:errors.append(str(error) if isinstance(error,ValueError) else 'invalid session evidence: '+type(error).__name__)
     return errors
@@ -247,8 +294,8 @@ def capture(args):
     try:
         manifest();check(args.cpp_build and args.rust_target and args.output,'session capture needs paths');target=Path(args.output).resolve();check(not any(p=='.env' or p.startswith('.env.') for p in target.parts),'forbidden evidence path');target.mkdir(parents=True,exist_ok=False);directory=target
         paths={'cpp':(common.ROOT/args.cpp_build).resolve()/'ansa_session_oracle','rust':(common.ROOT/args.rust_target).resolve()/'debug/examples/session_adapter'};source=common.source_info();check(not source['worktree_status'],'clean source required')
-        report.update(schema_version=1,suite='sessions',mode=args.action,source=source,platform=common.platform_info(),fixtures=fixtures(),manifest_sha256=common.sha(MANIFEST),binaries=binary_info(paths),commands={})
-        execute_cases(Bundle(directory,paths,report['commands']),args.action,report['cases'],True);check(source==common.source_info() and report['binaries']==binary_info(paths),'capture inputs changed');report['status']='PASS';report['errors']=verify(report,directory);report['status']='FAIL' if report['errors'] else 'PASS'
+        shim=(common.ROOT/args.cpp_build).resolve()/'libansa_journal_fault.so';report.update(schema_version=1,suite='sessions',mode=args.action,source=source,platform=common.platform_info(),fixtures=fixtures(),manifest_sha256=common.sha(MANIFEST),binaries=binary_info(paths),fault_shim=shim_info(shim),commands={})
+        execute_cases(Bundle(directory,paths,report['commands'],shim),args.action,report['cases'],True);check(source==common.source_info() and report['binaries']==binary_info(paths) and report['fault_shim']==shim_info(shim),'capture inputs changed');report['status']='PASS';report['errors']=verify(report,directory);report['status']='FAIL' if report['errors'] else 'PASS'
     except (OSError,ValueError,KeyError,TypeError,IndexError,AttributeError,OverflowError,subprocess.SubprocessError) as error:report['errors'].append(str(error) if isinstance(error,ValueError) else 'session capture failed: '+type(error).__name__)
     if directory is not None:common.write_json(directory/'session-report.json',report)
     print(json.dumps({'suite':'sessions','mode':args.action,'status':report['status'],'cases':len(report['cases']),'errors':report['errors']},indent=2));return int(report['status']!='PASS')

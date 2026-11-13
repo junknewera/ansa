@@ -263,7 +263,7 @@ impl Files {
 /// Narrow test-adapter capability: only a fresh private marked /tmp root.
 pub fn fixture_root(path: &Path) -> io::Result<()> {
     use std::{io::Read, os::unix::ffi::OsStrExt, path::Component};
-    if path.parent() != Some(std::env::temp_dir().as_path())
+    if path.parent() != Some(Path::new("/tmp"))
         || !path
             .file_name()
             .is_some_and(|n| n.as_bytes().starts_with(b"ansa-m4-"))

@@ -58,7 +58,7 @@ def source_info():
             "worktree_status": git("status", "--short").decode(), "files": files}
 
 
-def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=None):
+def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=None, process_env=None):
     """Keep exact output bytes; kill/reap our process group on a timeout."""
     stdout = output / (label + ".stdout")
     stderr = output / (label + ".stderr")
@@ -66,9 +66,14 @@ def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=
               "timed_out": False}
     start = time.monotonic()
     child_environment = None
+    if process_env is not None:
+        if set(process_env)!={"LD_PRELOAD","ANSA_JOURNAL_FAULT_ROOT","ANSA_JOURNAL_FAULT"}:
+            raise ValueError("unsupported synthetic fault environment")
+        child_environment=dict(os.environ,**process_env)
+        result["process_env"]=dict(process_env)
     if fixture_root is not None:
         # A single non-secret fixture input, never an environment dump.
-        child_environment = dict(os.environ, ANSA_AUTH_FIXTURES=str(fixture_root))
+        child_environment = dict(child_environment if child_environment is not None else os.environ, ANSA_AUTH_FIXTURES=str(fixture_root))
         result["fixture_root"] = str(fixture_root)
     with ExitStack() as resources:
         out = resources.enter_context(stdout.open("wb"))
