@@ -2,6 +2,7 @@
 """Small, offline M0 evidence capture. This is not a milestone scheduler."""
 
 import argparse
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -57,16 +58,19 @@ def source_info():
             "worktree_status": git("status", "--short").decode(), "files": files}
 
 
-def command(argv, cwd, output, label, timeout=60):
+def command(argv, cwd, output, label, timeout=60, input_file=None):
     """Keep exact output bytes; kill/reap our process group on a timeout."""
     stdout = output / (label + ".stdout")
     stderr = output / (label + ".stderr")
     result = {"argv": [str(a) for a in argv], "cwd": str(cwd), "exit_code": None,
               "timed_out": False}
     start = time.monotonic()
-    with stdout.open("wb") as out, stderr.open("wb") as err:
+    with ExitStack() as resources:
+        out = resources.enter_context(stdout.open("wb"))
+        err = resources.enter_context(stderr.open("wb"))
+        stdin = resources.enter_context(Path(input_file).open("rb")) if input_file else subprocess.DEVNULL
         try:
-            child = subprocess.Popen(result["argv"], cwd=cwd, stdin=subprocess.DEVNULL,
+            child = subprocess.Popen(result["argv"], cwd=cwd, stdin=stdin,
                                      stdout=out, stderr=err, start_new_session=True)
             try:
                 result["exit_code"] = child.wait(timeout=timeout)
@@ -333,17 +337,24 @@ def main():
     cap.add_argument("--output", type=Path, required=True)
     cap.add_argument("--run-ctest", action="store_true")
     chk = sub.add_parser("check", help="validate one native M0 capture, not close all M0 gates")
-    chk.add_argument("--milestone", choices=["M0"], required=True)
+    chk.add_argument("--milestone", choices=["M0", "M1"], required=True)
     chk.add_argument("--evidence", type=Path, required=True)
+    chk.add_argument("--fault-evidence", type=Path)
     for name in ("compare", "fault", "perf"):
         future = sub.add_parser(name, help="not implemented in M0 (always nonzero)")
         for option in ("suite", "cpp-build", "rust-target", "output"):
             future.add_argument("--" + option)
     args = parser.parse_args()
     if args.action in ("compare", "fault", "perf"):
+        if args.action in ("compare", "fault") and args.suite == "risk":
+            import risk
+            return risk.capture(args)
         print(args.action + ": suite not implemented in M0", file=sys.stderr)
         return 2
     try:
+        if args.action == "check" and args.milestone == "M1":
+            import risk
+            return risk.check(args.evidence.resolve(), args.fault_evidence)
         manifest = json.loads(MANIFEST.read_bytes())
         if args.action == "preflight":
             args.output.parent.mkdir(parents=True, exist_ok=True)

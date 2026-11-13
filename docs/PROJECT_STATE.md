@@ -1,8 +1,12 @@
 # Состояние ansa
 
+## Rust migration: M1 implementation checkpoint
+
+Реализованы synthetic JSON/hash, private early-exec supervisor и localhost HTTP/TLS/proxy spikes в `migration/m1-risk-spikes`. Debug и Nix Release CTest **87/87**, compare **602/602**, fault **286/286**, replay checker, Rust **4/4**, harness **20/20**, fmt/clippy и Nix Rust package прошли на X13s/aarch64. Independent JSON/process/transport review закрыт. Полный ASan/UBSan closeout ещё выполняется; Rust last verified milestone пока M0. Production executable/default остаются C++20. Scope, stricter design corrections и команды - в [M1 report](migration/M1.md).
+
 ## Rust migration: M0 закрыт (GO)
 
-Production executable и Nix default остаются C++20. **Rust last verified milestone - M0 GO, 2026-11-13**, проверенный code/budget checkpoint [6fb1073](https://github.com/junknewera/ansa/commit/6fb10735a9832f1570ed7cb812c1c1f3f4ebdb89), tag `migration/m0-toolchain-harness`. Исходная реализация - `e35b765`, review fixes - `a905212`. Scaffold не является Rust runtime; M1 не начат. C++ last known good остаётся отдельным baseline ниже.
+M0 toolchain/baseline закрыт 2026-11-13: проверенный code/budget checkpoint [6fb1073](https://github.com/junknewera/ansa/commit/6fb10735a9832f1570ed7cb812c1c1f3f4ebdb89), tag `migration/m0-toolchain-harness`. Исходная реализация - `e35b765`, review fixes - `a905212`. Scaffold не является Rust runtime. C++ last known good остаётся отдельным baseline ниже.
 
 Финальная native проверка `6fb1073` на `x13s`, NixOS 26.11/aarch64, kernel 7.2.9, pinned GCC 16.2.0: Debug CTest **87/87**, Nix Release **87/87**, ASan/UBSan **85/85** с `detect_leaks=1`/`halt_on_error=1`; оба mutants прошли в Debug/Release. Linux preflight **11/11**, включая procfs children. Новые Debug/sanitizer capture/check прошли из clean checkpoint с frozen budget; sanitizer использовал `TRUE/YES`. Harness/toolchain regressions **12/12**, Rust scaffold **1/1**, build/fmt/clippy/Nix Rust package и PTY backpressure прошли. Фактические rustc 1.98.1, Cargo CLI 1.98.0. Исторические x86_64 и промежуточные native результаты сохранены в [M0 closeout](migration/M0.md).
 

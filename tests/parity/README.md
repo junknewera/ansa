@@ -1,6 +1,20 @@
-# M0: offline capture и проверка evidence
+# Offline capture и проверка evidence
 
-`run.py` использует только Python standard library. Он записывает один C++ baseline и проверяет его фактические результаты. Runtime Rust, differential comparison, fault injection и performance runner в M0 не реализованы. Команды `compare`, `fault` и `perf` возвращают код **2** с явным `not implemented`; неизвестный milestone тоже не проходит.
+`run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1` для synthetic JSON/hash/process/transport probes. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
+
+## M1 risk suite
+
+Собери C++ target `ansa_risk_oracle` и Rust examples/bins, затем выполни compare,
+fault и check из [M1 report](../../docs/migration/M1.md#проверки-и-воспроизведение).
+Оба capture требуют свежие каталоги; checker по умолчанию ищет fault evidence
+в `<compare-directory>-fault`, иначе передай `--fault-evidence PATH`.
+
+Матрицы требуют 602 compare и 286 fault cases, включая localhost H1/H2/TLS,
+synthetic proxy и private supervisor. Raw stdin/stdout/stderr, timeout partial
+output, identities и observations сохраняются до semantic assertions. Checker
+проверяет actual raw outputs повторно; неизвестное расхождение или пропущенный
+case не проходят. Три reviewed stricter deviations описаны в report и manifest.
+M1 checker не заменяет полный C++ native gate, Cargo checks и independent review.
 
 ## Команды
 

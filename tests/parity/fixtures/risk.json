@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "suite": "risk",
+  "json_cases": [
+    {
+      "id": "null",
+      "payload": "null",
+      "accepted": true
+    },
+    {
+      "id": "booleans",
+      "payload": "[true,false]",
+      "accepted": true
+    },
+    {
+      "id": "number-lexemes",
+      "payload": "[1,1.0,1e0,-0,1e+0,1E00]",
+      "accepted": true
+    },
+    {
+      "id": "huge-int",
+      "payload": "9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "accepted": true
+    },
+    {
+      "id": "negative-huge-int",
+      "payload": "-9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "accepted": true
+    },
+    {
+      "id": "huge-state",
+      "payload": "{\"metadata\":{\"large\":99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999,\"small\":1e-300}}",
+      "accepted": true
+    },
+    {
+      "id": "decoded-strings",
+      "payload": "[\"\\u0061\",\"a\",\"\\u0000\",\"\\uD83D\\uDE00\"]",
+      "accepted": true
+    },
+    {
+      "id": "control-escape-writer",
+      "payload": "{\"\\u000b\":\"\\u001f\"}",
+      "accepted": true
+    },
+    {
+      "id": "escaped-slash",
+      "payload": "\"a\\/b\\\\c\"",
+      "accepted": true
+    },
+    {
+      "id": "opaque-order",
+      "payload": "{\"b\":[3,2,1],\"a\":{\"z\":0,\"x\":1}}",
+      "accepted": true
+    },
+    {
+      "id": "zero-exponent",
+      "payload": "0e-999",
+      "accepted": true
+    },
+    {
+      "id": "subnormal",
+      "payload": "4.9406564584124654e-324",
+      "accepted": true
+    },
+    {
+      "id": "round-up-subnormal",
+      "payload": "2.4703282292062328e-324",
+      "accepted": true
+    },
+    {
+      "id": "duplicate-key",
+      "payload": "{\"a\":1,\"a\":2}",
+      "accepted": false
+    },
+    {
+      "id": "decoded-duplicate",
+      "payload": "{\"a\":1,\"\\u0061\":2}",
+      "accepted": false
+    },
+    {
+      "id": "nul-duplicate",
+      "payload": "{\"\\u0000\":1,\"\\u0000\":2}",
+      "accepted": false
+    },
+    {
+      "id": "lone-surrogate",
+      "payload": "\"\\ud800\"",
+      "accepted": false
+    },
+    {
+      "id": "float-overflow",
+      "payload": "1e999",
+      "accepted": false
+    },
+    {
+      "id": "float-underflow",
+      "payload": "1e-999",
+      "accepted": false
+    },
+    {
+      "id": "round-down-underflow",
+      "payload": "2.4703282292062327e-324",
+      "accepted": false
+    },
+    {
+      "id": "trailing-data",
+      "payload": "{}{}",
+      "accepted": false
+    },
+    {
+      "id": "trailing-comma",
+      "payload": "[1,]",
+      "accepted": false
+    },
+    {
+      "id": "leading-zero",
+      "payload": "01",
+      "accepted": false
+    },
+    {
+      "id": "negative-leading-zero",
+      "payload": "-01",
+      "accepted": false
+    },
+    {
+      "id": "nan",
+      "payload": "NaN",
+      "accepted": false
+    },
+    {
+      "id": "comment",
+      "payload": "/*x*/0",
+      "accepted": false
+    },
+    {
+      "id": "invalid-escape",
+      "payload": "\"\\q\"",
+      "accepted": false
+    },
+    {
+      "id": "depth-63",
+      "payload": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "accepted": true
+    },
+    {
+      "id": "depth-64",
+      "payload": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "accepted": false
+    },
+    {
+      "id": "object-equality",
+      "payload": "{\"a\":1,\"b\":2}",
+      "accepted": true,
+      "other": "{\"b\":2,\"a\":1}",
+      "equal": true
+    },
+    {
+      "id": "array-order",
+      "payload": "[1,2]",
+      "accepted": true,
+      "other": "[2,1]",
+      "equal": false
+    },
+    {
+      "id": "numeric-equality",
+      "payload": "1",
+      "accepted": true,
+      "other": "1.0",
+      "equal": false
+    },
+    {
+      "id": "decoded-equality",
+      "payload": "\"\\u0061\"",
+      "accepted": true,
+      "other": "\"a\"",
+      "equal": true
+    },
+    {
+      "id": "invalid-comparison",
+      "payload": "1",
+      "accepted": false,
+      "other": "["
+    }
+  ],
+  "number_fuzz": {
+    "seed": 4501721,
+    "count": 512
+  },
+  "generated_limits": {
+    "nodes_accept_leaves": 131071,
+    "nodes_reject_leaves": 131072
+  },
+  "hash_domains": [
+    {
+      "id": "hash-domains-0",
+      "payload": "{\"tools\":[{\"name\":\"read_fixture\",\"description\":\"Read \\\\ fixture\\u000b\",\"implementation_revision\":\"v1\",\"schema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"integer\"}},\"required\":[\"value\"],\"additionalProperties\":false},\"requires_journal\":false},{\"name\":\"write_fixture\",\"description\":\"Synthetic only\",\"implementation_revision\":\"v2\",\"schema\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false},\"requires_journal\":true}],\"instructions\":[{\"path\":\"/fixture/AGENTS.md\",\"text\":\"Preserve numeric tokens.\\nNo network.\"}],\"epoch\":{\"id\":\"epoch-fixture\",\"instructions\":\"Synthetic risk spike\",\"state\":{\"order\":[3,2,1],\"number\":1,\"unicode\":\"Привет\"}},\"compact\":{\"object\":\"response.compaction\",\"id\":\"compact-fixture\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp\",\"encrypted_content\":\"opaque-fixture\\u000b\"}]},\"invocation\":{\"operation\":\"runtime:op:1\",\"call\":\"call-1\",\"name\":\"run_command\",\"revision\":\"v1\",\"arguments\":{\"command\":\"synthetic\"}},\"cwd\":\"/fixture\",\"argv\":[\"/fixture/tool\",\"a\\nb\"],\"timeout_ms\":1000,\"output_bytes\":4096}"
+    },
+    {
+      "id": "hash-domains-1",
+      "payload": "{\"tools\":[{\"name\":\"read_fixture\",\"description\":\"Read \\\\ fixture\\u000b\",\"implementation_revision\":\"v1\",\"schema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"integer\"}},\"required\":[\"value\"],\"additionalProperties\":false},\"requires_journal\":false},{\"name\":\"write_fixture\",\"description\":\"Synthetic only\",\"implementation_revision\":\"v2\",\"schema\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false},\"requires_journal\":true}],\"instructions\":[{\"path\":\"/fixture/AGENTS.md\",\"text\":\"Preserve numeric tokens.\\nNo network.\"}],\"epoch\":{\"id\":\"epoch-fixture\",\"instructions\":\"Synthetic risk spike\",\"state\":{\"order\":[3,2,1],\"number\":1.0,\"unicode\":\"Привет\"}},\"compact\":{\"object\":\"response.compaction\",\"id\":\"compact-fixture\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp\",\"encrypted_content\":\"opaque-fixture\\u000b\"}]},\"invocation\":{\"operation\":\"runtime:op:1\",\"call\":\"call-1\",\"name\":\"run_command\",\"revision\":\"v1\",\"arguments\":{\"command\":\"synthetic\"}},\"cwd\":\"/fixture\",\"argv\":[\"/fixture/tool\",\"a\\nb\"],\"timeout_ms\":1000,\"output_bytes\":4096}"
+    },
+    {
+      "id": "hash-domains-2",
+      "payload": "{\"tools\":[{\"name\":\"read_fixture\",\"description\":\"Read \\\\ fixture\\u000b\",\"implementation_revision\":\"v1\",\"schema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"integer\"}},\"required\":[\"value\"],\"additionalProperties\":false},\"requires_journal\":false},{\"name\":\"write_fixture\",\"description\":\"Synthetic only\",\"implementation_revision\":\"v2\",\"schema\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false},\"requires_journal\":true}],\"instructions\":[{\"path\":\"/fixture/AGENTS.md\",\"text\":\"Preserve numeric tokens.\\nNo network.\"}],\"epoch\":{\"id\":\"epoch-fixture\",\"instructions\":\"Synthetic risk spike\",\"state\":{\"order\":[3,2,1],\"number\":1e0,\"unicode\":\"Привет\"}},\"compact\":{\"object\":\"response.compaction\",\"id\":\"compact-fixture\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp\",\"encrypted_content\":\"opaque-fixture\\u000b\"}]},\"invocation\":{\"operation\":\"runtime:op:1\",\"call\":\"call-1\",\"name\":\"run_command\",\"revision\":\"v1\",\"arguments\":{\"command\":\"synthetic\"}},\"cwd\":\"/fixture\",\"argv\":[\"/fixture/tool\",\"a\\nb\"],\"timeout_ms\":1000,\"output_bytes\":4096}"
+    },
+    {
+      "id": "hash-domains-3",
+      "payload": "{\"tools\":[{\"name\":\"read_fixture\",\"description\":\"Read \\\\ fixture\\u000b\",\"implementation_revision\":\"v1\",\"schema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"integer\"}},\"required\":[\"value\"],\"additionalProperties\":false},\"requires_journal\":false},{\"name\":\"write_fixture\",\"description\":\"Synthetic only\",\"implementation_revision\":\"v2\",\"schema\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false},\"requires_journal\":true}],\"instructions\":[{\"path\":\"/fixture/AGENTS.md\",\"text\":\"Preserve numeric tokens.\\nNo network.\"}],\"epoch\":{\"id\":\"epoch-fixture\",\"instructions\":\"Synthetic risk spike\",\"state\":{\"order\":[3,2,1],\"number\":-0,\"unicode\":\"Привет\"}},\"compact\":{\"object\":\"response.compaction\",\"id\":\"compact-fixture\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp\",\"encrypted_content\":\"opaque-fixture\\u000b\"}]},\"invocation\":{\"operation\":\"runtime:op:1\",\"call\":\"call-1\",\"name\":\"run_command\",\"revision\":\"v1\",\"arguments\":{\"command\":\"synthetic\"}},\"cwd\":\"/fixture\",\"argv\":[\"/fixture/tool\",\"a\\nb\"],\"timeout_ms\":1000,\"output_bytes\":4096}"
+    },
+    {
+      "id": "hash-domains-4",
+      "payload": "{\"tools\":[{\"name\":\"read_fixture\",\"description\":\"Read \\\\ fixture\\u000b\",\"implementation_revision\":\"v1\",\"schema\":{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"integer\"}},\"required\":[\"value\"],\"additionalProperties\":false},\"requires_journal\":false},{\"name\":\"write_fixture\",\"description\":\"Synthetic only\",\"implementation_revision\":\"v2\",\"schema\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false},\"requires_journal\":true}],\"instructions\":[{\"path\":\"/fixture/AGENTS.md\",\"text\":\"Preserve numeric tokens.\\nNo network.\"}],\"epoch\":{\"id\":\"epoch-fixture\",\"instructions\":\"Synthetic risk spike\",\"state\":{\"order\":[3,2,1],\"number\":9999999999999999999999999999999999999999999,\"unicode\":\"Привет\"}},\"compact\":{\"object\":\"response.compaction\",\"id\":\"compact-fixture\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp\",\"encrypted_content\":\"opaque-fixture\\u000b\"}]},\"invocation\":{\"operation\":\"runtime:op:1\",\"call\":\"call-1\",\"name\":\"run_command\",\"revision\":\"v1\",\"arguments\":{\"command\":\"synthetic\"}},\"cwd\":\"/fixture\",\"argv\":[\"/fixture/tool\",\"a\\nb\"],\"timeout_ms\":1000,\"output_bytes\":4096}"
+    }
+  ],
+  "fixture_files": {
+    "transport/tls/ca.der": "f8c09ff0842a3cf908770023ad8f9cf2a8dd5a53d63f038e82a8e0bbeae8e9a7",
+    "transport/tls/ca.pem": "f5701137f09242baa95d9ea1ea7b5da4bd7e1676e8dd8cca85ae2bf80117b3a3",
+    "transport/tls/server-key.der": "01b883ea46e05dde3eb4323b9dfa34a3335af90301342dcf02b4766fd10a5065",
+    "transport/tls/server-key.pem": "d5f8fde9d780aa225cf3304c86a50a4ddc830f2b0473338b87098c93dc9c054e",
+    "transport/tls/server.der": "43dbb71aab07903da1c8dbc76b26f76cbdd9e6b9eef047ddeb5a17c3ed967856",
+    "transport/tls/server.pem": "f8caa8186700f0b499586c3afcddfe79f084c6e617d5fb7aae7c34259904e682"
+  },
+  "reviewed_deviations": {
+    "http-obsfold": {
+      "cpp": true,
+      "rust": false,
+      "reason": "Hyper rejects obsolete folded headers instead of curl normalization; stricter syntax rejection"
+    },
+    "http-info-count": {
+      "cpp": true,
+      "rust": false,
+      "reason": "Explicit cumulative 256 informational-response ceiling; stricter bounded observation policy"
+    },
+    "http-chunk-budget": {
+      "cpp": true,
+      "rust": false,
+      "reason": "H1 total plaintext bytes minus delivered body must fit 64KiB; chunk framing conservatively consumes this allowance"
+    }
+  },
+  "scope": "Synthetic codecs, early supervisor and local transport risk probes; not a full Rust runtime or full protocol admission"
+}
