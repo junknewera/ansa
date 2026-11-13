@@ -57,7 +57,11 @@ Harness не читает credential stores, не вызывает auth/login/li
 
 При timeout harness завершает и reap-ит запущенный им process group. Cleanup detached descendants проверяют существующие process tests и Linux probe; kill process group сам по себе не доказывает cleanup после `setsid`. Если proc children недоступен, capability gate остаётся blocked. Harness не ищет и не сигналит произвольным процессам. На текущем ограниченном x86_64 host отсутствие proc children нельзя выдавать за проверку X13s.
 
-`perf_budget.json` содержит **null/pending**, пока нет повторяемого native baseline. Записанный `elapsed_seconds` — диагностическое время одного запуска, не latency budget и не benchmark. Production first frame остаётся PENDING до M7/M8 с контролируемым synthetic filesystem/OS environment; scaffold и safe CLI не измеряют production bootstrap.
+`perf_budget.json` содержит согласованный `FROZEN_M0` baseline и численные пороги для safe CLI, footprint и Release target-only `-j2` builds. Raw observations, exact one-shot measurement script, hashes и методика сохранены по ссылке `evidence.directory`; результаты кратко описаны в [M0 handoff](../../docs/migration/M0.md). Первый ошибочный RSS-прогон сохранён как rejected attempt; бюджеты основаны только на исправленном v2.
+
+CLI wall time измеряет launch→exit readiness, RSS снимается отдельными GNU time samples без Python launcher floor. Cold обозначает только страницы самого executable с `mincore=0`, не все зависимости и системные caches. Build RSS содержит maximum individual process high-water и sampled sum по owned descendants через 20 ms, включая отдельные Ninja job groups; sampled peak не является точным physical RAM high-water. Сравнение требует одинаковых hardware/profile/jobs/cache protocol/adapters; три clean и девять incremental builds дают описательные статистики.
+
+Обычный capture `elapsed_seconds` остаётся диагностическим временем, а `perf` в M0 по-прежнему возвращает unimplemented/nonzero. Production first frame, history и прочие performance gates явно отложены до M7/M8 с контролируемым synthetic filesystem/OS environment. Scaffold и safe CLI не измеряют production bootstrap; отложенный metric не считается PASS.
 
 Проверки самого harness:
 
