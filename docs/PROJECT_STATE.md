@@ -1,5 +1,19 @@
 # Состояние ansa
 
+## Rust migration: M0 закрыт (GO)
+
+Production executable и Nix default остаются C++20. **Rust last verified milestone - M0 GO, 2026-11-13**, проверенный code/budget checkpoint [6fb1073](https://github.com/junknewera/ansa/commit/6fb10735a9832f1570ed7cb812c1c1f3f4ebdb89), tag `migration/m0-toolchain-harness`. Исходная реализация - `e35b765`, review fixes - `a905212`. Scaffold не является Rust runtime; M1 не начат. C++ last known good остаётся отдельным baseline ниже.
+
+Финальная native проверка `6fb1073` на `x13s`, NixOS 26.11/aarch64, kernel 7.2.9, pinned GCC 16.2.0: Debug CTest **87/87**, Nix Release **87/87**, ASan/UBSan **85/85** с `detect_leaks=1`/`halt_on_error=1`; оба mutants прошли в Debug/Release. Linux preflight **11/11**, включая procfs children. Новые Debug/sanitizer capture/check прошли из clean checkpoint с frozen budget; sanitizer использовал `TRUE/YES`. Harness/toolchain regressions **12/12**, Rust scaffold **1/1**, build/fmt/clippy/Nix Rust package и PTY backpressure прошли. Фактические rustc 1.98.1, Cargo CLI 1.98.0. Исторические x86_64 и промежуточные native результаты сохранены в [M0 closeout](migration/M0.md).
+
+Native resource baseline снят на snapshot `7b84446`: safe CLI warm/cold-executable wall/RSS, binary/strip-all/Nix closure sizes, три clean и девять incremental Release `-j2` builds. Clean максимум **39,61 s / 743,23 MiB sampled aggregate RSS**, incremental **3,31 s / 311,61 MiB**. Пользователь явно принял численные пороги в [perf_budget.json](../tests/parity/perf_budget.json); **17/17** baseline budget checks прошли. Финальный Nix executable имеет тот же SHA-256, что измеренный baseline. Это не Rust runtime performance PASS.
+
+Оба P2 закрыты. Независимый review проверил исправления, v2 raw evidence, методику и конкретные budgets; открытых подтверждённых findings нет, `git diff --check` чистый. Raw observations/script/hashes, финальные captures, build manifest и C++ fallback с indirect Nix GC root сохранены в `/home/gusevsaint/Workspace/pet/ansa-baselines/m0-resource-7b84446-v2/`; прежний fallback `m0-a905212` также сохранён. Первая ошибочная RSS-попытка помечена rejected и в budgets не входит.
+
+Следующая отдельная задача - **M1: JSON/hash compatibility, Linux supervisor и HTTP frame/trailer spikes** по плану. Автоматически M1 не начинать. Production first-frame, history и остальные performance gates явно относятся к M7/M8; live и cutover не разрешены M0 GO.
+
+## C++ last known good и история acceptance
+
 Обновлено 2026-11-12. **Carbon UI и быстрый live-старт проверены**. Last known good для кода - [28eb41f](https://github.com/junknewera/oh-my-harness/commit/28eb41f0af449e943811cfbf9a4053f2dd7983ee) на `main`. Пройдены Debug, Release Nix, ASan/UBSan, независимый review, визуальная проверка фактического PTY и live dispatch. Предыдущие baselines - история/streaming/basic-plan `93393ab`, локальный агент `66250f7`, SIWC `e2f8e1c`, persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Новая проверка](implementation-report.md#carbon-ui), [предыдущий milestone](implementation-report.md#carbon-cli).
 
 ## Carbon UI и запуск

@@ -3,3 +3,6 @@
 /.direnv/
 /.omh-session/
 /.omh-live-session/
+/rust/target/
+/tests/parity/__pycache__/
+/rust/target/
