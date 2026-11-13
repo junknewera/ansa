@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small offline M0/M1/M2 evidence capture. This is not a milestone scheduler."""
+"""Small offline M0/M1/M2/M3 evidence capture. This is not a milestone scheduler."""
 
 import argparse
 from contextlib import ExitStack
@@ -341,12 +341,12 @@ def main():
     cap.add_argument("--probe", type=Path)
     cap.add_argument("--output", type=Path, required=True)
     cap.add_argument("--run-ctest", action="store_true")
-    chk = sub.add_parser("check", help="validate native M0, M1 risk or M2 protocol evidence")
+    chk = sub.add_parser("check", help="validate native M0, M1 risk, M2 protocol or M3 auth evidence")
     chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3"], required=True)
     chk.add_argument("--evidence", type=Path, required=True)
     chk.add_argument("--fault-evidence", type=Path)
-    for name, description in (("compare", "capture native parity rows for risk or protocol"),
-                              ("fault", "capture native fault rows for risk or protocol"),
+    for name, description in (("compare", "capture native parity rows for risk, protocol or auth"),
+                              ("fault", "capture native fault rows for risk, protocol or auth"),
                               ("perf", "not implemented (always nonzero)")):
         future = sub.add_parser(name, help=description)
         for option in ("suite", "cpp-build", "rust-target", "output"):

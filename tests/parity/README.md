@@ -1,6 +1,35 @@
 # Offline capture и проверка evidence
 
-`run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1`; M2 - `compare/fault --suite protocol` и `check --milestone M2`. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
+`run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1`; M2 - `--suite protocol` и `--milestone M2`; M3 - `--suite auth` и `--milestone M3`. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
+
+## M3 auth suite
+
+В pinned Nix shell собери оба adapters и выполни:
+
+```sh
+cmake --build build-m3 --target ansa_auth_oracle -j 2
+cargo build --manifest-path rust/Cargo.toml --locked -p ansa --example auth_adapter --features auth-test-adapter
+python tests/parity/run.py compare --suite auth --cpp-build build-m3 --rust-target rust/target --output build-migration/M3
+python tests/parity/run.py fault --suite auth --cpp-build build-m3 --rust-target rust/target --output build-migration/M3-fault
+python tests/parity/run.py check --milestone M3 --evidence build-migration/M3
+```
+
+Матрицы требуют 220 compare и 273 fault cases: независимые JWT/claims assertions,
+все 16 native auth suites, совместимость private store в обе стороны,
+21 точку падения с восстановлением другим бинарником, file guards и настоящий
+межпроцессный refresh. Fixture keys и tokens синтетические; adapters работают
+только с принадлежащими тесту temporary roots. Checker повторно проверяет raw
+commands, snapshots и signed bytes. Пять reviewed stricter corrections описаны
+в [M3 report](../../docs/migration/M3.md).
+
+Для всех harness regressions нужны также `ansa_protocol_oracle`, `ansa_risk_oracle`
+и все Rust examples/bins с features `protocol-test-adapter,auth-test-adapter`:
+
+```sh
+ANSA_PARITY_CPP_BUILD=build-m3 python -m unittest discover -s tests/parity -p 'test_*.py'
+```
+
+Переменная задаёт build directory для protocol regression tests; default - `build-m2`.
 
 ## M2 protocol suite
 
