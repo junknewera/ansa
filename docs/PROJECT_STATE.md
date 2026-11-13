@@ -1,5 +1,17 @@
 # Состояние ansa
 
+## Актуальное архитектурное состояние — 2026-11-13
+
+**Production остаётся C++20.** Проверенный через GitHub main: `ca851c99d4887a121300f0bcee8687ed9d055071`; [PR #1](https://github.com/junknewera/ansa/pull/1) с Rust migration plan merged. Code last known good остаётся `28eb41f0af449e943811cfbf9a4053f2dd7983ee`; docs review не является новой runtime acceptance.
+
+[PR #2](https://github.com/junknewera/ansa/pull/2) открыт, не merged; migration head `c06b1a839695e0690ead1db88c5e2a2df9a198db`. Rust workspace существует в этой ветке как M0 scaffold. [M0 closeout](https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/docs/migration/M0.md) явно оставляет **NO-GO до native X13s acceptance**. M1 не начат. Следующее разрешённое действие по migration — завершить native M0 validation, не начинать Orchestrate/M1 по устаревшей фразе о следующем спринте.
+
+Предложена отдельная архитектура [Orchestrate](ORCHESTRATION_RESEARCH.md) и [ADR 0002](adr/0002-self-hosted-orchestration.md): собственный task control plane, SIWC planner/reviewer, Codex executor, host verification и один builder в MVP. Это design-only. Default production dependency — verified M10 GO, отдельный feature после cutover; optional non-production executor spike возможен после M6. Scope M0–M10 и текущий M0 PR не изменяются. [Implementation/review prompts](ORCHESTRATION_PROMPTS.md) предназначены для будущего допуска, не подтверждают готовность runtime.
+
+Состояние branches/PR выше — snapshot на дату аудита; перед новой задачей проверить refs и evidence снова. Дальнейшие разделы сохраняют исторические runtime results, они не закрывают новые migration gates.
+
+## Исторический runtime checkpoint — 2026-11-12
+
 Обновлено 2026-11-12. **Carbon UI и быстрый live-старт проверены**. Last known good для кода - [28eb41f](https://github.com/junknewera/oh-my-harness/commit/28eb41f0af449e943811cfbf9a4053f2dd7983ee) на `main`. Пройдены Debug, Release Nix, ASan/UBSan, независимый review, визуальная проверка фактического PTY и live dispatch. Предыдущие baselines - история/streaming/basic-plan `93393ab`, локальный агент `66250f7`, SIWC `e2f8e1c`, persistent offline sessions `c0295bd`, offline runtime `10a11dd` и protocol `ede828d`. [Новая проверка](implementation-report.md#carbon-ui), [предыдущий milestone](implementation-report.md#carbon-cli).
 
 ## Carbon UI и запуск
@@ -15,7 +27,7 @@
 
 `x13s`, NixOS/aarch64, GCC 16.2.0: Debug **87/87**, Nix Release **87/87**, ASan/UBSan **85/85** с detect_leaks=1 и halt_on_error=1. UI и auth-lifecycle прошли по 20 повторов, **40/40**. Установленный executable проходит self-check и offline roundtrip.
 
-Независимый Terra low review завершён без открытых подтверждённых замечаний. Исправления покрывают multiline fences в preview, literal `assistant manager`, перенос bold, NO_COLOR, динамическую высоту и auth dispatch/session boundaries. Реальный первый запрос после быстрого открытия вернул STARTUP_OK; проверка каталога и авторизации выполнялась на пути dispatch. `git diff --check` чистый. Следующий согласованный спринт остаётся orchestrate.
+Независимый Terra low review завершён без открытых подтверждённых замечаний. Исправления покрывают multiline fences в preview, literal `assistant manager`, перенос bold, NO_COLOR, динамическую высоту и auth dispatch/session boundaries. Реальный первый запрос после быстрого открытия вернул STARTUP_OK; проверка каталога и авторизации выполнялась на пути dispatch. `git diff --check` чистый. Orchestrate остаётся будущим режимом; актуальная последовательность migration и feature gates указана выше.
 
 ## Carbon CLI
 
@@ -24,7 +36,7 @@
 - Transcript строится из canonical accepted/done records независимо от model context и compact. Неизменяемые блоки ограничивают стоимость обновления конца истории. Фронтенд получает страницы с query echo и восстанавливается после resync. Ошибка fsync не продвигает публичный transcript до несохранённого assistant.
 - Live HTTP chunks дают предварительный текст до terminal. Preview имеет generation identity, состояния preview/committed/discarded и snapshot/resync. Cancel, ошибка transport/admission/batch и storage failure не превращают фрагмент в успешный ответ. Tools по-прежнему требуют полной проверки и durable intent.
 - Tab/Shift+Tab переключают basic/plan между задачами, slash-команды служат альтернативой. Режим записан в turn, входит в exact request provenance и сохраняется при Resume. Общая история продолжается в обоих режимах. Plan использует backend snapshot только из tools с read_only, без произвольного shell.
-- Следующий согласованный спринт - orchestrate: дочерние агенты, их задачи и состояния, сбор и проверка результатов. После реализации он станет третьим режимом Tab. [Границы](TODO.md).
+- Будущий Orchestrate: дочерние агенты, их задачи и состояния, сбор и проверка результатов; implementation следует отдельному ADR после migration gates. После реализации он станет третьим режимом Tab. [Границы](TODO.md).
 
 ## Проверка `93393ab`
 
@@ -105,7 +117,7 @@ Crash tests посылают SIGKILL собственным дочерним п�
 - Session journal version 1 восстанавливается полным replay. Миграции, отдельные индексы и ротация по общему размеру отложены. По умолчанию лимит Submit IDs - 4096, records - 32 MiB, parts - 4096. Compact уменьшает активный контекст; история журнала сохраняется.
 - Full access не является sandbox. no_new_privs запрещает повышение через exec, но не обращение к уже разрешённым privileged brokers. При SIGKILL самого supervisor результат unknown; без cgroup не гарантируется прекращение всех отделившихся потомков. Нет автоматического повтора неизвестного эффекта.
 - Reconciliation неизвестных эффектов и отдельный compiled file replacement tool требуют самостоятельного контракта. Произвольный shell не обещает preimage/conflict semantics или atomic CAS с внешними writers. Advisory lock и проверки inode/size имеют те же границы.
-- Изменение effective config или начальных AGENTS требует новой сессии из-за exact context epoch; basic/plan задаются отдельно на turn. Полная модельная история по-прежнему восстанавливается replay, стоимость копирования submit map и длительные сессии требуют отдельной проверки. Следующий спринт - orchestrate; MCP, hooks, Ask, интерактивный sudo, отдельный TUI и token-aware budget остаются в [TODO](TODO.md).
+- Изменение effective config или начальных AGENTS требует новой сессии из-за exact context epoch; basic/plan задаются отдельно на turn. Полная модельная история по-прежнему восстанавливается replay, стоимость копирования submit map и длительные сессии требуют отдельной проверки. Orchestrate следует отдельному ADR и migration dependency point; MCP, hooks, Ask, интерактивный sudo, отдельный TUI и token-aware budget остаются в [TODO](TODO.md).
 
 ## Первоисточники
 

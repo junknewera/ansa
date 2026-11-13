@@ -36,6 +36,16 @@ Production runtime пока остаётся C++20. Полная Rust migration 
 7. Rust gate: locked build/test, fmt, clippy, native aarch64, meaningful differential/fault tests и контроль зависимостей/ресурсов по milestone. Пустой, skipped либо неподдерживаемый required suite не считается PASS. C++ gates сохраняются; сравнивай одинаковые build profiles. Исправление oracle ошибки требует отдельного safety assertion, не ослабления проверки.
 8. C++ удаляется только после полного offline/live parity, двунаправленной совместимости, проверенного rollback, independent review и разрешения на cutover/удаление. Handoff различает C++ last known good, Rust last verified SHA, WIP и незакрытые gates. Ни docs-only PR, ни наличие Rust UI не меняют production language.
 
+## Проект Orchestrate — design-only
+
+[ADR 0002](docs/adr/0002-self-hosted-orchestration.md), [исследование](docs/ORCHESTRATION_RESEARCH.md) и [prompts](docs/ORCHESTRATION_PROMPTS.md) описывают предложенный будущий режим. Production implementation по умолчанию начинается отдельным feature milestone после verified M10 GO; M0–M10 не расширяются. Docs-only решение не закрывает native gates и не разрешает live inference/cutover. До M6 не дублируй будущий Rust supervisor ради Orchestrate; узкий non-production spike после M6 остаётся отдельным scope.
+
+- Control plane принадлежит ansa; модель предлагает план/review, но не меняет task state, policy, budget или acceptance. Один owner на task и один root run на repository; все completions проверяются по task/attempt/incarnation и source SHA.
+- Будущий task journal имеет отдельный versioned namespace. Legacy canonical session journal не меняется; child journals и immutable evidence не становятся вторым task authority. PROJECT_STATE и snapshots — handoff/projections, не coordination database.
+- Codex — optional bounded executor, не владелец milestone. Process launch и turn dispatch требуют отдельных durable intents; unknown execution/effect не повторяется автоматически. Cancel не rollback и не proof cleanup.
+- MVP использует одного builder без internal subagents. Каждый writer имеет owned worktree; host verification привязана к exact SHA, fresh reviewer читает actual diff и evidence, integration проверяется снова. Full access/worktree/hash не дают sandbox или tamper-proof evidence.
+- Используй только собственный разрешённый SIWC grant/официальный Codex auth либо отдельно выбранный OpenAI API route. Не читай token stores других приложений, не переключай billing/model/account неявно. Для спорных capabilities нужны pinned docs/schema и actual route acceptance, не static model list.
+
 ## Quality gate перед закрытием milestone
 
 1. Для production C++ собери и запусти entry point, полный CTest с `--output-on-failure --no-tests=error`, adversarial tests и ASan/UBSan. Команды в [README](README.md). Для migration дополнительно выполни Rust/compatibility gates выбранного milestone. Зафиксируй платформу, конфигурацию, точное число тестов и исход проверки; docs-only review не закрывает runtime milestone.
