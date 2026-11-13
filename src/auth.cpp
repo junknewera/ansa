@@ -154,7 +154,7 @@ std::string decode_form(std::string_view encoded) {
             text += static_cast<char>(c);
             i += 2;
         } else {
-            auth_require(static_cast<unsigned char>(encoded[i]) >= 0x20, "auth_callback_encoding");
+            auth_require(static_cast<unsigned char>(encoded[i]) >= 0x20 && encoded[i] != 0x7f, "auth_callback_encoding");
             text += encoded[i];
         }
     }
@@ -213,21 +213,9 @@ std::map<std::string, std::string> callback(int listener, std::string_view state
                 auth_require(count > 0, "auth_callback_read");
                 request.append(buffer, static_cast<std::size_t>(count));
             }
-            const auto end = request.find("\r\n");
-            const auto line = std::string_view(request).substr(0, end);
-            auth_require(line.starts_with("GET /auth/callback?") && line.ends_with(" HTTP/1.1") &&
-                         request.find("\r\nHost: 127.0.0.1:" + std::to_string(port) + "\r\n") != std::string::npos,
-                         "auth_callback_path");
-            auto fields = query_fields(line.substr(19, line.size() - 19 - 9));
-            const auto returned = fields.find("state");
-            auth_require(returned != fields.end() && returned->second.size() == state.size() &&
-                         CRYPTO_memcmp(returned->second.data(), state.data(), state.size()) == 0, "auth_callback_state");
-            if (fields.contains("error")) {
-                browser_reply(connection.get(), false);
-                fail(ErrorCode::validation, Stage::frontend, "auth_access_denied");
-            }
-            auth_require(fields.contains("code") && !fields["code"].empty() && fields["code"].size() <= 8192,
-                         "auth_callback_code");
+            const auto validated = auth_callback_fields(request, state, port);
+            std::map<std::string, std::string> fields;
+            for (const auto& key : validated.keys()) fields.emplace(key, validated.at(key).text());
             browser_reply(connection.get(), true);
             return fields;
         } catch (const Error& error) {
@@ -239,6 +227,43 @@ std::map<std::string, std::string> callback(int listener, std::string_view state
 }
 } // namespace
 
+Json auth_callback_fields(std::string_view request, std::string_view state, std::uint16_t port) {
+    auth_require(request.size() < 16384, "auth_callback_limit");
+    const auto head_end = request.find("\r\n\r\n"), first = request.find("\r\n");
+    auth_require(head_end != std::string_view::npos && first != std::string_view::npos, "auth_callback_path");
+    const auto line = request.substr(0, first);
+    auth_require(line.starts_with("GET /auth/callback?") && line.ends_with(" HTTP/1.1"), "auth_callback_path");
+    unsigned hosts = 0;
+    for (auto start = first + 2; start < head_end;) {
+        const auto end = request.find("\r\n", start);
+        auth_require(end != std::string_view::npos && end <= head_end, "auth_callback_path");
+        const auto header = request.substr(start, end - start);
+        const auto colon = header.find(':');
+        auth_require(!header.empty() && header.front() != ' ' && header.front() != '\t' && colon != std::string_view::npos,
+                     "auth_callback_path");
+        std::string name(header.substr(0, colon));
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (name == "host") {
+            auto value = header.substr(colon + 1);
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1);
+            auth_require(++hosts == 1 && value == "127.0.0.1:" + std::to_string(port), "auth_callback_path");
+        }
+        start = end + 2;
+    }
+    auth_require(hosts == 1, "auth_callback_path");
+    const auto fields = query_fields(line.substr(19, line.size() - 19 - 9));
+    const auto returned = fields.find("state");
+    auth_require(returned != fields.end() && returned->second.size() == state.size() &&
+                 CRYPTO_memcmp(returned->second.data(), state.data(), state.size()) == 0, "auth_callback_state");
+    auth_require(!fields.contains("error"), "auth_access_denied");
+    const auto code = fields.find("code");
+    auth_require(code != fields.end() && !code->second.empty() && code->second.size() <= 8192, "auth_callback_code");
+    std::vector<std::pair<std::string, Json>> values;
+    for (const auto& [key, value] : fields) values.emplace_back(key, Json::string(value));
+    return Json::object(values);
+}
+
 class AuthManager::Impl {
     const std::filesystem::path path_;
     const HttpExchange exchange_;
@@ -248,7 +273,7 @@ class AuthManager::Impl {
     Fd directory_;
 
     std::optional<Json> read(const char* name) const {
-        Fd file(::openat(directory_.get(), name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+        Fd file(::openat(directory_.get(), name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
         if (file.get() < 0 && errno == ENOENT) return {};
         struct stat status{};
         auth_require(file.get() >= 0 && ::fstat(file.get(), &status) == 0 && S_ISREG(status.st_mode) &&
@@ -306,7 +331,7 @@ class AuthManager::Impl {
         return true;
     }
     void request_logout() const {
-        Fd marker(::openat(directory_.get(), "signed-out", O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600));
+        Fd marker(::openat(directory_.get(), "signed-out", O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600));
         auth_require(marker.get() >= 0 && logged_out(), "auth_logout_state");
         sync_fd(marker.get());
         sync_fd(directory_.get());

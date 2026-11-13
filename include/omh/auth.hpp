@@ -13,6 +13,7 @@ std::string base64url(std::string_view);
 std::string unbase64url(std::string_view);
 std::string pkce_challenge(std::string_view);
 std::string form_encode(const std::vector<std::pair<std::string, std::string>>&);
+Json auth_callback_fields(std::string_view request, std::string_view state, std::uint16_t port);
 Json verify_id_token(std::string_view jwt, const Json& jwks, std::string_view client,
     std::string_view nonce, std::uint64_t now, bool refresh = false);
 

@@ -21,6 +21,7 @@ class ToolchainTests(unittest.TestCase):
         for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
                      "crates/ansa/Cargo.toml", "crates/ansa/src/lib.rs",
                      "crates/ansa/examples/protocol_adapter.rs",
+                     "crates/ansa/examples/auth_adapter.rs",
                      "crates/ansa/src/bin/ansa.rs", "crates/ansa-linux/Cargo.toml",
                      "crates/ansa-linux/src/lib.rs"):
             target = self.workspace / name
