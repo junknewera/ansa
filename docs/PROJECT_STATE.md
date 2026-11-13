@@ -30,6 +30,18 @@ outputs - `~/Workspace/pet/ansa-baselines/m4-453ba6f/`. Следующая от�
 M5: owned runtime, cancellation и summary loop; автоматически не начинать.
 Live/cutover/performance parity этим этапом не закрываются.
 
+## Loop engineering: GPT design proposal
+
+2026-11-13: добавлен отдельный документационный пакет — [спецификация](LOOP_ENGINEERING.md), [ADR 0003](adr/0003-gpt-diagnostic-escalation.md) и [prompts](LOOP_ENGINEERING_PROMPTS.md). Baseline проверки документации — [main@8f37af0](https://github.com/junknewera/ansa/commit/8f37af075fed5918afc1fafd9d7167271e8c8d26), после merged M4. Связанный [PR #3](https://github.com/junknewera/ansa/pull/3) остаётся отдельным draft native Orchestrate design; его ранний M0 snapshot не является текущим состоянием проекта.
+
+Предлагаемый профиль: Sol worker → три classified attempts без verified progress → fresh Astra advisor → discriminating experiment → максимум две guided attempts → optional bounded takeover. State/budget/acceptance принадлежат ANSA. Advice привязан к source/evidence и проверяется; общий бюджет, native recovery и single writer сохраняются. Конкретная модельная пара и threshold требуют eval против same-model/fresh-context/strong-from-start controls.
+
+**LE0 / docs-only.** Runtime не изменён; production/default C++20, Rust last verified milestone остаётся M4. LE1–LE4 — будущие feature gates после verified M10 и соответствующих O1–O4. Нет claims о работающем controller, live model availability или экономии подписки. Синтетический HTTP retry пример — иллюстрация, не обнаруженный ANSA bug и не результат исполнения моделей.
+
+Проверки LE0: исходные bytes восьми прочитанных repository files совпали с Git blob identities; whitespace/fences/reference checks, 52 относительные ссылки и три JSON blocks прошли. Два независимых scoped design reviews и targeted re-review закрыли замечания о pending transition после crash, evaluator эксперимента, invalidation final review и сравнимости eval arms. Это review агентов, не formal GitHub approval и не runtime acceptance. В design включены 22 будущих acceptance cases.
+
+Точный Git checkpoint документационного пакета фиксируется в сопровождающем PR. Runtime/Nix/native suites для этого docs-only изменения не исполняются и не объявляются пройденными. Следующий migration шаг по-прежнему M5; следующий шаг этого proposal — review предложенного решения и последующая отдельная feature implementation по gates, без автоматического старта.
+
 ## Rust migration: M3 закрыт (GO)
 
 **Rust last verified milestone - M3 GO, 2026-11-13**, code checkpoint

@@ -36,6 +36,15 @@ Production runtime пока остаётся C++20. Полная Rust migration 
 7. Rust gate: locked build/test, fmt, clippy, native aarch64, meaningful differential/fault tests и контроль зависимостей/ресурсов по milestone. Пустой, skipped либо неподдерживаемый required suite не считается PASS. C++ gates сохраняются; сравнивай одинаковые build profiles. Исправление oracle ошибки требует отдельного safety assertion, не ослабления проверки.
 8. C++ удаляется только после полного offline/live parity, двунаправленной совместимости, проверенного rollback, independent review и разрешения на cutover/удаление. Handoff различает C++ last known good, Rust last verified SHA, WIP и незакрытые gates. Ни docs-only PR, ни наличие Rust UI не меняют production language.
 
+## Loop engineering — design-only
+
+[Спецификация](docs/LOOP_ENGINEERING.md), [ADR 0003](docs/adr/0003-gpt-diagnostic-escalation.md) и [prompts](docs/LOOP_ENGINEERING_PROMPTS.md) описывают будущую native GPT diagnostic escalation. Это расширение proposal Orchestrate из [PR #3](https://github.com/junknewera/ansa/pull/3), отдельная feature после verified M10 GO и O1–O4 gates. Документация не реализует controller и не расширяет migration milestone.
+
+- Root код считает classified repair attempts и verified progress по frozen contract; model text, tool calls и новая session не сбрасывают бюджеты. После трёх no-progress attempts proposed pilot вызывает fresh GPT advisor; один experiment, максимум две guided и две takeover attempts ограничены общими caps.
+- Используй собственные ANSA sessions/direct SIWC. Advisor получает read-only ToolSnapshot, takeover — новую basic session. Model/effort/account binding явные; недоступный route не заменяется другим runtime, аккаунтом или billing path.
+- Advice — гипотеза с evidence и проверяемым прогнозом. Snapshot включает relevant dirty/untracked content, manifest и environment; stale/refuted advice не разрешает patch. Diagnostic review не заменяет independent final acceptance.
+- Task decisions/ledger находятся в отдельном future orchestration namespace. Session v1/RequestId semantics, durable native receipts, recovery original store, known late outcomes и запрет replay unknown effects сохраняются. Один active model child/writer в MVP; новый loop не обходит cleanup или cancel.
+
 ## Quality gate перед закрытием milestone
 
 1. Для production C++ собери и запусти entry point, полный CTest с `--output-on-failure --no-tests=error`, adversarial tests и ASan/UBSan. Команды в [README](README.md). Для migration дополнительно выполни Rust/compatibility gates выбранного milestone. Зафиксируй платформу, конфигурацию, точное число тестов и исход проверки; docs-only review не закрывает runtime milestone.

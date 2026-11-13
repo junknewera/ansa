@@ -4,6 +4,8 @@
 
 Новая инженерная сессия начинается с [AGENTS.md](AGENTS.md) и [текущего состояния проекта](docs/PROJECT_STATE.md).
 
+Проектируемое расширение: [Loop engineering на GPT](docs/LOOP_ENGINEERING.md) — после трёх попыток без проверенного прогресса свежая диагностическая сессия предлагает эксперимент и план продолжения. Это документационный proposal для будущего native Orchestrate после migration gates; текущие CLI и runtime его ещё не реализуют. [Решение](docs/adr/0003-gpt-diagnostic-escalation.md), [примеры prompts](docs/LOOP_ENGINEERING_PROMPTS.md).
+
 ## Обычный CLI
 
 ```sh
