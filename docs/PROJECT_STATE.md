@@ -1,5 +1,33 @@
 # Состояние ansa
 
+## Rust migration: M3 закрыт (GO)
+
+**Rust last verified milestone - M3 GO, 2026-11-13**, code checkpoint
+[`0ba175f`](https://github.com/junknewera/ansa/commit/0ba175f15cc6dbbd4d842c0fc52981cd88cc07b5),
+tag `migration/m3-auth-v1`. Реализованы synthetic RS256/OIDC, PKCE/callback,
+registration/login/refresh/logout, совместимый private store v1, cancel/leases
+и lazy dispatch guard. Production/default остаётся C++20.
+
+X13s/NixOS/aarch64: C++ Debug и Nix Release **87/87**, ASan/UBSan **85/85**;
+clean auth compare **220/220**, fault **273/273**, sanitized compare **220/220**,
+raw checker PASS. Cargo и Nix Rust **35/35** integration functions + **7/7**
+compile-fail doctests; harness **51/51**, Linux preflight **11/11**, toolchain,
+fmt/clippy default+features PASS. M1 regressions **602/286**, M2 **7303/195**,
+оба Rust replay mutants пойманы. 62 native C++ inputs совпали с Nix source.
+
+Два независимых reviews закрыты. В обе стороны проверены read/write/reopen,
+один concurrent refresh, 21 crash boundary с recovery другим binary,
+29 file/store guards и отсутствие повторного ambiguous POST. Пять stricter
+RSA/path corrections согласованы явно. C++ callback, FIFO и NUL path guards
+усилены и прошли полную native matrix. Dependencies: 146 external (+67), прежние
+versions/checksums сохранены, второго HTTP/TLS client нет.
+
+Evidence, logs, binaries, Git bundle, reviews и GC-rooted Release outputs -
+`~/Workspace/pet/ansa-baselines/m3-0ba175f/`. Подробности и команды -
+[M3 report](migration/M3.md). Следующая отдельная задача - M4: journal/session
+v1 и recovery; автоматически не начинать. Live/cutover/performance parity
+остаются вне этого gate; JSON optimization отложена.
+
 ## Rust migration: M2 закрыт (GO)
 
 **Rust last verified milestone - M2 GO, 2026-11-13**, code checkpoint
