@@ -101,6 +101,8 @@ fn cpp_golden_journals() {
         fs::create_dir(root.journal()).unwrap();
         let file = root.journal().join("part-00000000000000000000.log");
         fs::copy(fixtures().join(format!("{name}.log")), &file).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         let before = fs::read(&file).unwrap();
         let config = Request::load(d.field("configuration").unwrap()).unwrap();
         let mut restored = State::new("fixture".into(), config.clone(), config.tools.clone());

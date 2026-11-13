@@ -166,7 +166,7 @@ def malformed(c,kind):
     c.prepare({name:raw});before=c.shot()
     for adapter in ('cpp','rust'):
         result=accepted(c.call(adapter,store_request()));check(bool(result['diagnostic']),'malformed state writable');check(result['state']['initialized'] is False,'unsupported state silently rebound')
-        rejected=accepted(c.call(adapter,{'op':'journal','events':[{'kind':'test','value':2}]}));check(rejected['appends'][0]['accepted'] is False,'read-only append accepted')
+        rejected=accepted(c.call(adapter,store_request([v.golden()['traces']['completed'][1]])));check(rejected['appends']==[{'accepted':False,'diagnostic':'journal_read_only'}],'read-only session append accepted')
     check(c.shot()==before,'corruption recovery overwrote bytes')
 GUARDS=('part-hardlink','part-symlink','part-fifo','lock-hardlink','lock-symlink','lock-fifo','marker-hardlink','marker-fifo')
 def guard(c,kind):
