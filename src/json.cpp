@@ -1,5 +1,6 @@
 #include "omh/json.hpp"
 #include <openssl/evp.h>
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -59,12 +60,13 @@ bool equal(yyjson_val* a, yyjson_val* b) {
     }
     return yyjson_equals(a, b);
 }
-void append(std::string& out, std::string_view part) {
-    require(part.size() <= 16 * 1024 * 1024 - out.size(), "json_build_limit", Stage::json, ErrorCode::limit);
+void append(std::string& out, std::string_view part, std::size_t max_bytes = 16 * 1024 * 1024) {
+    require(out.size() <= max_bytes && part.size() <= max_bytes - out.size(), "json_build_limit", Stage::json, ErrorCode::limit);
     out.append(part);
 }
 } // namespace
-Json::Json(yyjson_doc* doc) : doc_(doc, yyjson_doc_free) {}
+Json::Json(yyjson_doc* doc, std::size_t max_bytes, std::size_t max_depth, std::size_t max_nodes)
+    : doc_(doc, yyjson_doc_free), max_bytes_(max_bytes), max_depth_(max_depth), max_nodes_(max_nodes) {}
 Json Json::parse(std::string_view bytes, std::size_t max_bytes, std::size_t depth, std::size_t max_nodes) {
     require(!bytes.empty(), "json_empty", Stage::json);
     require(bytes.size() <= max_bytes, "json_byte_limit", Stage::json, ErrorCode::limit);
@@ -85,13 +87,13 @@ Json Json::parse(std::string_view bytes, std::size_t max_bytes, std::size_t dept
     // Retain numeric tokens too: replay must not round opaque item metadata through double.
     auto* doc = yyjson_read(bytes.data(), bytes.size(), YYJSON_READ_NUMBER_AS_RAW);
     require(doc != nullptr, "json_invalid", Stage::json);
-    Json result(doc);
+    Json result(doc, max_bytes, depth, max_nodes);
     std::size_t nodes = 0;
     inspect(yyjson_doc_get_root(doc), depth, nodes, max_nodes);
     return result;
 }
-Json Json::string(std::string_view text) {
-    require(text.size() <= 16 * 1024 * 1024, "json_string_limit", Stage::json, ErrorCode::limit);
+Json Json::string(std::string_view text, std::size_t max_bytes) {
+    require(text.size() <= max_bytes, "json_string_limit", Stage::json, ErrorCode::limit);
     std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> doc(yyjson_mut_doc_new(nullptr), yyjson_mut_doc_free);
     require(bool(doc), "json_allocation", Stage::json);
     auto* str = yyjson_mut_strncpy(doc.get(), text.empty() ? "" : text.data(), text.size());
@@ -100,15 +102,15 @@ Json Json::string(std::string_view text) {
     std::size_t len = 0;
     std::unique_ptr<char, decltype(&std::free)> bytes(yyjson_mut_write(doc.get(), 0, &len), &std::free);
     require(bool(bytes), "json_string_invalid", Stage::json);
-    return parse(std::string_view(bytes.get(), len));
+    return parse(std::string_view(bytes.get(), len), max_bytes);
 }
-Json Json::object(const std::vector<std::pair<std::string, Json>>& entries) {
+Json Json::object(const std::vector<std::pair<std::string, Json>>& entries, std::size_t max_bytes) {
     std::string out = "{";
     for (std::size_t i = 0; i < entries.size(); ++i) {
-        if (i) append(out, ",");
-        append(out, string(entries[i].first).dump()); append(out, ":"); append(out, entries[i].second.dump());
+        if (i) append(out, ",",max_bytes);
+        append(out, string(entries[i].first,max_bytes).dump(),max_bytes); append(out, ":",max_bytes); append(out, entries[i].second.dump(),max_bytes);
     }
-    append(out, "}"); return parse(out);
+    append(out, "}",max_bytes); return parse(out,max_bytes);
 }
 Json Json::array(const std::vector<Json>& entries) {
     std::string out = "[";
@@ -140,7 +142,8 @@ bool Json::has(std::string_view key) const { return yyjson_obj_getn(raw(), key.e
 Json Json::at(std::string_view key) const {
     auto* v = yyjson_obj_getn(raw(), key.empty() ? "" : key.data(), key.size());
     require(v != nullptr, "json_missing_field", Stage::json);
-    return parse(write(v));
+    const auto encoded = write(v);
+    return parse(encoded, max_bytes_, max_depth_, max_nodes_);
 }
 std::string Json::text() const {
     require(yyjson_is_str(raw()), "json_expected_string", Stage::json);
@@ -161,7 +164,10 @@ std::vector<Json> Json::elements() const {
     require(is_array(), "json_expected_array", Stage::json);
     std::vector<Json> out;
     yyjson_arr_iter it = yyjson_arr_iter_with(raw());
-    while (auto* v = yyjson_arr_iter_next(&it)) out.push_back(parse(write(v)));
+    while (auto* v = yyjson_arr_iter_next(&it)) {
+        const auto encoded = write(v);
+        out.push_back(parse(encoded, max_bytes_, max_depth_, max_nodes_));
+    }
     return out;
 }
 bool Json::operator==(const Json& other) const { return equal(raw(), other.raw()); }

@@ -45,13 +45,16 @@ struct Limits {
 // Immutable, owning document. No borrowed parser values cross a public boundary.
 class Json {
     std::shared_ptr<yyjson_doc> doc_;
-    explicit Json(yyjson_doc* doc);
+    std::size_t max_bytes_, max_depth_, max_nodes_;
+    explicit Json(yyjson_doc* doc, std::size_t max_bytes = 16 * 1024 * 1024,
+                  std::size_t max_depth = 64, std::size_t max_nodes = 131072);
     yyjson_val* raw() const;
 public:
     static Json parse(std::string_view bytes, std::size_t max_bytes = 16 * 1024 * 1024,
                       std::size_t depth = 64, std::size_t nodes = 131072);
-    static Json string(std::string_view);
-    static Json object(const std::vector<std::pair<std::string, Json>>&);
+    static Json string(std::string_view, std::size_t max_bytes = 16 * 1024 * 1024);
+    static Json object(const std::vector<std::pair<std::string, Json>>&,
+                       std::size_t max_bytes = 16 * 1024 * 1024);
     static Json array(const std::vector<Json>&);
     std::string dump() const;
     bool is_object() const;

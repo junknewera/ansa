@@ -1,6 +1,27 @@
 # Offline capture и проверка evidence
 
-`run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1` для synthetic JSON/hash/process/transport probes. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
+`run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1`; M2 - `compare/fault --suite protocol` и `check --milestone M2`. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
+
+## M2 protocol suite
+
+Собери `ansa_protocol_oracle` и Rust example с feature `protocol-test-adapter`:
+
+```sh
+cmake --build build-ansa --target ansa_protocol_oracle -j 2
+cargo build --manifest-path rust/Cargo.toml --locked -p ansa --example protocol_adapter --features protocol-test-adapter
+python3 tests/parity/run.py compare --suite protocol --cpp-build build-ansa --rust-target rust/target --output build-migration/M2
+python3 tests/parity/run.py fault --suite protocol --cpp-build build-ansa --rust-target rust/target --output build-migration/M2-fault
+python3 tests/parity/run.py check --milestone M2 --evidence build-migration/M2
+```
+
+Матрицы требуют 7303 compare и 195 fault cases, обе SSE fixtures, реальные
+localhost HTTP transfer failures и pure counter executors. Fault запускает
+drop/reorder mutants production Rust replay builder. Checker заново проверяет
+retained requests/responses, полный continuation и нулевое число executors при
+отказе; missing/skipped cases, чужая платформа и подменённые raw files не проходят.
+Файлы evidence должны быть обычными, без symlinks/hardlinks и в пределах лимитов.
+Эти проверки дополняют native C++/Rust gates и independent review из
+[M2 report](../../docs/migration/M2.md).
 
 ## M1 risk suite
 

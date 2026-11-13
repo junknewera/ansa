@@ -1,5 +1,34 @@
 # Состояние ansa
 
+## Rust migration: M2 закрыт (GO)
+
+**Rust last verified milestone - M2 GO, 2026-11-13**, code checkpoint
+[`b9f254c`](https://github.com/junknewera/ansa/commit/b9f254c77dd597c6be03ed39aae0234d74f889d3),
+tag `migration/m2-protocol-replay`. Реализованы bounded SSE/Responses,
+lossless native replay, закрытые admission/result types, immutable tool snapshot,
+полный batch preflight и consume-once execution с pure synthetic counters.
+Production/default остаётся C++20.
+
+X13s/NixOS/aarch64: C++ Debug и Nix Release **87/87**, ASan/UBSan **85/85**;
+clean protocol compare **7303/7303**, fault **195/195**, оба Rust production
+replay mutants пойманы требуемыми assertions. Sanitized C++ compare
+**7303/7303**, raw checker PASS. M1 regressions: compare **602/602**, fault
+**286/286**. Cargo **19/19** integration functions и **7/7** compile-fail doctests,
+harness **43/43**, preflight **11/11**, fmt/clippy/default+feature и Nix Rust PASS.
+Cargo.lock и 79 external dependencies не изменены, TLS только rustls/ring.
+
+Независимые protocol/admission и transport/harness reviews закрыты. Исправлены
+нарушения argument lifecycle и полноты terminal, ранние preview/limit guards,
+binding batch results и evidence checker. C++ Json accessors сохраняют custom
+limits; эта узкая production-правка прошла всю native matrix, старый M1 fallback
+сохранён. 62 C++ native inputs в Nix Release source совпадают с checkpoint.
+
+Evidence, binaries, failed attempts, logs, source proof и GC-rooted Release
+outputs - `~/Workspace/pet/ansa-baselines/m2-b9f254c/`. Scope, review и точные
+команды - в [M2 report](migration/M2.md). Следующая отдельная задача - M3
+synthetic auth/OIDC/store; автоматически не начинать. Live, cutover и performance
+parity этим этапом не закрываются; JSON optimization отложена по решению пользователя.
+
 ## Rust migration: M1 закрыт (GO)
 
 **Rust last verified milestone - M1 GO, 2026-11-13**, code checkpoint [5324d2a](https://github.com/junknewera/ansa/commit/5324d2ad8235f636f0b5865d9384c0ba101d1208), tag `migration/m1-risk-spikes`. Реализованы synthetic JSON/hash, private early-exec supervisor и localhost HTTP/TLS/proxy spikes. На X13s/NixOS/aarch64: Debug и Nix Release CTest **87/87**, ASan/UBSan **85/85**, sanitized C++ oracle compare **602/602**, clean compare **602/602**, fault **286/286** и raw replay checker PASS. Cargo **4/4** integration functions включают 11 process и 7 H2 cases; harness **20/20**, Linux preflight **11/11**, fmt/clippy и Nix Rust package прошли.

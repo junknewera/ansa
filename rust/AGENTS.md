@@ -3,7 +3,29 @@
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
 docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
 
-## M1 boundary
+## M2 boundary
+
+- M1 is GO. M2 authorizes full offline protocol/SSE/Responses/replay and pure
+  tool-batch admission, with C++ remaining the production default.
+- Keep production request/replay builders in the test path. Preserve native
+  items, numeric tokens, encrypted strings, exact epochs/tools/account and
+  legacy hash bytes; compare ordinary request JSON structurally.
+- An admitted response must belong to its request and have verified successful
+  transport EOF. Its constructor and the successful-transfer proof are closed.
+  Reject the entire response/batch before any counter executor runs.
+- PreparedBatch is consume-once and not Clone. Saved-response admission uses
+  synthetic SSE through the same production decoder. No second validator.
+- Port actual assertions and parameterized loops from all seven C++ protocol
+  suites, including dependencies, streaming preview and contracts. Execute
+  drop/reorder mutants against production replay builders.
+- Implement protocol compare/fault and M2 raw-evidence checking. Missing,
+  skipped, all-reject or agreeing-but-wrong results must not pass.
+- One final PR after native gates and independent review. JSON optimization
+  and its early Release cost-probe are deferred; correctness bounds remain.
+- No real credentials/model calls, durable executors, journal, auth, owner loop,
+  UI, automatic retry or production cutover in this milestone.
+
+## Historical M1 boundary
 
 - M0 is GO. M1 authorizes only JSON/hash, private process supervisor and local
   HTTP/TLS risk spikes plus their synthetic fixtures/adapters. Production is C++.

@@ -1,4 +1,14 @@
 //! M1 localhost-only frame/proxy/TLS probe. No provider or tool admission path.
+use crate::{
+    protocol::{json::Json, sse::Limits},
+    provider::{
+        replay::continuation, request::Request as ProviderRequest, responses::ResponseStream,
+    },
+    tools::{
+        admission::{OperationIds, PreparedBatch},
+        registry::Snapshot,
+    },
+};
 use http_body_util::{BodyExt, Full};
 use hyper::{HeaderMap, Request, Uri, body::Bytes};
 use hyper_util::client::legacy::connect::{
@@ -290,7 +300,7 @@ pub async fn fetch(spec: Probe) -> serde_json::Value {
     let received = Arc::new(AtomicUsize::new(0));
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        exchange(spec, &mut driver, &received),
+        exchange(spec, &mut driver, &received, None),
     )
     .await;
     if let Some(driver) = driver.0.take() {
@@ -304,10 +314,60 @@ pub async fn fetch(spec: Probe) -> serde_json::Value {
         }
     }
 }
+#[cfg(feature = "protocol-test-adapter")]
+pub struct ProtocolProbe {
+    pub network: Probe,
+    pub request: ProviderRequest,
+    pub snapshot: Arc<Snapshot>,
+    pub invocations: Arc<AtomicUsize>,
+}
+#[cfg(feature = "protocol-test-adapter")]
+pub async fn fetch_protocol(spec: ProtocolProbe) -> serde_json::Value {
+    let local = spec.network.url.parse::<Uri>().is_ok_and(|uri| {
+        uri.scheme_str() == Some("http")
+            && matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]"))
+            && uri.port_u16().is_some()
+            && uri
+                .authority()
+                .is_some_and(|authority| !authority.as_str().contains('@'))
+    });
+    if !local {
+        return serde_json::json!({"accepted":false,"executors":0});
+    }
+    let mut driver = Driver::default();
+    let received = Arc::new(AtomicUsize::new(0));
+    let invocations = Arc::clone(&spec.invocations);
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        exchange(
+            spec.network,
+            &mut driver,
+            &received,
+            Some((spec.request, spec.snapshot, Arc::clone(&spec.invocations))),
+        ),
+    )
+    .await;
+    if let Some(driver) = driver.0.take() {
+        driver.abort();
+        let _ = driver.await;
+    }
+    match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            eprintln!("protocol network probe rejected: {error}");
+            serde_json::json!({"accepted":false,"executors":invocations.load(Ordering::Relaxed)})
+        }
+        Err(_) => {
+            eprintln!("protocol network probe timed out");
+            serde_json::json!({"accepted":false,"executors":invocations.load(Ordering::Relaxed)})
+        }
+    }
+}
 async fn exchange(
     spec: Probe,
     driver: &mut Driver,
     received: &AtomicUsize,
+    protocol: Option<(ProviderRequest, Arc<Snapshot>, Arc<AtomicUsize>)>,
 ) -> Result<serde_json::Value, BoxError> {
     let uri: Uri = spec.url.parse()?;
     if !matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]"))
@@ -358,6 +418,11 @@ async fn exchange(
     let budget = Arc::new(Mutex::new(HeaderBudget::default()));
     let (failure, mut failed) = tokio::sync::watch::channel(false);
     let _failure_lifetime = failure.clone();
+    let body = if let Some((request, _, _)) = &protocol {
+        request.json()?.dump()
+    } else {
+        "{\"stream\":true,\"store\":false}".to_owned()
+    };
     let mut request = Request::builder()
         .method("POST")
         .uri(if h2 || forward {
@@ -373,9 +438,7 @@ async fn exchange(
             uri.authority().ok_or("authority")?.as_str(),
         )
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from_static(
-            br#"{"stream":true,"store":false}"#,
-        )))?;
+        .body(Full::new(Bytes::from(body)))?;
     if let Some(auth) = forward_auth {
         request
             .headers_mut()
@@ -466,6 +529,72 @@ async fn exchange(
     }
     trailers.sort();
     let interim = budget.lock().expect("header budget lock").interim.clone();
+    if let Some((request, snapshot, invocations)) = protocol {
+        let mut stream = ResponseStream::new(
+            request.clone(),
+            Limits {
+                body: spec.body_limit,
+                ..Limits::default()
+            },
+        );
+        stream.feed(&bytes)?;
+        let completed = stream.finish()?;
+        let mut ids = OperationIds::new("local_http", 0)?;
+        let batch = match PreparedBatch::prepare(&completed, snapshot, &mut ids) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(
+                    serde_json::json!({"accepted":true,"batch_accepted":false,"items_raw":completed.items().iter().map(|item|item.value().dump()).collect::<Vec<_>>(),"calls":completed.calls().iter().map(|call|serde_json::json!({"id":call.item_id,"call_id":call.call_id,"name":call.name,"arguments":call.arguments})).collect::<Vec<_>>(),"executors":0,"interim":interim,"trailers":trailers}),
+                );
+            }
+        };
+        let results = batch.execute(false);
+        let next = continuation(&completed, &results)?;
+        let bound = &completed.request();
+        let descriptors = bound
+            .tools
+            .descriptors
+            .iter()
+            .map(|d| {
+                Json::object(vec![
+                    ("name", Json::string(&d.name)?),
+                    ("description", Json::string(&d.description)?),
+                    ("revision", Json::string(&d.revision)?),
+                    ("schema", d.schema.clone()),
+                ])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let context = Json::object(vec![
+            ("provider", Json::string(&bound.binding.provider)?),
+            ("account", Json::string(&bound.binding.account)?),
+            (
+                "requested_model",
+                Json::string(&bound.binding.requested_model)?,
+            ),
+            (
+                "returned_model",
+                Json::string(&bound.binding.returned_model)?,
+            ),
+            (
+                "epoch",
+                Json::object(vec![
+                    ("id", Json::string(&bound.epoch.id)?),
+                    ("instructions", Json::string(&bound.epoch.instructions)?),
+                    ("exact_state", bound.epoch.exact_state.clone()),
+                ])?,
+            ),
+            (
+                "tools",
+                Json::object(vec![
+                    ("revision", Json::string(&bound.tools.revision)?),
+                    ("descriptors", Json::array(descriptors)?),
+                ])?,
+            ),
+        ])?;
+        return Ok(
+            serde_json::json!({"accepted":true,"batch_accepted":true,"items_raw":completed.items().iter().map(|item|item.value().dump()).collect::<Vec<_>>(),"calls":completed.calls().iter().map(|call|serde_json::json!({"id":call.item_id,"call_id":call.call_id,"name":call.name,"arguments":call.arguments})).collect::<Vec<_>>(),"continuation_raw":next.json()?.dump(),"context_raw":context.dump(),"executors":invocations.load(Ordering::Relaxed),"interim":interim,"trailers":trailers}),
+        );
+    }
     Ok(
         serde_json::json!({"accepted":true,"executors":0,"body_hex":bytes.iter().map(|v| format!("{v:02x}")).collect::<String>(),"interim":interim,"trailers":trailers}),
     )
