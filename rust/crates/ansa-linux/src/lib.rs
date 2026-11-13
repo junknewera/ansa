@@ -1,3 +1,6 @@
-//! M0 placeholder for future reviewed Linux wrappers; no syscall code yet.
+//! Narrow Linux wrappers for isolated M1 process spikes.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod fs;
+pub mod process;

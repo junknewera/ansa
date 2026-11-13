@@ -26,6 +26,8 @@ option(OMH_MUTATION_CHILD "Disable recursive mutation test registration in isola
 if(BUILD_TESTING)
   # M0 environment probe is separate from the existing C++ parity baseline.
   add_executable(ansa_preflight tests/parity/preflight.cpp)
+  add_executable(ansa_risk_oracle tests/parity/cpp_adapter.cpp)
+  target_link_libraries(ansa_risk_oracle PRIVATE omh_core)
   add_executable(omh_tests tests/protocol_tests.cpp)
   target_link_libraries(omh_tests PRIVATE omh_core)
   target_compile_definitions(omh_tests PRIVATE OMH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")

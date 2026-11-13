@@ -1,8 +1,14 @@
 # Состояние ansa
 
+## Rust migration: M1 закрыт (GO)
+
+**Rust last verified milestone - M1 GO, 2026-11-13**, code checkpoint [5324d2a](https://github.com/junknewera/ansa/commit/5324d2ad8235f636f0b5865d9384c0ba101d1208), tag `migration/m1-risk-spikes`. Реализованы synthetic JSON/hash, private early-exec supervisor и localhost HTTP/TLS/proxy spikes. На X13s/NixOS/aarch64: Debug и Nix Release CTest **87/87**, ASan/UBSan **85/85**, sanitized C++ oracle compare **602/602**, clean compare **602/602**, fault **286/286** и raw replay checker PASS. Cargo **4/4** integration functions включают 11 process и 7 H2 cases; harness **20/20**, Linux preflight **11/11**, fmt/clippy и Nix Rust package прошли.
+
+Independent JSON/process/transport review закрыт без открытых findings; три stricter transport corrections зафиксированы явно. Evidence, binaries, logs и GC-rooted Release closures сохранены в `~/Workspace/pet/ansa-baselines/m1-5324d2a/`. C++ executable SHA-256 совпадает с M0 baseline, production/default остаются C++20, budgets сохранены. Scope, ограничения и команды - в [M1 report](migration/M1.md). Следующий шаг - M2: полный protocol, Responses/replay и batch admission; M1 не является Rust runtime или performance parity.
+
 ## Rust migration: M0 закрыт (GO)
 
-Production executable и Nix default остаются C++20. **Rust last verified milestone - M0 GO, 2026-11-13**, проверенный code/budget checkpoint [6fb1073](https://github.com/junknewera/ansa/commit/6fb10735a9832f1570ed7cb812c1c1f3f4ebdb89), tag `migration/m0-toolchain-harness`. Исходная реализация - `e35b765`, review fixes - `a905212`. Scaffold не является Rust runtime; M1 не начат. C++ last known good остаётся отдельным baseline ниже.
+M0 toolchain/baseline закрыт 2026-11-13: проверенный code/budget checkpoint [6fb1073](https://github.com/junknewera/ansa/commit/6fb10735a9832f1570ed7cb812c1c1f3f4ebdb89), tag `migration/m0-toolchain-harness`. Исходная реализация - `e35b765`, review fixes - `a905212`. Scaffold не является Rust runtime. C++ last known good остаётся отдельным baseline ниже.
 
 Финальная native проверка `6fb1073` на `x13s`, NixOS 26.11/aarch64, kernel 7.2.9, pinned GCC 16.2.0: Debug CTest **87/87**, Nix Release **87/87**, ASan/UBSan **85/85** с `detect_leaks=1`/`halt_on_error=1`; оба mutants прошли в Debug/Release. Linux preflight **11/11**, включая procfs children. Новые Debug/sanitizer capture/check прошли из clean checkpoint с frozen budget; sanitizer использовал `TRUE/YES`. Harness/toolchain regressions **12/12**, Rust scaffold **1/1**, build/fmt/clippy/Nix Rust package и PTY backpressure прошли. Фактические rustc 1.98.1, Cargo CLI 1.98.0. Исторические x86_64 и промежуточные native результаты сохранены в [M0 closeout](migration/M0.md).
 
