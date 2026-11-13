@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`ansa` - минимальный C++20 agent runtime, который легко читать, менять и расширять. Executable `ansa`; внутренний namespace `omh` сохраняется для совместимости протокольной основы. Agent loop принадлежит проекту и не зависит от Codex SDK или app-server.
+`ansa` - минимальный C++20 agent runtime, который легко читать, менять и расширять. Executable `ansa`; внутренний namespace `omh` сохраняется для совместимости протокольной основы. Agent loop принадлежит проекту: он использует собственный SIWC Responses adapter и локальные tools.
 
 Production runtime пока остаётся C++20. Полная Rust migration — отдельная ветка и последовательные gates из [плана](docs/RUST_MIGRATION_PLAN.md); наличие плана или scaffold не означает cutover.
 
@@ -35,6 +35,19 @@ Production runtime пока остаётся C++20. Полная Rust migration 
 6. До разрешённого live pilot используй synthetic stores/fixtures. Не открывай реальные credentials ради planning/inspection. После rotating refresh запрещён rollback старого credential backup; после side effects нельзя откатывать journal к старой копии и автоматически продолжать. Fallback C++ читает наиболее свежий совместимый state; иначе остановка dispatch и явное восстановление.
 7. Rust gate: locked build/test, fmt, clippy, native aarch64, meaningful differential/fault tests и контроль зависимостей/ресурсов по milestone. Пустой, skipped либо неподдерживаемый required suite не считается PASS. C++ gates сохраняются; сравнивай одинаковые build profiles. Исправление oracle ошибки требует отдельного safety assertion, не ослабления проверки.
 8. C++ удаляется только после полного offline/live parity, двунаправленной совместимости, проверенного rollback, independent review и разрешения на cutover/удаление. Handoff различает C++ last known good, Rust last verified SHA, WIP и незакрытые gates. Ни docs-only PR, ни наличие Rust UI не меняют production language.
+
+## Проект Orchestrate — design-only
+
+[ADR 0002](docs/adr/0002-self-hosted-orchestration.md), [исследование](docs/ORCHESTRATION_RESEARCH.md) и [prompts](docs/ORCHESTRATION_PROMPTS.md) описывают будущую native orchestration через собственный direct SIWC Responses route. Production implementation начинается отдельным feature milestone после verified M10 GO; M0–M10 не расширяются. Docs-only решение не закрывает native gates и не разрешает live inference/cutover. Узкий non-production native lifecycle spike после M6 остаётся отдельным scope.
+
+- Control plane принадлежит ansa; модель предлагает план/review, но не меняет task state, policy, budget или acceptance. Один task owner и один root run на repository; child session owner единолично меняет своё session state.
+- Композируй тот же Rust AgentRuntime/basic/plan loop. У каждого child отдельные SessionId, journal, context и ToolSnapshot; central auth broker обслуживает собственный SIWC grant без передачи credentials в модель/child artifacts. Не создавай второй agent loop или framework.
+- Будущий task journal имеет отдельный versioned namespace. Legacy session journal не меняется; known child receipts импортируются root по task/attempt/session/command/turn identity, sequence и digest. PROJECT_STATE и snapshots — handoff/projections, не второй authority.
+- До root ChildSubmitIntent child directory/init/binding должны быть durable; parent знает SessionId/CommandId/TurnId и exact payload digest до Submit. PostStatus accepted означает только очередь; native RequestId выделяется runtime до fsync, но root принимает его только из durable receipt после child journal fsync; он остаётся identity accepted Submit/turn, не HTTP-request ID. Потерянный ACK reconciles по прежнему CommandId/exact payload в том же store. Recovery — только OpenExisting, без CreateNew fallback. Frontend stream_sequence не journal offset. Open modes и receipt lookup/wrapper — proposed post-migration capability.
+- Native durable intent, auth admission и ProcessRunner evidence сохраняются. Cancel прекращает будущий dispatch, сохраняет late known outcome и ждёт native cleanup/reconciliation. effect_unknown не повторяется автоматически; stale completion не продолжает новый attempt.
+- MVP последовательно выполняет одного active native child: builder, read-only planner либо fresh reviewer, без recursive delegation. Root budget учитывает Resume и HTTP retries через restart/session changes; outer auth lease на весь child не создаётся. Каждый writer имеет owned worktree; frozen host verification привязана к exact SHA, reviewer читает actual diff/evidence, integration проверяется снова. Worktree/ToolSnapshot/hash не являются OS sandbox или tamper-proof evidence.
+- Единственный product inference route — собственный разрешённый direct SIWC. Codex runtime integration и paid API alternate отклонены; Codex допустим только как внешний инструмент разработчика. Не читай чужие token stores, не подменяй account/model/route неявно. Capabilities и usage проверяются на actual supported route.
+- O1 — fake child lifecycle/scripted receipts; O2 — native runtime composition/synthetic Responses и auth/recovery; O3 — frozen verification/fresh review/integration/publication с fake inference; O4 — отдельно разрешённый native X13s SIWC pilot. Реальные child APIs и claims о готовности появляются только после соответствующих gates.
 
 ## Quality gate перед закрытием milestone
 
