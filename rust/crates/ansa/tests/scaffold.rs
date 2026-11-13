@@ -1,23 +1,19 @@
 #![forbid(unsafe_code)]
 
 #[test]
-fn scaffold_does_not_claim_to_execute_runtime_commands() {
-    for args in [
-        vec![],
-        vec!["a prompt"],
-        vec!["--login"],
-        vec!["--offline-demo"],
-    ] {
+fn executable_exposes_local_help_and_a_real_offline_roundtrip() {
+    for args in [vec!["--help"], vec!["--offline-demo"]] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_ansa-rs"))
-            .args(args)
+            .args(&args)
             .output()
             .expect("run scaffold executable");
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
-        assert!(
-            String::from_utf8(output.stderr)
-                .expect("UTF-8 diagnostic")
-                .contains("Rust CLI is not implemented")
-        );
+        assert_eq!(output.status.code(), Some(0), "{:?}", output);
+        let text = String::from_utf8(output.stdout).expect("UTF-8");
+        assert!(text.contains(if args[0] == "--help" {
+            "Usage: ansa"
+        } else {
+            "OMH_TOOL_OK:OMH_FIXED_VALUE_42"
+        }));
+        assert!(output.stderr.is_empty());
     }
 }

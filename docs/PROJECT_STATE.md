@@ -1,5 +1,33 @@
 # Состояние ansa
 
+## Rust migration: M7 закрыт (GO)
+
+**Rust last verified milestone - M7 GO, 2026-11-14**, code checkpoint
+[`838f6bd`](https://github.com/junknewera/ansa/commit/838f6bd0c1af14686525ac2f646f83defe9dd430),
+tag `migration/m7-carbon-cli`. Реализованы Carbon, typed JSONL и настоящий CLI
+поверх M4 catalog, M5 runtime и M6 tools. Production/default остаётся C++20.
+
+X13s/NixOS/aarch64: C++ Debug/Release **87/87**, ASan/UBSan **85/85**;
+M7 compare **120/120**, fault **187/187**, sanitized compare **120/120**, raw
+checkers PASS. Cargo/Nix Rust: **100 integration + 7 unit + 9 doctests**;
+frontend **14/14**, harness **121/121**, preflight **11/11**, fmt/clippy PASS.
+Все M1-M6 regression checkers PASS, оба Rust replay mutants пойманы.
+Cargo.lock и 146 external packages сохранены; включён rustix termios.
+
+Отдельно проверены visual frames 80x24 → 20x10 → 100x32, history-before-input,
+повторный Cancel, draft после rejection, job control, terminal/OFD restoration,
+заблокированный output и ранняя отмена при accepted fsync. Настоящие C++/Rust
+CLI не обращаются к сети до первого prompt с synthetic expired profile.
+Два независимых review закрыты; оба reviewers повторили итоговый raw checker.
+
+Все captures - clean `838f6bd`. Nix source proof сверяет 110 C++/harness и
+100 Rust inputs; 55 native C++ inputs неизменны. C++ fallback hash сохранён.
+Evidence, binaries, source/handoff bundles, reviews и GC roots:
+`~/Workspace/pet/ansa-baselines/m7-838f6bd/`. Подробности - [M7 report](migration/M7.md).
+
+Следующая отдельная задача - M8: полный offline E2E и замороженные resource
+budgets. Автоматически не начинать. Live pilot и cutover остаются закрыты.
+
 ## Rust migration: M6 закрыт (GO)
 
 **Rust last verified milestone - M6 GO, 2026-11-14**, code checkpoint

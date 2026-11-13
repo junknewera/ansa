@@ -11,6 +11,11 @@ auth-test-adapter = []
 session-test-adapter = []
 runtime-test-adapter = []
 tools-test-adapter = []
+frontend-test-adapter = ["protocol-test-adapter"]
+
+[[example]]
+name = "frontend_adapter"
+required-features = ["frontend-test-adapter"]
 
 [[example]]
 name = "tools_adapter"
