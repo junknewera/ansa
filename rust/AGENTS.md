@@ -3,7 +3,18 @@
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
 docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
 
-## M6 boundary
+## M7 boundary
+
+- M6 is GO. M7 authorizes the existing CLI/Carbon/JSONL frontend over M5/M6.
+- Preserve flags, diagnostics, v1 events, history-before-input, basic/plan,
+  preview/resync and session selection. Use synthetic owned homes in tests.
+- Keep I/O bounded and cancellation responsive under blocked stdout/stderr.
+  Terminal state must be restored on shutdown and job control.
+- Narrow terminal/signal wrappers belong in ansa-linux with native review.
+  No frontend redesign, real credential inspection, live pilot or cutover.
+- One final PR after functional/visual/fault gates and independent review.
+
+## Historical M6 boundary
 
 - M5 is GO. M6 authorizes config/AGENTS, local file/search tools, process
   execution and legacy process evidence, using synthetic owned workspaces.

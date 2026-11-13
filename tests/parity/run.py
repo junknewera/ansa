@@ -356,7 +356,7 @@ def main():
     cap.add_argument("--output", type=Path, required=True)
     cap.add_argument("--run-ctest", action="store_true")
     chk = sub.add_parser("check", help="validate native M0, M1 risk, M2 protocol or M3 auth evidence")
-    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3", "M4", "M5", "M6"], required=True)
+    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7"], required=True)
     chk.add_argument("--evidence", type=Path, required=True)
     chk.add_argument("--fault-evidence", type=Path)
     for name, description in (("compare", "capture native parity rows for risk, protocol or auth"),
@@ -385,6 +385,9 @@ def main():
         if args.action in ("compare", "fault") and args.suite == "tools":
             import tools
             return tools.capture(args)
+        if args.action in ("compare", "fault") and args.suite == "frontend":
+            import frontend
+            return frontend.capture(args)
         print(args.action + ": suite not implemented in M0", file=sys.stderr)
         return 2
     try:
@@ -406,6 +409,9 @@ def main():
         if args.action == "check" and args.milestone == "M6":
             import tools
             return tools.check_evidence(args.evidence.resolve(), args.fault_evidence)
+        if args.action == "check" and args.milestone == "M7":
+            import frontend
+            return frontend.check_evidence(args.evidence.resolve(), args.fault_evidence)
         manifest = json.loads(MANIFEST.read_bytes())
         if args.action == "preflight":
             args.output.parent.mkdir(parents=True, exist_ok=True)

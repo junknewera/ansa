@@ -9,3 +9,4 @@ pub mod local;
 pub mod managed;
 pub mod process;
 pub mod supervisor;
+pub mod terminal;

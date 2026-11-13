@@ -20,9 +20,12 @@ pub use ansa::auth;
 #[path = "../src/config/mod.rs"]
 #[allow(dead_code)]
 pub mod config;
-#[path = "../src/frontend/mod.rs"]
+#[path = "../src/frontend/protocol_v1.rs"]
 #[allow(dead_code)]
-pub mod frontend;
+pub mod frontend_protocol;
+mod frontend {
+    pub use crate::frontend_protocol as protocol_v1;
+}
 #[path = "../src/session/transcript.rs"]
 #[allow(dead_code)]
 pub mod transcript;

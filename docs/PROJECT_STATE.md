@@ -1,5 +1,12 @@
 # Состояние ansa
 
+## Rust migration: M7 в приёмке
+
+M6 слит через PR #10 (`fad3de8`). Пользователь разрешил M7. В изолированной ветке
+`migration/m7-carbon-cli` реализованы Rust CLI, JSONL, Carbon и narrow terminal
+wrappers. Code checkpoint пока WIP: окончательные captures, Nix gates и review
+ещё не закрыты. Last verified milestone остаётся M6; production/default - C++.
+
 ## Rust migration: M6 закрыт (GO)
 
 **Rust last verified milestone - M6 GO, 2026-11-14**, code checkpoint

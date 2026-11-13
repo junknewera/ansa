@@ -1,4 +1,4 @@
-//! M6 offline runtime and local tools. The production entry point remains C++.
+//! M7 runtime and CLI. The production default remains C++ until cutover.
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +13,3 @@ pub mod runtime;
 pub mod session;
 pub mod tools;
 pub mod transport;
-
-/// The scaffold must not present itself as an implemented agent runtime.
-pub const SCAFFOLD_MESSAGE: &str = "ansa-rs: M6 offline runtime library; Rust CLI is not implemented. Use the C++ ansa executable.";
