@@ -431,6 +431,7 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
         vec![],
     )?;
     let reactor = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .build()
         .map_err(|_| "fixture_runtime")?;

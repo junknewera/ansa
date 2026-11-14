@@ -118,6 +118,16 @@ def replay(events,request):
         elif kind=='response':
             same(event['response']['request'],next_request,'E2E exact native continuation/results')
             response=event['response'];results=[];invocation=None
+            last_user=max(i for i,item in enumerate(next_request['input']) if item.get('role')=='user')
+            step=len([item for item in next_request['input'][last_user+1:] if item.get('type')=='function_call_output']);plan=active.get('mode','basic')=='plan';label=active['text']
+            need(set(response)=={'request','id','model','items'} and response['id']==f'response_{label}_{step}' and response['model']==configuration['binding']['returned_model'],'E2E response returned model/identity')
+            if step==(1 if plan else 3):
+                item={'type':'message','id':f'message_{label}','role':'assistant','status':'completed','content':[{'type':'output_text','text':'PLAN_OK' if plan else 'E2E_OK:exit7'}]}
+                same(response['items'],[item],'E2E terminal native message')
+            else:
+                need(len(response['items'])==1,'E2E native call inventory');item=response['items'][0]
+                expected_item={'type':'function_call','id':f'item_{label}_{step}','call_id':f'call_{label}_{step}','namespace':'omh','name':'run_command' if step==1 else 'read_file','arguments':item.get('arguments'),'status':'completed'}
+                same(item,expected_item,'E2E native call identity')
             if scope and capturing:expected.append(copy.deepcopy(next_request))
         elif kind=='intent':
             need(response is not None and invocation is None,'E2E intent order');invocation=event['invocation']
@@ -172,6 +182,12 @@ def validate(value,request,events,root,*,complete=True):
     need([e['operation_id'] for e in wire if e['type']=='tool_finished']==expected_operations,'E2E missing/reordered ToolFinished')
     need([e['turn'] for e in wire if e['type']=='done']==expected_done,'E2E missing/reordered wire Done')
     for command,turn,target in expected_accepted:need(any(e['type']=='command_accepted' and e['command_id']==command and e['turn']==turn and e['request_id']==target for e in wire),'E2E missing admission event')
+    final_text='PLAN_OK' if plan else 'E2E_OK:exit7'
+    need([(e['turn'],e['text']) for e in wire if e['type']=='text_delta']==[(turn,final_text) for turn in expected_done],'E2E wire final text')
+    for event in wire:
+        if event['type']=='text_preview':need(event['text'] in ('','E2E_PREVIEW',final_text),'E2E wire preview text')
+        if event['type']=='snapshot':need(event['text'] in ('',final_text),'E2E snapshot text')
+    if complete:need(snapshot['preview']['text']==final_text and snapshot['preview']['state']=='committed','E2E final preview binding')
     if not complete:
         need(snapshot['state']=='paused' and snapshot['resume_available'] is True and number(value['generation_count'])==2,'E2E bounded pause')
         need([e['kind'] for e in events]==['init','accepted','response','intent','outcome','continued','pause'],'E2E pending durable inventory')

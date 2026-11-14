@@ -14,6 +14,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 type Result<T> = std::result::Result<T, &'static str>;
 fn s(v: &str) -> Json {
@@ -31,22 +32,109 @@ fn o(v: Vec<(&str, Json)>) -> Json {
 fn option(row: &Json, key: &str) -> bool {
     row.has(key) && row.field(key).unwrap().boolean().unwrap()
 }
-async fn run(row: &Json) -> Result<Json> {
+#[derive(Default)]
+struct Measurements {
+    sync_start: Option<Instant>,
+    terminal: Option<Instant>,
+    fsync: Vec<usize>,
+    done: Vec<usize>,
+}
+impl Measurements {
+    fn save(&self) -> Result<Json> {
+        Ok(o(vec![
+            (
+                "fsync_ns",
+                Json::array(self.fsync.iter().copied().map(n).collect())?,
+            ),
+            (
+                "terminal_durable_ns",
+                Json::array(self.done.iter().copied().map(n).collect())?,
+            ),
+        ]))
+    }
+}
+fn nanos(value: Duration) -> usize {
+    value
+        .as_nanos()
+        .try_into()
+        .expect("bounded fixture duration")
+}
+fn sse_bench(root: &Path, row: &Json, configuration: Request) -> Result<Json> {
+    let directory = ansa_linux::fs::private_directory(root).map_err(|_| "fixture_root")?;
+    let wire = ansa_linux::local::read(&directory, "wire.sse", 2 * 1024 * 1024)
+        .map_err(|_| "fixture_wire")?
+        .ok_or("fixture_wire")?;
+    let iterations = row.usize_field("iterations")?;
+    if !(1..=1000).contains(&iterations) {
+        return Err("fixture_iterations");
+    }
+    let opaque = "x".repeat(256 * 1024);
+    let begin = Instant::now();
+    for _ in 0..iterations {
+        let mut stream = ansa::provider::responses::ResponseStream::new_for_adapter(
+            configuration.clone(),
+            ansa::protocol::sse::Limits::default(),
+            None,
+            None,
+        );
+        for chunk in wire.chunks(4096) {
+            stream.feed_for_adapter(chunk)?;
+        }
+        let result = stream.finish_for_adapter()?;
+        if result.returned_model() != configuration.binding.returned_model
+            || result.items().len() != 2
+            || !result.calls().is_empty()
+            || result.items()[0].value().text_field("encrypted_content")? != opaque.as_str()
+        {
+            return Err("fixture_sse_admission");
+        }
+        std::hint::black_box(result);
+    }
+    let elapsed = nanos(begin.elapsed());
+    Ok(o(vec![
+        ("wire_sha256", s(&sha256(&wire))),
+        ("bytes_per_response", n(wire.len())),
+        ("iterations", n(iterations)),
+        ("admissions", n(iterations)),
+        ("tool_calls", n(0)),
+        ("elapsed_ns", n(elapsed)),
+    ]))
+}
+async fn run(row: &Json, frontend: Option<&mut ansa::frontend::terminal::Io>) -> Result<Json> {
     let root = Path::new(row.text_field("root")?);
     ansa_linux::journal::fixture_workspace(root).map_err(|_| "fixture_owner")?;
     let home = root.join("home");
     let cwd = home.join("workspace");
+    let scope = if row.has("scope") {
+        let value = row.text_field("scope")?;
+        if !value.starts_with("metrics_") || !ansa::provider::contracts::valid_id(value) {
+            return Err("fixture_scope");
+        }
+        Some(value.to_owned())
+    } else {
+        None
+    };
+    let journal_dir = root.join(scope.as_deref().unwrap_or("journal"));
+    let tool_cwd = scope
+        .as_ref()
+        .map_or_else(|| cwd.clone(), |scope| cwd.join(scope));
+    if let Some(scope) = &scope {
+        ansa_linux::journal::fixture_scope(root, scope).map_err(|_| "fixture_scope_directory")?;
+    }
     let settings = load_agent_settings(&cwd, &home)?;
     let epoch = agent_epoch(&settings)?;
     let token = sha256(epoch.exact_state.field("instructions")?.dump().as_bytes());
     let tools = local_tools(
         settings,
         epoch.clone(),
-        &root.join("journal"),
+        &journal_dir,
         &root.join("auth"),
         &std::env::current_exe().map_err(|_| "fixture_executable")?,
     )?;
     let configuration = Request::new(app::binding(), epoch, tools.advertisement().clone(), vec![])?;
+    if row.has("op") && row.text_field("op")? == "sse_bench" {
+        return sse_bench(root, row, configuration);
+    }
     let quiet = option(row, "quiet");
     let plan = row.text_field("mode")? == "plan";
     let turns = row.usize_field("turns")?;
@@ -58,6 +146,11 @@ async fn run(row: &Json) -> Result<Json> {
     let saved = requests.clone();
     let generations = Arc::new(AtomicUsize::new(0));
     let gen_count = generations.clone();
+    let measuring = frontend.is_some();
+    let cancel_process = option(row, "cancel_process");
+    let measurements = Arc::new(Mutex::new(Measurements::default()));
+    let model_measurements = measurements.clone();
+    let path_prefix = scope.map_or_else(String::new, |scope| scope + "/");
     let generate: Generate = Arc::new(move |request, stop, preview| {
         if stop.cancelled() {
             return Err("fixture_cancelled");
@@ -86,6 +179,17 @@ async fn run(row: &Json) -> Result<Json> {
                 }
             }
             preview("E2E_PREVIEW")?;
+            if measuring {
+                // Both fixture clients pace terminal delivery past their 500ms
+                // transcript refresh, so the real preview can be observed.
+                let deadline = Instant::now() + Duration::from_millis(800);
+                while Instant::now() < deadline {
+                    if stop.cancelled() {
+                        return Err("fixture_cancelled");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             o(vec![
                 ("type", s("message")),
                 ("id", s(&format!("message_{label}"))),
@@ -109,11 +213,15 @@ async fn run(row: &Json) -> Result<Json> {
                             Json::array(vec![
                                 s("sh"),
                                 s("-c"),
-                                s("printf x >> marker; printf RUN_OK; exit 7"),
+                                s(if cancel_process {
+                                    "printf x >> marker; printf '%s' $$ > primary; printf ready > ready; exec sleep 30"
+                                } else {
+                                    "printf x >> marker; printf RUN_OK; exit 7"
+                                }),
                             ])?,
                         ),
-                        ("cwd", s(cwd.to_str().ok_or("fixture_utf8")?)),
-                        ("timeout_ms", n(3000)),
+                        ("cwd", s(tool_cwd.to_str().ok_or("fixture_utf8")?)),
+                        ("timeout_ms", n(if cancel_process { 30000 } else { 3000 })),
                         ("instruction_token", s(&token)),
                     ]),
                 )
@@ -121,7 +229,13 @@ async fn run(row: &Json) -> Result<Json> {
                 (
                     "read_file",
                     o(vec![
-                        ("path", s(if index == 0 { "value.txt" } else { "marker" })),
+                        (
+                            "path",
+                            s(&format!(
+                                "{path_prefix}{}",
+                                if index == 0 { "value.txt" } else { "marker" }
+                            )),
+                        ),
                         ("offset", n(0)),
                         ("max_bytes", n(8192)),
                         ("instruction_token", s(&token)),
@@ -138,12 +252,16 @@ async fn run(row: &Json) -> Result<Json> {
                 ("status", s("completed")),
             ])
         };
-        native::load(&o(vec![
+        let response = native::load(&o(vec![
             ("request", request.save()?),
             ("id", s(&format!("response_{label}_{index}"))),
             ("model", s(&request.binding.returned_model)),
             ("items", Json::array(vec![item])?),
-        ]))
+        ]))?;
+        if measuring && index == final_index {
+            model_measurements.lock().unwrap().terminal = Some(Instant::now());
+        }
+        Ok(response)
     });
     let compactions = Arc::new(AtomicUsize::new(0));
     let compact_count = compactions.clone();
@@ -152,13 +270,35 @@ async fn run(row: &Json) -> Result<Json> {
         offline::compact(request, stop)
     });
     let rounds = if option(row, "limited") { 1 } else { 8 };
-    let journal = if row.has("fault") {
+    let journal = if row.has("fault") || measuring {
         use ansa::session::journal_v1::{Observer, Point};
-        let fault = row.field("fault")?;
-        let kind = fault.text_field("kind")?.to_owned();
-        let wanted = fault.usize_field("occurrence")?;
+        let (kind, wanted) = if row.has("fault") {
+            let fault = row.field("fault")?;
+            (
+                fault.text_field("kind")?.to_owned(),
+                fault.usize_field("occurrence")?,
+            )
+        } else {
+            (String::new(), 0)
+        };
         let hits = AtomicUsize::new(0);
+        let journal_measurements = measurements.clone();
         Some(Arc::new(move |point, k: &str| {
+            if measuring {
+                let mut stats = journal_measurements.lock().unwrap();
+                if point == Point::BeforeSync {
+                    stats.sync_start = Some(Instant::now())
+                } else if point == Point::AfterSync {
+                    if let Some(start) = stats.sync_start.take() {
+                        stats.fsync.push(nanos(start.elapsed()));
+                    }
+                    if k == "done" {
+                        let elapsed =
+                            nanos(stats.terminal.ok_or("fixture_terminal_time")?.elapsed());
+                        stats.done.push(elapsed);
+                    }
+                }
+            }
             if point == Point::AfterSync
                 && k == kind
                 && hits.fetch_add(1, Ordering::SeqCst) + 1 == wanted
@@ -185,7 +325,7 @@ async fn run(row: &Json) -> Result<Json> {
             ..Limits::default()
         },
         Options {
-            directory: Some(root.join("journal")),
+            directory: Some(journal_dir),
             compact: Some(compact),
             keep_recent_turns: 2,
             streaming: true,
@@ -194,6 +334,16 @@ async fn run(row: &Json) -> Result<Json> {
         },
     )?;
     runtime.ready().await?;
+    if let Some(io) = frontend {
+        let code =
+            ansa::frontend::controller::run(&mut runtime, io, None, false, "M8 fixture").await?;
+        return Ok(o(vec![
+            ("exit", n(code as usize)),
+            ("metrics", measurements.lock().unwrap().save()?),
+            ("generation_count", n(generations.load(Ordering::SeqCst))),
+            ("summary_count", n(compactions.load(Ordering::SeqCst))),
+        ]));
+    }
     let handle = runtime.handle();
     let mut events = vec![];
     let mut last = Json::parse("null")?;
@@ -317,6 +467,35 @@ fn main() {
     if let Some(result) = ansa::process::supervisor::private_entry(&args) {
         std::process::exit(if result.is_ok() { 0 } else { 125 });
     }
+    if matches!(args.len(), 4 | 5) && args[1] == "--e2e-frontend" {
+        let result = (|| -> Result<i32> {
+            if !matches!(args[3].as_str(), "turn" | "cancel") {
+                return Err("fixture_mode");
+            }
+            let mut fields = vec![
+                ("root", s(&args[2])),
+                ("mode", s("basic")),
+                ("turns", n(0)),
+                ("start", n(0)),
+                ("quiet", b(true)),
+                ("cancel_process", b(args[3] == "cancel")),
+            ];
+            if args.len() == 5 {
+                fields.push(("scope", s(&args[4])));
+            }
+            let row = o(fields);
+            let mut io = ansa::frontend::terminal::Io::open(true)?;
+            let reactor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "fixture_runtime")?;
+            let result = reactor.block_on(run(&row, Some(&mut io)))?;
+            drop(io);
+            println!("\nM8_METRICS {}", result.dump());
+            Ok(result.usize_field("exit")? as i32)
+        })();
+        std::process::exit(result.unwrap_or(1));
+    }
     for line in io::stdin().lock().lines() {
         let result = line
             .map_err(|_| "fixture_input")
@@ -326,7 +505,7 @@ fn main() {
                     .enable_time()
                     .build()
                     .map_err(|_| "fixture_runtime")?
-                    .block_on(run(&row))
+                    .block_on(run(&row, None))
             });
         match result {
             Ok(value) => println!(

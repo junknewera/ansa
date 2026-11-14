@@ -132,6 +132,7 @@ pub fn binding() -> Binding {
 }
 fn reactor() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .build()
         .map_err(|_| "cli_runtime")

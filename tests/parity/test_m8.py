@@ -44,13 +44,22 @@ class RawControls(unittest.TestCase):
     def test_boolean_counter_is_not_integer(self):
         value,request,events,root=self.witness();value['generation_count']=True
         with self.assertRaisesRegex(ValueError,'invalid integer'):e2e.validate(value,request,events,root)
+    def test_returned_model_is_not_requested_model(self):
+        value,request,events,root=self.witness();next(e for e in reversed(events) if e['kind']=='response')['response']['model']='unapproved-model'
+        with self.assertRaisesRegex(ValueError,'returned model'):e2e.validate(value,request,events,root)
+    def test_terminal_assistant_native_payload_is_bound(self):
+        value,request,events,root=self.witness();next(e for e in reversed(events) if e['kind']=='response')['response']['items'][0]['content'][0]['text']='FORGED_TERMINAL_TEXT'
+        with self.assertRaisesRegex(ValueError,'terminal native'):e2e.validate(value,request,events,root)
+    def test_wire_text_delta_is_bound(self):
+        value,request,events,root=self.witness();next(e for e in value['events'] if e['type']=='text_delta')['text']='FORGED_DELTA'
+        with self.assertRaisesRegex(ValueError,'wire final text'):e2e.validate(value,request,events,root)
 
 class QualityControls(unittest.TestCase):
     def test_encoded_flags_and_wrappers_cannot_disable_instrumentation(self):
         with patch.dict(os.environ,{'CARGO_ENCODED_RUSTFLAGS':'-Copt-level=0','RUSTFLAGS':'untrusted','RUSTC_WRAPPER':'untrusted','MIRIFLAGS':'-Zmiri-disable-validation','MIRI':'untrusted','CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER':'untrusted'},clear=False):
             env,flags=quality.environment('address',Path('/nix/store/fixture/bin/rustc'))
-            self.assertEqual(env['CARGO_ENCODED_RUSTFLAGS'],'-Zsanitizer=address\x1f-Cdebuginfo=1')
-            self.assertEqual(flags,['-Zsanitizer=address','-Cdebuginfo=1'])
+            self.assertEqual(env['CARGO_ENCODED_RUSTFLAGS'],'-Zsanitizer=address\x1f-Cdebuginfo=1\x1f-Ctarget-feature=-outline-atomics')
+            self.assertEqual(flags,['-Zsanitizer=address','-Cdebuginfo=1','-Ctarget-feature=-outline-atomics'])
             self.assertEqual(env['RUSTC_WRAPPER'],'')
             self.assertNotIn('MIRIFLAGS',env)
             self.assertNotIn('CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER',env)
@@ -59,14 +68,39 @@ class QualityControls(unittest.TestCase):
             self.assertEqual(env['MIRIFLAGS'],'-Zmiri-strict-provenance')
 
     def test_missing_ignored_failed_and_filtered_tests_never_pass(self):
-        valid=b'test result: ok. 109 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;'
-        self.assertEqual(quality.executed_tests(valid,'address'),109)
-        for mutation in [b'',valid.replace(b'109 passed',b'0 passed'),valid.replace(b'0 ignored',b'1 ignored'),valid.replace(b'0 failed',b'1 failed'),valid.replace(b'0 filtered',b'1 filtered')]:
+        valid=b'test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;'
+        self.assertEqual(quality.executed_tests(valid,'address'),112)
+        for mutation in [b'',valid.replace(b'112 passed',b'0 passed'),valid.replace(b'0 ignored',b'1 ignored'),valid.replace(b'0 failed',b'1 failed'),valid.replace(b'0 filtered',b'1 filtered')]:
             with self.subTest(mutation=mutation):
                 with self.assertRaises(ValueError):quality.executed_tests(mutation,'address')
         with self.assertRaises(ValueError):quality.executed_tests(valid,'miri')
 
 class FixtureControls(unittest.TestCase):
+    def test_scoped_aliases_and_stale_readiness_rejected(self):
+        project=Path(__file__).resolve().parents[2]
+        binaries=[project/'build-ansa/ansa_e2e_oracle',project/'rust/target/debug/examples/e2e_adapter']
+        variants=[(name,kind) for name in ('value.txt','marker','primary','ready') for kind in ('symlink','dangling','hardlink','fifo')]+[('primary','regular'),('ready','regular'),('directory','symlink')]
+        for binary in binaries:
+            self.assertTrue(binary.is_file(),str(binary))
+            for child,kind in variants:
+                with self.subTest(binary=binary.name,child=child,kind=kind),tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp') as name,tempfile.TemporaryDirectory(prefix='ansa-m8-outside-',dir='/tmp') as other:
+                    root=Path(name);outside=Path(other);owner=root/'fixture-owner';owner.write_bytes(b'ansa-m4-synthetic-v1\n');owner.chmod(0o600)
+                    sentinel=outside/'sentinel';sentinel.write_bytes(b'outside');sentinel.chmod(0o600)
+                    home=root/'home';cwd=home/'workspace';cwd.mkdir(parents=True,mode=0o700);home.chmod(0o700)
+                    scope=cwd/'metrics_review'
+                    if child=='directory':scope.symlink_to(outside,target_is_directory=True)
+                    else:
+                        scope.mkdir(mode=0o700);target=scope/child
+                        if kind in ('symlink','dangling'):target.symlink_to(sentinel if kind=='symlink' else outside/'absent')
+                        elif kind=='hardlink':os.link(sentinel,target)
+                        elif kind=='fifo':os.mkfifo(target,0o600)
+                        else:target.write_bytes(b'stale');target.chmod(0o600)
+                    request={'root':str(root),'scope':'metrics_review','mode':'basic','turns':0,'start':0}
+                    result=subprocess.run([binary],input=json.dumps(request).encode()+b'\n',stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=3)
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertEqual(sentinel.read_bytes(),b'outside')
+                    self.assertEqual({p.name for p in outside.iterdir()},{'sentinel'})
+
     def test_aliases_rejected_before_fixture_writes(self):
         root=Path(__file__).resolve().parents[2]
         binaries=[root/'build-ansa/ansa_e2e_oracle',root/'rust/target/debug/examples/e2e_adapter']

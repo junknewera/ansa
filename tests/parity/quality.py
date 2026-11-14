@@ -21,6 +21,7 @@ def environment(mode,compiler):
     env.update(RUSTC=str(compiler),RUSTDOC=str(compiler.parent/'rustdoc'),RUSTC_WRAPPER='',RUSTC_WORKSPACE_WRAPPER='',CARGO_TARGET_DIR=str(common.ROOT/'build-quality'/mode),CARGO_BUILD_JOBS='2',CARGO_INCREMENTAL='0')
     env['PATH']=str(compiler.parent)+os.pathsep+env.get('PATH','')
     flags=[] if mode=='miri' else [f'-Zsanitizer={mode}','-Cdebuginfo=1']
+    if mode in ('address','thread'):flags.append('-Ctarget-feature=-outline-atomics')
     env['CARGO_ENCODED_RUSTFLAGS']='\x1f'.join(flags)
     if mode=='miri':env.update(MIRI=str(compiler.parent/'miri'),MIRIFLAGS='-Zmiri-strict-provenance')
     else:env.update(ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',LSAN_OPTIONS='exitcode=23',TSAN_OPTIONS='halt_on_error=1')
@@ -29,7 +30,7 @@ def environment(mode,compiler):
 def executed_tests(data,mode):
     text=data.decode('utf-8','strict')
     rows=re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;',text)
-    expected=2 if mode=='miri' else 109
+    expected=2 if mode=='miri' else 112
     if not rows or sum(int(row[0]) for row in rows)!=expected or any(any(int(v) for v in row[1:]) for row in rows):raise ValueError('quality executed/ignored test inventory')
     return expected
 
@@ -49,9 +50,9 @@ def capture(args):
         else:
             runner=Path(shutil.which('env')).resolve().parent/'env'
             if not str(runner).startswith('/nix/store/') or not runner.is_file():raise ValueError('trusted native runner unavailable')
-            command=[str(compiler.parent/'cargo'),'--config',f'target.{TARGET}.runner='+json.dumps([str(runner),'--']),'test',*(['-Zbuild-std'] if args.mode=='thread' else []),'--manifest-path','rust/Cargo.toml','--workspace','--locked','--lib','--tests','--target',TARGET]
+            command=[str(compiler.parent/'cargo'),'--config',f'target.{TARGET}.runner='+json.dumps([str(runner),'--']),'test',*(['-Zbuild-std'] if args.mode in ('address','thread') else []),'--manifest-path','rust/Cargo.toml','--workspace','--locked','--lib','--tests','--target',TARGET]
             report.update(runner=str(runner),runner_sha256=common.sha(runner))
-        report['std_instrumented']=args.mode=='thread'
+        report['std_instrumented']=args.mode in ('address','thread')
         env,flags=environment(args.mode,compiler)
         report.update(compiler_path=str(compiler),compiler_sha256=common.sha(compiler),rustflags=flags)
         # Environment is passed to this process only, never dumped into evidence.

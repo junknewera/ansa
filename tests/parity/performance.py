@@ -52,6 +52,52 @@ def footprints(binaries,directory):
         raw=json.loads((directory/row['stdout']['path']).read_bytes());info=next(iter(raw['info'].values())) if 'info' in raw else next(iter(raw['paths'].values())) if 'paths' in raw else next(iter(raw.values()))
         result[language]={'path':str(binary),'sha256':common.sha(binary),'installed_binary_bytes':binary.stat().st_size,'strip_all_binary_bytes':stripped.stat().st_size,'strip_all_sha256':common.sha(stripped),'nix_closure_nar_bytes':info['closureSize']}
     return result
+def startup(binaries,directory,adapter,counts=(0,100,4096),samples=20):
+    """Actual CLI on one shared canonical C++ store; no provider or auth calls."""
+    import termios
+    measurements=[];datasets=[]
+    for count in counts:
+        with tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp') as name:
+            root=Path(name);marker=root/'fixture-owner';marker.write_bytes(b'ansa-m4-synthetic-v1\n');marker.chmod(0o600)
+            request={'root':name,'mode':'plan','turns':count,'start':0,'quiet':True,'compact':True}
+            payload=directory/f'history-seed-{count}.stdin';payload.write_text(json.dumps(request)+'\n')
+            seed=common.command([adapter],common.ROOT,directory,f'history-seed-{count}',input_file=payload,timeout=600);seed['stdin']={'path':payload.name,'sha256':common.sha(payload)}
+            need(seed['exit_code']==0 and not seed['timed_out'],'history seed failed')
+            value=json.loads((directory/seed['stdout']['file']).read_bytes())['value']
+            need(value['generation_count']==2*count and value['summary_count']==max(0,(count-2)//2) and value['snapshot']['transcript_size']==2*count,'history seed canonical counts')
+            home=root/'home';cwd=home/'workspace';catalog=home/'.ansa/sessions/e2e';catalog.mkdir(mode=0o700,parents=True)
+            for parent in (home/'.ansa',home/'.ansa/sessions'):parent.chmod(0o700)
+            info=catalog/'info.json';info.write_text(json.dumps({'schema_version':1,'id':'e2e','cwd':str(cwd),'profile':'offline'}));info.chmod(0o600)
+            retained=directory/'datasets'/str(count);retained.mkdir(parents=True)
+            parts={}
+            for source in sorted((root/'journal').glob('part-*.log')):
+                data=protocol.owned_bytes(source,64*1024*1024,single_link=True);target=retained/source.name;target.write_bytes(data);target.chmod(0o600)
+                destination=catalog/source.name;destination.write_bytes(data);destination.chmod(0o600);parts[source.name]=common.sha(target)
+            need(parts,'empty history seed');datasets.append({'submits':count,'root':str(root),'parts':parts,'seed':seed})
+            for index in range(samples):
+                for language,binary in binaries.items():
+                    label=f'{language}-history-{count}-{index:02}';row={'language':language,'submits':count,'sample':index,'status':'FAIL'};measurements.append(row);screen=None
+                    try:
+                        begin=time.perf_counter_ns();screen=frontend_io.Pty(str(binary),root,home,cwd,'',True,argv=['--offline','--cwd',str(cwd),'--session','e2e','--auth-dir',str(root/'auth')])
+                        if count:screen.wait(f'fixture{count-1}',timeout=60)
+                        screen.wait('готов',timeout=60);ready=time.perf_counter_ns();row.update(first_frame_seconds=(ready-begin)/1e9,history_ready_seconds=(ready-begin)/1e9)
+                        need(not termios.tcgetattr(screen.slave)[3]&termios.ECHO,'input echo is active')
+                        if count:need(screen.raw.find(f'fixture{count-1}'.encode())<screen.raw.rfind(b'> '),'history follows input')
+                        at=len(screen.raw);begin=time.perf_counter_ns();screen.send(b'INPUT_PROBE');screen.wait('INPUT_PROBE',since=at);row['input_ack_seconds']=(time.perf_counter_ns()-begin)/1e9
+                        screen.send(b'\x7f'*11+b'/exit\r');result=screen.finish();need(result['exit']==0 and result['termios_restored'] and result['flags_restored'],'history CLI shutdown/restoration')
+                        need(all(common.sha(catalog/name)==digest for name,digest in parts.items()),'startup/input changed journal')
+                        row.update(status='PASS',exit_code=result['exit'],termios_restored=True,flags_restored=True,observations=screen.observations)
+                    finally:
+                        if screen is not None:
+                            raw=directory/(label+'.pty');raw.write_bytes(screen.raw);row['raw']={'path':raw.name,'sha256':common.sha(raw)};screen.close()
+                        common.write_json(directory/'startup-progress.json',{'datasets':datasets,'runs':measurements})
+            print('actual CLI history dataset',count,'complete',flush=True)
+    summary={}
+    for language in binaries:
+        for count in counts:
+            rows=[row for row in measurements if row['language']==language and row['submits']==count]
+            summary[f'{language}-{count}']={field:statistics([row[field] for row in rows]) for field in ('first_frame_seconds','history_ready_seconds','input_ack_seconds')}
+    return {'datasets':datasets,'runs':measurements,'summary':summary}
 def build_measurements(directory):
     head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=common.ROOT,text=True).strip()
     names=subprocess.check_output(['git','ls-tree','-r','--name-only',head,'--','CMakeLists.txt','src','include','rust'],cwd=common.ROOT,text=True).splitlines()
@@ -109,8 +155,18 @@ def capture(args):
         budget=json.loads(BUDGET.read_text());need(budget['status']=='FROZEN_M0','frozen M0 budget required')
         need(common.sha(m.TIMER)==budget['environment']['timer']['sha256'],'GNU time identity')
         report.update(source=source,platform=common.platform_info(),budget_sha256=common.sha(BUDGET),policy_sha256=common.sha(POLICY),host_before=m.state(),method={'cli':'Unchanged M0 timer/RSS/cache method; interleaved C++ and Rust, same release profile','builds':'External dependencies primed once; own Rust packages cleaned each run; target-only -j2; entry point comment edits; sampled descendants every20ms','cold':'Only executable pages, mincore=0 before exec; filesystem/dependency caches not cold-controlled'})
-        report['cli']=safe_cli(binaries,output);report['footprints']=footprints(binaries,output);report['builds']=build_measurements(output)
+        report['cli']=safe_cli(binaries,output);report['footprints']=footprints(binaries,output)
+        adapter=Path(args.cpp_build or common.ROOT/'build-ansa-release').resolve()/'ansa_e2e_oracle'
+        report['startup']=startup(binaries,output,adapter)
+        report['open_metrics']=[metric for metric in NEW_METRICS if metric not in ('first_frame','history_ready','input_ack')]
+        policy=json.loads(POLICY.read_text());report['new_metric_errors']=[]
+        for count in (0,100,4096):
+            for metric in ('first_frame_seconds','history_ready_seconds','input_ack_seconds'):
+                baseline=report['startup']['summary'][f'cpp-{count}'][metric]['p95_nearest_rank'];actual=report['startup']['summary'][f'rust-{count}'][metric]['p95_nearest_rank'];limit=max(baseline*policy['new_latency']['max_ratio'],baseline+policy['new_latency']['additive_floor_seconds'])
+                if actual>limit:report['new_metric_errors'].append(f'{metric} dataset {count} exceeds agreed p95 budget')
+        report['builds']=build_measurements(output)
         report['errors']=frozen_errors(report,budget)
+        report['errors']+=report['new_metric_errors']
         need(source==common.source_info(),'performance source changed')
         report['status']='INCOMPLETE' if not report['errors'] else 'FAIL'
     except (OSError,ValueError,RuntimeError,KeyError,AssertionError,subprocess.SubprocessError) as error:report['errors'].append(str(error))

@@ -379,6 +379,17 @@ impl State {
         Some(frame)
     }
 }
+fn readiness_source(
+    descriptor: ansa_linux::terminal::Descriptor,
+) -> std::io::Result<tokio::io::unix::AsyncFd<ansa_linux::terminal::Descriptor>> {
+    // Pinned Tokio's legacy safe constructor requires a stable owned FD in
+    // practice. Descriptor owns a private OwnedFd; these local registrations
+    // only expose immutable access and never replace/close their inner value.
+    // Registration drops before Descriptor and before Io restores its guards.
+    #[allow(deprecated)]
+    tokio::io::unix::AsyncFd::with_interest(descriptor, tokio::io::Interest::READABLE)
+}
+
 pub async fn run(
     runtime: &mut Runtime,
     io: &mut Io,
@@ -406,6 +417,18 @@ pub async fn run(
     let mut dirty = true;
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Regular files do not support epoll: keep the bounded polling fallback.
+    let input_events = if prompt.is_none() {
+        readiness_source(io.input.duplicate().map_err(|_| "cli_input_poll")?).ok()
+    } else {
+        None
+    };
+    let signal_events = readiness_source(
+        io.signals
+            .readiness_descriptor()
+            .map_err(|_| "cli_signal_poll")?,
+    )
+    .map_err(|_| "cli_signal_poll")?;
     loop {
         if finished || io.writer.failed() {
             handle.request_shutdown();
@@ -419,6 +442,18 @@ pub async fn run(
             }
             break;
         }
+        let can_read = !eof
+            && !finished
+            && (!jsonl_mode || replies.is_empty())
+            && state.pending_draft.is_none()
+            && prompt.is_none()
+            && (jsonl_mode
+                || (state.snapshot.is_some()
+                    && (io.raw.is_none()
+                        || (state.history_ready
+                            && first_frame.is_some_and(|v| io.writer.displayed(v))))));
+        let mut input_guard = None;
+        let mut signal_guard = None;
         tokio::select! {biased;
             reply=replies.join_next(),if !replies.is_empty()=>{
                 if let Some(reply)=reply {dirty=true;let (id,submit,result)=reply.map_err(|_|"cli_post_task")?;
@@ -441,6 +476,9 @@ pub async fn run(
                 if let Some(event)=event {dirty=true;if jsonl_mode {io.writer.text(jsonl::encode(&event).dump()+"\n");}else{if matches!(event.payload,EventPayload::ResyncRequired {..}){resync=true;}state.apply(&event,io);}}else{events_done=true;}
             },
             result=runtime.join(),if !actor_done=>{result?;actor_done=true;actor_deadline=Some(Instant::now()+Duration::from_millis(250));},
+            ready=async {input_events.as_ref().expect("enabled").readable().await},if can_read&&input_events.is_some()=>{input_guard=Some(ready.map_err(|_|"cli_input_poll")?);},
+            ready=signal_events.readable()=>{signal_guard=Some(ready.map_err(|_|"cli_signal_poll")?);},
+            _=io.writer.changed()=>{},
             _=interval.tick()=>{},
         }
         while let Some(signal) = io.signals.take().map_err(|_| "cli_signal_read")? {
@@ -558,16 +596,6 @@ pub async fn run(
                     finished = true;
                     handle.request_shutdown();
                 }
-            }
-            if io.raw.is_some() && dirty {
-                if let Some(frame) = state.render(io, context)
-                    && last_frame.as_ref() != Some(&frame)
-                {
-                    let sequence = io.writer.frame(frame.clone());
-                    first_frame.get_or_insert(sequence);
-                    last_frame = Some(frame);
-                }
-                dirty = false;
             }
         }
         if !eof
@@ -734,10 +762,37 @@ pub async fn run(
                 Err(_) => return Err("cli_input_read"),
             }
         }
+        if io.raw.is_some() && dirty {
+            if let Some(frame) = state.render(io, context)
+                && last_frame.as_ref() != Some(&frame)
+            {
+                let sequence = io.writer.frame(frame.clone());
+                first_frame.get_or_insert(sequence);
+                last_frame = Some(frame);
+            }
+            dirty = false;
+        }
+        // Preserve cached readiness while bytes remain, including deferred input.
+        if let Some(mut guard) = input_guard
+            && !io.input.ready(false).map_err(|_| "cli_input_poll")?
+        {
+            guard.clear_ready();
+        }
+        if let Some(mut guard) = signal_guard
+            && !signal_events
+                .get_ref()
+                .ready(false)
+                .map_err(|_| "cli_signal_poll")?
+        {
+            guard.clear_ready();
+        }
         if eof && !closed && !state.deferred_cancel && replies.is_empty() {
             handle.close_input();
             closed = true;
         }
+        // A perpetually readable TTY must yield to post tasks, timers and the
+        // reactor; AsyncFd::readable itself does not consume Tokio's budget.
+        tokio::task::yield_now().await;
     }
     handle.request_shutdown();
     while replies.join_next().await.is_some() {}

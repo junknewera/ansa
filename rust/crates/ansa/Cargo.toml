@@ -12,7 +12,7 @@ session-test-adapter = []
 runtime-test-adapter = []
 tools-test-adapter = []
 frontend-test-adapter = ["protocol-test-adapter"]
-e2e-test-adapter = ["ansa-linux/fixture-e2e"]
+e2e-test-adapter = ["ansa-linux/fixture-e2e", "protocol-test-adapter"]
 
 [[example]]
 name = "e2e_adapter"
