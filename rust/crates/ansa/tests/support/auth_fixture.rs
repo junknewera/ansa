@@ -287,7 +287,7 @@ impl Server {
                 self.refreshes.fetch_add(1, Ordering::AcqRel);
                 self.log("refresh")?;
                 if self.crash_refresh.load(Ordering::Acquire) {
-                    std::process::exit(9);
+                    ansa_linux::process::fixture_exit(9);
                 }
                 ensure(!fields.contains_key("scope"), "fixture_refresh_scope")?;
                 self.refresh_entered.store(true, Ordering::Release);
@@ -1139,7 +1139,7 @@ pub fn helper(root: &Path, action: &str, now: u64) -> Result<()> {
             _ => None,
         };
         if let Some(code) = code {
-            std::process::exit(code);
+            ansa_linux::process::fixture_exit(code);
         }
         Ok(())
     });

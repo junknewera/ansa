@@ -2,6 +2,15 @@ pub use rustix::process::{Pid, Signal};
 use std::io;
 use std::path::Path;
 
+/// Abrupt termination at a synthetic durable crash boundary, without running
+/// atexit handlers. Normal runtime shutdown must join its owned workers instead.
+pub fn fixture_exit(code: i32) -> ! {
+    // SAFETY: _exit accepts every integer status and terminates the whole process
+    // without accessing Rust objects, unwinding, or invoking exit handlers. It
+    // is async-signal-safe even when the intentionally crashed child has threads.
+    unsafe { libc::_exit(code) }
+}
+
 /// Called only by private fresh-executable modes, before threads/Tokio/auth.
 pub fn reset_signals() -> io::Result<()> {
     if std::fs::read_dir("/proc/self/task")?.count() != 1 {
