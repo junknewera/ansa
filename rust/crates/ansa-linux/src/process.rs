@@ -3,12 +3,15 @@ use std::io;
 use std::path::Path;
 
 /// Abrupt termination at a synthetic durable crash boundary, without running
-/// atexit handlers. Normal runtime shutdown must join its owned workers instead.
+/// atexit/sanitizer exit handlers. Normal runtime shutdown must join its owned
+/// workers instead. Rustix's exit_group is an experimental runtime API.
 pub fn fixture_exit(code: i32) -> ! {
-    // SAFETY: _exit accepts every integer status and terminates the whole process
-    // without accessing Rust objects, unwinding, or invoking exit handlers. It
-    // is async-signal-safe even when the intentionally crashed child has threads.
-    unsafe { libc::_exit(code) }
+    // SAFETY: Linux exit_group accepts every integer status and no pointers. It
+    // terminates the entire process without touching Rust objects or unwinding.
+    // The direct syscall models a hard crash: TSan also intercepts libc::_exit
+    // and runs its finalizer, which is inappropriate at an intentional crash.
+    unsafe { libc::syscall(libc::SYS_exit_group, code) };
+    std::process::abort() // Fail closed if this mandatory Linux syscall fails.
 }
 
 /// Called only by private fresh-executable modes, before threads/Tokio/auth.
