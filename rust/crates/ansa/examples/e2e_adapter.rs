@@ -256,10 +256,10 @@ async fn run(row: &Json) -> Result<Json> {
             if !quiet {
                 events.push(encoded.clone());
             }
-            if let EventPayload::RuntimeError { diagnostic, .. } = &event.payload {
-                if diagnostic != "tool_round_limit" {
-                    return Err("fixture_runtime_error");
-                }
+            if let EventPayload::RuntimeError { diagnostic, .. } = &event.payload
+                && diagnostic != "tool_round_limit"
+            {
+                return Err("fixture_runtime_error");
             }
             if let EventPayload::FrontendSnapshot(view) = &event.payload {
                 last = encoded;

@@ -49,7 +49,7 @@ def footprints(binaries,directory):
         m.run(language+'-strip',['strip','--strip-all',stripped],common.ROOT)
         package=binary.parent.parent;need(str(package).startswith('/nix/store/'),'Nix package required for closure measurement')
         row=m.run(language+'-closure',['nix','path-info','--json','--json-format','2','--closure-size',package],common.ROOT)
-        raw=json.loads((directory/row['stdout']['path']).read_bytes());info=next(iter(raw['paths'].values())) if 'paths' in raw else next(iter(raw.values()))
+        raw=json.loads((directory/row['stdout']['path']).read_bytes());info=next(iter(raw['info'].values())) if 'info' in raw else next(iter(raw['paths'].values())) if 'paths' in raw else next(iter(raw.values()))
         result[language]={'path':str(binary),'sha256':common.sha(binary),'installed_binary_bytes':binary.stat().st_size,'strip_all_binary_bytes':stripped.stat().st_size,'strip_all_sha256':common.sha(stripped),'nix_closure_nar_bytes':info['closureSize']}
     return result
 def build_measurements(directory):
