@@ -1,5 +1,12 @@
 # Состояние ansa
 
+## Rust migration: M8 в работе
+
+PR #11 слит (`dca0c64`). Пользователь разрешил продолжить M8: полную offline
+приёмку, resource budgets M0 и отдельный pinned nightly quality shell.
+Ветка `migration/m8-offline-parity`, checkpoint пока WIP. Последний проверенный
+milestone - M7; production/default остаётся C++.
+
 ## Rust migration: M7 закрыт (GO)
 
 **Rust last verified milestone - M7 GO, 2026-11-14**, code checkpoint

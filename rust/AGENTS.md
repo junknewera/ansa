@@ -3,7 +3,19 @@
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
 docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
 
-## M7 boundary
+## M8 boundary
+
+- M7 is merged and GO. M8 authorizes offline E2E, repeated races, quality
+  tooling and the frozen M0 resource budgets. Production remains C++.
+- Use production builders/runtime/tools/frontend with synthetic owned stores.
+  Preserve both directions of v1 read/append/reopen and exact request counts.
+- Keep production dependencies and Cargo.lock frozen. Quality nightly is
+  separately pinned; unsupported sanitizers/Miri remain explicit open gates.
+- Never silently raise perf thresholds or turn missing measurements into PASS.
+  No live credentials, live calls, cutover or removal of C++.
+- One final PR with evidence and independent review.
+
+## Historical M7 boundary
 
 - M6 is GO. M7 authorizes the existing CLI/Carbon/JSONL frontend over M5/M6.
 - Preserve flags, diagnostics, v1 events, history-before-input, basic/plan,

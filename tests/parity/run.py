@@ -44,7 +44,7 @@ def source_info():
     def git(*args):
         return subprocess.check_output(["git", "-C", str(ROOT), *args], timeout=15)
     paths = git("ls-files", "--cached", "--others", "--exclude-standard", "-z", "--",
-                "CMakeLists.txt", "flake.nix", "flake.lock", "include", "src", "tests", "rust")
+                "CMakeLists.txt", "flake.nix", "flake.lock", "include", "src", "tests", "rust", "nix")
     # Only reviewed code/config/fixture types; never inspect environment/credential files.
     suffixes = {".cpp", ".hpp", ".rs", ".py", ".sh", ".cmake", ".nix", ".json", ".sse", ".toml", ".lock"}
     files = {}
