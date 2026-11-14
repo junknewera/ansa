@@ -4,8 +4,25 @@
 
 PR #11 слит (`dca0c64`). Пользователь разрешил продолжить M8: полную offline
 приёмку, resource budgets M0 и отдельный pinned nightly quality shell.
-Ветка `migration/m8-offline-parity`, checkpoint пока WIP. Последний проверенный
-milestone - M7; production/default остаётся C++.
+Ветка `migration/m8-offline-parity`, code checkpoint **`a398b7b` (WIP)**.
+По просьбе пользователя работа остановлена на проверенном промежуточном
+checkpoint. Последний полностью проверенный milestone - M7; production/default
+остаётся C++.
+
+Сохранены JSON sharing без изменения лимитов, readiness-ввод и исправление
+starvation при непрерывном TTY input, полный offline E2E driver и черновые
+измерительные адаптеры. На X13s/aarch64: Rust **105 integration + 7 unit +
+9 doctests**, fmt/clippy, Debug/Release build; Python harness **136/136**.
+Короткие native metric probes обоих клиентов на fresh/100 - PASS. Два targeted
+independent reviews состоялись; полного финального sign-off ещё нет.
+
+**M8 остаётся NO-GO**: полные perf distributions, final differential captures,
+nightly quality matrix и Nix gates не завершены. Дополнительные perf thresholds
+приняты пользователем; M0 ceilings не менялись. Следующий шаг - закончить
+независимую проверку raw performance evidence и подключить измерительные probes,
+затем снимать полную матрицу на clean SHA. Подробности и пути логов -
+[M8 WIP handoff](migration/M8.md). PR пока не готовится; продолжать после команды
+пользователя.
 
 ## Rust migration: M7 закрыт (GO)
 
