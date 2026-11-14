@@ -2,6 +2,81 @@
 use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags};
 use std::{fs::File, io, os::unix::fs::MetadataExt, path::Path};
 
+/// Test-only workspace creation anchored to a verified synthetic root.
+#[cfg(feature = "fixture-e2e")]
+pub fn fixture_workspace(root: &Path) -> io::Result<()> {
+    use std::io::{Read, Write};
+    fixture_root(root)?;
+    fn child(parent: &File, name: &str) -> io::Result<File> {
+        match fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => (),
+            Err(error) => return Err(error.into()),
+        }
+        let fd = fs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file = File::from(fd);
+        let meta = file.metadata()?;
+        if meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::other("fixture_directory"));
+        }
+        Ok(file)
+    }
+    let parent = crate::fs::private_directory(root)?;
+    let home = child(&parent, "home")?;
+    let cwd = child(&home, "workspace")?;
+    child(&parent, "journal")?;
+    child(&parent, "auth")?;
+    match fs::openat(
+        &cwd,
+        "value.txt",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    ) {
+        Ok(fd) => {
+            let mut file = File::from(fd);
+            file.write_all(b"SOURCE_VALUE\n")?;
+            file.sync_all()?;
+        }
+        Err(rustix::io::Errno::EXIST) => (),
+        Err(error) => return Err(error.into()),
+    }
+    for (name, limit) in [("value.txt", 13), ("marker", 4096)] {
+        let fd = match fs::openat(
+            &cwd,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) if name == "marker" => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut file = File::from(fd);
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.nlink() != 1
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.len() > limit
+        {
+            return Err(io::Error::other("fixture_file"));
+        }
+        let mut bytes = vec![];
+        Read::by_ref(&mut file)
+            .take(limit + 1)
+            .read_to_end(&mut bytes)?;
+        if (name == "value.txt" && bytes != b"SOURCE_VALUE\n")
+            || (name == "marker" && bytes.iter().any(|b| *b != b'x'))
+        {
+            return Err(io::Error::other("fixture_data"));
+        }
+    }
+    Ok(())
+}
+
 pub struct Files {
     directory: File,
     _lock: File,

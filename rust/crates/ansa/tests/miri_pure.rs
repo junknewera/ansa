@@ -9,7 +9,10 @@ fn owned_json_survives_source_drop_and_preserves_number_lexemes() {
     };
     assert_eq!(value.text_field("opaque").unwrap(), "é😀");
     let values = value.field("items").unwrap().elements().unwrap();
-    assert_eq!(values.iter().map(Json::dump).collect::<Vec<_>>(), ["1", "1.0", "1e0"]);
+    assert_eq!(
+        values.iter().map(Json::dump).collect::<Vec<_>>(),
+        ["1", "1.0", "1e0"]
+    );
 }
 
 #[test]
