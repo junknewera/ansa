@@ -1,4 +1,4 @@
-"""WIP M8 latency/SSE probes, not an acceptance gate until raw replay is added."""
+"""Owned native M8 latency/SSE probes with retained observation clocks."""
 import hashlib
 import json
 import os
@@ -18,12 +18,45 @@ import perf_measure
 
 COUNTS=(0,100,4096)
 SAMPLES=20
-FIELDS={'turn':('submit_preview_seconds','terminal_durable_done_seconds','fsync_seconds'),
-        'cancel':('cancel_ack_seconds','process_cleanup_seconds','fsync_seconds')}
+FIELDS={'turn':('submit_preview_seconds','terminal_durable_done_seconds','fsync_seconds','rss_bytes'),
+        'cancel':('cancel_ack_seconds','process_cleanup_seconds','fsync_seconds','rss_bytes')}
 def need(value,message):
     if not value:raise ValueError(message)
 def stats(values):return perf_measure.stats([{'value':value} for value in values],'value')
 def artifact(path):return {'path':path.name,'sha256':common.sha(path)}
+class ObservedPty(frontend_io.Pty):
+    def __init__(self,*args,**kwargs):
+        self.trace={'start_ns':time.perf_counter_ns(),'reads':[],'sends':[],'signals':[],'rss_bytes':[]}
+        super().__init__(*args,**kwargs)
+        self.trace.update(popen_pid=self.child.pid,parent_pid=os.getpid(),popen_identity=list(perf_measure.identity(self.child.pid)),argv=self.child.args)
+    def drain(self,timeout=.01):
+        start=len(self.raw);super().drain(timeout)
+        if len(self.raw)>start:self.trace['reads'].append({'begin':start,'end':len(self.raw),'at_ns':time.perf_counter_ns()})
+    def send(self,data):
+        if isinstance(data,str):data=data.encode()
+        self.trace['sends'].append({'bytes_hex':data.hex(),'offset':len(self.raw),'at_ns':time.perf_counter_ns()})
+        super().send(data)
+    def signal(self,number):
+        self.trace['signals'].append({'number':number,'offset':len(self.raw),'at_ns':time.perf_counter_ns()});self.child.send_signal(number)
+    def memory(self):
+        need(list(perf_measure.identity(self.child.pid))==self.trace['popen_identity'],'PTY identity changed')
+        lines=Path(f'/proc/{self.child.pid}/status').read_text().splitlines()
+        value=int(next(line.split()[1] for line in lines if line.startswith('VmHWM:')))*1024
+        need(value>0,'missing native RSS');self.trace['rss_bytes'].append(value)
+    def finish(self,*args,**kwargs):
+        result=super().finish(*args,**kwargs);self.trace.update(exit_ns=time.perf_counter_ns(),exit_code=result['exit'],termios_restored=result['termios_restored'],flags_restored=result['flags_restored'])
+        return result
+def seen(trace,raw,text,offset=0):
+    if isinstance(text,str):text=text.encode()
+    index=raw.find(text,offset);need(index>=0,'missing measured PTY text')
+    end=index+len(text)
+    return next(row['at_ns'] for row in trace['reads'] if row['end']>=end)
+def send_latency(screen,text):
+    sent=screen.trace['sends'][-1];return (seen(screen.trace,screen.raw,text,sent['offset'])-sent['at_ns'])/1e9
+def retain_observation(screen,row,directory,label):
+    path=directory/(label+'.observation.json')
+    common.write_json(path,{'trace':screen.trace,'process':{key:row[key] for key in ('ancestry','primary_bytes_hex','before_exited','after_exited','cleanup_ns','cancel_ns','ack_ns','popen_pid','parent_pid') if key in row}})
+    row['observation']=artifact(path)
 def owned_root():
     temporary=tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp');root=Path(temporary.name)
     marker=root/'fixture-owner';marker.write_bytes(b'ansa-m4-synthetic-v1\n');marker.chmod(0o600)
@@ -35,6 +68,8 @@ def call(binary,row,directory,label,env=None,pass_fds=()):
     out=directory/(label+'.stdout');err=directory/(label+'.stderr');inp=directory/(label+'.stdin')
     out.write_bytes(result.stdout);err.write_bytes(result.stderr);inp.write_bytes(payload)
     command={'argv':[str(binary)],'stdin':artifact(inp),'stdout':artifact(out),'stderr':artifact(err),'exit_code':result.returncode,'elapsed_ns':time.perf_counter_ns()-start}
+    if pass_fds:
+        command['allocation_instrumentation']={'library':env['LD_PRELOAD'],'library_sha256':common.sha(Path(env['LD_PRELOAD'])),'output_fd':int(env['ANSA_ALLOCATION_FD']),'inherited_fds':list(pass_fds)}
     need(result.returncode==0 and not result.stderr,'metric adapter failed: '+label)
     response=json.loads(result.stdout);need(response['accepted'] is True,'metric adapter rejected')
     return response['value'],command
@@ -53,7 +88,7 @@ def pin_ancestors(primary,child):
             fd=os.pidfd_open(pid);fds.append(fd)
             raw=Path(f'/proc/{pid}/stat').read_text();suffix=raw[raw.rfind(')')+2:].split();parent=int(suffix[1]);start=int(suffix[19])
             need(pid not in [r['pid'] for r in result],'metric process cycle')
-            result.append({'pid':pid,'ppid':parent,'starttime':start});pid=parent
+            result.append({'pid':pid,'ppid':parent,'starttime':start,'proc_stat':raw,'pidfd_info':Path(f'/proc/self/fdinfo/{fd}').read_text()});pid=parent
         need(len(fds)>=2 and child.poll() is None,'metric process not owned')
         return fds,result
     except BaseException:
@@ -89,7 +124,7 @@ def pipeline(adapters,directory,counts=COUNTS,samples=SAMPLES):
                         for name,data in parts.items():(store/name).write_bytes(data);(store/name).chmod(0o600)
                         row={'language':language,'submits':count,'sample':index,'kind':kind,'scope':scope,'root':str(root),'status':'FAIL'};runs.append(row);screen=None;fds=[]
                         try:
-                            screen=frontend_io.Pty(str(binary),root,home,cwd,'',True,argv=['--e2e-frontend',str(root),kind,scope])
+                            screen=ObservedPty(str(binary),root,home,cwd,'',True,argv=['--e2e-frontend',str(root),kind,scope])
                             screen.wait('готов',timeout=90)
                             # Reopened seeded journals retain plan mode. Change
                             # it explicitly before timing the same basic work.
@@ -99,23 +134,23 @@ def pipeline(adapters,directory,counts=COUNTS,samples=SAMPLES):
                             at=len(screen.raw);begin=time.perf_counter_ns();screen.send(f'fixture{prefix}\r')
                             row['submit_ns']=begin
                             if kind=='turn':
-                                screen.wait('E2E_PREVIEW',since=at,timeout=90);row['submit_preview_seconds']=(time.perf_counter_ns()-begin)/1e9
+                                screen.wait('E2E_PREVIEW',since=at,timeout=90);row['submit_preview_seconds']=send_latency(screen,'E2E_PREVIEW')
                                 screen.wait('E2E_OK:exit7',since=at,timeout=90);screen.wait('готов',since=at,timeout=90)
                             else:
                                 deadline=time.monotonic()+90
                                 while not (work/'ready').is_file():
                                     need(time.monotonic()<deadline and screen.child.poll() is None,'metric process readiness');screen.drain(.001)
-                                primary=int((work/'primary').read_text());fds,ancestry=pin_ancestors(primary,screen.child)
+                                row['primary_bytes_hex']=(work/'primary').read_bytes().hex();primary=int(bytes.fromhex(row['primary_bytes_hex']));fds,ancestry=pin_ancestors(primary,screen.child)
                                 row.update(popen_pid=screen.child.pid,parent_pid=os.getpid(),ancestry=ancestry,before_exited=[exited(fd) for fd in fds]);need(not any(row['before_exited']),'process exited before cancel')
-                                at=len(screen.raw);begin=time.perf_counter_ns();screen.child.send_signal(signal.SIGINT)
+                                at=len(screen.raw);screen.signal(signal.SIGINT);begin=screen.trace['signals'][-1]['at_ns']
                                 ack=None;cleanup=None;deadline=time.monotonic()+5
                                 while ack is None or cleanup is None:
                                     screen.drain(.001);now=time.perf_counter_ns()
-                                    if ack is None and 'отменено'.encode() in screen.raw[at:]:ack=now
+                                    if ack is None and 'отменено'.encode() in screen.raw[at:]:ack=seen(screen.trace,screen.raw,'отменено',at)
                                     if cleanup is None and all(exited(fd) for fd in fds):cleanup=now
                                     need(time.monotonic()<deadline and screen.child.poll() is None,'metric cancel/cleanup deadline')
                                 row.update(cancel_ns=begin,ack_ns=ack,cleanup_ns=cleanup,cancel_ack_seconds=(ack-begin)/1e9,process_cleanup_seconds=(cleanup-begin)/1e9,after_exited=[exited(fd) for fd in fds])
-                            screen.send(b'\x04');result=screen.finish();need(result['exit']==0 and result['termios_restored'] and result['flags_restored'],'metric PTY restoration')
+                            screen.memory();row['rss_bytes']=max(screen.trace['rss_bytes']);screen.send(b'\x04');result=screen.finish();need(result['exit']==0 and result['termios_restored'] and result['flags_restored'],'metric PTY restoration')
                             measured=footer(screen.raw);row['native']=measured;row['observations']=result['observations'];row.update(exit_code=0,termios_restored=True,flags_restored=True)
                             after={p.name:protocol.owned_bytes(p,64*1024*1024,single_link=True) for p in sorted(store.glob('part-*.log'))};deltas={}
                             for name,data in after.items():
@@ -136,6 +171,7 @@ def pipeline(adapters,directory,counts=COUNTS,samples=SAMPLES):
                             for fd in fds:os.close(fd)
                             if screen is not None:
                                 raw=directory/(scope+'.pty');raw.write_bytes(screen.raw);row['raw']=artifact(raw);screen.close()
+                                retain_observation(screen,row,directory,scope)
                             common.write_json(directory/'pipeline-progress.json',{'datasets':datasets,'runs':runs})
                         shutil.rmtree(store);shutil.rmtree(work)
             print('native pipeline dataset',count,'complete',flush=True)
@@ -145,7 +181,7 @@ def pipeline(adapters,directory,counts=COUNTS,samples=SAMPLES):
         for count in counts:
             for kind,fields in FIELDS.items():
                 selected=[r for r in runs if r['language']==language and r['submits']==count and r['kind']==kind]
-                summary[f'{language}-{count}-{kind}']={field:stats([r[field] for r in selected]) for field in fields}
+                summary[f'{language}-{count}-{kind}']={field:stats([r[field] for r in selected]) if field!='fsync_seconds' else stats([n/1e9 for r in selected for n in r['native']['metrics']['fsync_ns']]) for field in fields}
     return {'datasets':datasets,'runs':runs,'summary':summary,'method':'20 interleaved samples/client/dataset/kind; new owned scopes append once to a shared immutable prefix. 100/4096 measure the 100th/4096th Submit. Final terminal delivery paced800ms equally so the actual500ms transcript refresh exposes preview. Native monotonic clocks start AFTER terminal admission; fsync is before_sync..after_sync. Parent PTY and pinned descendant pidfds measure visible cancel and cleanup before harness intervention.'}
 def wire():
     response={'id':'bench_response','model':'gpt-6.1-sol','status':'in_progress','output':[]}

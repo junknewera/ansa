@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "suite": "e2e",
+  "tty_flood_repeats": 3,
   "compare_ids": [
     "pipeline-basic-1",
     "pipeline-basic-3",

@@ -88,7 +88,7 @@ def owned_tree(root, root_identity):
     return result
 
 
-def run(label, argv, cwd, group=False, memory=False, timeout=600, process_env=None):
+def run(label, argv, cwd, group=False, memory=False, timeout=600, process_env=None, metadata=None):
     before = state() if group else None
     peak = [0]
     done = threading.Event()
@@ -144,6 +144,9 @@ def run(label, argv, cwd, group=False, memory=False, timeout=600, process_env=No
         result['rss_raw'] = {'path': str(rss_file.relative_to(OUT)), 'sha256': digest(rss_file)}
     if group:
         result['host_before'], result['host_after'] = before, state()
+    if metadata:
+        if set(metadata)&set(result):raise ValueError('measurement metadata overwrites an observed field')
+        result.update(metadata)
     RUNS.append(result)
     with (OUT / 'progress.jsonl').open('a') as stream:
         stream.write(json.dumps(result, sort_keys=True) + '\n')

@@ -13,6 +13,7 @@ import run as common
 import runtime
 import sessions
 import session_cases as v
+import tty_flood
 
 MAX=64*1024*1024
 MANIFEST=common.ROOT/'tests/parity/fixtures/e2e.json'
@@ -36,7 +37,7 @@ def jobs(mode):
     return result
 def inventory(mode):return [name for name,_ in jobs(mode)]
 def manifest():
-    expected={'schema_version':1,'suite':'e2e','compare_ids':inventory('compare'),'fault_ids':inventory('fault'),'components':COMPONENTS}
+    expected={'schema_version':1,'suite':'e2e','compare_ids':inventory('compare'),'fault_ids':inventory('fault'),'components':COMPONENTS,'tty_flood_repeats':tty_flood.REPEATS}
     need(auth.json_bytes(protocol.owned_bytes(MANIFEST,MAX))==dict(expected,components=[list(p) for p in COMPONENTS]),'E2E manifest differs')
 def identities(paths):
     need(set(paths)=={'cpp','rust'} and paths['cpp'].name=='ansa_e2e_oracle' and paths['rust'].name=='e2e_adapter','E2E binary inventory')
@@ -263,6 +264,8 @@ def verify(report,directory):
         need(report['manifest_sha256']==common.sha(MANIFEST) and report['source']['files']==common.source_info()['files'] and report['source']['worktree_status']=='','E2E source identity')
         platform=report['platform'];need(platform['machine']=='aarch64' and platform['os_release']['ID']=='nixos','E2E native platform')
         paths={key:Path(value['path']) for key,value in report['binaries'].items()};need(report['binaries']==identities(paths),'E2E binaries')
+        if report['mode']=='fault':tty_flood.verify(report['tty_flood'],directory,paths['rust'].with_name('frontend_adapter'))
+        else:need(report['tty_flood'] is None,'unexpected compare stress')
         need(set(report['components'])=={milestone for milestone,_ in COMPONENTS},'E2E component inventory')
         for milestone,suite in COMPONENTS:
             command=report['components'][milestone];child=directory/'components'/(milestone+('-fault' if report['mode']=='fault' else ''))
@@ -279,6 +282,7 @@ def capture(args):
         cpp=Path(args.cpp_build).resolve();rust=Path(args.rust_target).resolve();paths={'cpp':cpp/'ansa_e2e_oracle','rust':rust/'debug/examples/e2e_adapter'}
         report.update(schema_version=1,suite='e2e',mode=args.action,source=source,platform=common.platform_info(),manifest_sha256=common.sha(MANIFEST),binaries=identities(paths))
         bundle=sessions.Bundle(directory,paths,{});execute(bundle,args.action,report['cases'],True);report['commands']=bundle.commands
+        report['tty_flood']=tty_flood.capture(paths['rust'].with_name('frontend_adapter'),directory) if args.action=='fault' else None
         for milestone,suite in COMPONENTS:
             child=directory/'components'/(milestone+('-fault' if args.action=='fault' else ''))
             result=common.command([sys.executable,common.ROOT/'tests/parity/run.py',args.action,'--suite',suite,'--cpp-build',cpp,'--rust-target',rust,'--output',child],common.ROOT,directory,'component-'+milestone,timeout=1800)
