@@ -1,13 +1,5 @@
 # Состояние ansa
 
-## Уточнение loop proposal, 2026-11-15
-
-Актуальный `main` — [5029b8b](https://github.com/junknewera/ansa/commit/5029b8b8972ea4c64ac213474b37f53a13bd5ab5): [M9 GO](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md), Rust default, C++ fallback и исходники сохранены; M10 требует отдельного решения. Ниже сохранена история M4 и исходного LE0 review на базе этой ветки; она не описывает нынешний `main`. Обновление proposal не переносит runtime в ветку и не воспроизводит M9 acceptance.
-
-Поверх [docs checkpoint 6f6d09c](https://github.com/junknewera/ansa/commit/6f6d09c5ab21db761ca9abdf47b1e9cbfbc73163) уточнены [спецификация](LOOP_ENGINEERING.md), [ADR](adr/0003-gpt-diagnostic-escalation.md) и [prompts](LOOP_ENGINEERING_PROMPTS.md): сквозной prerequisite управляемого effort для LE2/native eval, отдельная probe/gate ablation и различие repair/diagnosis/dispatch counters. В текущем native request builder effort ещё не передаётся; отсутствие поля не означает нулевой reasoning. Strict gate, общий cap семь attempts, LE1 offline scope и post-M10/O sequencing сохранены.
-
-Это docs-only correction. Независимый review уточнённых контрактов завершён без существенных открытых findings; whitespace, Markdown fences, reference definitions, 34 относительные ссылки и два JSON blocks проверены. Это review документации, не formal GitHub approval. Native/runtime suites и live calls не выполнялись; новые runtime gates не закрыты. Реализация и включение feature остаются отдельными задачами по LE gates. Результаты исходного LE0 review ниже относятся к своему checkpoint, а не автоматически к этой поправке.
-
 ## Rust migration: M4 закрыт (GO)
 
 **Rust last verified milestone - M4 GO, 2026-11-13**, code checkpoint
@@ -49,6 +41,14 @@ Live/cutover/performance parity этим этапом не закрываютс�
 Проверки LE0: исходные bytes восьми прочитанных repository files совпали с Git blob identities; whitespace/fences/reference checks, 52 относительные ссылки и три JSON blocks прошли. Два независимых scoped design reviews и targeted re-review закрыли замечания о pending transition после crash, evaluator эксперимента, invalidation final review и сравнимости eval arms. Это review агентов, не formal GitHub approval и не runtime acceptance. В design включены 22 будущих acceptance cases.
 
 Проверенный docs checkpoint — [4f64aa2](https://github.com/junknewera/ansa/commit/4f64aa290604aab1b31c2e2c410c25e2706cf78e). Remote blobs семи изменённых Markdown-файлов совпали с проверенными локальными bytes; остальные repository blobs не изменены. Эта handoff-запись добавляет ссылку на checkpoint отдельным documentation commit. Runtime/Nix/native suites для docs-only изменения не исполнялись и не объявляются пройденными. Следующий migration шаг по-прежнему M5; следующий шаг proposal — review решения и последующая отдельная feature implementation по gates, без автоматического старта.
+
+### Уточнение loop proposal, 2026-11-15
+
+Актуальный `main` — [5029b8b](https://github.com/junknewera/ansa/commit/5029b8b8972ea4c64ac213474b37f53a13bd5ab5): [M9 GO](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md), Rust default, C++ fallback и исходники сохранены; M10 требует отдельного решения. Исторические разделы M4 и исходного LE0 review относятся к baseline этой ветки; они не описывают нынешний `main`. Обновление proposal не переносит runtime в ветку и не воспроизводит M9 acceptance.
+
+Поверх [docs checkpoint 6f6d09c](https://github.com/junknewera/ansa/commit/6f6d09c5ab21db761ca9abdf47b1e9cbfbc73163) уточнены [спецификация](LOOP_ENGINEERING.md), [ADR](adr/0003-gpt-diagnostic-escalation.md) и [prompts](LOOP_ENGINEERING_PROMPTS.md): сквозной prerequisite управляемого effort для LE2/native eval, отдельная probe/gate ablation и различие repair/diagnosis/dispatch counters. В текущем native request builder effort ещё не передаётся; отсутствие поля не означает нулевой reasoning. Strict gate, общий cap семь attempts, LE1 offline scope и post-M10/O sequencing сохранены.
+
+Это docs-only correction. Независимый review уточнённых контрактов завершён без существенных открытых findings; whitespace, Markdown fences, reference definitions, 34 относительные ссылки и два JSON blocks проверены. Это review документации, не formal GitHub approval. Native/runtime suites и live calls не выполнялись; новые runtime gates не закрыты. Реализация и включение feature остаются отдельными задачами по LE gates. Результаты исходного LE0 review относятся к своему checkpoint, а не автоматически к этой поправке.
 
 ## Rust migration: M3 закрыт (GO)
 
