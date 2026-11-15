@@ -1,8 +1,8 @@
 # AGENTS.md
 
-`ansa` - минимальный C++20 agent runtime, который легко читать, менять и расширять. Executable `ansa`; внутренний namespace `omh` сохраняется для совместимости протокольной основы. Agent loop принадлежит проекту и не зависит от Codex SDK или app-server.
+`ansa` - минимальный agent runtime, который легко читать, менять и расширять. Nix default - Rust release candidate с executable `ansa`; C++ fallback и namespace `omh` сохранены для совместимости. Agent loop принадлежит проекту и не зависит от Codex SDK или app-server.
 
-Production runtime пока остаётся C++20. Полная Rust migration — отдельная ветка и последовательные gates из [плана](docs/RUST_MIGRATION_PLAN.md); наличие плана или scaffold не означает cutover.
+M9 прошёл bounded live acceptance и подготовил обратимый Rust cutover. Явные packages `.#ansa-rust` и `.#ansa-cpp` сохранены. Удаление C++ относится к отдельно разрешаемому M10; результаты и ограничения - в [PROJECT_STATE](docs/PROJECT_STATE.md).
 
 ## Начало задачи
 
@@ -21,9 +21,9 @@ Production runtime пока остаётся C++20. Полная Rust migration 
 - Веди один canonical append-only session journal. Snapshot frontend и производные индексы не становятся вторым источником истины. Реальные auth credentials держи вне исходников, fixtures, логов и журнала. Не открывай `.env`, `.env.*` и credential stores существующих агентов.
 - Full access не является sandbox. no_new_privs и ограничения capabilities не отменяют уже совершённые или remote effects; при неизвестном cleanup сохраняй unknown. Новые библиотеки и подсистемы требуют конкретной необходимости.
 
-## Текущий production C++
+## Сохранённый C++ fallback
 
-Используй C++20, RAII, CMake и pinned Nix flake. Держи зависимости и абстракции соразмерными текущему milestone. Собирай и запускай на NixOS/aarch64. Пока Rust не прошёл cutover gates, C++ executable/package остаётся рабочим baseline; не удаляй его и не выдавай migration scaffold за production.
+Используй C++20, RAII, CMake и pinned Nix flake для C++ fallback. Собирай и запускай на NixOS/aarch64. Сохраняй проверенный executable, Nix GC root и текущую совместимость state; не удаляй fallback до разрешённого M10.
 
 ## Migration Rust
 

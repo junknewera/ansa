@@ -50,10 +50,13 @@ def source_hash(path):
     path=Path(path);need(str(path).startswith('/nix/store/') and not any(p=='.env' or p.startswith('.env.') for p in path.parts) and path==path.resolve(),'Nix source path')
     with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC),'rb') as stream:
         meta=os.fstat(stream.fileno());need(stat.S_ISREG(meta.st_mode) and meta.st_size<=64*1024*1024,'Nix source file type/size');return hashlib.sha256(stream.read(64*1024*1024+1)).hexdigest()
+CPP_PACKAGE_SELECTOR='packages: (packages.ansa-cpp or packages.default).drvPath'
 def expected_derivation(language,head):
     need(language in ('cpp','rust') and re.fullmatch('[0-9a-f]{40}',head),'pinned package source revision')
-    reference='git+file://'+str(common.ROOT)+'?rev='+head+'#packages.aarch64-linux.'+('default' if language=='cpp' else 'ansa-rust')+'.drvPath'
-    return subprocess.check_output(['nix','eval','--no-update-lock-file','--raw',reference],stderr=subprocess.PIPE,text=True,timeout=90).strip()
+    reference='git+file://'+str(common.ROOT)+'?rev='+head+'#packages.aarch64-linux'
+    suffix=['--apply',CPP_PACKAGE_SELECTOR] if language=='cpp' else []
+    if language=='rust':reference+='.ansa-rust.drvPath'
+    return subprocess.check_output(['nix','eval','--no-update-lock-file','--raw',reference,*suffix],stderr=subprocess.PIPE,text=True,timeout=90).strip()
 def installed_source(binary,language,files,head):
     package=str(Path(binary).parent.parent);need(package.startswith('/nix/store/'),'installed source package')
     derivation=subprocess.check_output(['nix-store','--query','--deriver',package],text=True,timeout=30).strip()
