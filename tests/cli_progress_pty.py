@@ -279,7 +279,7 @@ def reading_failure(adapter, output):
             screen.send(b'\x1b[5~');screen.wait('чтение')
             screen.vt.update(screen.raw)
             body=frozen_body(screen.vt)
-            screen.wait('http_timeout')
+            screen.wait('http_timeout');screen.wait('пауза')
             editor(screen,'DRAFT Ж界😀');screen.vt.update(screen.raw)
             assert screen.vt.line(-4).startswith('http_timeout'),screen.vt.line(-4)
             assert body==frozen_body(screen.vt),'failure moved the frozen conversation'
@@ -290,7 +290,7 @@ def reading_failure(adapter, output):
             assert screen.vt.line(-4).startswith('http_timeout')
             assert screen.vt.line(-3).startswith('Диалог отправлен')
             screen.send(b'\x7f'*len('DRAFT Ж界😀')+b'\x04')
-            return save(screen,output,'reading-failure-copy')
+            return save(screen,output,'reading-failure-copy',(1,))
         finally:
             (output/'reading-failure-live.pty').write_bytes(screen.raw);screen.close()
 
