@@ -36,6 +36,7 @@ def main():
             shutil.copy2(common.ROOT/'rust'/name, workspace/name)
         shutil.copytree(common.ROOT/'rust/crates', workspace/'crates')
         shutil.copytree(common.ROOT/'tests/fixtures', workspace/'tests/fixtures')
+        os.environ['ANSA_PROTOCOL_FIXTURES'] = str(workspace/'tests/fixtures')
         path = workspace/'crates/ansa/src/provider/replay.rs'
         original = path.read_text()
         assert original.count(SITE) == 1, 'production replay mutation site changed'

@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'parity'))
 import frontend
@@ -21,7 +22,7 @@ import tty_flood
 FAULTS = ('pending', 'pending-signal', 'read-error', 'stderr', 'epipe',
           'blocked-cancel', 'blocked-shutdown')
 INVENTORY = ['legacy-reopen', 'credential-canaries', *FAULTS,
-             *('tty-flood-' + str(i) for i in range(tty_flood.REPEATS))]
+             *('tty-flood-' + str(i) for i in range(3))]
 
 
 @contextlib.contextmanager
@@ -184,6 +185,7 @@ def main():
     try:
         source = common.source_info()
         assert not source['worktree_status'], 'clean checkpoint required'
+        assert tty_flood.REPEATS == 3, 'TTY flood inventory changed'
         assert not (common.ROOT/'src').exists() and not (common.ROOT/'CMakeLists.txt').exists()
         platform = common.platform_info()
         assert platform['machine'] == 'aarch64' and platform['os_release']['ID'] == 'nixos'
@@ -202,6 +204,7 @@ def main():
         report['status'] = 'PASS'
     except (AssertionError, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         report['errors'].append(str(error) or type(error).__name__)
+        (args.output/'failure.txt').write_text(traceback.format_exc())
     common.write_json(args.output/'report.json', report)
     print(json.dumps(dict(status=report['status'], passed=len(report['cases']), errors=report['errors'])))
     return int(report['status'] != 'PASS')

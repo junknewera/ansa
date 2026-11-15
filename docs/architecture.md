@@ -62,7 +62,7 @@ Legacy serializer отдельно сохраняет C++ v1 dump bytes, уча�
 | Tool result для replay | 128 KiB |
 | HTTP headers / fields | 64 KiB суммарно / 256 на block |
 
-Лимиты проверяются до append/parse соответствующего payload; depth проверяется также до yyjson parse. JSON/SSE input bytes ограничивают и объём внутренних parser allocations. Node/duplicate-key validation выполняется после parse. Одновременные owning copies увеличивают peak memory относительно body limit; это не обещание RSS ≤16 MiB. Overflow не приводит к усечённому executable JSON.
+Лимиты проверяются при incremental framing и JSON validation. JSON/SSE input bytes ограничивают объём parser allocations; depth, nodes и duplicate keys проверяются при построении owning значений. Одновременные owning copies увеличивают peak memory относительно body limit; это не обещание RSS ≤16 MiB. Overflow не приводит к усечённому executable JSON.
 
 ## Replay и provenance
 
