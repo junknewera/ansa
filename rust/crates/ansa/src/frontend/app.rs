@@ -488,11 +488,10 @@ fn live_jsonl(args: &[String]) -> Result<i32> {
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or("live_session_required")?;
     let auth = auth_manager(&auth)?;
-    let initial = auth.access(&Cancel::default(), false)?;
+    // Match the interactive path: token/refresh checks belong to cancellable
+    // dispatch, after signals are installed, never to JSONL startup. No auth
+    // watcher or refresh transport runs before the single-thread signal guard.
     let (account, generate, mut options) = authorized(auth, model.clone())?;
-    if account != initial.account {
-        return Err("auth_account_mismatch");
-    }
     options.directory = Some(directory);
     let tools = pure_tools()?;
     let bound = Binding {
