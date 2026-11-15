@@ -4,6 +4,11 @@ Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone i
 docs/RUST_MIGRATION_PLAN.md before changes here. M9 makes Rust the default
 release candidate; explicit C++ fallback remains available until M10.
 
+Follow the root AGENTS.md development cycle and PR authorization: targeted
+checks and review first, one prepared clean checkpoint for full gates, no
+competing builds during acceptance. The commands below are required checks,
+not a requirement to repeat the full matrix after every WIP or docs-only edit.
+
 ## M9 boundary
 
 - The current user authorized the bounded M9 plan recorded in docs/migration/M9.md:
