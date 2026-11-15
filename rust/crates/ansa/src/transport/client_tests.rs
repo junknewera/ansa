@@ -21,8 +21,17 @@ use std::{
 #[path = "../../examples/support/frame_server.rs"]
 mod frame_server;
 
-fn fixtures() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests")
+fn protocol_fixture(name: &str) -> std::path::PathBuf {
+    std::env::var_os("ANSA_PROTOCOL_FIXTURES")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests/fixtures"))
+        .join(name)
+}
+fn transport_fixtures() -> std::path::PathBuf {
+    std::env::var_os("ANSA_PARITY_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tests/parity"))
+        .join("fixtures")
 }
 fn registry() -> (Arc<crate::tools::registry::Snapshot>, Arc<AtomicUsize>) {
     let mut definition = app::pure_tools()
@@ -118,10 +127,10 @@ fn h1_peer(listener: TcpListener, case: &str, body: &[u8]) {
 fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let body = std::fs::read(fixtures().join("fixtures/round1.sse")).unwrap();
+    let body = std::fs::read(protocol_fixture("round1.sse")).unwrap();
     let server = if h2 {
         listener.set_nonblocking(true).unwrap();
-        let fixture = fixtures().join("parity/fixtures");
+        let fixture = transport_fixtures();
         let case = case.to_owned();
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -144,7 +153,7 @@ fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(
-            std::fs::read(fixtures().join("parity/fixtures/transport/tls/ca.der")).unwrap(),
+            std::fs::read(transport_fixtures().join("transport/tls/ca.der")).unwrap(),
         ))
         .unwrap();
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -336,9 +345,7 @@ fn strict_headers_and_failed_eof_never_dispatch() {
                     if h2 {
                         assert_eq!(
                             received,
-                            std::fs::read(fixtures().join("fixtures/round1.sse"))
-                                .unwrap()
-                                .len(),
+                            std::fs::read(protocol_fixture("round1.sse")).unwrap().len(),
                             "timeout must follow the complete terminal body"
                         );
                     }
