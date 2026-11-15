@@ -15,7 +15,10 @@ use crate::{
     runtime::{Handle, PostStatus, Runtime},
     session::transcript,
 };
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 use tokio::task::JoinSet;
 pub(crate) mod workbench;
 pub fn history_page_current(page: &TranscriptPage, query: &GetTranscript, total: usize) -> bool {
@@ -73,6 +76,7 @@ pub struct State {
     reading_total: usize,
     copy: CopyHistory,
     snapshot_read: Option<CommandId>,
+    delivered: BTreeSet<String>,
 }
 impl State {
     pub fn new(handle: &Handle) -> Self {
@@ -116,6 +120,7 @@ impl State {
             reading_total: 0,
             copy: CopyHistory::default(),
             snapshot_read: None,
+            delivered: BTreeSet::new(),
         }
     }
     fn command(&mut self, handle: &Handle, payload: CommandPayload) -> RuntimeCommand {
@@ -188,6 +193,42 @@ impl State {
                 .snapshot
                 .as_ref()
                 .is_none_or(|v| v.submit != self.pending)
+    }
+    fn observe_deliveries<'a>(&mut self, commands: impl IntoIterator<Item = &'a CommandId>) {
+        let mut fresh = false;
+        for command in commands {
+            // The canonical session admits at most 4096 followup identities.
+            // Keep both event and snapshot observations in the same bounded set.
+            if self.delivered.len() < 4096 {
+                fresh |= self.delivered.insert(command.0.clone());
+            }
+        }
+        if fresh {
+            self.cancelled = false;
+        }
+    }
+    fn delivery_snapshot(&mut self, snapshot: &Snapshot) {
+        self.observe_deliveries(
+            snapshot
+                .followups
+                .iter()
+                .filter(|message| {
+                    message.state == "delivered"
+                        && Some(&message.target) == snapshot.request.as_ref()
+                })
+                .map(|message| &message.command),
+        );
+    }
+    fn delivery_event(&mut self, request: Option<&RequestId>, commands: &[CommandId]) {
+        if request.is_some()
+            && request
+                == self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.request.as_ref())
+        {
+            self.observe_deliveries(commands);
+        }
     }
     fn recall_page(&mut self, handle: &Handle, replies: &mut Replies) {
         if replies.len() >= 32 {
@@ -447,6 +488,7 @@ impl State {
     pub fn apply(&mut self, event: &RuntimeEvent, io: &Io) {
         match &event.payload {
             EventPayload::FrontendSnapshot(v) => {
+                self.delivery_snapshot(v);
                 self.progress.observe(v, Instant::now());
                 if diagnostics::needs_attention(v)
                     && self.snapshot.as_ref().is_none_or(|old| {
@@ -558,8 +600,8 @@ impl State {
             EventPayload::FollowupQueued { .. } => {
                 self.report(io, "Сообщение сохранено; ожидает текущий шаг\n")
             }
-            EventPayload::FollowupDelivered { .. } => {
-                self.cancelled = false;
+            EventPayload::FollowupDelivered { commands } => {
+                self.delivery_event(event.request.as_ref(), commands);
                 self.report(io, "Уточнение передано агенту\n");
             }
             EventPayload::GenerationSelected { selection, .. } => {
@@ -1375,6 +1417,82 @@ mod tests {
         assert!(internal);
         assert_eq!(result.unwrap(), PostStatus::Accepted);
         assert_eq!(state.exit, 0);
+        runtime.shutdown().await.unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivery_resync_rearms_cancel_once_across_event_snapshot_orders() {
+        let mut runtime = super::super::app::offline_runtime(None, false).unwrap();
+        runtime.ready().await.unwrap();
+        let handle = runtime.handle();
+        let mut snapshot = loop {
+            if let EventPayload::FrontendSnapshot(snapshot) =
+                runtime.next_event().await.unwrap().payload
+            {
+                break *snapshot;
+            }
+        };
+        snapshot.request = Some("active".into());
+        let initial = snapshot.clone();
+        snapshot.followups = vec![Followup {
+            command: "message-b".into(),
+            target: "active".into(),
+            text: "B".into(),
+            state: "delivered".into(),
+        }];
+        for event_first in [false, true] {
+            let mut state = State::new(&handle);
+            state.snapshot = Some(initial.clone());
+            state.cancelled = true;
+            if event_first {
+                state.delivery_event(snapshot.request.as_ref(), &["message-b".into()]);
+            } else {
+                // The transient event was lost when the outbox overflowed.
+                state.delivery_snapshot(&snapshot);
+            }
+            assert!(
+                !state.cancelled,
+                "new delivered step must permit its own Cancel"
+            );
+            state.cancelled = true; // The user now interrupts B.
+            state.delivery_snapshot(&snapshot);
+            assert!(
+                state.cancelled,
+                "late/repeated snapshot must preserve B's Cancel"
+            );
+            state.delivery_event(snapshot.request.as_ref(), &["message-b".into()]);
+            assert!(
+                state.cancelled,
+                "late/repeated event must preserve B's Cancel"
+            );
+            state.delivery_snapshot(&snapshot);
+            assert!(state.cancelled);
+        }
+        let mut state = State::new(&handle);
+        state.snapshot = Some(initial);
+        state.cancelled = true;
+        let mut historical = snapshot.clone();
+        historical.followups[0].target = "old-request".into();
+        state.delivery_snapshot(&historical);
+        state.delivery_event(
+            Some(&RequestId("old-request".into())),
+            &["old-message".into()],
+        );
+        assert!(
+            state.cancelled,
+            "historical delivery cannot rearm the current step"
+        );
+        state.observe_deliveries(&[CommandId("one".into()), CommandId("two".into())]);
+        state.cancelled = true;
+        state.observe_deliveries(&[CommandId("two".into())]);
+        assert!(
+            state.cancelled,
+            "all identities in a delivered batch must be remembered"
+        );
+        let many = (0..4200)
+            .map(|index| CommandId(format!("delivery-{index}")))
+            .collect::<Vec<_>>();
+        state.observe_deliveries(&many);
+        assert_eq!(state.delivered.len(), 4096);
         runtime.shutdown().await.unwrap();
     }
 }

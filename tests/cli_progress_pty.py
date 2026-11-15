@@ -300,8 +300,11 @@ def busy(adapter, output):
             (output/'busy-journals.json').write_text(json.dumps(journals(root))+'\n')
             return row
         finally:
-            (output / "busy-live.pty").write_bytes(screen.raw)
-            screen.close()
+            try:
+                (output / "busy-live.pty").write_bytes(screen.raw)
+                (output / "busy-journals.json").write_text(json.dumps(journals(root))+'\n')
+            finally:
+                screen.close()
 
 
 def tools(adapter, output, failed=False, plain=True):
