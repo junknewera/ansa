@@ -1,5 +1,42 @@
 # Состояние ansa
 
+## JSONL startup: auth access перенесён в dispatch
+
+Проверенный code checkpoint
+[`f0a34fd`](https://github.com/junknewera/ansa/commit/f0a34fd50e71b6ed4b9ec367e54af43206a5c2a0),
+2026-11-15. В первом local-harness-benchmark пилоте четыре ответа прошли
+проверку; пятая попытка завершилась `cli_signal_handler` до Submit. Исходный
+baseline сохранён в `~/Workspace/pet/local-harness-benchmark/results/experiments/ansa-pilot-20261115T1358Z/`.
+
+`--live-jsonl` больше не вызывает eager `auth.access` перед установкой signals.
+Как и обычный CLI, startup читает локальный auth status; token access, refresh,
+account/session/model проверки выполняет cancellable dispatch до generation и
+tools. Signal guard не ослаблен, sleep/retry не добавлены. Старый M9 executable
+в synthetic повторе дал тот же `cli_signal_handler` **2/256** раз, а expired
+профиль начинал сеть до JSONL readiness. Конкретный отказ signal syscall либо
+проверки `/proc/self/task` исходная общая diagnostic не различает.
+
+X13s/NixOS/aarch64: Debug и установленный Nix Release - **259/259** startup
+сценариев каждый, включая expired idle без сети и SIGINT/SIGTERM при заблокированной
+подготовке auth. Proxy удерживает CONNECT до TLS/discovery; rotating token POST
+эта новая регрессия не проверяет. Cargo workspace **117 native + 9 doctests**,
+Python **171/171**, frontend fault **187/187** с raw replay, pinned nightly
+ASan с instrumented std/leak detection **117/117**, fmt/clippy all targets/features,
+Nix package и production `--self-check`/`--offline-demo` PASS. Независимый review
+подтвердил сохранение auth binding и отмены. Реальные profiles/model calls не
+использовались. Это целевая правка startup; полный M8/M9 perf/live gate не повторялся.
+C++ production inputs и fallback неизменны.
+
+Evidence и GC root установленного исправленного binary:
+`~/Workspace/pet/ansa-baselines/startup-signals-f0a34fd/`. Первые проверки нового
+worktree обнаружили недостающие adapters/Release cache; после подготовки
+canonical reference binaries и CMake-конфигурации весь Python-набор прошёл.
+Неудачные setup attempts сохранены. По запросу пользователя удалены старые
+Cargo/CMake кэши, освобождено **37,4 GiB**; исходники, canonical journals,
+evidence и rollback binaries сохранены. Для повторения старых captures могут
+потребоваться пересборки adapters. Следующий шаг - UX из TODO: копирование
+диалога, история ввода, таймер и отображение инструментов.
+
 ## Rust migration: M9 закрыт (GO)
 
 В текущей сессии пользователь разрешил bounded M9 при условии, что полноценный
