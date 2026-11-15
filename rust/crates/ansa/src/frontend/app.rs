@@ -243,6 +243,8 @@ pub fn authorized(
     let account = guard.account().to_owned();
     let guard = Arc::new(Mutex::new(guard));
     let check = guard.clone();
+    let request_check = guard.clone();
+    let selection = guard.clone();
     let provider = guard.clone();
     let lease = guard;
     let generate_auth = auth.clone();
@@ -264,11 +266,23 @@ pub fn authorized(
     });
     let compact_generate = generate.clone();
     let options = RuntimeOptions {
+        check_request: Arc::new(move |request, epoch, cancel| {
+            request_check
+                .lock()
+                .map_err(|_| "auth_state")?
+                .check_request(request, epoch, cancel)
+        }),
+        select_generation: Arc::new(move |value, cancel| {
+            selection
+                .lock()
+                .map_err(|_| "auth_state")?
+                .check_generation(value, cancel)
+        }),
         check_dispatch: Arc::new(move |epoch, cancel| {
             check
                 .lock()
                 .map_err(|_| "auth_state")?
-                .check_dispatch(epoch, cancel)
+                .check_account(epoch, cancel)
         }),
         tool_guard: Arc::new(move |cancel| {
             let session = lease.lock().map_err(|_| "auth_state")?.session().to_owned();
@@ -311,6 +325,7 @@ fn text(args: &[String]) -> Result<i32> {
     let mut bound = binding();
     bound.requested_model = settings.model.clone();
     bound.returned_model = settings.returned_model.clone();
+    let mut workspace_auth = None;
     let (generate, mut options) = if parsed.offline {
         (
             Arc::new(|request: &Request, stop: &Cancel, _| offline::generate(request, stop))
@@ -322,8 +337,9 @@ fn text(args: &[String]) -> Result<i32> {
             },
         )
     } else {
-        let (account, generate, options) =
-            authorized(auth_manager(&parsed.auth)?, settings.model.clone())?;
+        let auth = auth_manager(&parsed.auth)?;
+        let (account, generate, options) = authorized(auth.clone(), settings.model.clone())?;
+        workspace_auth = Some(auth);
         bound.account = account;
         (generate, options)
     };
@@ -347,27 +363,64 @@ fn text(args: &[String]) -> Result<i32> {
         &std::env::current_exe().map_err(|_| "process_executable")?,
     )?;
     let configuration = Request::new(bound, epoch, tools.advertisement().clone(), vec![])?;
-    options.directory = Some(selected.directory);
+    options.directory = Some(selected.directory.clone());
+    if parsed.offline {
+        let model = settings.model.clone();
+        options.select_generation = Arc::new(move |selection, _| {
+            if selection.model == model && selection.effort.is_none() {
+                Ok(())
+            } else {
+                Err("model_not_available")
+            }
+        });
+    }
+    let factory = super::sessions::Factory::new(
+        settings.clone(),
+        parsed.auth.clone(),
+        parsed.offline,
+        configuration.binding.account.clone(),
+        workspace_auth,
+    );
     // Signals must be blocked before starting owner and output threads.
     let mut io = Io::open(parsed.prompt.is_none())?;
-    let mut runtime = Runtime::new(
-        SessionId(selected.id.clone()),
-        configuration,
-        tools,
-        generate,
-        Limits {
-            compact_bytes: settings.compact_bytes,
-            tool_rounds: settings.tool_rounds,
-            tool_calls: settings.tool_calls,
-            ..Limits::default()
-        },
-        options,
-    )?;
+    let (mut runtime, root_kind, parent) = if parsed.resume || !parsed.session.is_empty() {
+        let restored = factory.resume(&selected.id)?;
+        (restored.runtime, restored.kind, restored.parent)
+    } else {
+        (
+            Runtime::new(
+                SessionId(selected.id.clone()),
+                configuration,
+                tools,
+                generate,
+                Limits {
+                    compact_bytes: settings.compact_bytes,
+                    tool_rounds: settings.tool_rounds,
+                    tool_calls: settings.tool_calls,
+                    ..Limits::default()
+                },
+                options,
+            )?,
+            super::sessions::Kind::Main,
+            None,
+        )
+    };
     io.status(&format!(
         "ansa session {} (full access, sudo disabled)\n",
         selected.id
     ));
     let context = format!("{}  {}", settings.cwd.display(), settings.model);
+    if io.raw.is_some() {
+        return reactor()?.block_on(controller::workbench::run(
+            runtime,
+            &mut io,
+            &context,
+            factory,
+            selected.id,
+            root_kind,
+            parent,
+        ));
+    }
     reactor()?.block_on(controller::run(
         &mut runtime,
         &mut io,

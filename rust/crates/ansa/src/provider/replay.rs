@@ -157,5 +157,6 @@ pub fn continuation(
         },
         response.request.tools.clone(),
         input,
-    )
+    )?
+    .with_effort(response.request.effort.clone())
 }

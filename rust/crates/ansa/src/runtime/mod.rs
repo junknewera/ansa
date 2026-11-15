@@ -6,6 +6,7 @@ mod shutdown;
 mod work;
 pub use crate::auth::Cancel;
 pub use crate::frontend::protocol_v1::*;
+pub use crate::session::state::ForkSeed;
 use crate::{
     context::legacy_compact::CompactedContext,
     provider::{request::Request, responses::AdmittedResponse},
@@ -19,6 +20,8 @@ pub type Generate =
     Arc<dyn Fn(&Request, &Cancel, PreviewSink) -> Result<AdmittedResponse> + Send + Sync>;
 pub type Compact = Arc<dyn Fn(&Request, &Cancel) -> Result<CompactedContext> + Send + Sync>;
 pub type CheckDispatch = Arc<dyn Fn(u64, &Cancel) -> Result<()> + Send + Sync>;
+pub type CheckRequest = Arc<dyn Fn(&Request, u64, &Cancel) -> Result<()> + Send + Sync>;
+pub type SelectGeneration = Arc<dyn Fn(&GenerationSelection, &Cancel) -> Result<()> + Send + Sync>;
 pub type ToolGuard = Arc<dyn Fn(&Cancel) -> Result<Lease> + Send + Sync>;
 /// Ownership is retained and dropped on the auth worker, never on the reactor.
 pub struct Lease {
@@ -56,6 +59,9 @@ impl Default for Limits {
 }
 #[derive(Clone)]
 pub struct Options {
+    pub fork_seed: Option<crate::session::state::ForkSeed>,
+    pub check_request: CheckRequest,
+    pub select_generation: SelectGeneration,
     pub directory: Option<PathBuf>,
     pub compact: Option<Compact>,
     pub journal: Option<Observer>,
@@ -67,6 +73,9 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            fork_seed: None,
+            check_request: Arc::new(|_, _, _| Ok(())),
+            select_generation: Arc::new(|_, _| Err("generation_selection_unavailable")),
             directory: None,
             compact: None,
             journal: None,

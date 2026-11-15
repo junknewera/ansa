@@ -4,7 +4,7 @@ use super::{
     codec_v1::{Invocation, SavedResult},
     journal_v1::{Journal, Observer},
     need,
-    state::State,
+    state::{ForkSeed, State},
 };
 use crate::protocol::json::Json;
 use std::{
@@ -27,10 +27,27 @@ impl Store {
     pub fn open(path: &Path, state: State, observe: Option<Observer>) -> Result<Self> {
         Self::open_with_replay(path, state, observe, |_| Ok(()))
     }
+    pub(crate) fn open_with_seed(
+        path: &Path,
+        state: State,
+        observe: Option<Observer>,
+        seed: Option<&ForkSeed>,
+    ) -> Result<Self> {
+        Self::open_seeded_with_replay(path, state, observe, seed, |_| Ok(()))
+    }
     pub fn open_with_replay(
+        path: &Path,
+        state: State,
+        observe: Option<Observer>,
+        replay: impl FnMut(&Json) -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_seeded_with_replay(path, state, observe, None, replay)
+    }
+    fn open_seeded_with_replay(
         path: &Path,
         mut state: State,
         observe: Option<Observer>,
+        seed: Option<&ForkSeed>,
         mut replay: impl FnMut(&Json) -> Result<()>,
     ) -> Result<Self> {
         let mut journal = Journal::open(
@@ -43,15 +60,18 @@ impl Store {
         )?;
         let diagnostic = journal.diagnostic();
         if diagnostic.is_empty() && journal.empty() {
-            let init = state.initialization()?;
+            let init = state.initialization_with_seed(seed)?;
+            let mut next = state.clone();
+            next.apply(&init)?;
             journal.append(&init)?;
-            state.apply(&init)?;
+            state = next;
             replay(&init)?;
         }
-        let recovered_pause = state
-            .turn
-            .as_ref()
-            .is_some_and(|t| t.stage != "completed" && t.stage != "cancelled");
+        let recovered_pause = state.pending_followups().next().is_some()
+            || state
+                .turn
+                .as_ref()
+                .is_some_and(|t| t.stage != "completed" && t.stage != "cancelled");
         Ok(Self {
             journal,
             state: Arc::new(state),

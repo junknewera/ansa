@@ -68,8 +68,12 @@ impl Handle {
             CommandPayload::Cancel(_) => &self.cancel,
             CommandPayload::GetSnapshot(_) => &self.snapshot,
             CommandPayload::Resume(_) => &self.resume,
-            CommandPayload::GetTranscript(_) => &self.transcript,
-            CommandPayload::Submit(_) => &self.submits,
+            CommandPayload::GetTranscript(_)
+            | CommandPayload::GetTimeline(_)
+            | CommandPayload::GetContext => &self.transcript,
+            CommandPayload::Submit(_)
+            | CommandPayload::Steer(_)
+            | CommandPayload::SetGeneration(_) => &self.submits,
         };
         let (reply, receiver) = oneshot::channel();
         match sender.try_send(Envelope { command, reply }) {

@@ -15,8 +15,12 @@ use crate::{
     runtime::{Handle, PostStatus, Runtime},
     session::transcript,
 };
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 use tokio::task::JoinSet;
+pub(crate) mod workbench;
 pub fn history_page_current(page: &TranscriptPage, query: &GetTranscript, total: usize) -> bool {
     page.query == *query && page.total >= total
 }
@@ -72,6 +76,7 @@ pub struct State {
     reading_total: usize,
     copy: CopyHistory,
     snapshot_read: Option<CommandId>,
+    delivered: BTreeSet<String>,
 }
 impl State {
     pub fn new(handle: &Handle) -> Self {
@@ -115,6 +120,7 @@ impl State {
             reading_total: 0,
             copy: CopyHistory::default(),
             snapshot_read: None,
+            delivered: BTreeSet::new(),
         }
     }
     fn command(&mut self, handle: &Handle, payload: CommandPayload) -> RuntimeCommand {
@@ -142,7 +148,9 @@ impl State {
         }
         debug_assert!(matches!(
             payload,
-            CommandPayload::GetSnapshot(_) | CommandPayload::GetTranscript(_)
+            CommandPayload::GetSnapshot(_)
+                | CommandPayload::GetTranscript(_)
+                | CommandPayload::GetTimeline(_)
         ));
         self.post_with_origin(handle, payload, replies, true)
     }
@@ -160,8 +168,12 @@ impl State {
         if internal_read && matches!(command.payload, CommandPayload::GetSnapshot(_)) {
             self.snapshot_read = Some(command.command.clone());
         }
-        let submit = matches!(command.payload, CommandPayload::Submit(_));
-        if submit {
+        let new_turn = matches!(command.payload, CommandPayload::Submit(_));
+        let submit = matches!(
+            command.payload,
+            CommandPayload::Submit(_) | CommandPayload::Steer(_)
+        );
+        if new_turn {
             self.pending = Some(command.command.clone());
         }
         if let CommandPayload::Resume(target) = &command.payload {
@@ -181,6 +193,42 @@ impl State {
                 .snapshot
                 .as_ref()
                 .is_none_or(|v| v.submit != self.pending)
+    }
+    fn observe_deliveries<'a>(&mut self, commands: impl IntoIterator<Item = &'a CommandId>) {
+        let mut fresh = false;
+        for command in commands {
+            // The canonical session admits at most 4096 followup identities.
+            // Keep both event and snapshot observations in the same bounded set.
+            if self.delivered.len() < 4096 {
+                fresh |= self.delivered.insert(command.0.clone());
+            }
+        }
+        if fresh {
+            self.cancelled = false;
+        }
+    }
+    fn delivery_snapshot(&mut self, snapshot: &Snapshot) {
+        self.observe_deliveries(
+            snapshot
+                .followups
+                .iter()
+                .filter(|message| {
+                    message.state == "delivered"
+                        && Some(&message.target) == snapshot.request.as_ref()
+                })
+                .map(|message| &message.command),
+        );
+    }
+    fn delivery_event(&mut self, request: Option<&RequestId>, commands: &[CommandId]) {
+        if request.is_some()
+            && request
+                == self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.request.as_ref())
+        {
+            self.observe_deliveries(commands);
+        }
     }
     fn recall_page(&mut self, handle: &Handle, replies: &mut Replies) {
         if replies.len() >= 32 {
@@ -273,8 +321,40 @@ impl State {
         if text != "/status" {
             self.explicit_status = false;
         }
-        if matches!(text.split_whitespace().next(), Some("/model" | "/thinking")) {
-            self.report(io, "Команды /model и /thinking пока недоступны; используйте --model при запуске новой сессии\n");
+        let mut words = text.split_whitespace();
+        let first = words.next();
+        if matches!(first, Some("/model" | "/thinking" | "/effort")) {
+            let Some(value) = words.next() else {
+                self.report(
+                    io,
+                    "Укажите /model MODEL или /effort LEVEL (default - выбор провайдера)\n",
+                );
+                return (true, false);
+            };
+            if words.next().is_some() {
+                self.report(io, "Ожидалось одно значение\n");
+                return (false, false);
+            }
+            let Some(snapshot) = &self.snapshot else {
+                return (false, false);
+            };
+            let selection = if first == Some("/model") {
+                GenerationSelection {
+                    model: value.into(),
+                    effort: None,
+                }
+            } else {
+                GenerationSelection {
+                    model: snapshot.generation.model.clone(),
+                    effort: if value == "default" {
+                        None
+                    } else {
+                        Some(value.into())
+                    },
+                }
+            };
+            self.post(handle, CommandPayload::SetGeneration(selection), replies);
+            self.report(io, "Проверяю выбор для следующих сообщений...\n");
             return (true, false);
         }
         match text {
@@ -347,6 +427,33 @@ impl State {
             return (false, false);
         }
         if !self.available() {
+            if let Some(target) = self
+                .snapshot
+                .as_ref()
+                .filter(|v| {
+                    !v.storage_failed
+                        && !matches!(
+                            v.state.as_str(),
+                            "paused" | "cancelled" | "completed" | "idle"
+                        )
+                })
+                .and_then(|v| v.request.clone())
+            {
+                let id = CommandId(format!("c_{}_{}", self.prefix, self.sequence + 1));
+                let posted = self.post(
+                    handle,
+                    CommandPayload::Steer(Steer {
+                        target,
+                        text: text.into(),
+                    }),
+                    replies,
+                );
+                if posted && io.raw.is_some() {
+                    self.pending_draft = Some((id, self.editor.bytes.clone(), self.editor.cursor));
+                    self.status = "Сообщение ожидает завершения текущего шага".into();
+                }
+                return (posted, false);
+            }
             self.report(io, "ansa: busy; wait or use Ctrl+C\n");
             self.exit = 1;
             return (false, false);
@@ -381,6 +488,7 @@ impl State {
     pub fn apply(&mut self, event: &RuntimeEvent, io: &Io) {
         match &event.payload {
             EventPayload::FrontendSnapshot(v) => {
+                self.delivery_snapshot(v);
                 self.progress.observe(v, Instant::now());
                 if diagnostics::needs_attention(v)
                     && self.snapshot.as_ref().is_none_or(|old| {
@@ -489,6 +597,23 @@ impl State {
                 self.input_history.retry(None);
                 self.copy.retry(None);
             }
+            EventPayload::FollowupQueued { .. } => {
+                self.report(io, "Сообщение сохранено; ожидает текущий шаг\n")
+            }
+            EventPayload::FollowupDelivered { commands } => {
+                self.delivery_event(event.request.as_ref(), commands);
+                self.report(io, "Уточнение передано агенту\n");
+            }
+            EventPayload::GenerationSelected { selection, .. } => {
+                self.report(
+                    io,
+                    &format!(
+                        "{} · {} - со следующего сообщения\n",
+                        selection.model,
+                        selection.effort.as_deref().unwrap_or("default")
+                    ),
+                );
+            }
             EventPayload::RuntimeError {
                 command,
                 diagnostic,
@@ -503,6 +628,24 @@ impl State {
         }
     }
     fn render(&mut self, io: &Io, context: &str) -> Option<carbon::Frame> {
+        self.render_inner(io, context, None, None)
+    }
+    fn render_workspace(
+        &mut self,
+        io: &Io,
+        context: &str,
+        ui: &carbon::Workspace,
+        projected: Option<&[Entry]>,
+    ) -> Option<carbon::Frame> {
+        self.render_inner(io, context, Some(ui), projected)
+    }
+    fn render_inner(
+        &mut self,
+        io: &Io,
+        context: &str,
+        ui: Option<&carbon::Workspace>,
+        projected: Option<&[Entry]>,
+    ) -> Option<carbon::Frame> {
         let view = self.snapshot.as_ref()?;
         if !self.history_ready {
             return None;
@@ -588,8 +731,17 @@ impl State {
                 view.completed_tools,
                 view.tools.len()
             ));
-        } else if !view.worker_busy {
-            status.push_str("  ↑/↓: ввод");
+        }
+        let queued = view
+            .followups
+            .iter()
+            .filter(|f| f.state == "queued")
+            .count();
+        if queued > 0 {
+            status.push_str(&format!("  сообщений ожидает: {queued}"));
+        }
+        if let Some(projected) = projected {
+            entries = projected.to_vec();
         }
         if !self.follow_tail && self.reading.is_none() {
             self.reading = Some(entries.clone());
@@ -623,16 +775,30 @@ impl State {
         };
         status.push_str(&diagnostics::status_notice(view, &detail));
         let visible = self.reading.as_deref().unwrap_or(&entries);
-        let frame = carbon::layout_full(
-            visible,
-            &self.editor.bytes,
-            self.editor.cursor,
-            &status,
-            self.scroll,
-            context,
-            io.size,
-            io.color,
-        )?;
+        let frame = if let Some(ui) = ui {
+            carbon::layout_workspace(
+                visible,
+                &self.editor.bytes,
+                self.editor.cursor,
+                &status,
+                self.scroll,
+                context,
+                io.size,
+                io.color,
+                ui,
+            )?
+        } else {
+            carbon::layout_full(
+                visible,
+                &self.editor.bytes,
+                self.editor.cursor,
+                &status,
+                self.scroll,
+                context,
+                io.size,
+                io.color,
+            )?
+        };
         self.scroll_limit = frame.scroll_limit;
         Some(frame)
     }
@@ -799,20 +965,12 @@ pub async fn run(
                     }
                 }
                 SIGTSTP => {
-                    if let Some(raw) = &mut io.raw {
-                        raw.restore();
-                    }
-                    io.signals.suspend().map_err(|_| "cli_suspend")?;
-                    if let Some(raw) = &mut io.raw {
-                        raw.resume().map_err(|_| "cli_termios")?;
-                    }
+                    io.suspend().await?;
                     last_frame = None;
                     io.writer.invalidate();
                 }
                 SIGCONT => {
-                    if let Some(raw) = &mut io.raw {
-                        raw.resume().map_err(|_| "cli_termios")?;
-                    }
+                    io.resume_terminal()?;
                     last_frame = None;
                     io.writer.invalidate();
                 }
@@ -989,7 +1147,7 @@ pub async fn run(
                                     state.editor.clear();
                                     state.input_history.reset();
                                 }
-                                Action::Submit => {
+                                Action::Submit | Action::QueueSubmit => {
                                     // A delayed recall may not replace a draft rejected as busy.
                                     state.input_history.edited(&state.editor);
                                     match state.editor.text().map(str::to_owned) {
@@ -1049,6 +1207,17 @@ pub async fn run(
                                     );
                                 }
                                 Action::CopyHistory => state.start_copy(io),
+                                Action::FocusNext | Action::FocusPrevious | Action::Mouse(_) => {}
+                                Action::Escape => {
+                                    state.follow_tail = !state.follow_tail;
+                                    state.expanded = true;
+                                    state.reading = None;
+                                    if state.follow_tail {
+                                        state.scroll = 0;
+                                    } else {
+                                        state.reading_total = state.page.2;
+                                    }
+                                }
                                 Action::ToggleTools => {
                                     state.tools_expanded = !state.tools_expanded;
                                     state.reading = None;
@@ -1167,6 +1336,7 @@ pub async fn run(
     handle.request_shutdown();
     while replies.join_next().await.is_some() {}
     runtime.join().await?;
+    let reporting_ok = io.stop_reporting().is_ok();
     if io.raw.is_some() {
         io.writer.text("\x1b[1B\r\n".into());
     }
@@ -1178,7 +1348,7 @@ pub async fn run(
     {
         state.exit = 1;
     }
-    if !io.writer.finish() {
+    if !io.writer.finish() || !reporting_ok {
         let code = output_error.unwrap_or("cli_output");
         if jsonl_mode {
             io.status(&(jsonl::error(code, None).dump() + "\n"));
@@ -1247,6 +1417,82 @@ mod tests {
         assert!(internal);
         assert_eq!(result.unwrap(), PostStatus::Accepted);
         assert_eq!(state.exit, 0);
+        runtime.shutdown().await.unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivery_resync_rearms_cancel_once_across_event_snapshot_orders() {
+        let mut runtime = super::super::app::offline_runtime(None, false).unwrap();
+        runtime.ready().await.unwrap();
+        let handle = runtime.handle();
+        let mut snapshot = loop {
+            if let EventPayload::FrontendSnapshot(snapshot) =
+                runtime.next_event().await.unwrap().payload
+            {
+                break *snapshot;
+            }
+        };
+        snapshot.request = Some("active".into());
+        let initial = snapshot.clone();
+        snapshot.followups = vec![Followup {
+            command: "message-b".into(),
+            target: "active".into(),
+            text: "B".into(),
+            state: "delivered".into(),
+        }];
+        for event_first in [false, true] {
+            let mut state = State::new(&handle);
+            state.snapshot = Some(initial.clone());
+            state.cancelled = true;
+            if event_first {
+                state.delivery_event(snapshot.request.as_ref(), &["message-b".into()]);
+            } else {
+                // The transient event was lost when the outbox overflowed.
+                state.delivery_snapshot(&snapshot);
+            }
+            assert!(
+                !state.cancelled,
+                "new delivered step must permit its own Cancel"
+            );
+            state.cancelled = true; // The user now interrupts B.
+            state.delivery_snapshot(&snapshot);
+            assert!(
+                state.cancelled,
+                "late/repeated snapshot must preserve B's Cancel"
+            );
+            state.delivery_event(snapshot.request.as_ref(), &["message-b".into()]);
+            assert!(
+                state.cancelled,
+                "late/repeated event must preserve B's Cancel"
+            );
+            state.delivery_snapshot(&snapshot);
+            assert!(state.cancelled);
+        }
+        let mut state = State::new(&handle);
+        state.snapshot = Some(initial);
+        state.cancelled = true;
+        let mut historical = snapshot.clone();
+        historical.followups[0].target = "old-request".into();
+        state.delivery_snapshot(&historical);
+        state.delivery_event(
+            Some(&RequestId("old-request".into())),
+            &["old-message".into()],
+        );
+        assert!(
+            state.cancelled,
+            "historical delivery cannot rearm the current step"
+        );
+        state.observe_deliveries(&[CommandId("one".into()), CommandId("two".into())]);
+        state.cancelled = true;
+        state.observe_deliveries(&[CommandId("two".into())]);
+        assert!(
+            state.cancelled,
+            "all identities in a delivered batch must be remembered"
+        );
+        let many = (0..4200)
+            .map(|index| CommandId(format!("delivery-{index}")))
+            .collect::<Vec<_>>();
+        state.observe_deliveries(&many);
+        assert_eq!(state.delivered.len(), 4096);
         runtime.shutdown().await.unwrap();
     }
 }

@@ -15,6 +15,7 @@ import unicodedata
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "parity"))
 from frontend_io import Pty, environment, journals
+from session_cases import decode as decode_journal
 
 
 class Terminal:
@@ -23,6 +24,7 @@ class Terminal:
         self.cols,self.rows=cols,rows; self.cells=[[' ']*cols for _ in range(rows)]
         self.x=self.y=0; self.saved=(0,0); self.pending=''; self.offset=0
         self.decoder=codecs.getincrementaldecoder('utf-8')('replace')
+        self.alternate=False;self.cursor_visible=True;self.sgr=()
     def update(self, raw):
         self.pending+=self.decoder.decode(raw[self.offset:]);self.offset=len(raw)
         index=0
@@ -44,6 +46,10 @@ class Terminal:
                     elif cmd=='K':
                         begin,end=(0,self.cols) if args[0]==2 else (0,self.x+1) if args[0]==1 else (self.x,self.cols)
                         self.cells[self.y][begin:end]=[' ']*(end-begin)
+                    elif cmd in ('h','l'):
+                        if match[1]=='?1049':self.alternate=cmd=='h'
+                        elif match[1]=='?25':self.cursor_visible=cmd=='h'
+                    elif cmd=='m':self.sgr=() if args==[0] else tuple(args)
                     index+=len(match[0]);continue
                 if self.pending[index+1]==']':
                     end=self.pending.find('\x07',index+2)
@@ -72,8 +78,10 @@ def editor(screen, text, since=0):
     deadline=time.monotonic()+4
     while True:
         screen.vt.update(screen.raw)
-        if screen.vt.line(-2)==('> '+text).rstrip():return
-        assert time.monotonic()<deadline and screen.child.poll() is None, ('editor',text,screen.vt.line(-2))
+        workspace=screen.vt.line(0).startswith('ANSA')
+        row,prefix=(-4,'› ') if workspace else (-2,'> ')
+        if screen.vt.line(row)==(prefix+text).rstrip():return
+        assert time.monotonic()<deadline and screen.child.poll() is None, ('editor',text,screen.vt.line(row))
         screen.drain(.01)
 
 def copied(screen, since):
@@ -85,7 +93,24 @@ def copied(screen, since):
         screen.drain(.01)
 
 def frozen_body(terminal):
-    return tuple(tuple(row) for row in terminal.cells[1:-4])
+    begin,end=(3,-5) if terminal.line(0).startswith('ANSA') else (1,-4)
+    return tuple(tuple(row) for row in terminal.cells[begin:end])
+
+
+def journal_events(root):
+    parts={Path(name).name:bytes.fromhex(raw) for name,raw in journals(root).items()
+           if Path(name).parent==Path('journal')}
+    return decode_journal(parts)
+
+
+def until(screen, predicate, label, timeout=4):
+    if not hasattr(screen,'vt'):screen.vt=Terminal()
+    deadline=time.monotonic()+timeout
+    while True:
+        screen.vt.update(screen.raw)
+        if predicate():return
+        assert time.monotonic()<deadline and screen.child.poll() is None,(label,'\n'.join(screen.vt.line(i) for i in range(screen.vt.rows)))
+        screen.drain(.01)
 
 
 def save(screen, output, name, expected=(0,)):
@@ -126,7 +151,9 @@ def recall(binary, output):
             screen.wait("basic")
             screen.send("DRAFT Ж界😀")
             editor(screen, "DRAFT Ж界😀")
-            assert screen.vt.line(0).startswith('ansa') and screen.vt.line(-1).startswith('basic')
+            assert screen.vt.line(0).startswith('ANSA') and 'basic' in screen.vt.line(-2)
+            frame='\n'.join(screen.vt.line(i) for i in range(screen.vt.rows))
+            assert all(hint not in frame for hint in ['Ctrl+F','PgUp','PgDn','↑/↓'])
             assert b'\x1b]52;' not in screen.raw
             at=len(screen.raw)
             before=journals(root)
@@ -136,30 +163,37 @@ def recall(binary, output):
             editor(screen,'DRAFT Ж界😀')
             assert journals(root)==before,'copy changed canonical journal'
             # Browse every canonical page; input remains pinned and unchanged.
-            for _ in range(50):
+            for _ in range(160):
                 screen.send(b'\x1b[5~')
                 for _ in range(3):screen.drain(.01)
                 screen.vt.update(screen.raw)
-                if 'seed-00' in '\n'.join(screen.vt.line(i) for i in range(1,20)):break
+                if 'seed-00' in '\n'.join(screen.vt.line(i) for i in range(3,19)):break
             else:raise AssertionError('first canonical message is unreachable')
             editor(screen,'DRAFT Ж界😀')
             # Return through forward pages, then wait beyond periodic refresh.
-            for _ in range(60):
+            for _ in range(160):
                 screen.send(b'\x1b[6~')
                 for _ in range(3):screen.drain(.01)
                 screen.vt.update(screen.raw)
-                if 'seed-39' in '\n'.join(screen.vt.line(i) for i in range(1,20)):
+                if 'seed-39' in '\n'.join(screen.vt.line(i) for i in range(3,19)):
                     screen.send(b'\x1b[6~');break
             else:raise AssertionError('tail is unreachable')
-            until=time.monotonic()+.7
-            while time.monotonic()<until:screen.drain(.01)
+            deadline=time.monotonic()+.7
+            while time.monotonic()<deadline:screen.drain(.01)
             screen.vt.update(screen.raw)
-            assert 'seed-39' in '\n'.join(screen.vt.line(i) for i in range(1,20)),'polling lost tail'
+            assert 'seed-39' in '\n'.join(screen.vt.line(i) for i in range(3,19)),'polling lost tail'
+            if 'HISTORY' not in screen.vt.line(1):
+                screen.send(b'\x1b')
+                until(screen,lambda:'HISTORY' in screen.vt.line(1),'Esc entered reading')
             screen.send(b'\x06')
+            editor(screen,'DRAFT Ж界😀')
+            assert 'HISTORY' in screen.vt.line(1),'removed Ctrl+F binding changed reading mode'
+            screen.send(b'\x1b')
+            until(screen,lambda:'HISTORY' not in screen.vt.line(1),'Esc returned to live')
             screen.resize(100,32)
             screen.vt=Terminal(100,32)
             editor(screen,'DRAFT Ж界😀')
-            assert screen.vt.line(0).startswith('ansa') and screen.vt.line(-1).startswith('basic')
+            assert screen.vt.line(0).startswith('ANSA') and 'basic' in screen.vt.line(-2)
             screen.resize(80,24)
             screen.vt=Terminal()
             editor(screen,'DRAFT Ж界😀')
@@ -215,25 +249,62 @@ def busy(adapter, output):
             screen.wait("basic")
             screen.send("first\r")
             screen.wait("предварительный ответ")
-            screen.send("SECOND_DRAFT")
-            editor(screen, "SECOND_DRAFT")
+            message="SECOND Ж界😀"
+            draft="AFTER_QUEUE Ж界😀"
+            screen.send(message)
+            editor(screen, message)
             at = len(screen.raw)
             screen.send(b"\x1b[A")
             editor(screen, "first", at)
             at = len(screen.raw)
-            screen.send(b"\r")
-            screen.wait("busy", at)
-            editor(screen, "first", at)
-            at = len(screen.raw)
             screen.send(b"\x1b[B")
-            editor(screen, "SECOND_DRAFT", at)
+            editor(screen, message, at)
+            screen.send(b'\r')
+            screen.wait('Сообщение сохранено',at)
+            until(screen,lambda:any(event['kind']=='queued' and event['text']==message for event in journal_events(root)),
+                  'followup durable before interrupt')
+            queued=[event for event in journal_events(root) if event['kind']=='queued']
+            assert len(queued)==1 and queued[0]['text']==message,queued
+            editor(screen,'')
+            assert (root/'generated').read_bytes()==b'x','queued message interrupted provider before Ctrl+C'
+            screen.send(draft);editor(screen,draft)
+            screen.send(b'\x1b[5~');screen.wait('чтение')
+            screen.vt.update(screen.raw);body=frozen_body(screen.vt)
             screen.child.send_signal(signal.SIGINT)
-            screen.wait("отменено")
-            screen.send(b"\x7f" * len("SECOND_DRAFT") + b"\x04")
-            return save(screen, output, "busy-rejected-draft-preview", (1,))
+            until(screen,lambda:(root/'generated').read_bytes()==b'xx','interrupted provider read queued message')
+            events=journal_events(root)
+            delivered=[event for event in events if event['kind']=='steered']
+            assert len(delivered)==1 and delivered[0]['commands']==[queued[0]['command']],delivered
+            texts=[item['content'] for item in delivered[0]['next']['input'] if item.get('role')=='user']
+            assert texts[-2:]==['first',message] and texts.count(message)==1,texts
+            assert not any(event['kind']=='done' and event.get('turn')==queued[0]['turn'] for event in events),'large task finished before delivery'
+            # The external journal/worker marker precedes UI snapshot delivery.
+            # Copy intentionally pins the last snapshot applied by the frontend.
+            until(screen,lambda:any('чтение, новых: 1' in screen.vt.line(row) for row in range(screen.vt.rows)),
+                  'UI snapshot includes the delivered message before copy')
+            editor(screen,draft);screen.vt.update(screen.raw)
+            assert body==frozen_body(screen.vt),'steering moved frozen conversation'
+            at=len(screen.raw);screen.send(b'\x19')
+            copied_text=copied(screen,at)
+            assert copied_text.count('first\n\n')==1 and copied_text.count(message+'\n\n')==1,copied_text
+            assert draft not in copied_text and 'assistant manager' not in copied_text,'draft/preview entered confirmed transcript'
+            editor(screen,draft)
+            at=len(screen.raw);screen.child.send_signal(signal.SIGINT)
+            screen.wait('отменено',at)
+            screen.send(b'\x7f'*len(draft)+b'\x04')
+            row=save(screen,output,'busy-steer-draft-preview')
+            events=journal_events(root)
+            assert len([event for event in events if event['kind']=='queued'])==1
+            assert len([event for event in events if event['kind']=='steered'])==1
+            assert (root/'generated').read_bytes()==b'xx','second cancel restarted work without another message'
+            (output/'busy-journals.json').write_text(json.dumps(journals(root))+'\n')
+            return row
         finally:
-            (output / "busy-live.pty").write_bytes(screen.raw)
-            screen.close()
+            try:
+                (output / "busy-live.pty").write_bytes(screen.raw)
+                (output / "busy-journals.json").write_text(json.dumps(journals(root))+'\n')
+            finally:
+                screen.close()
 
 
 def tools(adapter, output, failed=False, plain=True):
@@ -340,6 +411,10 @@ def main():
     body=frozen_body(terminal)
     terminal.update(raw+b'\x1b[2;1H\x1b[2Kmutated')
     assert body!=frozen_body(terminal),'frozen-body checker accepted repaint mutant'
+    terminal=Terminal();raw=b'\x1b[1;1HANSA\x1b[4;1Horiginal';terminal.update(raw)
+    body=frozen_body(terminal)
+    terminal.update(raw+b'\x1b[4;1H\x1b[2Kmutated')
+    assert body!=frozen_body(terminal),'workspace frozen-body checker accepted repaint mutant'
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--fixture-binary", type=Path, required=True)

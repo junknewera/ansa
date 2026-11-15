@@ -56,6 +56,13 @@ pub(crate) struct Owner {
     recovery: Option<OperationId>,
     receipts: BTreeMap<String, SubmitReceipt>,
     queued: VecDeque<RuntimeCommand>,
+    new_followups: VecDeque<RuntimeCommand>,
+    control_replies: BTreeMap<String, oneshot::Sender<Result<PostStatus>>>,
+    control_commands: BTreeMap<String, RuntimeCommand>,
+    selections: VecDeque<RuntimeCommand>,
+    selecting: Option<RuntimeCommand>,
+    selection_stop: Option<Cancel>,
+    deferred_completions: VecDeque<Completion>,
     pending_receipt: Option<SubmitReceipt>,
     cancelling: Option<CommandId>,
     resuming: Option<CommandId>,
@@ -128,6 +135,13 @@ impl Owner {
             recovery: None,
             receipts: BTreeMap::new(),
             queued: VecDeque::new(),
+            new_followups: VecDeque::new(),
+            control_replies: BTreeMap::new(),
+            control_commands: BTreeMap::new(),
+            selections: VecDeque::new(),
+            selecting: None,
+            selection_stop: None,
+            deferred_completions: VecDeque::new(),
             pending_receipt: None,
             cancelling: None,
             resuming: None,
@@ -172,7 +186,7 @@ impl Owner {
         Ok(Identity {
             incarnation: self.incarnation.clone(),
             turn: self.turn(),
-            request: self.request().ok_or("runtime_request")?,
+            request: self.request().unwrap_or_else(|| "control".into()),
             resume_epoch: self.resume_epoch,
             generation: self.generation,
         })
@@ -238,6 +252,19 @@ impl Owner {
             .as_ref()
             .or_else(|| self.state.turn.as_ref().map(|t| &t.receipt));
         self.emit(EventPayload::FrontendSnapshot(Box::new(Snapshot {
+            timeline_size: self.state.timeline.len(),
+            generation: self.state.generation.clone(),
+            followups: self
+                .state
+                .followups
+                .iter()
+                .rev()
+                .take(32)
+                .map(|message| message.as_ref().clone())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
             through_sequence: 0,
             state: self.phase.clone(),
             request: self.request(),
@@ -320,6 +347,35 @@ impl Owner {
         );
     }
     fn fail(&mut self, code: &'static str) {
+        if let Some(stop) = &self.selection_stop {
+            stop.cancel();
+        }
+        for (_, reply) in std::mem::take(&mut self.control_replies) {
+            let _ = reply.send(Err(code));
+        }
+        self.control_commands.clear();
+        // A provider/auth completion can be parked behind the failing journal
+        // write. It has already returned, so do not retain a fictitious busy
+        // worker that would prevent bounded shutdown.
+        while let Some(done) = self.deferred_completions.pop_front() {
+            match done {
+                Completion::Provider { identity, .. }
+                    if self.provider.as_ref() == Some(&identity) =>
+                {
+                    self.provider = None
+                }
+                Completion::Auth { identity, task, .. }
+                    if self
+                        .auth
+                        .as_ref()
+                        .is_some_and(|(active, kind, _)| *active == identity && *kind == task) =>
+                {
+                    self.auth = None;
+                    self.selecting = None;
+                }
+                _ => {}
+            }
+        }
         self.storage_failed = true;
         self.diagnostic = if crate::provider::contracts::valid_id(code) {
             code.into()
@@ -415,11 +471,27 @@ impl Owner {
     fn authorize(&mut self, workers: &Workers, task: AuthTask) -> Result<()> {
         let identity = self.identity()?;
         self.gate.allow(&identity)?;
+        let request = if matches!(task, AuthTask::Generate | AuthTask::Compact) {
+            let current = self.state.turn.as_ref().ok_or("runtime_turn")?;
+            Some(if task == AuthTask::Generate {
+                if let Some(response) = &current.tools_response {
+                    crate::session::codec_v1::next_request(response, &current.results)?
+                } else {
+                    current.next.clone()
+                }
+            } else {
+                current.next.clone()
+            })
+        } else {
+            None
+        };
         workers
             .auth
             .as_ref()
             .ok_or("auth_worker_closed")?
             .try_send(AuthJob {
+                selection: None,
+                request,
                 identity: identity.clone(),
                 stop: self.turn_stop.clone(),
                 task,
@@ -519,6 +591,9 @@ impl Owner {
         self.cancelling = Some(command);
         self.phase = "cancelled".into();
         self.pending_pause = None;
+        if self.state.pending_followups().next().is_some() && self.recovery.is_none() {
+            self.recovered_pause = false;
+        }
         if self.storage_failed {
             let command = self.cancelling.take().expect("owned cancel");
             self.emit(EventPayload::Cancelled { command });
@@ -528,15 +603,171 @@ impl Owner {
     fn admit(&mut self, envelope: Envelope) -> Result<()> {
         let command = envelope.command;
         let status = self.admit_inner(&command);
-        let _ = envelope.reply.send(status);
+        if matches!(status, Ok(PostStatus::Accepted))
+            && matches!(
+                command.payload,
+                CommandPayload::Steer(_) | CommandPayload::SetGeneration(_)
+            )
+        {
+            // Admission is acknowledged only after the durable queued/selection
+            // record. Cancel and snapshot use independent mailboxes meanwhile.
+            self.control_commands
+                .insert(command.command.0.clone(), command.clone());
+            self.control_replies
+                .insert(command.command.0, envelope.reply);
+        } else {
+            let _ = envelope.reply.send(status);
+        }
         Ok(())
     }
     fn admit_inner(&mut self, command: &RuntimeCommand) -> Result<PostStatus> {
         if self.closing.mode.load(Ordering::Acquire) != 0 {
             return Ok(PostStatus::Closed);
         }
+        if let Some(pending) = self.control_commands.get(&command.command.0) {
+            return Ok(
+                if pending.payload == command.payload && pending.turn == command.turn {
+                    PostStatus::QueueFull
+                } else {
+                    PostStatus::CommandConflict
+                },
+            );
+        }
         match &command.payload {
+            CommandPayload::Steer(message) => {
+                if let Some(previous) = self
+                    .state
+                    .followups
+                    .iter()
+                    .find(|m| m.command == command.command)
+                {
+                    let turn_matches = self
+                        .state
+                        .submits
+                        .values()
+                        .any(|r| r.request == previous.target && r.turn == command.turn);
+                    return Ok(
+                        if previous.target == message.target
+                            && previous.text == message.text
+                            && turn_matches
+                        {
+                            PostStatus::Duplicate
+                        } else {
+                            PostStatus::CommandConflict
+                        },
+                    );
+                }
+                if self
+                    .new_followups
+                    .iter()
+                    .any(|c| c.command == command.command)
+                    || self.control_replies.contains_key(&command.command.0)
+                {
+                    return Ok(PostStatus::QueueFull);
+                }
+                if self.receipts.contains_key(&command.command.0)
+                    || self
+                        .state
+                        .generation_commands
+                        .contains_key(&command.command.0)
+                {
+                    return Ok(PostStatus::CommandConflict);
+                }
+                if self.request().as_ref() != Some(&message.target) || self.turn() != command.turn {
+                    return Ok(PostStatus::StaleTarget);
+                }
+                if self.storage_failed {
+                    return Err("journal_read_only");
+                }
+                // An admitted command remains reserved while it is waiting,
+                // selected by advance(), or in the journal worker. Popping it
+                // from the deque does not release its durable queue slot.
+                let reserved = self
+                    .control_commands
+                    .values()
+                    .filter(|c| {
+                        matches!(c.payload, CommandPayload::Steer(_))
+                            && !self.state.followups.iter().any(|m| m.command == c.command)
+                    })
+                    .count();
+                if self.state.followups.len() + reserved >= 4096 {
+                    return Ok(PostStatus::CommandIdLimit);
+                }
+                if self.state.pending_followups().count() + reserved >= self.limits.commands.min(16)
+                {
+                    return Ok(PostStatus::QueueFull);
+                }
+                self.new_followups.push_back(command.clone());
+            }
+            CommandPayload::SetGeneration(selection) => {
+                if let Some(previous) = self.state.generation_commands.get(&command.command.0) {
+                    return Ok(if previous == selection {
+                        PostStatus::Duplicate
+                    } else {
+                        PostStatus::CommandConflict
+                    });
+                }
+                if self.control_replies.contains_key(&command.command.0) {
+                    return Ok(PostStatus::QueueFull);
+                }
+                if self.receipts.contains_key(&command.command.0)
+                    || self
+                        .state
+                        .followups
+                        .iter()
+                        .any(|m| m.command == command.command)
+                {
+                    return Ok(PostStatus::CommandConflict);
+                }
+                if self.storage_failed {
+                    return Err("journal_read_only");
+                }
+                let reserved = self
+                    .control_commands
+                    .values()
+                    .filter(|c| {
+                        matches!(c.payload, CommandPayload::SetGeneration(_))
+                            && !self.state.generation_commands.contains_key(&c.command.0)
+                    })
+                    .count();
+                if self.state.generation_commands.len() + reserved >= 4096 {
+                    return Ok(PostStatus::CommandIdLimit);
+                }
+                if reserved >= 4 {
+                    return Ok(PostStatus::QueueFull);
+                }
+                self.selections.push_back(command.clone());
+            }
+            CommandPayload::GetContext => {
+                self.emit(EventPayload::ContextSnapshot {
+                    command: command.command.clone(),
+                    seed: self.state.fork_seed()?,
+                });
+            }
+            CommandPayload::GetTimeline(query) => {
+                let page = self.state.timeline.page(query.clone());
+                self.emit(EventPayload::TimelinePage(TranscriptPage {
+                    begin: page.begin,
+                    end: page.end,
+                    total: page.total,
+                    entries: page.entries,
+                    query: page.query,
+                }));
+            }
             CommandPayload::Submit(submitted) => {
+                if self
+                    .state
+                    .generation_commands
+                    .contains_key(&command.command.0)
+                    || self
+                        .state
+                        .followups
+                        .iter()
+                        .any(|m| m.command == command.command)
+                    || self.control_replies.contains_key(&command.command.0)
+                {
+                    return Ok(PostStatus::CommandConflict);
+                }
                 if let Some(receipt) = self.receipts.get(&command.command.0) {
                     if *receipt.text != submitted.text
                         || receipt.turn != command.turn
@@ -751,13 +982,7 @@ impl Owner {
             }
             return Ok(());
         }
-        if self.cancelling.is_some()
-            && self
-                .state
-                .turn
-                .as_ref()
-                .is_some_and(|t| t.stage != "cancelled")
-        {
+        if self.cancelling.is_some() && self.state.turn.is_some() {
             return self.record(workers, Kind::Cancel, "cancel", vec![]);
         }
         if let Some(outcome) = self.pending_outcome.take() {
@@ -781,6 +1006,31 @@ impl Owner {
         }
         if self.tool.is_none() && self.phase == "cancelled" {
             self.release_auth(workers)?;
+        }
+        if let Some(done) = self.deferred_completions.pop_front() {
+            self.completed(workers, done)?;
+            // A consumed completion can remove the last worker without
+            // producing another wake (e.g. late provider success after Cancel).
+            // Continue the bounded owner transition instead of parking B until
+            // an unrelated frontend command happens to arrive.
+            return self.advance(workers);
+        }
+        if !self.starting
+            && let Some(command) = self.new_followups.pop_front()
+        {
+            let CommandPayload::Steer(message) = command.payload else {
+                return Err("steer_contract");
+            };
+            return self.record(
+                workers,
+                Kind::Queued,
+                "queued",
+                vec![
+                    ("command", Json::string(&command.command.0)?),
+                    ("target", Json::string(&message.target.0)?),
+                    ("text", Json::string(&message.text)?),
+                ],
+            );
         }
         if self.starting {
             if !self.recovery_attempted {
@@ -807,8 +1057,43 @@ impl Owner {
             }
             return Ok(());
         }
+        if !self.shutting_down
+            && self.closing.mode.load(Ordering::Acquire) != 2
+            && self.auth.is_none()
+            && let Some(command) = self.selections.pop_front()
+        {
+            let CommandPayload::SetGeneration(selection) = &command.payload else {
+                return Err("generation_selection");
+            };
+            let identity = self.identity()?;
+            let stop = Cancel::default();
+            workers
+                .auth
+                .as_ref()
+                .ok_or("auth_worker_closed")?
+                .try_send(AuthJob {
+                    selection: Some(selection.clone()),
+                    request: None,
+                    identity: identity.clone(),
+                    stop: stop.clone(),
+                    task: AuthTask::SelectGeneration,
+                })
+                .map_err(|_| "auth_queue_full")?;
+            self.selection_stop = Some(stop);
+            self.auth = Some((identity, AuthTask::SelectGeneration, false));
+            self.selecting = Some(command);
+            return Ok(());
+        }
         if self.busy() {
             return Ok(());
+        }
+        if self.state.pending_followups().next().is_some()
+            && self.owned_intent
+            && let Some(intent) = self.state.turn.as_ref().and_then(|t| t.intent.as_ref())
+        {
+            self.pending_outcome = Some(not_started(intent));
+            self.permit = None;
+            return self.advance(workers);
         }
         if let Some(command) = self.resuming.take() {
             if self.phase != "paused" || self.recovery.is_some() {
@@ -830,6 +1115,38 @@ impl Owner {
                 Kind::Pause,
                 "pause",
                 vec![("diagnostic", Json::string(code)?)],
+            );
+        }
+        if !self.shutting_down
+            && !self.recovered_pause
+            && self.recovery.is_none()
+            && self.state.pending_followups().next().is_some()
+        {
+            let messages = self.state.pending_followups().cloned().collect::<Vec<_>>();
+            let turn = self.turn();
+            self.finish_preview("discarded", false);
+            return self.persist(
+                workers,
+                Kind::Steered,
+                Box::new(move |state| {
+                    transition(
+                        &turn,
+                        "steered",
+                        vec![
+                            (
+                                "commands",
+                                Json::array(
+                                    messages
+                                        .iter()
+                                        .map(|m| Json::string(&m.command.0))
+                                        .collect::<Result<Vec<_>>>()?,
+                                )?,
+                            ),
+                            ("next", state.followup_request(&messages)?.save()?),
+                        ],
+                    )
+                }),
+                None,
             );
         }
         if self.available()
@@ -919,6 +1236,46 @@ impl Owner {
         }
         self.pending_receipt = None;
         match done.kind {
+            Kind::Queued => {
+                let command: CommandId = receipt.event().text_field("command")?.into();
+                self.control_commands.remove(&command.0);
+                if let Some(reply) = self.control_replies.remove(&command.0) {
+                    let _ = reply.send(Ok(PostStatus::Accepted));
+                }
+                self.emit(EventPayload::FollowupQueued { command });
+                self.snapshot(None);
+            }
+            Kind::Steered => {
+                self.turn_stop = Cancel::default();
+                self.gate.reset();
+                self.resume_epoch += 1;
+                self.plan = None;
+                self.permit = None;
+                self.pending_pause = None;
+                self.diagnostic.clear();
+                self.phase = "generating".into();
+                let commands = receipt
+                    .event()
+                    .field("commands")?
+                    .elements()?
+                    .iter()
+                    .map(|id| Ok(CommandId(id.text()?.into())))
+                    .collect::<Result<Vec<_>>>()?;
+                self.emit(EventPayload::FollowupDelivered { commands });
+                self.snapshot(None);
+            }
+            Kind::GenerationSelected => {
+                let command: CommandId = receipt.event().text_field("command")?.into();
+                self.control_commands.remove(&command.0);
+                if let Some(reply) = self.control_replies.remove(&command.0) {
+                    let _ = reply.send(Ok(PostStatus::Accepted));
+                }
+                self.emit(EventPayload::GenerationSelected {
+                    command,
+                    selection: self.state.generation.clone(),
+                });
+                self.snapshot(None);
+            }
             Kind::Accepted => {
                 if self.phase != "cancelled" {
                     self.phase = self
@@ -1031,6 +1388,22 @@ impl Owner {
         Ok(())
     }
     fn completed(&mut self, workers: &Workers, done: Completion) -> Result<()> {
+        if self.storing.is_some()
+            && matches!(
+                &done,
+                Completion::Provider { .. }
+                    | Completion::Auth {
+                        task: AuthTask::BeforeIntent | AuthTask::SelectGeneration,
+                        ..
+                    }
+            )
+        {
+            if self.deferred_completions.len() >= 3 {
+                return Err("runtime_completion_limit");
+            }
+            self.deferred_completions.push_back(done);
+            return Ok(());
+        }
         // A biased select is only priority at poll time. Started can be sent
         // after that poll but before Completion becomes ready. Every executor
         // sends Started before its completion, so consume it while the exact
@@ -1164,6 +1537,52 @@ impl Owner {
                 } else {
                     self.auth = None;
                 }
+                if task == AuthTask::SelectGeneration {
+                    self.selection_stop = None;
+                    let command = self.selecting.take().ok_or("generation_selection")?;
+                    if self.shutting_down || self.storage_failed {
+                        self.control_commands.remove(&command.command.0);
+                        if let Some(reply) = self.control_replies.remove(&command.command.0) {
+                            let _ = reply.send(if self.storage_failed {
+                                Err("journal_read_only")
+                            } else {
+                                Ok(PostStatus::Closed)
+                            });
+                        }
+                        return Ok(());
+                    }
+                    match result {
+                        Err(code) => {
+                            self.control_commands.remove(&command.command.0);
+                            if let Some(reply) = self.control_replies.remove(&command.command.0) {
+                                let _ = reply.send(Err(code));
+                            }
+                            self.reject(&command, code);
+                        }
+                        Ok(_) => {
+                            let CommandPayload::SetGeneration(selection) = command.payload else {
+                                return Err("generation_selection");
+                            };
+                            self.record(
+                                workers,
+                                Kind::GenerationSelected,
+                                "generation_selected",
+                                vec![
+                                    ("command", Json::string(&command.command.0)?),
+                                    ("model", Json::string(&selection.model)?),
+                                    (
+                                        "effort",
+                                        selection.effort.as_ref().map_or_else(
+                                            || Json::parse("null"),
+                                            |value| Json::string(value),
+                                        )?,
+                                    ),
+                                ],
+                            )?;
+                        }
+                    }
+                    return Ok(());
+                }
                 if !self.can_act() {
                     if holding {
                         self.release_auth(workers)?;
@@ -1182,9 +1601,17 @@ impl Owner {
                         self.pause(code);
                     }
                     Ok(stop) => match task {
-                        AuthTask::Generate => self.provider(workers, ProviderTask::Generate)?,
+                        AuthTask::SelectGeneration => unreachable!("selection handled above"),
+                        AuthTask::Generate => {
+                            if self.state.pending_followups().next().is_none() {
+                                self.provider(workers, ProviderTask::Generate)?;
+                            }
+                        }
                         AuthTask::Compact => self.provider(workers, ProviderTask::Compact)?,
                         AuthTask::BeforeIntent => {
+                            if self.state.pending_followups().next().is_some() {
+                                return Ok(());
+                            }
                             let current = self.state.turn.as_ref().ok_or("runtime_turn")?;
                             let invocation = self
                                 .plan
@@ -1200,7 +1627,7 @@ impl Owner {
                             )?;
                         }
                         AuthTask::ToolLease => {
-                            if stop.cancelled() {
+                            if stop.cancelled() || self.state.pending_followups().next().is_some() {
                                 let intent = self
                                     .state
                                     .turn
@@ -1208,7 +1635,9 @@ impl Owner {
                                     .and_then(|t| t.intent.as_ref())
                                     .ok_or("runtime_intent")?;
                                 self.pending_outcome = Some(not_started(intent));
-                                self.pause("auth_required");
+                                if stop.cancelled() {
+                                    self.pause("auth_required");
+                                }
                                 self.release_auth(workers)?;
                             } else {
                                 self.execute(workers, stop)?;
@@ -1290,6 +1719,22 @@ impl Owner {
         loop {
             if self.closing.mode.load(Ordering::Acquire) == 2 && !self.shutting_down {
                 self.shutting_down = true;
+                if let Some(stop) = &self.selection_stop {
+                    stop.cancel();
+                }
+                // Commands not yet assigned to a journal write have no durable
+                // admission. Release their callers; never start a new catalog
+                // validation while shutting down.
+                for command in self
+                    .new_followups
+                    .drain(..)
+                    .chain(self.selections.drain(..))
+                {
+                    self.control_commands.remove(&command.command.0);
+                    if let Some(reply) = self.control_replies.remove(&command.command.0) {
+                        let _ = reply.send(Ok(PostStatus::Closed));
+                    }
+                }
                 self.queued.clear();
                 if self.can_cancel() {
                     self.cancel("shutdown".into());
@@ -1427,6 +1872,9 @@ impl Owner {
 }
 impl Drop for Owner {
     fn drop(&mut self) {
+        if let Some(stop) = &self.selection_stop {
+            stop.cancel();
+        }
         self.gate.cancel();
         self.turn_stop.cancel();
     }

@@ -32,6 +32,7 @@ pub mod transcript;
 mod session {
     pub use crate::transcript;
     pub use ansa::session::catalog;
+    pub use ansa::session::state;
 }
 mod transport {
     pub use crate::http_impl as http;
