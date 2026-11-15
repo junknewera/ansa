@@ -409,14 +409,27 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
         _ => None,
     };
     let tools = app::pure_tools()?;
-    let tools = if mode == "large-jsonl" {
+    let tools = if matches!(mode, "large-jsonl" | "progress" | "progress-error") {
         let mut registry = ansa::tools::registry::Registry::new();
         let mut definition = tools
             .definition("get_test_value")
             .expect("fixture tool")
             .clone();
-        definition.executor =
-            Arc::new(|_| ansa::tools::registry::Outcome::succeeded("x".repeat(100 * 1024)));
+        let selected = mode.to_owned();
+        definition.executor = Arc::new(move |_| {
+            if selected == "large-jsonl" {
+                return ansa::tools::registry::Outcome::succeeded("x".repeat(100 * 1024));
+            }
+            std::thread::sleep(Duration::from_millis(1200));
+            if selected == "progress-error" {
+                ansa::tools::registry::Outcome::failed_known("TOOL_FAILURE Ж😀".into())
+            } else {
+                ansa::tools::registry::Outcome::succeeded(format!(
+                    "TOOL_RESULT Ж😀\n\x1b]0;INJECTED\x07\n{}",
+                    "details ".repeat(600)
+                ))
+            }
+        });
         registry.register_with_policy(
             definition,
             ansa::tools::registry::Policy {
@@ -517,12 +530,13 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
             if mode_owned == "preview-invalid" {
                 return Err("fixture_invalid_response");
             }
-            if mode_owned == "large-jsonl"
-                && request.input.last().is_none_or(|v| {
-                    !v.has("type") || v.text_field("type") != Ok("function_call_output")
-                })
-            {
-                let items = (0..12)
+            if matches!(
+                mode_owned.as_str(),
+                "large-jsonl" | "progress" | "progress-error"
+            ) && request.input.last().is_none_or(|v| {
+                !v.has("type") || v.text_field("type") != Ok("function_call_output")
+            }) {
+                let items = (0..if mode_owned == "large-jsonl" { 12 } else { 1 })
                     .map(|i| {
                         obj(vec![
                             ("type", s("function_call")),

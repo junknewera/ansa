@@ -2,9 +2,12 @@
 use super::{
     Result,
     carbon::{self, Entry},
+    copy::CopyHistory,
     diagnostics::{self, WaitClock},
+    history::History,
     input::{Action, Editor},
     jsonl,
+    progress::Progress,
     protocol_v1::*,
     terminal::Io,
 };
@@ -61,6 +64,13 @@ pub struct State {
     last_pause: String,
     wait_clock: WaitClock,
     explicit_status: bool,
+    input_history: History,
+    progress: Progress,
+    tools_expanded: bool,
+    reading: Option<Vec<Entry>>,
+    follow_tail: bool,
+    reading_total: usize,
+    copy: CopyHistory,
 }
 impl State {
     pub fn new(handle: &Handle) -> Self {
@@ -72,12 +82,12 @@ impl State {
             history_ready: false,
             query: GetTranscript {
                 before: 0,
-                limit: 16,
+                limit: 32,
                 forward: false,
             },
             editor: Editor::default(),
             mode: AgentMode::Basic,
-            expanded: false,
+            expanded: true,
             scroll: 0,
             scroll_limit: 0,
             status: String::new(),
@@ -96,6 +106,13 @@ impl State {
             last_pause: String::new(),
             wait_clock: WaitClock::default(),
             explicit_status: false,
+            input_history: History::default(),
+            progress: Progress::default(),
+            tools_expanded: false,
+            reading: None,
+            follow_tail: true,
+            reading_total: 0,
+            copy: CopyHistory::default(),
         }
     }
     fn command(&mut self, handle: &Handle, payload: CommandPayload) -> RuntimeCommand {
@@ -139,6 +156,10 @@ impl State {
         if submit {
             self.pending = Some(command.command.clone());
         }
+        if let CommandPayload::Resume(target) = &command.payload {
+            self.progress
+                .resume_sent(command.command.clone(), target.clone(), Instant::now());
+        }
         let h = handle.clone();
         replies.spawn(async move {
             let id = command.command.clone();
@@ -153,11 +174,60 @@ impl State {
                 .as_ref()
                 .is_none_or(|v| v.submit != self.pending)
     }
+    fn recall_page(&mut self, handle: &Handle, replies: &mut Replies) {
+        if replies.len() >= 32 {
+            return;
+        }
+        let Some(query) = self.input_history.query() else {
+            return;
+        };
+        let command = self.command(handle, CommandPayload::GetTranscript(query));
+        self.input_history.sent(command.command.clone());
+        let h = handle.clone();
+        replies.spawn(async move {
+            let id = command.command.clone();
+            (id, false, true, h.post(command).await)
+        });
+    }
     fn available(&self) -> bool {
         !self.awaiting()
             && self.snapshot.as_ref().is_some_and(|v| {
                 !v.worker_busy && matches!(v.state.as_str(), "idle" | "completed" | "cancelled")
             })
+    }
+    fn start_copy(&mut self, io: &Io) {
+        let result = if io.raw.is_some() {
+            self.copy
+                .start(self.snapshot.as_ref().map_or(0, |v| v.transcript_size))
+        } else {
+            Err("/copy доступен в интерактивном терминале")
+        };
+        self.report(io, result.err().unwrap_or("Копирование диалога..."));
+    }
+    fn copy_page(&mut self, handle: &Handle, replies: &mut Replies, io: &Io) {
+        if let Some(result) = self.copy.take() {
+            let message = match result {
+                Ok(text) if io.writer.clipboard(&text) => {
+                    "Диалог отправлен в буфер терминала (OSC 52)"
+                }
+                Ok(_) => "Копирование недоступно: очередь вывода заполнена",
+                Err(message) => message,
+            };
+            self.report(io, message);
+        }
+        if replies.len() >= 32 {
+            return;
+        }
+        let Some(query) = self.copy.query() else {
+            return;
+        };
+        let command = self.command(handle, CommandPayload::GetTranscript(query));
+        self.copy.sent(command.command.clone());
+        let h = handle.clone();
+        replies.spawn(async move {
+            let id = command.command.clone();
+            (id, false, true, h.post(command).await)
+        });
     }
     fn report(&mut self, io: &Io, text: &str) {
         if io.raw.is_some() {
@@ -179,6 +249,9 @@ impl State {
             text.push('\n');
             text.push_str(&wait);
         }
+        if let Some(elapsed) = self.progress.elapsed() {
+            text.push_str(&format!("\nВремя задачи: {elapsed}"));
+        }
         text.push('\n');
         text
     }
@@ -193,6 +266,10 @@ impl State {
             self.explicit_status = false;
         }
         match text {
+            "/copy" => {
+                self.start_copy(io);
+                return (true, false);
+            }
             "/exit" | "/quit" => {
                 handle.request_shutdown();
                 return (true, true);
@@ -268,6 +345,9 @@ impl State {
             replies,
         );
         if posted {
+            self.progress
+                .submitted(self.pending.clone().expect("posted Submit"), Instant::now());
+            self.tools_expanded = false;
             self.cancelled = false;
             if io.raw.is_some() {
                 self.pending_draft = self
@@ -285,6 +365,7 @@ impl State {
     pub fn apply(&mut self, event: &RuntimeEvent, io: &Io) {
         match &event.payload {
             EventPayload::FrontendSnapshot(v) => {
+                self.progress.observe(v, Instant::now());
                 if self
                     .snapshot
                     .as_ref()
@@ -338,11 +419,16 @@ impl State {
                 self.printed = event.request.clone();
             }
             EventPayload::TranscriptPage(v) => {
+                self.input_history.apply(v, &mut self.editor);
+                self.copy.apply(v);
                 if history_page_current(
                     v,
                     &self.query,
                     self.snapshot.as_ref().map_or(0, |v| v.transcript_size),
                 ) {
+                    if (v.begin, v.end) != (self.page.0, self.page.1) {
+                        self.reading = None;
+                    }
                     self.entries = v.entries.clone();
                     self.page = (v.begin, v.end, v.total);
                     self.history_ready = true;
@@ -355,18 +441,35 @@ impl State {
                 }
             }
             EventPayload::ToolStarted(v) => {
-                if io.raw.is_some() {
-                    self.status = format!(
-                        "tool: {}",
-                        if v.name.is_empty() {
-                            "running"
-                        } else {
-                            &v.name
-                        }
-                    );
+                if let Some(view) = &mut self.snapshot
+                    && event.request.is_some()
+                    && event.request == view.request
+                {
+                    self.progress
+                        .project(view, Activity::Started(v.clone()), Instant::now());
                 }
             }
-            EventPayload::RuntimeError { diagnostic, .. } => {
+            EventPayload::ToolFinished(v) => {
+                if let Some(view) = &mut self.snapshot
+                    && event.request.is_some()
+                    && event.request == view.request
+                {
+                    self.progress
+                        .project(view, Activity::Finished(v.clone()), Instant::now());
+                }
+            }
+            EventPayload::ResyncRequired { .. } => {
+                self.input_history.retry(None);
+                self.copy.retry(None);
+            }
+            EventPayload::RuntimeError {
+                command,
+                diagnostic,
+            } => {
+                if let Some(command) = command {
+                    self.progress.rejected(command);
+                    self.copy.rejected(command);
+                }
                 self.report(io, &format!("ansa: {}\n", diagnostics::error(diagnostic)))
             }
             _ => {}
@@ -408,6 +511,16 @@ impl State {
                 text: e.text.clone(),
             })
             .collect();
+        if let Some(index) = self.entries[begin..]
+            .iter()
+            .position(|e| e.role == "user" && Some(&e.request) == view.request.as_ref())
+        {
+            entries.splice(
+                index + 1..index + 1,
+                self.progress
+                    .entries(view, self.tools_expanded, Instant::now()),
+            );
+        }
         if preview_visible(
             &self.entries,
             self.page.1,
@@ -424,6 +537,8 @@ impl State {
                     preview.text,
                     if preview.state == "discarded" {
                         " (незавершённый ответ)"
+                    } else if view.state != "completed" {
+                        " (предварительный ответ)"
                     } else {
                         ""
                     }
@@ -447,18 +562,64 @@ impl State {
                 text: self.status_text().trim_end().into(),
             });
         }
-        let phase = match view.state.as_str() {
-            "idle" | "completed" => "готов",
-            "cancelled" => "отменено",
-            "paused" => "пауза",
-            _ => "в работе",
+        let preview = self
+            .preview
+            .as_ref()
+            .is_some_and(|p| !p.text.is_empty() && p.state == "preview")
+            && self.preview_request == view.request;
+        let phase = Progress::phase(view, preview);
+        let mut status = format!("{}  {phase}", jsonl::mode(self.mode));
+        if let Some(elapsed) = self.progress.elapsed() {
+            status.push_str(&format!("  {elapsed}"));
+        }
+        if !view.tools.is_empty() {
+            status.push_str(&format!(
+                "  tools {}/{}  Ctrl+T",
+                view.completed_tools,
+                view.tools.len()
+            ));
+        } else if !view.worker_busy {
+            status.push_str("  ↑/↓: ввод");
+        }
+        if !self.follow_tail && self.reading.is_none() {
+            self.reading = Some(entries.clone());
+        }
+        if !self.follow_tail {
+            status.push_str(&format!(
+                "  чтение, новых: {}",
+                view.transcript_size.saturating_sub(self.reading_total)
+            ));
+        }
+        // A live notice has a reserved row outside the frozen conversation.
+        // Keep the code first so even a narrow terminal shows the failure.
+        let notice = if diagnostics::needs_attention(view) {
+            format!(
+                "{}{}: {}",
+                diagnostics::safe_code(&view.diagnostic),
+                if view.recovery_operation.is_some() {
+                    " effect_unknown"
+                } else {
+                    ""
+                },
+                diagnostics::pause(view)
+            )
+        } else {
+            String::new()
         };
-        let frame = carbon::layout(
-            &entries,
+        status.push('\n');
+        status.push_str(&notice);
+        status.push('\n');
+        status.push_str(&if self.explicit_status {
+            self.status_text().replace('\n', "  ")
+        } else {
+            self.status.trim().to_owned()
+        });
+        let visible = self.reading.as_deref().unwrap_or(&entries);
+        let frame = carbon::layout_full(
+            visible,
             &self.editor.bytes,
             self.editor.cursor,
-            &format!("{}  {phase}", jsonl::mode(self.mode)),
-            self.expanded,
+            &status,
             self.scroll,
             context,
             io.size,
@@ -552,6 +713,9 @@ pub async fn run(
                     let code=if expected_close {None}else{match result {Ok(PostStatus::Accepted|PostStatus::Duplicate)=>None,Ok(PostStatus::QueueFull)=>Some("command_queue_full"),Ok(PostStatus::Closed)=>Some("runtime_closed"),Ok(PostStatus::StaleTarget)=>Some("stale_cancel_target"),Ok(PostStatus::StaleIncarnation)=>Some("stale_incarnation"),Ok(PostStatus::CommandIdLimit)=>Some("submit_id_limit"),Ok(PostStatus::CommandConflict)=>Some("command_id_conflict"),Err(code)=>Some(code)}};
                     if state.pending_draft.as_ref().is_some_and(|(draft,_,_)|draft==&id){let (_,bytes,cursor)=state.pending_draft.take().expect("checked");if code.is_some(){state.editor.bytes=bytes;state.editor.cursor=cursor;}}
                     if let Some(code)=code {
+                        state.input_history.retry(Some(&id));
+                        state.copy.rejected(&id);
+                        state.progress.rejected(&id);
                         if submit && state.pending.as_ref()==Some(&id) {
                             state.pending=None;
                             if prompt.is_some(){finished=true;}
@@ -617,12 +781,14 @@ pub async fn run(
                         raw.resume().map_err(|_| "cli_termios")?;
                     }
                     last_frame = None;
+                    io.writer.invalidate();
                 }
                 SIGCONT => {
                     if let Some(raw) = &mut io.raw {
                         raw.resume().map_err(|_| "cli_termios")?;
                     }
                     last_frame = None;
+                    io.writer.invalidate();
                 }
                 SIGWINCH => {
                     io.resize();
@@ -655,6 +821,10 @@ pub async fn run(
                     state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                     next_cancel = Instant::now() + Duration::from_millis(40);
                 }
+            }
+            if io.raw.is_some() {
+                state.recall_page(&handle, &mut replies);
+                state.copy_page(&handle, &mut replies, io);
             }
             if let Some(prompt) = prompt {
                 if !sent_prompt {
@@ -733,6 +903,7 @@ pub async fn run(
                         }
                     }
                     state.editor.clear();
+                    state.input_history.reset();
                     eof = true;
                 }
                 Ok(size) => {
@@ -759,29 +930,58 @@ pub async fn run(
                             }
                             continue;
                         }
-                        if let Some(action) = state.editor.feed(byte, io.raw.is_some()) {
+                        let before = (
+                            state.editor.bytes.len(),
+                            state.editor.cursor,
+                            state.editor.overflow,
+                        );
+                        let action = state.editor.feed(byte, io.raw.is_some());
+                        if before
+                            != (
+                                state.editor.bytes.len(),
+                                state.editor.cursor,
+                                state.editor.overflow,
+                            )
+                        {
+                            state.input_history.edited(&state.editor);
+                        }
+                        if let Some(action) = action {
                             match action {
                                 Action::Overflow => {
                                     state.report(io, "ansa: submit_size\n");
                                     state.exit = 1;
                                     state.editor.clear();
+                                    state.input_history.reset();
                                 }
-                                Action::Submit => match state.editor.text().map(str::to_owned) {
-                                    Ok(text) => {
-                                        let (accepted, exit) =
-                                            state.text(&text, &handle, io, &mut replies);
-                                        if accepted || io.raw.is_none() {
-                                            state.editor.clear();
-                                            state.scroll = 0;
+                                Action::Submit => {
+                                    // A delayed recall may not replace a draft rejected as busy.
+                                    state.input_history.edited(&state.editor);
+                                    match state.editor.text().map(str::to_owned) {
+                                        Ok(text) => {
+                                            let (accepted, exit) =
+                                                state.text(&text, &handle, io, &mut replies);
+                                            if accepted || io.raw.is_none() {
+                                                state.input_history.reset();
+                                                state.editor.clear();
+                                                state.scroll = 0;
+                                                state.follow_tail = true;
+                                                state.reading = None;
+                                                state.query = GetTranscript {
+                                                    before: 0,
+                                                    limit: 32,
+                                                    forward: false,
+                                                };
+                                            }
+                                            finished |= exit;
                                         }
-                                        finished |= exit;
+                                        Err(code) => {
+                                            state.report(io, &format!("ansa: {code}\n"));
+                                            state.exit = 1;
+                                            state.editor.clear();
+                                            state.input_history.reset();
+                                        }
                                     }
-                                    Err(code) => {
-                                        state.report(io, &format!("ansa: {code}\n"));
-                                        state.exit = 1;
-                                        state.editor.clear();
-                                    }
-                                },
+                                }
                                 Action::ToggleMode => {
                                     if state.available() {
                                         state.mode = if state.mode == AgentMode::Basic {
@@ -792,23 +992,50 @@ pub async fn run(
                                     }
                                 }
                                 Action::ToggleHistory => {
-                                    state.expanded = !state.expanded;
+                                    state.expanded = true;
+                                    state.follow_tail = true;
+                                    state.reading = None;
                                     state.scroll = 0;
-                                    if !state.expanded {
-                                        state.query = GetTranscript {
-                                            before: 0,
-                                            limit: 16,
-                                            forward: false,
-                                        };
-                                        next_history = Instant::now();
-                                    }
+                                    state.query = GetTranscript {
+                                        before: 0,
+                                        limit: 32,
+                                        forward: false,
+                                    };
+                                    next_history = Instant::now();
+                                }
+                                Action::HistoryOlder | Action::HistoryNewer => {
+                                    let total =
+                                        state.snapshot.as_ref().map_or(0, |s| s.transcript_size);
+                                    state.input_history.navigate(
+                                        action == Action::HistoryOlder,
+                                        &mut state.editor,
+                                        total,
+                                    );
+                                }
+                                Action::CopyHistory => state.start_copy(io),
+                                Action::ToggleTools => {
+                                    state.tools_expanded = !state.tools_expanded;
+                                    state.reading = None;
                                 }
                                 Action::PageUp => {
+                                    if state.page.1 == 0 {
+                                        continue;
+                                    }
+                                    if state.follow_tail {
+                                        state.reading_total = state
+                                            .snapshot
+                                            .as_ref()
+                                            .map_or(0, |v| v.transcript_size);
+                                    }
+                                    state.follow_tail = false;
+                                    if state.query.before == 0 {
+                                        state.query.before = state.page.1;
+                                    }
                                     if state.expanded {
                                         if state.scroll >= state.scroll_limit && state.page.0 > 0 {
                                             state.query = GetTranscript {
                                                 before: state.page.0,
-                                                limit: 16,
+                                                limit: 32,
                                                 forward: false,
                                             };
                                             state.scroll = 0;
@@ -826,12 +1053,21 @@ pub async fn run(
                                     {
                                         state.query = GetTranscript {
                                             before: state.page.1,
-                                            limit: 16,
+                                            limit: 32,
                                             forward: true,
                                         };
                                         next_history = Instant::now();
                                     } else {
                                         state.scroll = state.scroll.saturating_sub(8);
+                                        if state.scroll == 0 && state.page.1 == state.page.2 {
+                                            state.follow_tail = true;
+                                            state.reading = None;
+                                            state.query = GetTranscript {
+                                                before: 0,
+                                                limit: 32,
+                                                forward: false,
+                                            };
+                                        }
                                     }
                                 }
                                 Action::Eof => eof = true,
@@ -855,6 +1091,9 @@ pub async fn run(
             }
         }
         if io.raw.is_some() && state.explicit_status && state.wait_clock.tick(Instant::now()) {
+            dirty = true;
+        }
+        if io.raw.is_some() && state.progress.tick(Instant::now()) {
             dirty = true;
         }
         if io.raw.is_some() && dirty {
@@ -892,6 +1131,9 @@ pub async fn run(
     handle.request_shutdown();
     while replies.join_next().await.is_some() {}
     runtime.join().await?;
+    if io.raw.is_some() {
+        io.writer.text("\x1b[1B\r\n".into());
+    }
     if state.exit != 130
         && state
             .snapshot

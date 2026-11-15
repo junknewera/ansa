@@ -7,6 +7,10 @@ pub enum Action {
     ToggleHistory,
     PageUp,
     PageDown,
+    HistoryOlder,
+    HistoryNewer,
+    ToggleTools,
+    CopyHistory,
     Eof,
 }
 #[derive(Default, Debug)]
@@ -33,6 +37,8 @@ impl Editor {
             if !self.escape.is_empty() || ch == 27 {
                 self.escape.push(ch);
                 let action = match self.escape.as_slice() {
+                    b"\x1b[A" => Some(Action::HistoryOlder),
+                    b"\x1b[B" => Some(Action::HistoryNewer),
                     b"\x1b[D" => {
                         if self.cursor > 0 {
                             self.cursor -= 1;
@@ -68,6 +74,8 @@ impl Editor {
             }
             match ch {
                 6 => return Some(Action::ToggleHistory),
+                20 => return Some(Action::ToggleTools),
+                25 => return Some(Action::CopyHistory),
                 9 => return Some(Action::ToggleMode),
                 4 => return self.bytes.is_empty().then_some(Action::Eof),
                 127 | 8 => {

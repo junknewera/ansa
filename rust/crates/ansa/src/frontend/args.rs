@@ -58,11 +58,12 @@ impl Options {
                 }
             }
         }
-        if value
-            .prompt
-            .as_deref()
-            .is_some_and(|s| matches!(s, "/resume" | "/cancel" | "/status" | "/exit" | "/quit"))
-        {
+        if value.prompt.as_deref().is_some_and(|s| {
+            matches!(
+                s,
+                "/resume" | "/cancel" | "/status" | "/copy" | "/exit" | "/quit"
+            )
+        }) {
             return Err("slash_command_requires_stdin");
         }
         Ok(value)
