@@ -1,5 +1,40 @@
 # Состояние ansa
 
+## Rust hotfix P1: SIWC streaming и причины паузы
+
+Проверенный code checkpoint
+[`fba5200`](https://github.com/junknewera/ansa/commit/fba52003ee9825b51af880d22fe1a62060135023),
+2026-11-15. После ручного сбоя `http_content_type_count` исправлена
+несовместимость Rust streaming: SIWC Responses допускает отсутствующий MIME
+только для проверенного endpoint/POST/профиля и HTTP 200, как C++ fallback.
+Strict callers, неверный/повторный MIME, trailers и неполный EOF отклоняются.
+HTTP/1.1 и TLS HTTP/2 регрессии проверяют полный production decode/batch path:
+4 положительных, 24 отклонённых и 4 preconnect controls; при отказах ноль
+executors, в том числе при timeout после полного terminal body.
+
+CLI показывает сохранённую причину паузы, стадию, elapsed и доступность
+Resume/Cancel; `/status`, rejected Submit и restart сохраняют diagnostic.
+Live CLI сообщает о 75 с на один HTTP transfer, не на всю задачу. Отдельные
+DNS/headers/first-token стадии не определяются. Storage diagnostic приоритетнее
+сохранённой причины turn; `effect_unknown` не скрывается. Auto retry не добавлен.
+
+X13s/NixOS/aarch64, stable rustc 1.98.1: workspace **118 native + 9 doctests**,
+Nix Release package с тем же набором тестов, fmt/clippy all features/targets,
+Python harness **163/163**, installed `--self-check`/`--offline-demo` PASS.
+Pinned nightly ASan с instrumented std и leak detection: **118/118** на clean
+`fba5200`. Два независимых reviews PASS; замечания к регрессиям закрыты.
+Первый Nix attempt выявил неверные fixture paths в новых unit tests;
+повторный package build прошёл после перехода на существующие fixture roots.
+
+Evidence, failed attempts, reviews, installed binary и GC root:
+`~/Workspace/pet/ansa-baselines/live-p1-fba5200/`.
+C++ sources/default, Cargo.lock и dependency/toolchain pins неизменны;
+неизменённые C++ reference binaries переиспользованы из M8.
+Это целевой hotfix, не новая полная приёмка M8/M9. Фактические headers сбоя
+пользователя не снимались; ответ реального провайдера после исправления ещё не
+подтверждён. M9 live acceptance/cutover требует отдельного согласования.
+UX-анализ Codex/OpenCode и история ввода остаются в [TODO](TODO.md).
+
 ## Rust migration: M8 закрыт (GO)
 
 **Rust last verified milestone - M8 GO, 2026-11-15**, code checkpoint
