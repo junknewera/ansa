@@ -454,6 +454,34 @@ Crash tests посылают SIGKILL собственным дочерним п�
 - Reconciliation неизвестных эффектов и отдельный compiled file replacement tool требуют самостоятельного контракта. Произвольный shell не обещает preimage/conflict semantics или atomic CAS с внешними writers. Advisory lock и проверки inode/size имеют те же границы.
 - Изменение effective config или начальных AGENTS требует новой сессии из-за exact context epoch; basic/plan задаются отдельно на turn. Полная модельная история по-прежнему восстанавливается replay, стоимость копирования submit map и длительные сессии требуют отдельной проверки. Следующий спринт - orchestrate; MCP, hooks, Ask, интерактивный sudo, отдельный TUI и token-aware budget остаются в [TODO](TODO.md).
 
+## Research proposal: эволюция initial, plan и compact prompts
+
+Срез 2026-11-15 на main baseline
+[a6f2031](https://github.com/junknewera/ansa/commit/a6f203173969c72f9b9e9b0a8ad873958215db6d).
+[Исследование](PROMPT_EVOLUTION_RESEARCH.md) сопоставляет OpenCode, Kimi CLI/Code,
+Codex, Pi, Harness², DeepSeek Harness и Hermes: состав effective request,
+изменения текстов/сборки, причины из commit/PR/review и пределы измерений.
+[Evidence ledger](research/prompt-evolution-evidence.json) хранит 64 выбранных
+события с pinned sources и доступными metadata; полная история всех веток не
+заявляется.
+
+Source review обнаружил compatibility риски будущей замены plan suffix и compact
+prompt: replay сравнивает saved request с заново собранным запросом, где текст
+hardcoded. Это вывод из кода, не выполненная runtime reproduction. Сначала нужен
+явный versioned reconstruction старых policies и соответствующие fixtures.
+Exact provenance, compiled read_only gate и unknown-effect authority уже есть;
+предложенный inspection manifest остаётся производным представлением.
+
+Независимые reviews проверили OpenCode/Kimi, Codex/Hermes, Pi/ANSA и интеграцию
+ledger; уточнения scope и недоказанного эффекта кандидата внесены. Статически
+проверены SHA/dates/counts, локальные ссылки и сохранение прежнего текста docs.
+
+Этот checkpoint — только research/docs. Upstream tests и model experiments
+описаны по источникам, не повторялись; live calls не запускались. Новый prompt
+не внедрён, long-context fidelity не принята, M9 и production checkpoint выше
+не пересматриваются. Следующий шаг — отдельный scope после review предложений,
+с сохранением текущей очереди UX/benchmark и требований совместимости C++ до M10.
+
 ## Первоисточники
 
 Начинай с `src/`, `include/omh/`, `tests/`, [README](../README.md), [architecture.md](architecture.md) и [implementation-report.md](implementation-report.md). Внешние справочные материалы на X13s читай для конкретного вопроса.

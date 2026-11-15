@@ -33,4 +33,10 @@
 - Отдельный TUI поверх общего typed frontend/runtime API; Carbon CLI уже использует производный transcript canonical journal и preview/commit/discard со snapshot/resync.
 - Token-aware context budget и проверка качества compact на длинных задачах.
 
+Исследование [эволюции prompt layers](PROMPT_EVOLUTION_RESEARCH.md) и
+[evidence ledger](research/prompt-evolution-evidence.json) подготовлены отдельно.
+Кандидаты: versioned plan/compact reconstruction, derived inspection manifest и
+проверка handoff fidelity. Это предложения, не реализованные возможности;
+приоритет текущих UX/benchmark задач и отдельный M10 не изменён.
+
 Другие открытые технические ограничения и результаты предыдущих milestones - в [PROJECT_STATE.md](PROJECT_STATE.md).
