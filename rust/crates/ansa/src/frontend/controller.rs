@@ -663,6 +663,7 @@ pub async fn run(
     let mut resync = false;
     let mut next_history = Instant::now();
     let mut next_cancel = Instant::now();
+    let mut next_settled = Instant::now();
     let mut last_frame = None;
     let mut dirty = true;
     let mut interval = tokio::time::interval(Duration::from_millis(10));
@@ -799,6 +800,16 @@ pub async fn run(
         }
         let ready = state.snapshot.is_some();
         if !jsonl_mode && ready && !closed && !finished && !actor_done {
+            // Late tool outcomes need not publish a new snapshot. Refresh the
+            // terminal state until cleanup/storage has actually settled, so
+            // timers and admission cannot stay stuck on a stale busy flag.
+            if state.snapshot.as_ref().is_some_and(|v| {
+                v.worker_busy && matches!(v.state.as_str(), "cancelled" | "paused" | "completed")
+            }) && Instant::now() >= next_settled
+            {
+                state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
+                next_settled = Instant::now() + Duration::from_millis(40);
+            }
             if resync {
                 state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                 resync = false;

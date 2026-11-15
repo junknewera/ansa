@@ -180,7 +180,7 @@ impl Progress {
         }
         match view.state.as_str() {
             "idle" | "completed" => "готов",
-            "cancelled" if view.worker_busy => "отмена",
+            "cancelled" if view.worker_busy => "отменено; завершение",
             "cancelled" => "отменено",
             "paused" => "пауза",
             "generating" if preview => "получение ответа",

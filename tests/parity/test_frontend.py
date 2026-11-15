@@ -3,6 +3,7 @@ import contextlib
 import copy
 import io
 import json
+import runpy
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import frontend
 import sessions
 import frontend_io
 import session_cases
+Terminal = runpy.run_path(str(Path(__file__).parent.parent/'cli_progress_pty.py'))['Terminal']
 
 class Fake:
     root=Path('/tmp/ansa-m4-counterexample')
@@ -35,7 +37,11 @@ class FrontendEvidenceTests(unittest.TestCase):
                         self.assertNotIn('Ожидание ответа:'.encode(),screen.raw);self.assertNotIn(b'HTTP: ',screen.raw)
                         self.assertIn(b'/resume',screen.raw);self.assertIn('продолжить'.encode(),screen.raw)
                         at=len(screen.raw);screen.send('/status\r');screen.wait('paused tools=0',since=at);screen.wait(code,since=at)
-                        at=len(screen.raw);screen.send('another\r');screen.wait(code,since=at)
+                        at=len(screen.raw);screen.send('another\r');screen.wait('another',since=at)
+                        # Delta painting keeps the already visible cause intact.
+                        # Assert the current screen rather than require a duplicate write.
+                        terminal=Terminal();terminal.update(screen.raw)
+                        self.assertIn(code,'\n'.join(terminal.line(i) for i in range(terminal.rows)))
                         self.assertEqual((root/'generated').read_bytes(),b'x')
                         screen.send(b'\x7f'*7+b'\x04');value=screen.finish();self.assertEqual(value['exit'],1);self.assertTrue(value['termios_restored'] and value['flags_restored'])
                     finally:screen.close()

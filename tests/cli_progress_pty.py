@@ -294,6 +294,33 @@ def reading_failure(adapter, output):
         finally:
             (output/'reading-failure-live.pty').write_bytes(screen.raw);screen.close()
 
+def cancel_tool(adapter, output):
+    with tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp') as name:
+        root=Path(name);home,cwd=roots(root)
+        screen=Pty(str(adapter),root,home,cwd,'progress',True)
+        try:
+            screen.wait('basic');screen.send('question\r')
+            screen.wait('get_test_value: выполняется')
+            screen.child.send_signal(signal.SIGINT);screen.wait('отменено')
+            screen.wait('get_test_value: готово')
+            until=time.monotonic()+4
+            if not hasattr(screen,'vt'):screen.vt=Terminal()
+            while True:
+                screen.vt.update(screen.raw);footer=screen.vt.line(-1)
+                if 'отменено' in footer and 'завершение' not in footer:break
+                assert time.monotonic()<until,'cancelled cleanup stayed busy'
+                screen.drain(.01)
+            until=time.monotonic()+1.1
+            while time.monotonic()<until:screen.drain(.01)
+            screen.vt.update(screen.raw)
+            assert screen.vt.line(-1)==footer,'cancelled timer did not stop'
+            at=len(screen.raw);screen.send('next\r');screen.wait('done',at)
+            assert b'ansa: busy' not in screen.raw[at:],'stale busy rejected next task'
+            screen.send(b'\x04')
+            return save(screen,output,'cancel-tool-settled-next-task')
+        finally:
+            (output/'cancel-tool-live.pty').write_bytes(screen.raw);screen.close()
+
 
 def main():
     # Prove that the independent checker rejects in-place dialogue repaint.
@@ -311,7 +338,7 @@ def main():
     rows = recall(binary, args.output)
     rows += [busy(adapter, args.output), tools(adapter, args.output),
              tools(adapter, args.output, plain=False), tools(adapter, args.output, failed=True),
-             reading_failure(adapter,args.output)]
+             reading_failure(adapter,args.output),cancel_tool(adapter,args.output)]
     report = {"passed": len(rows), "cases": rows}
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))
