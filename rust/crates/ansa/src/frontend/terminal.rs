@@ -29,6 +29,7 @@ struct Shared {
     displayed: AtomicU64,
     inflight: AtomicBool,
     changed: tokio::sync::Notify,
+    repaint: AtomicBool,
 }
 pub struct Writer {
     shared: Arc<Shared>,
@@ -50,12 +51,13 @@ impl Writer {
             displayed: AtomicU64::new(0),
             inflight: AtomicBool::new(false),
             changed: tokio::sync::Notify::new(),
+            repaint: AtomicBool::new(false),
         });
         let state = shared.clone();
         let join = thread::Builder::new()
             .name("ansa-output".into())
             .spawn(move || {
-                let mut previous = 0;
+                let mut previous: Option<Frame> = None;
                 loop {
                     let item = {
                         let mut p = state.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -83,10 +85,18 @@ impl Writer {
                         break;
                     };
                     let (sequence, text) = match item {
-                        Item::Text(v) => (0, v),
+                        Item::Text(v) => {
+                            previous = None;
+                            (0, v)
+                        }
                         Item::Frame(sequence, v) => {
-                            let result = v.paint(previous);
-                            previous = v.lines.len();
+                            if state.repaint.swap(false, Ordering::AcqRel) {
+                                previous = None;
+                            }
+                            let result = previous
+                                .as_ref()
+                                .map_or_else(|| v.paint(0), |old| v.paint_changes(old));
+                            previous = Some(v);
                             (sequence, result)
                         }
                     };
@@ -164,6 +174,19 @@ impl Writer {
         p.frame = Some((sequence, frame));
         self.shared.wake.notify_one();
         sequence
+    }
+    pub fn clipboard(&self, text: &str) -> bool {
+        use base64::Engine;
+        if text.len() > super::copy::LIMIT {
+            return false;
+        }
+        self.text(format!(
+            "\x1b]52;c;{}\x07",
+            base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+        ))
+    }
+    pub fn invalidate(&self) {
+        self.shared.repaint.store(true, Ordering::Release);
     }
     pub fn displayed(&self, sequence: u64) -> bool {
         self.shared.displayed.load(Ordering::Acquire) >= sequence

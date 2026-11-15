@@ -56,6 +56,7 @@ fn argument_grammar_keeps_legacy_option_and_prompt_rules() {
         (vec!["a", "b"], "cli_prompt_arguments"),
         (vec!["--unknown", "x"], "unknown_cli_option"),
         (vec!["/cancel"], "slash_command_requires_stdin"),
+        (vec!["/copy"], "slash_command_requires_stdin"),
     ] {
         assert_eq!(args(&input).unwrap_err(), expected);
     }
@@ -137,6 +138,16 @@ fn editor_preserves_utf8_boundaries_and_escape_following_text() {
     assert_eq!(editor.text(), Ok("abc"));
     assert_eq!(editor.feed(9, true), Some(Action::ToggleMode));
     assert_eq!(editor.feed(6, true), Some(Action::ToggleHistory));
+    for (sequence, expected) in [
+        (b"\x1b[A", Action::HistoryOlder),
+        (b"\x1b[B", Action::HistoryNewer),
+    ] {
+        for &ch in &sequence[..2] {
+            assert!(editor.feed(ch, true).is_none());
+        }
+        assert_eq!(editor.feed(sequence[2], true), Some(expected));
+    }
+    assert_eq!(editor.feed(20, true), Some(Action::ToggleTools));
 }
 #[test]
 fn editor_overflow_cannot_be_healed_by_backspaces() {
@@ -226,6 +237,50 @@ fn carbon_keeps_role_markdown_and_clears_shrunk_rows() {
     assert!(small.paint(frame.lines.len()).contains("\x1b7\x1b[1B"));
     assert_eq!(small.cursor, 7);
     assert!(carbon::layout(&history, b"", 0, "basic", false, 0, "", (4, 3), false).is_none());
+    // Full mode owns the real terminal height, and status ticks leave the
+    // selectable dialogue untouched. Resizing repaints the new dimensions.
+    let full = carbon::layout_full(
+        &history,
+        b"draft",
+        3,
+        "basic",
+        0,
+        "context",
+        (80, 48),
+        false,
+    )
+    .unwrap();
+    assert_eq!(full.lines.len(), 48);
+    assert_eq!(full.lines[46], "> draft");
+    assert_eq!(full.cursor, 5);
+    let tick = carbon::layout_full(
+        &history,
+        b"draft",
+        3,
+        "basic  1 с",
+        0,
+        "context",
+        (80, 48),
+        false,
+    )
+    .unwrap();
+    let delta = tick.paint_changes(&full);
+    assert!(!delta.contains("bold") && !delta.contains("draft") && !delta.contains("\x1b[2J"));
+    assert!(delta.contains("1 с"));
+    let resized = carbon::layout_full(
+        &history,
+        b"draft",
+        3,
+        "basic",
+        0,
+        "context",
+        (40, 10),
+        false,
+    )
+    .unwrap();
+    assert_eq!(resized.lines.len(), 10);
+    assert_eq!(resized.lines[8], "> draft");
+    assert!(resized.paint_changes(&full).starts_with("\x1b[H\x1b[2J"));
 }
 #[test]
 fn history_queries_and_preview_cannot_publish_stale_or_tool_round_text() {

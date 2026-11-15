@@ -1,5 +1,57 @@
 # Состояние ansa
 
+## Carbon: полноэкранный диалог и прозрачность задачи
+
+Проверенный code checkpoint
+[`c5534d3`](https://github.com/junknewera/ansa/commit/c5534d3df3f87a21c49e2ef401142ea1e582f804).
+Интерфейс по умолчанию занимает всю высоту терминала, ввод закреплён внизу.
+`PgUp`/`PgDn` открывают всю canonical историю, `Ctrl+F` возвращает к концу.
+При чтении новые события не сдвигают текст; текущие ошибки и уведомления
+показываются отдельно. Delta repaint сохраняет неподвижные строки.
+`↑`/`↓` восстанавливают предыдущие сообщения, черновик и курсор. Footer показывает
+время задачи и настоящий этап; `Ctrl+T` раскрывает tools и их вывод.
+`Ctrl+Y` или `/copy` копирует подтверждённый диалог через OSC 52, до 64 KiB,
+без preview/черновика и без обрезки. После resize сохраняется страница;
+верхняя строка может измениться при переносе текста под новую ширину.
+
+X13s/NixOS/aarch64: Debug и установленный Nix Release **127 native + 9 doctests**,
+fmt/clippy all targets/features, pinned ASan с instrumented std/leak detection
+**127/127**, Python **171/171**, новые PTY **8/8 Debug и 8/8 Release**.
+Изолированный frontend fault **187/187** и независимый raw replay PASS.
+C++ CTest **87/87** повторён на сохранённых native binaries при неизменных
+C++ inputs; прежние M8 ASan/UBSan fallback не пересобирались. Production
+`--self-check`/`--offline-demo` PASS. ELF **6,39 MiB**, closure **63,53 MiB**.
+Зависимости, pins, journal и core не менялись. Полный M8 perf/live не повторялся;
+UX-проверки используют synthetic profiles без реальных credentials/model calls.
+
+Независимый review закрыл потерю черновика при позднем recall, ложное время
+после restart, пропущенный ToolStarted, возврат к началу вместо tail, скрытые
+причины паузы, mutable test snapshot и устаревший busy после отмены tools.
+Terminal-state refresh использует один in-flight GetSnapshot; readonly QueueFull
+повторяется без ложной пользовательской ошибки. Canonical Cancel и known outcomes
+проверяются отдельно от надписи об отмене. Evidence и GC root:
+`~/Workspace/pet/ansa-baselines/carbon-c5534d3/`.
+
+Открытая отдельная задача: под параллельной сборкой large JSONL capture завершился
+exit 1 с усечённым последним snapshot, без stderr; canonical journal, Done и все
+12 outcomes целы. Наиболее вероятен прежний абсолютный deadline drain **250 ms**;
+прямой trace вызова abort не снимался. Этот shutdown/write код не менялся UX-правкой.
+Quiet interleaved M8/current **3+3** попытки и отдельный полный fault gate прошли;
+это не закрывает отказ под нагрузкой. Сохранены failed capture и setup failures.
+Следующий шаг - progress-aware drain с ограниченным ожиданием заблокированного
+stdout, явной диагностикой и регрессией медленного читателя. Эта задача отделена
+от нового frontend; устойчивость большого JSONL под нагрузкой остаётся открытой.
+
+## local-harness-benchmark: отдельный повтор formula после startup fix
+
+Исходный frozen pilot остаётся **4 verified + 1 startup infrastructure error**.
+Повтор только formula на исправленном `f0a34fd` завершился за **14,839 с**:
+один response, ноль tools; независимый blind review **4/4** критериев.
+Результат хранится отдельно:
+`~/Workspace/pet/local-harness-benchmark/results/followups/score-after-startup-fix-20261115/`.
+Пять задач теперь имеют проверенные ответы на двух версиях; это не новый общий
+baseline 5/5. Полный повтор пилота и новые live calls не запускались.
+
 ## JSONL startup: auth access перенесён в dispatch
 
 Проверенный code checkpoint

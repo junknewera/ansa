@@ -10,9 +10,21 @@ pub struct Frame {
     pub lines: Vec<String>,
     pub cursor: usize,
     pub scroll_limit: usize,
+    viewport: Option<(usize, usize)>,
 }
 impl Frame {
     pub fn paint(&self, previous: usize) -> String {
+        if self.viewport.is_some() {
+            let mut out = "\x1b[H\x1b[2J".to_owned();
+            for (i, line) in self.lines.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("\r\n");
+                }
+                out.push_str(line);
+            }
+            out.push_str(&format!("\x1b[1A\r\x1b[{}C", self.cursor));
+            return out;
+        }
         let rows = self.lines.len();
         let mut out = if previous == 0 {
             format!("{}\r\x1b[{}A", "\n".repeat(rows - 1), rows - 1)
@@ -34,6 +46,36 @@ impl Frame {
             }
             out.push_str("\x1b8");
         }
+        out
+    }
+    pub fn paint_changes(&self, previous: &Self) -> String {
+        if self.viewport.is_none()
+            || self.viewport != previous.viewport
+            || self.lines.len() != previous.lines.len()
+        {
+            return self.paint(previous.lines.len());
+        }
+        let mut out = format!("\r\x1b[{}A", previous.lines.len() - 2);
+        let mut row = 0;
+        for (index, line) in self.lines.iter().enumerate() {
+            if previous.lines[index] == *line {
+                continue;
+            }
+            if index > row {
+                out.push_str(&format!("\x1b[{}B", index - row));
+            }
+            out.push_str("\r\x1b[2K");
+            out.push_str(line);
+            row = index;
+        }
+        let target = self.lines.len() - 2;
+        if row > target {
+            out.push_str(&format!("\x1b[{}A", row - target));
+        }
+        if row < target {
+            out.push_str(&format!("\x1b[{}B", target - row));
+        }
+        out.push_str(&format!("\r\x1b[{}C", self.cursor));
         out
     }
 }
@@ -146,11 +188,43 @@ pub fn layout(
     size: (usize, usize),
     color: bool,
 ) -> Option<Frame> {
+    layout_impl(
+        history, input, cursor, status, expanded, scroll, context, size, color, false,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub fn layout_full(
+    history: &[Entry],
+    input: &[u8],
+    cursor: usize,
+    status: &str,
+    scroll: usize,
+    context: &str,
+    size: (usize, usize),
+    color: bool,
+) -> Option<Frame> {
+    layout_impl(
+        history, input, cursor, status, true, scroll, context, size, color, true,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn layout_impl(
+    history: &[Entry],
+    input: &[u8],
+    cursor: usize,
+    status: &str,
+    expanded: bool,
+    scroll: usize,
+    context: &str,
+    size: (usize, usize),
+    color: bool,
+    full: bool,
+) -> Option<Frame> {
     let (cols, rows) = size;
     if cols < 5 || rows < 5 {
         return None;
     }
-    let max_rows = (rows - 1).clamp(4, 30);
+    let max_rows = if full { rows } else { (rows - 1).clamp(4, 30) };
     let cols = cols - 1;
     let width = Width::default();
     let mint = if color { "\x1b[38;2;133;220;177m" } else { "" };
@@ -197,7 +271,7 @@ pub fn layout(
                 }
             }
             let mut bold = false;
-            let mut code = user;
+            let mut code = user || entry.role == "tool" && first;
             let mut at = 0;
             while at < text.len() {
                 if assistant
@@ -276,7 +350,7 @@ pub fn layout(
             first = false;
         }
     }
-    let available = max_rows - 3;
+    let available = max_rows - if full { 5 } else { 3 };
     let end = wrapped.len() - scroll.min(wrapped.len().saturating_sub(1));
     let begin = end.saturating_sub(available);
     let mut header = format!("{mint}{}ansa{reset}", if color { "\x1b[1m" } else { "" });
@@ -294,6 +368,27 @@ pub fn layout(
     }
     let mut lines = vec![header];
     lines.extend_from_slice(&wrapped[begin..end]);
+    let mut status_lines = status.splitn(3, '\n');
+    let status = if full {
+        status_lines.next().unwrap_or("")
+    } else {
+        status
+    };
+    if full {
+        lines.resize(max_rows - 4, String::new());
+        for _ in 0..2 {
+            let mut line = String::new();
+            let mut used = 0;
+            for glyph in glyphs(status_lines.next().unwrap_or("").as_bytes(), &width) {
+                if glyph.newline || used + glyph.width > cols {
+                    break;
+                }
+                line.push_str(&glyph.text);
+                used += glyph.width;
+            }
+            lines.push(line);
+        }
+    }
     let cursor = cursor.min(input.len());
     let before = glyphs(&input[..cursor], &width);
     let after = glyphs(&input[cursor..], &width);
@@ -327,10 +422,14 @@ pub fn layout(
     lines.push(editor);
     let mut clipped = String::new();
     let mut used = 0;
-    let text = format!(
-        "{status}  Tab: режим  Ctrl+F: история{}",
-        if expanded { "  PgUp/PgDn" } else { "" }
-    );
+    let text = if full {
+        format!("{status}  PgUp/PgDn: история  Ctrl+F: вниз")
+    } else {
+        format!(
+            "{status}  Tab: режим  Ctrl+F: история{}",
+            if expanded { "  PgUp/PgDn" } else { "" }
+        )
+    };
     for glyph in glyphs(text.as_bytes(), &width) {
         if glyph.newline || used + glyph.width > cols {
             break;
@@ -343,5 +442,6 @@ pub fn layout(
         lines,
         cursor: 2 + before_width,
         scroll_limit: wrapped.len().saturating_sub(available),
+        viewport: full.then_some(size),
     })
 }
