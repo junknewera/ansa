@@ -156,7 +156,12 @@ def pty_case(c,case,plain=False):
     for observation in result['observations']:
         needle=raw_hex(observation['text_hex']);begin=integer(observation['since']);end=integer(observation['through']);check(needle and 0<=begin<end<=len(raw) and needle in raw[begin:end],'PTY observation raw binding')
     if plain:check(b'\x1b[38;' not in raw and b'\x1b[0m' not in raw,'NO_COLOR')
-    if case=='terminal':first=raw_hex(result['marks']['first']);check(raw.startswith(first) and first and 0<=first.find(b'> EARLIER_CONTEXT')<first.rfind(b'> '),'history-before-input');check(b'\x1b[31m' not in raw and b'assistant manager' in raw and b'next' in raw,'PTY sanitization/busy draft')
+    if case=='terminal':
+        first=raw_hex(result['marks']['first']);check(raw.startswith(first) and first and 0<=first.find(b'> EARLIER_CONTEXT')<first.rfind(b'> '),'history-before-input');check(b'\x1b[31m' not in raw and b'assistant manager' in raw and b'next' in raw,'PTY sanitization/busy draft')
+        check(len(journal)==1,'terminal canonical journal');records=next(iter(journal.values()));accepted=[e for e in records if e['kind']=='accepted'];cancelled=[e for e in records if e['kind']=='cancel']
+        check([e['kind'] for e in records]==['init','accepted','response','done','accepted','cancel'],'terminal active-preview durable trace')
+        check(accepted[0]['command']=='previous' and accepted[0]['turn']==records[2]['turn']==records[3]['turn']=='previous' and accepted[0]['request']=='request_1' and accepted[0]['text']=='EARLIER_CONTEXT **bold** `code` alpha bravo charlie delta \x1b[31m','terminal seed binding')
+        check(accepted[1]['text']=='привет' and accepted[1]['mode']=='basic' and accepted[1]['request']=='request_2' and accepted[1]['turn']!='previous' and cancelled[0]['turn']==accepted[1]['turn'],'busy draft cancelled the active preview turn')
     if case=='reject':mark=raw_hex(result['marks']['rejected']);check(mark and raw.startswith(mark) and b'secondAFTER' in mark,'rejected admission lost input')
     if case=='job-control':check(result['marks'].get('stopped') is True,'job control')
     if case=='preview-invalid':

@@ -9,7 +9,17 @@ use std::{
 pub struct Descriptor {
     fd: OwnedFd,
 }
+impl AsRawFd for Descriptor {
+    fn as_raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+}
 impl Descriptor {
+    pub fn duplicate(&self) -> io::Result<Self> {
+        Ok(Self {
+            fd: rustix::io::fcntl_dupfd_cloexec(&self.fd, 3)?,
+        })
+    }
     pub fn new(raw: i32) -> io::Result<Self> {
         // SAFETY: fcntl accepts a raw descriptor; errors are checked, and a
         // successful duplicate transfers a new owned CLOEXEC descriptor once.
@@ -144,6 +154,12 @@ pub struct Signals {
     _thread: PhantomData<Rc<()>>,
 }
 impl Signals {
+    /// Readiness registration owns a separate CLOEXEC FD, not another reader.
+    pub fn readiness_descriptor(&self) -> io::Result<Descriptor> {
+        Ok(Descriptor {
+            fd: rustix::io::fcntl_dupfd_cloexec(&self.fd, 3)?,
+        })
+    }
     pub fn new() -> io::Result<Self> {
         if std::fs::read_dir("/proc/self/task")?.count() != 1 {
             return Err(io::Error::other("cli_signal_threads"));

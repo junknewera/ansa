@@ -11,6 +11,7 @@ from unittest.mock import patch
 import frontend
 import sessions
 import frontend_io
+import session_cases
 
 class Fake:
     root=Path('/tmp/ansa-m4-counterexample')
@@ -22,6 +23,19 @@ def replace_events(value):value['stdout_hex']=''.join(json.dumps(e,separators=('
 def bridge_fake(name):
     value=control(name);fake=Fake(value);fake.root=Path(json.loads(bytes.fromhex(value['request_hex']))['root']);return fake
 class FrontendEvidenceTests(unittest.TestCase):
+    def test_native_eof_drains_active_turn_without_closed_poll_errors(self):
+        binary=frontend.common.ROOT/'rust/target/debug/examples/frontend_adapter'
+        for plain in (False,True):
+            with self.subTest(plain=plain),tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp') as name:
+                root=Path(name);owner=root/'fixture-owner';owner.write_bytes(b'ansa-m4-synthetic-v1\n');owner.chmod(0o600);root,home,cwd=frontend_io.fixture(root)
+                value=frontend_io.terminal(str(binary),{'case':'eof-drain','plain':plain},root,home,cwd)
+                self.assertEqual(value['exit'],0,bytes.fromhex(value['stdout_hex']))
+                self.assertTrue(value['termios_restored'] and value['flags_restored'])
+                self.assertNotIn(b'runtime_closed',bytes.fromhex(value['stdout_hex']))
+                self.assertEqual((root/'generated').read_bytes(),b'x')
+                groups=frontend.journal_events(value['journals']);self.assertEqual(len(groups),1)
+                records=next(iter(groups.values()));self.assertEqual([e['kind'] for e in records],['init','accepted','response','done'])
+                self.assertEqual(records[1]['text'],'question');self.assertEqual(records[2]['turn'],records[3]['turn'])
     def test_inventory_is_closed_and_unique(self):
         for mode in ('compare','fault'):
             ids=frontend.inventory(mode);self.assertEqual(len(ids),len(set(ids)));self.assertGreater(len(ids),100)
@@ -110,6 +124,17 @@ class FrontendEvidenceTests(unittest.TestCase):
     def test_missing_durable_preview_trace_cannot_pass(self):
         value=control('preview');value['journals']={}
         with self.assertRaises(ValueError):frontend.pty_case(Fake(value),'preview-invalid')
+    def test_terminal_cancel_is_bound_to_active_preview(self):
+        value=control('terminal');frontend.pty_case(Fake(value),'terminal')
+        key=next(iter(value['journals']));original=next(iter(frontend.journal_events(value['journals']).values()))
+        for variant in ('wrong-done','wrong-text','timeout'):
+            with self.subTest(variant=variant):
+                records=copy.deepcopy(original)
+                if variant=='wrong-done':records[3]['turn']=records[4]['turn']
+                elif variant=='wrong-text':records[4]['text']='next'
+                else:records.insert(5,{'kind':'pause','turn':records[4]['turn'],'diagnostic':'fixture_terminal_cancel_timeout'})
+                mutated=copy.deepcopy(value);mutated['journals'][key]=session_cases.encode(records).hex()
+                with self.assertRaises(ValueError):frontend.pty_case(Fake(mutated),'terminal')
     def test_missing_durable_pending_trace_cannot_pass(self):
         value=control('pending');value['journals']={}
         with self.assertRaises(ValueError):frontend.fault_case(Fake(value),'pending')

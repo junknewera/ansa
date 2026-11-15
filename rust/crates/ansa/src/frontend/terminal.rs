@@ -28,6 +28,7 @@ struct Shared {
     sequence: AtomicU64,
     displayed: AtomicU64,
     inflight: AtomicBool,
+    changed: tokio::sync::Notify,
 }
 pub struct Writer {
     shared: Arc<Shared>,
@@ -48,6 +49,7 @@ impl Writer {
             sequence: AtomicU64::new(0),
             displayed: AtomicU64::new(0),
             inflight: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
         });
         let state = shared.clone();
         let join = thread::Builder::new()
@@ -107,12 +109,14 @@ impl Writer {
                         }
                     }
                     if state.failed.load(Ordering::Acquire) {
+                        state.changed.notify_one();
                         break;
                     }
                     state.inflight.store(false, Ordering::Release);
                     if remaining.is_empty() && sequence > 0 {
                         state.displayed.store(sequence, Ordering::Release);
                     }
+                    state.changed.notify_one();
                 }
             })
             .map_err(|_| "cli_output_thread")?;
@@ -128,6 +132,9 @@ impl Writer {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         p.queue.len() < 32 && p.bytes <= 16 * 1024 * 1024
+    }
+    pub async fn changed(&self) {
+        self.shared.changed.notified().await;
     }
     pub fn text(&self, text: String) -> bool {
         if text.len() > 16 * 1024 * 1024 + 1 {

@@ -31,7 +31,7 @@ pub fn preview_visible(
         && request.is_some()
         && preview.is_some_and(|p| !p.text.is_empty() && (p.state != "committed" || completed))
 }
-type Replies = JoinSet<(CommandId, bool, Result<PostStatus>)>;
+type Replies = JoinSet<(CommandId, bool, bool, Result<PostStatus>)>;
 pub struct State {
     pub snapshot: Option<Snapshot>,
     pub turn: TurnId,
@@ -103,6 +103,27 @@ impl State {
         }
     }
     fn post(&mut self, handle: &Handle, payload: CommandPayload, replies: &mut Replies) -> bool {
+        self.post_with_origin(handle, payload, replies, false)
+    }
+    fn post_read(
+        &mut self,
+        handle: &Handle,
+        payload: CommandPayload,
+        replies: &mut Replies,
+    ) -> bool {
+        debug_assert!(matches!(
+            payload,
+            CommandPayload::GetSnapshot(_) | CommandPayload::GetTranscript(_)
+        ));
+        self.post_with_origin(handle, payload, replies, true)
+    }
+    fn post_with_origin(
+        &mut self,
+        handle: &Handle,
+        payload: CommandPayload,
+        replies: &mut Replies,
+        internal_read: bool,
+    ) -> bool {
         if replies.len() >= 64 {
             return false;
         }
@@ -114,7 +135,7 @@ impl State {
         let h = handle.clone();
         replies.spawn(async move {
             let id = command.command.clone();
-            (id, submit, h.post(command).await)
+            (id, submit, internal_read, h.post(command).await)
         });
         true
     }
@@ -170,7 +191,7 @@ impl State {
             "/cancel" => {
                 if self.awaiting() {
                     self.deferred_cancel = true;
-                    self.post(handle, CommandPayload::GetSnapshot(0), replies);
+                    self.post_read(handle, CommandPayload::GetSnapshot(0), replies);
                 } else if let Some(target) = self.snapshot.as_ref().and_then(|v| v.request.clone())
                 {
                     self.post(handle, CommandPayload::Cancel(target), replies);
@@ -379,6 +400,17 @@ impl State {
         Some(frame)
     }
 }
+fn readiness_source(
+    descriptor: ansa_linux::terminal::Descriptor,
+) -> std::io::Result<tokio::io::unix::AsyncFd<ansa_linux::terminal::Descriptor>> {
+    // Pinned Tokio's legacy safe constructor requires a stable owned FD in
+    // practice. Descriptor owns a private OwnedFd; these local registrations
+    // only expose immutable access and never replace/close their inner value.
+    // Registration drops before Descriptor and before Io restores its guards.
+    #[allow(deprecated)]
+    tokio::io::unix::AsyncFd::with_interest(descriptor, tokio::io::Interest::READABLE)
+}
+
 pub async fn run(
     runtime: &mut Runtime,
     io: &mut Io,
@@ -406,6 +438,18 @@ pub async fn run(
     let mut dirty = true;
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Regular files do not support epoll: keep the bounded polling fallback.
+    let input_events = if prompt.is_none() {
+        readiness_source(io.input.duplicate().map_err(|_| "cli_input_poll")?).ok()
+    } else {
+        None
+    };
+    let signal_events = readiness_source(
+        io.signals
+            .readiness_descriptor()
+            .map_err(|_| "cli_signal_poll")?,
+    )
+    .map_err(|_| "cli_signal_poll")?;
     loop {
         if finished || io.writer.failed() {
             handle.request_shutdown();
@@ -419,10 +463,25 @@ pub async fn run(
             }
             break;
         }
+        let can_read = !eof
+            && !finished
+            && (!jsonl_mode || replies.is_empty())
+            && state.pending_draft.is_none()
+            && prompt.is_none()
+            && (jsonl_mode
+                || (state.snapshot.is_some()
+                    && (io.raw.is_none()
+                        || (state.history_ready
+                            && first_frame.is_some_and(|v| io.writer.displayed(v))))));
+        let mut input_guard = None;
+        let mut signal_guard = None;
         tokio::select! {biased;
             reply=replies.join_next(),if !replies.is_empty()=>{
-                if let Some(reply)=reply {dirty=true;let (id,submit,result)=reply.map_err(|_|"cli_post_task")?;
-                    let code=match result {Ok(PostStatus::Accepted|PostStatus::Duplicate)=>None,Ok(PostStatus::QueueFull)=>Some("command_queue_full"),Ok(PostStatus::Closed)=>Some("runtime_closed"),Ok(PostStatus::StaleTarget)=>Some("stale_cancel_target"),Ok(PostStatus::StaleIncarnation)=>Some("stale_incarnation"),Ok(PostStatus::CommandIdLimit)=>Some("submit_id_limit"),Ok(PostStatus::CommandConflict)=>Some("command_id_conflict"),Err(code)=>Some(code)};
+                if let Some(reply)=reply {dirty=true;let (id,submit,internal_read,result)=reply.map_err(|_|"cli_post_task")?;
+                    // An internal read already queued at a local shutdown can
+                    // lose its reply. Explicit/user commands still report Closed.
+                    let expected_close=internal_read&&(closed||finished)&&matches!(&result,Ok(PostStatus::Closed));
+                    let code=if expected_close {None}else{match result {Ok(PostStatus::Accepted|PostStatus::Duplicate)=>None,Ok(PostStatus::QueueFull)=>Some("command_queue_full"),Ok(PostStatus::Closed)=>Some("runtime_closed"),Ok(PostStatus::StaleTarget)=>Some("stale_cancel_target"),Ok(PostStatus::StaleIncarnation)=>Some("stale_incarnation"),Ok(PostStatus::CommandIdLimit)=>Some("submit_id_limit"),Ok(PostStatus::CommandConflict)=>Some("command_id_conflict"),Err(code)=>Some(code)}};
                     if state.pending_draft.as_ref().is_some_and(|(draft,_,_)|draft==&id){let (_,bytes,cursor)=state.pending_draft.take().expect("checked");if code.is_some(){state.editor.bytes=bytes;state.editor.cursor=cursor;}}
                     if let Some(code)=code {
                         if submit && state.pending.as_ref()==Some(&id) {
@@ -441,6 +500,9 @@ pub async fn run(
                 if let Some(event)=event {dirty=true;if jsonl_mode {io.writer.text(jsonl::encode(&event).dump()+"\n");}else{if matches!(event.payload,EventPayload::ResyncRequired {..}){resync=true;}state.apply(&event,io);}}else{events_done=true;}
             },
             result=runtime.join(),if !actor_done=>{result?;actor_done=true;actor_deadline=Some(Instant::now()+Duration::from_millis(250));},
+            ready=async {input_events.as_ref().expect("enabled").readable().await},if can_read&&input_events.is_some()=>{input_guard=Some(ready.map_err(|_|"cli_input_poll")?);},
+            ready=signal_events.readable()=>{signal_guard=Some(ready.map_err(|_|"cli_signal_poll")?);},
+            _=io.writer.changed()=>{},
             _=interval.tick()=>{},
         }
         while let Some(signal) = io.signals.take().map_err(|_| "cli_signal_read")? {
@@ -459,7 +521,7 @@ pub async fn run(
                     if !state.cancelled && state.awaiting() {
                         state.cancelled = true;
                         state.deferred_cancel = true;
-                        state.post(&handle, CommandPayload::GetSnapshot(0), &mut replies);
+                        state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                     } else if !state.cancelled
                         && state.snapshot.as_ref().is_some_and(|v| {
                             v.request.is_some()
@@ -502,13 +564,13 @@ pub async fn run(
             }
         }
         let ready = state.snapshot.is_some();
-        if !jsonl_mode && ready {
+        if !jsonl_mode && ready && !closed && !finished && !actor_done {
             if resync {
-                state.post(&handle, CommandPayload::GetSnapshot(0), &mut replies);
+                state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                 resync = false;
             }
             if io.raw.is_some() && Instant::now() >= next_history {
-                state.post(
+                state.post_read(
                     &handle,
                     CommandPayload::GetTranscript(state.query.clone()),
                     &mut replies,
@@ -522,7 +584,7 @@ pub async fn run(
                     }
                     state.deferred_cancel = false;
                 } else if Instant::now() >= next_cancel {
-                    state.post(&handle, CommandPayload::GetSnapshot(0), &mut replies);
+                    state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                     next_cancel = Instant::now() + Duration::from_millis(40);
                 }
             }
@@ -558,16 +620,6 @@ pub async fn run(
                     finished = true;
                     handle.request_shutdown();
                 }
-            }
-            if io.raw.is_some() && dirty {
-                if let Some(frame) = state.render(io, context)
-                    && last_frame.as_ref() != Some(&frame)
-                {
-                    let sequence = io.writer.frame(frame.clone());
-                    first_frame.get_or_insert(sequence);
-                    last_frame = Some(frame);
-                }
-                dirty = false;
             }
         }
         if !eof
@@ -734,10 +786,37 @@ pub async fn run(
                 Err(_) => return Err("cli_input_read"),
             }
         }
+        if io.raw.is_some() && dirty {
+            if let Some(frame) = state.render(io, context)
+                && last_frame.as_ref() != Some(&frame)
+            {
+                let sequence = io.writer.frame(frame.clone());
+                first_frame.get_or_insert(sequence);
+                last_frame = Some(frame);
+            }
+            dirty = false;
+        }
+        // Preserve cached readiness while bytes remain, including deferred input.
+        if let Some(mut guard) = input_guard
+            && !io.input.ready(false).map_err(|_| "cli_input_poll")?
+        {
+            guard.clear_ready();
+        }
+        if let Some(mut guard) = signal_guard
+            && !signal_events
+                .get_ref()
+                .ready(false)
+                .map_err(|_| "cli_signal_poll")?
+        {
+            guard.clear_ready();
+        }
         if eof && !closed && !state.deferred_cancel && replies.is_empty() {
             handle.close_input();
             closed = true;
         }
+        // A perpetually readable TTY must yield to post tasks, timers and the
+        // reactor; AsyncFd::readable itself does not consume Tokio's budget.
+        tokio::task::yield_now().await;
     }
     handle.request_shutdown();
     while replies.join_next().await.is_some() {}
@@ -781,7 +860,7 @@ fn post_line(bytes: &[u8], handle: &Handle, io: &Io, replies: &mut Replies) {
                 io.status(&(jsonl::error("command_queue_full", correlated).dump() + "\n"));
             } else {
                 let h = handle.clone();
-                replies.spawn(async move { (id, false, h.post(command).await) });
+                replies.spawn(async move { (id, false, false, h.post(command).await) });
             }
         }
         Err(code) => io.status(&(jsonl::error(code, None).dump() + "\n")),

@@ -174,11 +174,13 @@ class Pty:
         return {'exit':self.child.returncode,'stdout_hex':self.raw.hex(),'observations':self.observations,'termios_restored':restored==self.original,'flags_restored':flags==self.flags}
     def close(self):stop(self.child);os.close(self.master);os.close(self.slave)
 def terminal(binary,row,root,home,cwd):
-    case=row['case'];mode='terminal' if case=='terminal' else 'limit' if case=='reject' else 'preview-invalid' if case=='preview-invalid' else 'cancel'
+    case=row['case'];mode='terminal' if case=='terminal' else 'limit' if case=='reject' else 'preview-invalid' if case=='preview-invalid' else 'eof-drain' if case=='eof-drain' else 'cancel'
     screen=Pty(binary,root,home,cwd,mode,row.get('plain',False));marks={}
     try:
         screen.wait('basic')
-        if case=='terminal':
+        if case=='eof-drain':
+            screen.send('question\r');wait_file(root/'generated');need(b'done' not in screen.raw,'EOF followed terminal response');screen.send(b'\x04')
+        elif case=='terminal':
             need(not (root/'generated').exists(),'generation before first history frame')
             need(screen.raw.find(b'> EARLIER_CONTEXT')<screen.raw.rfind(b'> '),'history before first input')
             marks['first']=screen.raw.hex();screen.send(b'\t');screen.wait('plan');screen.send(b'\x1b[Z');screen.wait('basic',since=len(bytes.fromhex(marks['first'])))

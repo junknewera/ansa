@@ -1,5 +1,5 @@
 {
-  description = "ansa: C++20 local agent and Rust migration scaffold";
+  description = "ansa: C++20 local agent and Rust migration";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/7fd4004d0511991fff3a0524856a9be09e28c5f0";
   outputs = { nixpkgs, ... }:
     let
@@ -53,6 +53,11 @@
           default = pkgs.mkShell {
             inputsFrom = [ (package system) ];
             packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy pkgs.python3 ];
+          };
+        } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
+          quality = pkgs.mkShell {
+            packages = [ (pkgs.callPackage ./nix/quality-toolchain.nix {}) pkgs.python3 ];
+            inputsFrom = [ (package system) ];
           };
         });
     };

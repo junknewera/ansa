@@ -1,0 +1,32 @@
+{
+  "components": {
+    "cargo": {
+      "sha256": "9a4841d2a2f90b8cd865f17ff092fecbd6d762d12e9a3a54a3ecfe002037d41e",
+      "url": "https://static.rust-lang.org/dist/2026-11-13/cargo-nightly-aarch64-unknown-linux-gnu.tar.xz",
+      "version": "0.103.0-nightly (ede6cefea 2026-11-11)"
+    },
+    "miri-preview": {
+      "sha256": "87dc51dfaaa0174010b2a289abbcb3722eec8f6db408e30dbf837d2022fdf636",
+      "url": "https://static.rust-lang.org/dist/2026-11-13/miri-nightly-aarch64-unknown-linux-gnu.tar.xz",
+      "version": "0.1.0-nightly"
+    },
+    "rust-src": {
+      "sha256": "76f91b25ef13a7ced62f195cc25b257a10b1201afddcf07d33d740530814b1d8",
+      "url": "https://static.rust-lang.org/dist/2026-11-13/rust-src-nightly.tar.xz",
+      "version": "1.102.0-nightly (8eb778d04 2026-11-12)"
+    },
+    "rust-std": {
+      "sha256": "d0e5d5d7c0f2d93aacf84444f82d49dcb2e0ce82d176f174d3eb1b15c29ce906",
+      "url": "https://static.rust-lang.org/dist/2026-11-13/rust-std-nightly-aarch64-unknown-linux-gnu.tar.xz",
+      "version": "1.102.0-nightly (8eb778d04 2026-11-12)"
+    },
+    "rustc": {
+      "sha256": "bd0900228bccb8f74d1b7b456520a96fb6a12299cbaf50ab99fdf57a8a049ccb",
+      "url": "https://static.rust-lang.org/dist/2026-11-13/rustc-nightly-aarch64-unknown-linux-gnu.tar.xz",
+      "version": "1.102.0-nightly (8eb778d04 2026-11-12)"
+    }
+  },
+  "date": "2026-11-13",
+  "manifest_sha256": "f40c762a71846e6c75cf351f9c30b1f9d0d5119ca46673a90bfde100f4eae3e2",
+  "target": "aarch64-unknown-linux-gnu"
+}

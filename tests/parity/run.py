@@ -44,7 +44,7 @@ def source_info():
     def git(*args):
         return subprocess.check_output(["git", "-C", str(ROOT), *args], timeout=15)
     paths = git("ls-files", "--cached", "--others", "--exclude-standard", "-z", "--",
-                "CMakeLists.txt", "flake.nix", "flake.lock", "include", "src", "tests", "rust")
+                "CMakeLists.txt", "flake.nix", "flake.lock", "include", "src", "tests", "rust", "nix")
     # Only reviewed code/config/fixture types; never inspect environment/credential files.
     suffixes = {".cpp", ".hpp", ".rs", ".py", ".sh", ".cmake", ".nix", ".json", ".sse", ".toml", ".lock"}
     files = {}
@@ -356,16 +356,25 @@ def main():
     cap.add_argument("--output", type=Path, required=True)
     cap.add_argument("--run-ctest", action="store_true")
     chk = sub.add_parser("check", help="validate native M0, M1 risk, M2 protocol or M3 auth evidence")
-    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7"], required=True)
+    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"], required=True)
     chk.add_argument("--evidence", type=Path, required=True)
     chk.add_argument("--fault-evidence", type=Path)
     for name, description in (("compare", "capture native parity rows for risk, protocol or auth"),
                               ("fault", "capture native fault rows for risk, protocol or auth"),
-                              ("perf", "not implemented (always nonzero)")):
+                              ("perf", "capture release resource measurements against frozen M0 budgets")):
         future = sub.add_parser(name, help=description)
         for option in ("suite", "cpp-build", "rust-target", "output"):
             future.add_argument("--" + option)
+        if name == "perf":
+            future.add_argument("--cpp", required=True)
+            future.add_argument("--rust", required=True)
     args = parser.parse_args()
+    if args.action == "perf":
+        import performance
+        return performance.capture(args)
+    if args.action in ("compare", "fault") and args.suite == "e2e":
+        import e2e
+        return e2e.capture(args)
     if args.action in ("compare", "fault", "perf"):
         if args.action in ("compare", "fault") and args.suite == "risk":
             import risk
@@ -391,6 +400,9 @@ def main():
         print(args.action + ": suite not implemented in M0", file=sys.stderr)
         return 2
     try:
+        if args.action == "check" and args.milestone == "M8":
+            import e2e
+            return e2e.check_evidence(args.evidence, args.fault_evidence)
         if args.action == "check" and args.milestone == "M1":
             import risk
             return risk.check(args.evidence.resolve(), args.fault_evidence)

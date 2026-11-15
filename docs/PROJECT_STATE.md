@@ -1,5 +1,40 @@
 # Состояние ansa
 
+## Rust migration: M8 закрыт (GO)
+
+**Rust last verified milestone - M8 GO, 2026-11-15**, code checkpoint
+[`50f016f`](https://github.com/junknewera/ansa/commit/50f016fc52a05388b4b3338e4355a669ff0271e8),
+tag `migration/m8-offline-parity`. Полная synthetic offline-композиция и
+замороженные M0/согласованные M8 resource budgets прошли приёмку.
+Production/default остаётся C++20; Rust package - `ansa-rs`.
+
+X13s/NixOS/aarch64: C++ Debug/Release **87/87**; ASan/UBSan **85 sanitized +
+2 Debug mutation checks**. Rust **105 integration + 7 unit + 9 doctests**,
+fmt/clippy all features/targets, Python harness **162/162**, preflight **11/11**,
+Nix flake check PASS. Nightly ASan/LSan/TSan **112/112 каждый**, Miri **2/2**
+на точном clean code SHA. Offline **8763 compare / 2026 fault**, включая
+20 repeated races, плюс **3 TTY flood runs**; raw checkers PASS.
+
+JSON sharing, readiness input и receipt delta устранили лишнее копирование.
+Исправлена EOF/shutdown гонка: successful turn больше не получает ложный exit 1
+из-за фонового history query после close. Native regression до правки ошибался
+в обоих PTY modes; после правки сохраняет durable Done и exit 0.
+
+Все performance budgets PASS: startup/history/preview/Done/Cancel/cleanup/fsync,
+SSE, safe CLI, RSS, size/closure и clean/incremental build при -j2. История 4096:
+p95 Rust **4,01 с**, C++ **9,80 с**. Rust executable **6,29 MiB**, closure
+**63,43 MiB**; clean own-target Release max **26,39 с**, incremental **0,962 с**.
+Состоялись два независимых reviews, полный independent raw replay и source proofs.
+Cargo.lock, 146 external packages и numeric M0 budgets не менялись.
+
+Evidence, failed attempts, standalone binaries, source/handoff bundles, integrity
+manifest и GC roots: `~/Workspace/pet/ansa-baselines/m8-50f016f/`.
+C++ executable побайтово совпадает с M7 fallback; прежний archive сохранён.
+Методы, точные результаты и ограничения - [M8 report](migration/M8.md).
+
+Следующий этап - отдельно согласовать M9: bounded live acceptance и обратимый
+cutover. Он остаётся **NOT AUTHORIZED**; автоматически его не начинать.
+
 ## Rust migration: M7 закрыт (GO)
 
 **Rust last verified milestone - M7 GO, 2026-11-14**, code checkpoint

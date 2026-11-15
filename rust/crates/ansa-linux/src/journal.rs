@@ -2,6 +2,122 @@
 use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags};
 use std::{fs::File, io, os::unix::fs::MetadataExt, path::Path};
 
+/// Test-only workspace creation anchored to a verified synthetic root.
+#[cfg(feature = "fixture-e2e")]
+pub fn fixture_workspace(root: &Path) -> io::Result<()> {
+    fixture_root(root)?;
+    fn child(parent: &File, name: &str) -> io::Result<File> {
+        match fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => (),
+            Err(error) => return Err(error.into()),
+        }
+        let fd = fs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file = File::from(fd);
+        let meta = file.metadata()?;
+        if meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::other("fixture_directory"));
+        }
+        Ok(file)
+    }
+    let parent = crate::fs::private_directory(root)?;
+    let home = child(&parent, "home")?;
+    let cwd = child(&home, "workspace")?;
+    child(&parent, "journal")?;
+    child(&parent, "auth")?;
+    fixture_files(&cwd, false)
+}
+
+/// Each measurement scope is a separate owned workspace, including shell outputs.
+#[cfg(feature = "fixture-e2e")]
+pub fn fixture_scope(root: &Path, scope: &str) -> io::Result<()> {
+    fixture_root(root)?;
+    if !scope.starts_with("metrics_")
+        || scope.len() > 64
+        || !scope
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(io::Error::other("fixture_scope"));
+    }
+    let mut directory = crate::fs::private_directory(root)?;
+    for name in ["home", "workspace", scope] {
+        directory = File::from(fs::openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let meta = directory.metadata()?;
+        if meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::other("fixture_scope_directory"));
+        }
+    }
+    fixture_files(&directory, true)
+}
+
+#[cfg(feature = "fixture-e2e")]
+fn fixture_files(cwd: &File, fresh_process: bool) -> io::Result<()> {
+    use std::io::{Read, Write};
+    if fresh_process {
+        for name in ["primary", "ready"] {
+            match fs::statat(cwd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(rustix::io::Errno::NOENT) => (),
+                _ => return Err(io::Error::other("fixture_readiness_exists")),
+            }
+        }
+    }
+    match fs::openat(
+        cwd,
+        "value.txt",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    ) {
+        Ok(fd) => {
+            let mut file = File::from(fd);
+            file.write_all(b"SOURCE_VALUE\n")?;
+            file.sync_all()?;
+        }
+        Err(rustix::io::Errno::EXIST) => (),
+        Err(error) => return Err(error.into()),
+    }
+    for (name, limit) in [("value.txt", 13), ("marker", 4096)] {
+        let fd = match fs::openat(
+            cwd,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) if name == "marker" => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut file = File::from(fd);
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.nlink() != 1
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.len() > limit
+        {
+            return Err(io::Error::other("fixture_file"));
+        }
+        let mut bytes = vec![];
+        Read::by_ref(&mut file)
+            .take(limit + 1)
+            .read_to_end(&mut bytes)?;
+        if (name == "value.txt" && bytes != b"SOURCE_VALUE\n")
+            || (name == "marker" && bytes.iter().any(|b| *b != b'x'))
+        {
+            return Err(io::Error::other("fixture_data"));
+        }
+    }
+    Ok(())
+}
+
 pub struct Files {
     directory: File,
     _lock: File,
@@ -130,8 +246,18 @@ impl Catalog {
             }
             let meta = fs::statat(&directory, entry.file_name(), AtFlags::empty())?;
             if fs::FileType::from_raw_mode(meta.st_mode) == fs::FileType::RegularFile {
-                result = Some(result.map_or((meta.st_mtime, meta.st_mtime_nsec), |old| {
-                    std::cmp::max(old, (meta.st_mtime, meta.st_mtime_nsec))
+                // rustix's libc backend (including Miri) uses signed nanoseconds;
+                // the raw Linux backend uses u64. Normalize without wrapping.
+                #[allow(clippy::useless_conversion)]
+                let nanos: u64 = meta
+                    .st_mtime_nsec
+                    .try_into()
+                    .map_err(|_| io::Error::other("session_mtime"))?;
+                if nanos >= 1_000_000_000 {
+                    return Err(io::Error::other("session_mtime"));
+                }
+                result = Some(result.map_or((meta.st_mtime, nanos), |old| {
+                    std::cmp::max(old, (meta.st_mtime, nanos))
                 }));
             }
         }
