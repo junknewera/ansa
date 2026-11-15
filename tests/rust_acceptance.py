@@ -137,7 +137,9 @@ def canaries(binary, output):
                     connection.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
                 lines.until(lambda es: any(e['type'] == 'snapshot' and e['state'] == 'paused' for e in es))
                 result = lines.finish()
-                assert result['exit'] == 1
+                # A handled runtime failure is a versioned JSONL error/snapshot;
+                # transport EOF remains successful, as in the legacy client.
+                assert result['exit'] == 0, 'JSONL EOF exit status'
                 assert not any(e['type'] in ('tool_started', 'tool_finished', 'done', 'text_delta') for e in lines.events)
                 parts = {Path(name).name: bytes.fromhex(data) for name, data in io.journals(root).items()}
                 records = session_cases.decode(parts)
