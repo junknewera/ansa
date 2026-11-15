@@ -278,6 +278,10 @@ def busy(adapter, output):
             texts=[item['content'] for item in delivered[0]['next']['input'] if item.get('role')=='user']
             assert texts[-2:]==['first',message] and texts.count(message)==1,texts
             assert not any(event['kind']=='done' and event.get('turn')==queued[0]['turn'] for event in events),'large task finished before delivery'
+            # The external journal/worker marker precedes UI snapshot delivery.
+            # Copy intentionally pins the last snapshot applied by the frontend.
+            until(screen,lambda:any('чтение, новых: 1' in screen.vt.line(row) for row in range(screen.vt.rows)),
+                  'UI snapshot includes the delivered message before copy')
             editor(screen,draft);screen.vt.update(screen.raw)
             assert body==frozen_body(screen.vt),'steering moved frozen conversation'
             at=len(screen.raw);screen.send(b'\x19')
