@@ -1,6 +1,6 @@
 //! Bounded user-facing status derived from the runtime snapshot.
 use super::protocol_v1::{RequestId, Snapshot};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub(crate) fn safe_code(code: &str) -> &str {
     if code.len() <= 64 && crate::provider::contracts::valid_id(code) {
@@ -13,6 +13,7 @@ pub(crate) fn safe_code(code: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     fn view() -> Snapshot {
         Snapshot {
             through_sequence: 1,
@@ -77,36 +78,17 @@ mod tests {
         clock.observe(&v, start);
         clock.observe(&v, start + Duration::from_secs(1));
         assert!(clock.tick(start + Duration::from_secs(3)));
-        assert!(clock.text(None).unwrap().contains("3 с"));
+        assert!(clock.text().unwrap().contains("3 с"));
         assert!(!clock.tick(start + Duration::from_millis(3100)));
         v.request = Some("request_2".into());
         clock.observe(&v, start + Duration::from_secs(4));
-        assert!(clock.text(None).unwrap().contains("0 с"));
+        assert!(clock.text().unwrap().contains("0 с"));
         v.state = "executing".into();
         clock.observe(&v, start + Duration::from_secs(5));
-        assert!(clock.text(None).unwrap().contains("Выполнение инструмента"));
+        assert!(clock.text().unwrap().contains("Выполнение инструмента"));
         v.worker_busy = false;
         clock.observe(&v, start + Duration::from_secs(6));
-        assert!(clock.text(None).is_none());
-    }
-    #[test]
-    fn http_hint_is_opt_in_and_never_a_turn_deadline() {
-        let mut v = view();
-        v.state = "generating".into();
-        v.worker_busy = true;
-        let mut clock = WaitClock::default();
-        clock.observe(&v, Instant::now());
-        assert!(!clock.text(None).unwrap().contains("HTTP"));
-        let text = clock.text(Some(Duration::from_secs(75))).unwrap();
-        assert!(text.contains("75 с на запрос, не на всю задачу"));
-        v.state = "executing".into();
-        clock.observe(&v, Instant::now());
-        assert!(
-            !clock
-                .text(Some(Duration::from_secs(75)))
-                .unwrap()
-                .contains("HTTP")
-        );
+        assert!(clock.text().is_none());
     }
 }
 pub(crate) fn error(code: &str) -> String {
@@ -188,25 +170,16 @@ impl WaitClock {
         self.seconds = seconds;
         changed
     }
-    pub fn text(&self, http_timeout: Option<Duration>) -> Option<String> {
+    pub fn text(&self) -> Option<String> {
         self.started?;
         let stage = match self.stage.as_str() {
             "loading" => "Открытие сессии",
-            "generating" => "Ожидание/обработка ответа провайдера",
+            "generating" => "Ожидание ответа",
             "compacting" => "Сжатие контекста",
             "executing" => "Выполнение инструмента",
             "persisting" | "finishing" => "Сохранение результата",
             _ => "Ожидание завершения операции",
         };
-        let mut text = format!("{stage}: {} с", self.seconds);
-        if let Some(timeout) =
-            http_timeout.filter(|_| matches!(self.stage.as_str(), "generating" | "compacting"))
-        {
-            text.push_str(&format!(
-                ". HTTP: до {} с на запрос, не на всю задачу",
-                timeout.as_secs()
-            ));
-        }
-        Some(text)
+        Some(format!("{stage}: {} с", self.seconds))
     }
 }

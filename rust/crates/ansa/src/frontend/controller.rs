@@ -60,7 +60,6 @@ pub struct State {
     pending_draft: Option<(CommandId, Vec<u8>, usize)>,
     last_pause: String,
     wait_clock: WaitClock,
-    http_timeout: Option<Duration>,
     explicit_status: bool,
 }
 impl State {
@@ -96,7 +95,6 @@ impl State {
             pending_draft: None,
             last_pause: String::new(),
             wait_clock: WaitClock::default(),
-            http_timeout: None,
             explicit_status: false,
         }
     }
@@ -177,7 +175,7 @@ impl State {
             text.push('\n');
             text.push_str(&diagnostics::pause(view));
         }
-        if let Some(wait) = self.wait_clock.text(self.http_timeout) {
+        if let Some(wait) = self.wait_clock.text() {
             text.push('\n');
             text.push_str(&wait);
         }
@@ -443,12 +441,6 @@ impl State {
                 text: self.status.clone(),
             });
         }
-        if let Some(text) = self.wait_clock.text(self.http_timeout) {
-            entries.push(Entry {
-                role: "status".into(),
-                text,
-            });
-        }
         if self.explicit_status {
             entries.push(Entry {
                 role: "status".into(),
@@ -494,19 +486,8 @@ pub async fn run(
     jsonl_mode: bool,
     context: &str,
 ) -> Result<i32> {
-    run_with_http_timeout(runtime, io, prompt, jsonl_mode, context, None).await
-}
-pub(crate) async fn run_with_http_timeout(
-    runtime: &mut Runtime,
-    io: &mut Io,
-    prompt: Option<&str>,
-    jsonl_mode: bool,
-    context: &str,
-    http_timeout: Option<Duration>,
-) -> Result<i32> {
     let handle = runtime.handle();
     let mut state = State::new(&handle);
-    state.http_timeout = http_timeout;
     let mut replies = Replies::new();
     let mut eof = false;
     let mut closed = false;
@@ -873,7 +854,7 @@ pub(crate) async fn run_with_http_timeout(
                 Err(_) => return Err("cli_input_read"),
             }
         }
-        if io.raw.is_some() && state.wait_clock.tick(Instant::now()) {
+        if io.raw.is_some() && state.explicit_status && state.wait_clock.tick(Instant::now()) {
             dirty = true;
         }
         if io.raw.is_some() && dirty {

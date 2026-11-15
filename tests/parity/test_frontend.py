@@ -32,7 +32,7 @@ class FrontendEvidenceTests(unittest.TestCase):
                     screen=frontend_io.Pty(str(binary),root,home,cwd,mode,plain)
                     try:
                         screen.wait('basic');screen.send('question\r');screen.wait(code,timeout=4);screen.wait('пауза')
-                        self.assertIn(b'1 '+ 'с'.encode(),screen.raw);self.assertNotIn(b'HTTP: ',screen.raw)
+                        self.assertNotIn('Ожидание ответа:'.encode(),screen.raw);self.assertNotIn(b'HTTP: ',screen.raw)
                         self.assertIn(b'/resume',screen.raw);self.assertIn('продолжить'.encode(),screen.raw)
                         at=len(screen.raw);screen.send('/status\r');screen.wait('paused tools=0',since=at);screen.wait(code,since=at)
                         at=len(screen.raw);screen.send('another\r');screen.wait(code,since=at)
