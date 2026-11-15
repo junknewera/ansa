@@ -157,7 +157,7 @@ Runtime накапливает контекст между завершённы�
 
 ## Границы реализации
 
-- libcurl отвечает за HTTPS bytes; bounded SSE framer - за события; Responses reducer - за semantic admission.
+- HTTPS bytes обслуживает Hyper/rustls в Rust и libcurl в C++ fallback; bounded SSE framer отвечает за события, Responses reducer - за semantic admission.
 - Admission требует successful terminal, согласованных IDs/model/items/arguments и завершённого framing. До проверки всего batch executors недоступны.
 - Owning JSON сохраняет порядок native items, opaque strings и числовые tokens без округления. Replay использует исходные prefix, context epoch и advertised tool snapshot.
 - `ToolRegistry` хранит compiled descriptor/schema/validator/executor/revision. Provider получает только descriptions. Обычный CLI регистрирует `list_directory`, `read_file`, `search_files`, `run_command` и детерминированный `get_test_value`; JSONL сохраняет прежний pure snapshot.

@@ -1,7 +1,8 @@
 # Rust migration scope
 
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
-docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
+docs/RUST_MIGRATION_PLAN.md before changes here. M9 makes Rust the default
+release candidate; explicit C++ fallback remains available until M10.
 
 ## M9 boundary
 
@@ -12,10 +13,11 @@ docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
   environment dumps, automatic request retries or old credential restoration.
 - Run offline E2E first on the exact checkpoint. Preserve native replay,
   targeted Cancel, known outcomes, canonical journal bytes and C++ fallback.
-- Rust becomes the default candidate package only after successful acceptance;
-  no global shell/package changes. C++ removal and benchmark runner are separate.
+- M9 acceptance passed on clean 742d29c. The recorded run used all three budget
+  reservations; this grant is not a standing authorization to repeat live calls.
+- No global shell/package changes. C++ removal and benchmark runner are separate.
 
-## M8 boundary
+## Historical M8 boundary
 
 - M7 is merged and GO. M8 authorizes offline E2E, repeated races, quality
   tooling and the frozen M0 resource budgets. Production remains C++.

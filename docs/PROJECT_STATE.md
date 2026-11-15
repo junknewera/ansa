@@ -1,6 +1,6 @@
 # Состояние ansa
 
-## M9: согласованная приёмка, WIP
+## Rust migration: M9 закрыт (GO)
 
 В текущей сессии пользователь разрешил bounded M9 при условии, что полноценный
 local-harness-benchmark пока преждевременен. Исходники стенда подтверждают:
@@ -8,10 +8,31 @@ local-harness-benchmark пока преждевременен. Исходник�
 Граница: текущий профиль, `gpt-6.1-sol`, не более 12 generation/summary requests,
 тестовый `/tmp`, одна явная refresh-проверка, без logout/login.
 
-В изолированной ветке `migration/m9-cutover` подготовлены проверка живого
-production CLI и Rust default candidate с явным C++ fallback. GO ещё не заявлен;
-глобальная установка и shell не меняются. Предыдущие проверенные результаты
-сохраняются ниже. План и ограничения - [M9](migration/M9.md).
+Проверенный clean code checkpoint
+[`742d29c`](https://github.com/junknewera/ansa/commit/742d29cae55cfd993d3ce817962fbabdcccb6a99),
+tag `migration/m9-cutover`, 2026-11-15. Nix default выбирает Rust release
+candidate (`ansa`, совместимый `ansa-rs`); `.#ansa-cpp` сохраняет C++ fallback.
+Глобальная установка и shell не менялись, C++ sources не удалены.
+
+X13s/NixOS/aarch64: Rust native/Nix Release **117 + 9 doctests**; Python
+**171/171**; fresh compare **8763/8763** и независимый raw replay PASS; C++ Nix
+CTest **87/87**, Rust ASan с leak detection **117/117**, fmt/clippy, preflight
+и flake check PASS. C++ Debug/ASan/UBSan M8 переиспользованы при неизменных native
+inputs и побайтово идентичном installed C++ binary. Полная M8 perf/fault-матрица
+не переснималась. Rust ELF **6,30 MiB**, closure **63,44 MiB**, pins не менялись.
+
+Live: **5 responses** в пределах **12 reserved requests**, refresh **1**,
+без login/logout. Два отдельных tool rounds с read_file/run_command, durable
+Done, restart/continue и C++ reopen новой completed-сессии сохранили историю и
+точные bytes. Адресный Cancel сохранил known result, process cleanup завершился
+до EOF, termios восстановлен; cancelled Rust restart не добавил событий.
+Encrypted reasoning - **not_observed**, provider reasoning items не прислал.
+Два независимых reviews закрыты, включая 34 live artifacts.
+
+Evidence и GC roots: `~/Workspace/pet/ansa-baselines/m9-742d29c/`.
+Методы, failed attempts и ограничения - [M9](migration/M9.md).
+Следующие отдельные задачи: benchmark runner/adapter ansa и UX из TODO.
+Удаление C++ в M10 требует отдельного решения после пользовательского использования.
 
 ## Rust hotfix P1: SIWC streaming и причины паузы
 
