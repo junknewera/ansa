@@ -1,5 +1,38 @@
 # Состояние ansa
 
+## Исправление opaque_conflict и завершения вывода
+
+Проверенный code checkpoint
+[`c5656ea`](https://github.com/junknewera/ansa/commit/c5656ea93df9cabf429d8a3ea48f18a4055a0f23).
+Промежуточный `encrypted_content` reasoning item может быть неполным: теперь
+сохраняется только проверенное окончательное значение. Совпадение done/terminal,
+identity, EOF и полный admission batch остаются обязательными. Нативная регрессия
+проверяет partial/null/empty added, точный replay и отказы при подмене final.
+Сохранённый C++ по-прежнему отвергает новый допустимый промежуточный случай;
+это исправление provider compatibility, а не изменение legacy v1 журнала.
+
+Причина паузы отображается один раз вне замороженного диалога, включая узкий
+терминал и сочетание storage failure с `effect_unknown`. `/model` и `/thinking`
+явно сообщают, что пока недоступны, без Submit/provider dispatch. Signal exits
+SIGTERM/SIGHUP не заменяются обычным exit 1 при выходе из paused session.
+
+JSONL drain продлевается при успешной записи и останавливается после 250 ms
+без прогресса с явной диагностикой; Cancel/signals остаются доступны. Старый
+M8 binary воспроизводимо обрывает новый сценарий медленного читателя, новый
+передаёт полный вывод. Четыре сценария drain и отдельный медленный читатель
+под контролируемой CPU-нагрузкой прошли. Исправлена также гонка M1 fixture:
+PID ready-file публикуется после полной записи; 40 повторов по 11 сценариев PASS.
+
+X13s/NixOS/aarch64: Cargo **130 native + 9 doctests**, fmt/clippy all targets/features,
+Nix Release, pinned ASan с instrumented std/leak detection **130/130**, Python
+**171/171**, protocol compare **7303/7303**, protocol fault **195/195**, frontend
+fault **187/187** и независимый raw replay PASS. PTY **10/10 Debug и 10/10 Release**,
+installed startup **259/259**, production self-check/offline demo PASS.
+Независимый native review завершён без открытых замечаний. Failed Nix attempt
+и диагностика fixture race сохранены. C++ inputs не менялись; прежние C++ gates
+не пересобирались. Evidence и GC root: `~/Workspace/pet/ansa-baselines/stream-output-c5656ea/`.
+Следующий согласованный шаг - M10, удаление C++ из production build с сохранением rollback.
+
 ## Carbon: полноэкранный диалог и прозрачность задачи
 
 Проверенный code checkpoint
@@ -32,15 +65,13 @@ Terminal-state refresh использует один in-flight GetSnapshot; read
 проверяются отдельно от надписи об отмене. Evidence и GC root:
 `~/Workspace/pet/ansa-baselines/carbon-c5534d3/`.
 
-Открытая отдельная задача: под параллельной сборкой large JSONL capture завершился
+На checkpoint `c5534d3` под параллельной сборкой large JSONL capture завершился
 exit 1 с усечённым последним snapshot, без stderr; canonical journal, Done и все
 12 outcomes целы. Наиболее вероятен прежний абсолютный deadline drain **250 ms**;
 прямой trace вызова abort не снимался. Этот shutdown/write код не менялся UX-правкой.
 Quiet interleaved M8/current **3+3** попытки и отдельный полный fault gate прошли;
 это не закрывает отказ под нагрузкой. Сохранены failed capture и setup failures.
-Следующий шаг - progress-aware drain с ограниченным ожиданием заблокированного
-stdout, явной диагностикой и регрессией медленного читателя. Эта задача отделена
-от нового frontend; устойчивость большого JSONL под нагрузкой остаётся открытой.
+Этот отказ закрыт progress-aware drain и регрессиями медленного читателя выше.
 
 ## local-harness-benchmark: отдельный повтор formula после startup fix
 
