@@ -11,6 +11,7 @@ from unittest.mock import patch
 import frontend
 import sessions
 import frontend_io
+import session_cases
 
 class Fake:
     root=Path('/tmp/ansa-m4-counterexample')
@@ -110,6 +111,17 @@ class FrontendEvidenceTests(unittest.TestCase):
     def test_missing_durable_preview_trace_cannot_pass(self):
         value=control('preview');value['journals']={}
         with self.assertRaises(ValueError):frontend.pty_case(Fake(value),'preview-invalid')
+    def test_terminal_cancel_is_bound_to_active_preview(self):
+        value=control('terminal');frontend.pty_case(Fake(value),'terminal')
+        key=next(iter(value['journals']));original=next(iter(frontend.journal_events(value['journals']).values()))
+        for variant in ('wrong-done','wrong-text','timeout'):
+            with self.subTest(variant=variant):
+                records=copy.deepcopy(original)
+                if variant=='wrong-done':records[3]['turn']=records[4]['turn']
+                elif variant=='wrong-text':records[4]['text']='next'
+                else:records.insert(5,{'kind':'pause','turn':records[4]['turn'],'diagnostic':'fixture_terminal_cancel_timeout'})
+                mutated=copy.deepcopy(value);mutated['journals'][key]=session_cases.encode(records).hex()
+                with self.assertRaises(ValueError):frontend.pty_case(Fake(mutated),'terminal')
     def test_missing_durable_pending_trace_cannot_pass(self):
         value=control('pending');value['journals']={}
         with self.assertRaises(ValueError):frontend.fault_case(Fake(value),'pending')
