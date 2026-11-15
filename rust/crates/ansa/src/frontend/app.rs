@@ -368,12 +368,15 @@ fn text(args: &[String]) -> Result<i32> {
         selected.id
     ));
     let context = format!("{}  {}", settings.cwd.display(), settings.model);
-    reactor()?.block_on(controller::run(
+    reactor()?.block_on(controller::run_with_http_timeout(
         &mut runtime,
         &mut io,
         parsed.prompt.as_deref(),
         false,
         &context,
+        (!parsed.offline).then_some(Duration::from_millis(
+            crate::transport::http::RESPONSES_TIMEOUT_MS,
+        )),
     ))
 }
 fn auth_cli(command: &str, path: &Path) -> Result<i32> {

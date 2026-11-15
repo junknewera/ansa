@@ -1350,6 +1350,16 @@ impl Owner {
                         self.diagnostic = ready.diagnostic.into();
                         self.storage_failed = !ready.diagnostic.is_empty();
                         self.recovered_pause = ready.requires_resume;
+                        if self.diagnostic.is_empty() && ready.requires_resume {
+                            self.diagnostic = self
+                                .state
+                                .turn
+                                .as_ref()
+                                .map(|turn| turn.diagnostic.as_str())
+                                .filter(|code| crate::provider::contracts::valid_id(code))
+                                .unwrap_or("session_interrupted")
+                                .to_owned();
+                        }
                         self.receipts = self.state.submits.clone();
                         self.recovery = self
                             .state

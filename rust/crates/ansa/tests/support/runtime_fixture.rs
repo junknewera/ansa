@@ -1342,10 +1342,48 @@ pub async fn restart_resume() {
     .await;
     let handle = runtime.handle();
     let view = snapshot(&handle, "restart").await;
+    assert_eq!(
+        view.diagnostic, "auth_required",
+        "restart discarded the durable pause cause"
+    );
     assert!(view.resume_available);
     assert_eq!(view.state, "paused");
     assert!(!view.worker_busy);
     assert_eq!(count.load(Ordering::SeqCst), 1, "restart executed tool");
+    assert_eq!(
+        snapshot(&handle, "resync").await.diagnostic,
+        "auth_required"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let corrupt = Root::new();
+        let directory = corrupt.journal();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let name = "part-00000000000000000000.log";
+        let mut bytes = std::fs::read(root.journal().join(name)).unwrap();
+        // Keep the durable pause intact, then add a full frame with a bad checksum.
+        bytes.extend_from_slice(format!("00000002 fffffffd {}\n{{}}", "0".repeat(64)).as_bytes());
+        let part = directory.join(name);
+        std::fs::write(&part, bytes).unwrap();
+        std::fs::set_permissions(part, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut broken = setup(
+            count.clone(),
+            None,
+            generator(2),
+            Limits::default(),
+            Options {
+                directory: Some(directory),
+                ..Options::default()
+            },
+        )
+        .await;
+        let bad = snapshot(&broken.handle(), "corruption").await;
+        assert!(bad.storage_failed && !bad.resume_available);
+        assert_eq!(bad.diagnostic, "journal_checksum");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        finish(&mut broken).await;
+    }
     post(
         &handle,
         "resume",

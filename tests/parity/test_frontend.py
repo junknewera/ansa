@@ -23,6 +23,28 @@ def replace_events(value):value['stdout_hex']=''.join(json.dumps(e,separators=('
 def bridge_fake(name):
     value=control(name);fake=Fake(value);fake.root=Path(json.loads(bytes.fromhex(value['request_hex']))['root']);return fake
 class FrontendEvidenceTests(unittest.TestCase):
+    def test_native_pause_reason_survives_status_submit_and_restart(self):
+        binary=frontend.common.ROOT/'rust/target/debug/examples/frontend_adapter'
+        for mode,code in [('fail-timeout','http_timeout'),('fail-connect','http_connect'),('fail-transfer','http_transfer'),('fail-mime','http_content_type_count')]:
+            for plain in (False,True):
+                with self.subTest(mode=mode,plain=plain),tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp') as name:
+                    root=Path(name);owner=root/'fixture-owner';owner.write_bytes(b'ansa-m4-synthetic-v1\n');owner.chmod(0o600);root,home,cwd=frontend_io.fixture(root)
+                    screen=frontend_io.Pty(str(binary),root,home,cwd,mode,plain)
+                    try:
+                        screen.wait('basic');screen.send('question\r');screen.wait(code,timeout=4);screen.wait('пауза')
+                        self.assertIn(b'1 '+ 'с'.encode(),screen.raw);self.assertNotIn(b'HTTP: ',screen.raw)
+                        self.assertIn(b'/resume',screen.raw);self.assertIn('продолжить'.encode(),screen.raw)
+                        at=len(screen.raw);screen.send('/status\r');screen.wait('paused tools=0',since=at);screen.wait(code,since=at)
+                        at=len(screen.raw);screen.send('another\r');screen.wait(code,since=at)
+                        self.assertEqual((root/'generated').read_bytes(),b'x')
+                        screen.send(b'\x7f'*7+b'\x04');value=screen.finish();self.assertEqual(value['exit'],1);self.assertTrue(value['termios_restored'] and value['flags_restored'])
+                    finally:screen.close()
+                    records=next(iter(frontend.journal_events(frontend_io.journals(root)).values()));self.assertEqual([e['kind'] for e in records],['init','accepted','pause']);self.assertEqual(records[-1]['diagnostic'],code)
+                    screen=frontend_io.Pty(str(binary),root,home,cwd,mode,plain)
+                    try:
+                        screen.wait(code);self.assertEqual((root/'generated').read_bytes(),b'x')
+                        screen.send('/cancel\r');screen.wait('отменено');screen.send(b'\x04');value=screen.finish();self.assertEqual(value['exit'],0);self.assertTrue(value['termios_restored'] and value['flags_restored'])
+                    finally:screen.close()
     def test_native_eof_drains_active_turn_without_closed_poll_errors(self):
         binary=frontend.common.ROOT/'rust/target/debug/examples/frontend_adapter'
         for plain in (False,True):

@@ -24,6 +24,15 @@ use std::{
     time::Duration,
 };
 type Sink<'a> = dyn FnMut(&[u8]) -> Result<()> + 'a;
+#[derive(Clone, Copy)]
+enum StreamAdmission<'a> {
+    Strict,
+    SiwcResponses(&'a Json),
+}
+struct RoutePolicy<'a> {
+    local_only: bool,
+    admission: StreamAdmission<'a>,
+}
 fn tls() -> Result<rustls::ClientConfig> {
     let path = std::env::var_os("SSL_CERT_FILE")
         .or_else(|| std::env::var_os("NIX_SSL_CERT_FILE"))
@@ -104,7 +113,12 @@ fn head(headers: &hyper::HeaderMap, status: u16) -> Result<Head> {
     })
 }
 /// Uses the existing proxy connector; never redirects/retries an ambiguous POST.
-fn perform(request: &HttpRequest, stop: &Cancel, sink: Option<&mut Sink<'_>>) -> Result<HttpReply> {
+fn perform(
+    request: &HttpRequest,
+    stop: &Cancel,
+    sink: Option<&mut Sink<'_>>,
+    admission: StreamAdmission<'_>,
+) -> Result<HttpReply> {
     let uri: Uri = request.url.parse().map_err(|_| "url_invalid")?;
     if uri.scheme_str() != Some("https")
         || !matches!(uri.host(), Some("auth.openai.com" | "api.openai.com"))
@@ -127,7 +141,18 @@ fn perform(request: &HttpRequest, stop: &Cancel, sink: Option<&mut Sink<'_>>) ->
     }
     let proxy = proxy_for(&uri, &env)?;
     let tls = tls()?;
-    perform_route(request, stop, sink, uri, tls, proxy, false)
+    perform_route(
+        request,
+        stop,
+        sink,
+        uri,
+        tls,
+        proxy,
+        RoutePolicy {
+            local_only: false,
+            admission,
+        },
+    )
 }
 fn perform_route(
     request: &HttpRequest,
@@ -136,8 +161,11 @@ fn perform_route(
     uri: Uri,
     tls: rustls::ClientConfig,
     proxy: Option<hyper_util::client::proxy::matcher::Intercept>,
-    local_only: bool,
+    policy: RoutePolicy<'_>,
 ) -> Result<HttpReply> {
+    if let StreamAdmission::SiwcResponses(value) = policy.admission {
+        super::http::validate_request_profile(request.url, request.method, value)?;
+    }
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls.clone())
         .https_or_http()
@@ -146,7 +174,7 @@ fn perform_route(
         .wrap_connector(Route {
             proxy,
             tls,
-            local_only,
+            local_only: policy.local_only,
         });
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -183,7 +211,10 @@ fn perform_route(
             let head=head(reply.headers(),reply.status().as_u16())?;
             if sink.is_some() {
                 if head.status!=200 {return Err(match head.status {401=>"auth_required",403=>"provider_policy_denied",429=>"provider_usage_limit",_=>"provider_http_failure"});}
-                super::http::validate_head(&head)?;
+                match policy.admission {
+                    StreamAdmission::Strict => super::http::validate_head(&head)?,
+                    StreamAdmission::SiwcResponses(value) => super::http::admit_request(&head, request.url, request.method, value, true)?,
+                }
             }
             let mut bytes=Vec::new();let mut count=0;
             while let Some(frame)=reply.body_mut().frame().await {
@@ -245,12 +276,15 @@ pub fn fixture_stream(
         uri,
         tls,
         None,
-        true,
+        RoutePolicy {
+            local_only: true,
+            admission: StreamAdmission::Strict,
+        },
     )
     .map(|_| ())
 }
 pub fn exchange(request: &HttpRequest, stop: &Cancel) -> Result<HttpReply> {
-    perform(request, stop, None)
+    perform(request, stop, None, StreamAdmission::Strict)
 }
 pub fn stream(
     value: &Json,
@@ -266,10 +300,15 @@ pub fn stream(
             body: Secret::new(value.dump()),
             bearer: Some(bearer.clone()),
             body_limit: 16 * 1024 * 1024,
-            timeout_ms: 75000,
+            timeout_ms: super::http::RESPONSES_TIMEOUT_MS,
         },
         stop,
         Some(sink),
+        StreamAdmission::SiwcResponses(value),
     )
     .map(|_| ())
 }
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;

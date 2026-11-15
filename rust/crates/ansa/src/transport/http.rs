@@ -9,12 +9,11 @@ pub struct Head {
     pub content_types: Vec<String>,
 }
 pub const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
-pub fn admit_request(
-    head: &Head,
+pub const RESPONSES_TIMEOUT_MS: u64 = 75_000;
+pub(crate) fn validate_request_profile(
     url: &str,
     method: &str,
     request: &crate::protocol::json::Json,
-    allow_missing_siwc: bool,
 ) -> Result<(), &'static str> {
     if url != RESPONSES_ENDPOINT || method != "POST" {
         return Err("http_endpoint");
@@ -22,6 +21,16 @@ pub fn admit_request(
     if !request.field("stream")?.boolean()? || request.field("store")?.boolean()? {
         return Err("http_request_profile");
     }
+    Ok(())
+}
+pub fn admit_request(
+    head: &Head,
+    url: &str,
+    method: &str,
+    request: &crate::protocol::json::Json,
+    allow_missing_siwc: bool,
+) -> Result<(), &'static str> {
+    validate_request_profile(url, method, request)?;
     if head.status != 200 {
         return Err("http_status");
     }
