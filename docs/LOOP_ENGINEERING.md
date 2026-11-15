@@ -8,11 +8,13 @@
 
 ## D0. Исходное состояние и место решения
 
-Проверенный repository baseline: [`main@8f37af0`][A-main]. В нём Rust M4 принят, production/default остаётся C++20; следующий migration milestone — M5. Результаты native M4 принадлежат прежнему [отчёту](migration/M4.md), эта работа их не воспроизводила. Текущие ограничения находятся в [PROJECT_STATE](PROJECT_STATE.md), [архитектуре](architecture.md) и [migration plan](RUST_MIGRATION_PLAN.md).
+Исторический baseline исследования от 2026-11-13: [`main@8f37af0`][A-main]. В нём Rust M4 принят, production/default остаётся C++20; следующим migration milestone был M5. Результаты native M4 принадлежат прежнему [отчёту](migration/M4.md), эта работа их не воспроизводила. Исходные ограничения ветки находятся в [PROJECT_STATE](PROJECT_STATE.md), [архитектуре](architecture.md) и [migration plan](RUST_MIGRATION_PLAN.md).
+
+**Уточнение 2026-11-15.** На [`main@5029b8b`][A-current-main] M9 принят: Rust выбран по умолчанию, C++ fallback и исходники сохранены; M10 требует отдельного решения. Основание — [PROJECT_STATE на этом commit][A-current-state]. Это обновление контекста proposal, не перенос runtime из `main` в историческую ветку PR и не повторение M9 acceptance. Согласованная последовательность implementation после verified M10 и O gates сохраняется.
 
 [Draft PR #3][A-orchestration-pr] описывает отдельную native orchestration feature. Используется его [ADR 0002 на фиксированном commit][A-orchestration-adr]: собственные ANSA sessions, direct SIWC, один task owner, один active model child, durable child receipts, worktrees и independent acceptance. Его исторические сведения о M0 не переносятся в текущий baseline. Новый документ можно ревьюить от актуального `main`, пока PR #3 остаётся открытым; отсутствующий в `main` ADR связан абсолютной pinned ссылкой.
 
-Loop engineering расширяет будущую **политику восстановления** Orchestrate. Default implementation sequencing остаётся после verified M10 GO и соответствующих O1–O4 gates. M0–M10 не расширяются. Наличие M4 journal primitives не означает наличие Rust AgentRuntime, task controller или child-session bridge.
+Loop engineering расширяет будущую **политику восстановления** Orchestrate. Default implementation sequencing остаётся после verified M10 GO и соответствующих O1–O4 gates. M0–M10 не расширяются. Наличие journal primitives в историческом M4 baseline не означало наличие Rust AgentRuntime; нынешний M9 runtime также сам по себе не реализует предложенные task controller и child-session bridge.
 
 Пакет решения:
 
@@ -65,6 +67,14 @@ Loop engineering расширяет будущую **политику восст
 
 ID и указанные effort опубликованы в model cards [O1][O2]. Их наличие не гарантирует доступ конкретного SIWC аккаунта или выигрыш данной пары. Alias/model revision, requested/returned model, effort, account-binding reference и capability outcome фиксируются для каждого запуска. `ultra` в этот пример не включён.
 
+### Prerequisite для управляемого effort
+
+На `main@5029b8b` native [`Binding` и `Request::json`][A-current-request] не содержат настройки `reasoning.effort` и не передают её в request. Поэтому `medium`/`high` выше — требование будущей feature, не уже работающий переключатель. Отсутствие этого поля не доказывает отсутствие reasoning или нулевой effort у модели.
+
+До native composition и сравнений с управляемым effort требуется сквозной контракт: разрешённая configuration → actual provider request → immutable сохранённая settings identity/provenance → journal, request fingerprint и exact replay. Конкретный тип или совместимое versioned расширение выбирается при реализации; strict legacy session v1 и прежние bindings/bytes сохраняются. Старую session нельзя переопределять ради другого effort: нужен новый явный binding/session. Отдельно записываются requested effort, evidence поддержки параметра для actual route/model и наблюдаемые provider metadata; effective effort, которого provider не сообщает, остаётся unknown.
+
+Неподдерживаемый параметр, отсутствие его реализации или неподтверждённая route/model capability дают именованный blocker для такого native profile/eval arm. Нельзя молча отбросить effort, подставить default или другой route и объявить сравнение состоявшимся. LE2 проверяет request serialization, provenance/fingerprint/replay и отсутствие fallback на synthetic route; LE4 проверяет доступность на фактическом разрешённом route. LE1 остаётся pure offline reducer с fake ports и не включает реализацию provider settings.
+
 ### Direct SIWC boundary
 
 Собственный adapter использует разрешённый direct Responses route. Inference docs описывают публичный endpoint, account-scoped model discovery и terminal success [O3]. На admission проверяются активный профиль, grant, model slug и параметры; отсутствие `chatgpt.tokens.use.direct`, недоступная модель и quota error дают именованный blocker [O5]. Каталог — предварительное свидетельство, фактический ответ всё ещё может быть отклонён.
@@ -80,6 +90,12 @@ Schema-valid текст остаётся предложением. Не пред
 **Repair attempt** — одна host-assigned `AttemptId`: зафиксированная исходная версия → гипотеза и ограниченный patch → frozen candidate → результат host verification. Первый candidate тоже attempt. Baseline verification до редактирования не является attempt. Несколько чтений, HTTP rounds, test commands и Resume внутри одного attempt не превращаются в несколько repair attempts.
 
 Root резервирует слот attempt **до** запуска writer. Слот считается израсходованным при запуске и не возвращается после crash, cancel или inconclusive verification. Счётчик no-progress изменяется лишь после классифицированного результата. Повторная доставка того же receipt не расходует слот повторно. `RequestId` сохраняет значение identity accepted Submit/turn в пределах SessionId; это не AttemptId и не ID каждого HTTP exchange.
+
+| Счётчик | Что расходуется |
+|---|---|
+| Repair/write attempts | Local, guided и takeover совместно расходуют максимум семь slots; три — порог подряд идущих no-progress outcomes, не cap всей local phase |
+| Diagnosis / experiment | Отдельные incident/probe caps; read-only diagnosis не является write attempt, изменение принятого candidate требует repair slot |
+| Provider/tool/verification dispatch | Все фактические вызовы, включая advisor, probe, retries и final gates, расходуют свои лимиты внутри прежнего root budget |
 
 ### Детерминированное определение прогресса
 
@@ -219,6 +235,8 @@ Host строит пакет из canonical receipts и actual files. Worker sum
 
 До dispatch фиксируется `ExperimentEvaluatorSpec`: версия host evaluator, входные поля фактического runner output, predicates для supported/refuted и правила missing/invalid evidence. Advisor может предложить predicates, но host допускает только поддерживаемые типизированные сравнения/проверки, а не произвольный model-generated evaluator code. В retry-примере supported требует одинаковый operation ID, разные pre-serialization keys и совпадение каждого pre-key с соответствующим wire-key; refuted — одинаковые pre-keys при полном валидном trace. Оба predicates истинны, ни один не определён или trace неполон — inconclusive. Свободный текст «гипотеза подтверждена» не меняет outcome. Если проверяемый evaluator невозможно задать, automatic guided dispatch не допускается.
 
+`Supported` означает совпадение наблюдения с frozen prediction, а не доказательство единственной root cause или корректности следующего patch. Последние по-прежнему требуют отдельной проверки.
+
 Отчёт ограничен размером; unknown fields/IDs, несуществующие evidence refs, invalid schema и незавершённый response не допускаются. Один форматирующий retry не становится новой бесплатной diagnosis. Если проверка опровергла прогноз, executor не исполняет прежний план как подтверждённый. Сохраняется refutation; дальше разрешён только bounded takeover или blocker. Более сильная модель может ошибаться и может честно вернуть insufficient evidence.
 
 ### Минимальные domain events
@@ -335,6 +353,20 @@ drive_pending_transition(attempt_id):
 
 Порог 1/3/5 и optional early-cycle rule сравниваются на development set; затем выбранная policy фиксируется до held-out evaluation. Нельзя подбирать threshold на тех же задачах, на которых заявляется итоговый выигрыш. Порядок arms рандомизируется, worktrees/sessions независимы, версии окружения и доступные model revisions записаны; решения между arms не передаются.
 
+### C. Отдельная ablation probe и допуска к guided repair
+
+Для выбранного advisor profile сравнить три политики на одинаковых stuck snapshots. Зафиксировать один advice report на snapshot, одинаковые worker/advisor model и effort, исходный evidence packet, permissions и observable root budgets; стоимость создания report учитывать во всех arms. Новый evidence от probe — явная экспериментальная переменная. Общий внешний final evaluator одинаков и недоступен для подбора patch.
+
+| Arm | Политика | Что проверяется |
+|---|---|---|
+| P0 | Advice без исполнения probe; plan проверяется ограниченной repair attempt | Ценность совета без дополнительного измерения |
+| P1 | Advice + probe как evidence; outcome не является обязательным `supported` gate | Дополнительная информация от probe относительно P0 |
+| P2 | Advice + probe; только `supported` допускает guided repair | Польза и потери строгого gate относительно P1 |
+
+P2 сохраняет proposed default. P0/P1 — отдельно разрешаемые экспериментальные policies в disposable evaluation worktrees, с явным host permit и маркировкой непроверенного/refuted advice. Они не меняют production gate и не объявляют такой advice подтверждённым. Все permissions, cleanup, effect-unknown stop, seven-slot cap и final acceptance сохраняются; каждый trial patch расходует repair slot, probe/calls/time — общий budget. Эти arms не запускаются автоматически вместе с LE1.
+
+Измерять paired accepted repairs, лишнюю стоимость probe, harmful advice/regressions, ложный `supported` и ложные diagnoses по внешней проверке. Отдельно считать случаи, когда P2 блокирует advice, а сопоставимый P1 trial проходит final evaluator: это наблюдаемая потеря потенциально полезных repairs, а не доказательство истинности diagnosis. Где причинную гипотезу независимо проверить нельзя, её truth label остаётся unknown. Решение смягчать gate принимается отдельно по этим данным; до него действует строгая таблица D4.
+
 ### Метрики и критерий решения
 
 - Accepted task rate и conditional recovery rate в остаточном бюджете.
@@ -356,7 +388,7 @@ drive_pending_transition(attempt_id):
 |---|---|---|
 | LE0 — design | Текущий docs PR | Контракты, GPT example, sources и independent design review |
 | LE1 — offline policy | Post-M10 и O1 foundation | Pure reducer/ledger, scripted receipts, fake child port; idempotent counters, bounded phases и crash/stop tests |
-| LE2 — native composition | O2 | Тот же AgentRuntime, actual durable child bridge, synthetic SIWC, fresh contexts, native cancel/recovery и usage permits |
+| LE2 — native composition | O2 и effort prerequisite из D2 | Тот же AgentRuntime, actual durable child bridge, synthetic SIWC; effort в request и immutable provenance/fingerprint/replay, fresh contexts, native cancel/recovery и usage permits |
 | LE3 — evidence and gates | O3 | Frozen inventory, actual host runner, advisor validator, discriminating experiment, independent final review и integration на final SHA |
 | LE4 — native pilot/eval | O4 и разрешённый live scope | Account capabilities, реальные usage/latency, paired rescue + whole-pipeline; отдельное решение о включении |
 
@@ -385,6 +417,7 @@ drive_pending_transition(attempt_id):
 | Store missing/corrupt, root/child receipt conflict | Fail closed; никакого CreateNew recovery fallback |
 | Usage неизвестен после timeout/restart | Не становится нулём; резерв не возвращён без evidence |
 | Sol/Astra либо effort недоступны аккаунту | Именованный blocker, без model/account/billing подмены |
+| Effort задан в profile, но отсутствует в actual request либо replay identity | Native profile/eval заблокирован; нет silent default, mutation старой session или ложного сравнения effort |
 | Интеграция изменила candidate или base при прежнем patch diff | Новый exact-target review и final verification; прежний PASS недостаточен |
 | Patch готов, budget final gates отсутствует | Partial/blocked, не Accepted |
 | Restart после terminal run | Reconcile late evidence, ни одного автоматического нового loop |
@@ -398,6 +431,9 @@ drive_pending_transition(attempt_id):
 Официальные страницы проверены 2026-11-13. Repository facts привязаны к commit; рекомендации и численные caps — решения этого proposal. Primary papers описывают свои экспериментальные условия, не обещания ANSA.
 
 [A-main]: https://github.com/junknewera/ansa/tree/8f37af075fed5918afc1fafd9d7167271e8c8d26
+[A-current-main]: https://github.com/junknewera/ansa/tree/5029b8b8972ea4c64ac213474b37f53a13bd5ab5
+[A-current-state]: https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md
+[A-current-request]: https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/rust/crates/ansa/src/provider/request.rs
 [A-orchestration-pr]: https://github.com/junknewera/ansa/pull/3
 [A-orchestration-adr]: https://github.com/junknewera/ansa/blob/cac4f12c8063f54c032bbd532f59e047a59891f2/docs/adr/0002-self-hosted-orchestration.md
 [O1]: https://developers.openai.com/api/docs/models/gpt-6.1-sol

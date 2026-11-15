@@ -2,7 +2,8 @@
 
 - **Статус:** Proposed, design-only.
 - **Дата:** 2026-11-13.
-- **Baseline:** [main@8f37af0](https://github.com/junknewera/ansa/tree/8f37af075fed5918afc1fafd9d7167271e8c8d26), Rust M4 GO; production/default C++20.
+- **Исторический baseline, 2026-11-13:** [main@8f37af0](https://github.com/junknewera/ansa/tree/8f37af075fed5918afc1fafd9d7167271e8c8d26), Rust M4 GO; production/default C++20.
+- **Уточнение 2026-11-15:** на [main@5029b8b](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md) M9 GO, Rust default и сохранённый C++ fallback; M10 требует отдельного решения. Это контекст proposal, не обновление runtime исторической ветки; post-M10/O gates сохраняются.
 - **Связанный proposal:** [PR #3](https://github.com/junknewera/ansa/pull/3), [ADR 0002 на cac4f12](https://github.com/junknewera/ansa/blob/cac4f12c8063f54c032bbd532f59e047a59891f2/docs/adr/0002-self-hosted-orchestration.md). ADR 0002 ещё не находится в `main`; номер 0003 сохраняет порядок независимых proposals.
 - **Спецификация:** [Loop engineering](../LOOP_ENGINEERING.md); [prompts](../LOOP_ENGINEERING_PROMPTS.md).
 
@@ -34,11 +35,15 @@ Controller — Rust code будущего Orchestrate. Worker/advisor/reviewer �
 
 Используется собственный direct SIWC adapter и действующий account binding. Model/effort availability проверяются для этого route; public model card не подтверждает entitlement. Не вводятся Codex SDK/app-server, внешний agent CLI, платный fallback, неявная подмена аккаунта или модели. Новые role sessions не получают дополнительный subscription allowance.
 
+Управляемый effort — prerequisite LE2/native eval, пока отсутствующий в [`Binding`/`Request::json` на main@5029b8b](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/rust/crates/ansa/src/provider/request.rs). Нужна цепочка config → actual request → immutable сохранённая settings identity/provenance → journal/fingerprint/exact replay, совместимая с legacy v1 и не меняющая старую session. Requested effort и evidence actual route/model support различаются; отсутствие поля не означает нулевой reasoning. Unsupported/unknown capability или непереданный параметр блокируют native profile, без silent default. LE1 использует fake ports; provider implementation в его scope не входит. Детальный контракт — D2 спецификации.
+
 ### 4. Evidence перед интерпретацией
 
 Diagnosis получает цель, frozen manifest, snapshot полного relevant content, environment, actual commands/results/logs, историю attempts и оставшийся budget. Summary worker — интерпретация; raw evidence доступно advisor через scoped reads.
 
 Advisor возвращает причину, альтернативы, опровержимое предсказание, минимальный эксперимент и conditional plan. Host валидирует identity/scope, замораживает типизированные evaluation predicates и выполняет разрешённый эксперимент. Refuted/inconclusive advice не применяется как подтверждённое. Snapshot/policy/manifest mismatch делает advice stale. Для переноса guidance на следующий candidate нужна явная новая binding; encrypted reasoning другой сессии не копируется в текстовый handoff.
+
+`Supported` подтверждает frozen prediction, а не истинность единственной root cause. Strict supported-before-guided-repair gate остаётся default. Отдельная экспериментальная ablation D8 сравнивает advice без probe, advice с probe как evidence и strict gate при одинаковых model/effort/budgets и внешнем final evaluator. Первые два arm требуют отдельной evaluation policy и disposable worktrees; они не включаются автоматически в production.
 
 ### 5. Durable control и stop
 
@@ -67,10 +72,12 @@ Root caps охватывают все calls, retries, Resume, compact, advisor, 
 
 Получаем наблюдаемую, воспроизводимую policy выхода из тупика и возможность отказаться от неверного совета. Платим дополнительными inference, context transfer, verification и сложностью durable control. Ошибки GPT ролей могут коррелировать; более сильная модель не заменяет тесты и scope checks.
 
-Production sequencing сохраняет [migration plan](../RUST_MIGRATION_PLAN.md): новая feature после verified M10 GO и соответствующих O1–O4. LE1–LE3 — offline/synthetic implementation gates; LE4 — отдельно разрешённый native pilot. Этот docs PR не запускает M5, live calls, cutover, merge или production enablement.
+Production sequencing сохраняет [migration plan](../RUST_MIGRATION_PLAN.md): новая feature после verified M10 GO и соответствующих O1–O4. LE1–LE3 — offline/synthetic implementation gates; LE4 — отдельно разрешённый native pilot. Этот docs PR не запускает следующий migration milestone, live calls, cutover, merge или production enablement.
 
 ## Revisit criteria
 
 Сравнить одинаковые stuck snapshots: continuation, higher effort, fresh worker, same-model advisor, Astra advisor и takeover. Затем сравнить complete pipelines со single Sol/Astra от исходной задачи, включая sunk failures. Зафиксировать tradeoff до eval; не заявлять equal-cost при неизвестных credit/usage данных.
+
+В probe/gate ablation измерять false supported/diagnosis, harmful advice и полезные repairs, потерянные из-за strict gate, с paired trial на том же snapshot и неизменным final acceptance. Неизвестную истинность diagnosis не превращать в PASS. Изменение default gate требует отдельного решения по этим данным.
 
 Если advisor не даёт измеренной пользы против controls или увеличивает harmful regressions/false acceptance, оставить profile выключенным либо сузить routing к доказанному классу задач. Точный threshold, модель и budgets пересматриваются по данным; native-only authority/recovery invariants сохраняются.
