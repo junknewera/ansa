@@ -1,5 +1,67 @@
 # Состояние ansa
 
+## Carbon workspace: согласованный макет и уточнения на границе шага
+
+**GO**, проверенный code checkpoint
+[`93092cb`](https://github.com/junknewera/ansa/commit/93092cba00998c1c936158cdfdc0d129192165c1),
+X13s/NixOS/aarch64. Интерактивный интерфейс по умолчанию реализует
+`designs/final-design/` с исправленным Preview из PNG `-3`: чат и закреплённый
+ввод, inspector, чтение через Esc, копирование выделения мышью, многострочный
+ввод, сохранение черновика и позиции чтения. Вызовы tools, публичные summaries,
+этапы и время выводятся из runtime/journal; неподтверждённый preview обозначен
+явно. Процент контекста не выдумывается при отсутствии usage/window metadata.
+
+Уточнения сохраняются и доставляются после текущего model/tool шага, до следующего
+действия. Ctrl+C прерывает этот шаг и ускоряет доставку; без уточнения останавливает
+работу. Known outcomes сохраняются, storage failure и неизвестные effects
+блокируют дальнейший dispatch. Snapshot восстанавливает состояние после потери
+уведомлений; общий bounded dedupe доставки сохраняет новую отмену при повторных
+или запоздалых событиях. `/model` и `/effort` (`/thinking`) сохраняют подтверждённый
+выбор для следующих turns. Поиск слов и Ctrl+F исключены по решению пользователя.
+
+`/fork` создаёт независимую сессию с полным native context, `/btw` - отдельный
+read-only разговор с явной передачей результата. Реальный субагент запускается
+прямой командой `/agent`; его подтверждённый результат возвращается родителю
+однократно. `/files` даёт Source/Diff/Markdown Preview и управляемый `$EDITOR`,
+`/run` - локальную консоль с отдельной provenance. Diff сравнивает HEAD с текущим
+снимком и запрещает promisor-fetch helpers. Возврат после редактора восстанавливает
+foreground, экран, курсор, стили, termios и FD flags; setup/cancel ограничены по
+времени, неизвестный cleanup не объявляется успешным. Обычные v1 journal bytes
+сохранены; наследуемая сессия использует атомарный init v2 с fork seed, который
+старый reader обязан отклонить. Рабочая папка у веток общая.
+
+Locked Cargo **179 native + 9 doctests**, Nix Release **179 + 9**, fmt/clippy по всем
+targets/features, сборка adapters, заполненный Cargo offline cache, default Nix
+build и flake check PASS. Pinned ASan с instrumented std/leak detection **179/179**;
+replay baseline PASS, drop/reorder mutants **2/2 killed** на нужных assertions.
+Rust-only acceptance **12/12 Debug и 12/12 installed Release**, прежняя PTY-приёмка
+**10/10 в обоих профилях**, новая workspace PTY **11/11 в обоих профилях**, editor
+setup/backpressure **2/2 в обоих профилях**, drain **4/4**, startup **259/259**.
+Дополнительный probe **6/6** проверяет main suspend/resume, явного субагента с
+однократным возвратом и one-shot/pipeline/NO_COLOR. Cancel/resync regression
+отдельно прошёл **20/20** повторов PTY. Self-check/offline demo PASS. Cargo,
+replay, ASan и Nix использовали jobs/cores=2; тяжёлые сборки выполнялись
+последовательно перед чувствительными PTY/fault suites. Flake check переиспользует
+уже проверенную package derivation; её cargoCheckHook реально выполнил 179+9.
+
+Независимые runtime, terminal/workspace, auth и packaging reviews завершены без
+открытых обязательных замечаний. Сохранены failed captures и категории setup,
+oracle и product, включая missing Git в sandbox, синхронизацию copy с UI snapshot
+и потерянное уведомление доставки при resync. Git добавлен только в check inputs
+и devshells; Cargo dependencies/lock и runtime dependencies не менялись. Полная
+матрица захвачена на чистом checkpoint без правок исходников. Команды, SHA,
+профили, hashes и измеренные длительности находятся в evidence; ожидание очереди
+не измерялось и не приписывается модели. Новых live model calls не было.
+Rust UBSan/full TSan/Miri, x86_64, hardware power loss и новая perf/live матрица
+не объявляются PASS. При полностью заблокированном TTY доставка escape cleanup
+ожидает возобновления вывода; termios/flags и ограничение выхода проверены.
+
+Evidence, включая прежние неуспешные попытки, и package GC root:
+`~/Workspace/pet/ansa-baselines/carbon-workspace-93092cb/`.
+Следующий этап - промпты, разрешения/владение субагентов и только provider-enforced
+constrained decoding конечного ответа; требования сохранены в [TODO](TODO.md#следующий-этап-субагентов).
+
+
 ## M10: Rust production, C++ выведен из сборки
 
 **GO**, проверенный code checkpoint
