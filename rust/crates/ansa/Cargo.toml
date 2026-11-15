@@ -43,7 +43,7 @@ name = "auth_adapter"
 required-features = ["auth-test-adapter"]
 
 [[bin]]
-name = "ansa-rs"
+name = "ansa"
 path = "src/bin/ansa.rs"
 
 [dependencies]

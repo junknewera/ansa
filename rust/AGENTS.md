@@ -1,15 +1,25 @@
 # Rust migration scope
 
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
-docs/RUST_MIGRATION_PLAN.md before changes here. M9 makes Rust the default
-release candidate; explicit C++ fallback remains available until M10.
+docs/RUST_MIGRATION_PLAN.md before changes here. Production is Rust; the verified
+C++ rollback is retained outside the current build graph.
 
 Follow the root AGENTS.md development cycle and PR authorization: targeted
 checks and review first, one prepared clean checkpoint for full gates, no
 competing builds during acceptance. The commands below are required checks,
 not a requirement to repeat the full matrix after every WIP or docs-only edit.
 
-## M9 boundary
+## M10 boundary
+
+- The user explicitly authorized C++ removal after the output-drain fix.
+- Preserve legacy codecs, golden fixtures, admission, replay and current state.
+- The default package, native tests and installed CLI acceptance are Rust-only.
+  Run the closed inventory in docs/migration/M10.md; missing/skipped is not PASS.
+- Keep the pinned dependencies and toolchains. No new live calls, schema change,
+  UX redesign or restoration of old credentials/journals.
+- C++ source tag/executable/GC root remain available for explicit rollback.
+
+## Historical M9 boundary
 
 - The current user authorized the bounded M9 plan recorded in docs/migration/M9.md:
   current ansa profile, gpt-6.1-sol, at most 12 model generation/summary requests,
@@ -148,7 +158,7 @@ not a requirement to repeat the full matrix after every WIP or docs-only edit.
 Use `nix develop --no-update-lock-file` and run:
 
 ```sh
-python3 tests/parity/check_toolchain.py
+python tests/parity/check_toolchain.py
 cargo build --manifest-path rust/Cargo.toml --workspace --locked
 cargo test --manifest-path rust/Cargo.toml --workspace --locked
 cargo fmt --manifest-path rust/Cargo.toml --all --check
@@ -157,6 +167,6 @@ nix build --no-update-lock-file .#ansa-rust
 ```
 
 Record the actual compiler/Cargo versions, platform, test counts and failures.
-The scaffold test proves only that the binary does not claim runtime behavior.
-It does not close native X13s, protocol parity, process or live gates. Keep the
-C++ default package and executable available throughout M0.
+The sections marked Historical describe completed migration stages. Current
+acceptance also requires the installed CLI, replay mutations, PTY/startup and
+quality commands from docs/migration/M10.md. Old C++ comparisons are archival.

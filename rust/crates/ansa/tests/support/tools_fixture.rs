@@ -65,7 +65,7 @@ pub fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 pub fn worker() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_ansa-rs")
+    option_env!("CARGO_BIN_EXE_ansa")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_exe().unwrap())
 }

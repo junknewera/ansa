@@ -85,76 +85,65 @@ ProcessRunner использует отдельный supervisor/subreaper: пр
 
 Зависимости и компилятор зафиксированы через `flake.lock`. Проверенная платформа - NixOS/aarch64, ThinkPad X13s. В flake также объявлен x86_64-linux; он пока не проверен.
 
-```sh
-nix develop --no-update-lock-file
-cmake -S . -B build-ansa -G Ninja -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-ansa -j 4
-ctest --test-dir build-ansa --output-on-failure --no-tests=error
-./build-ansa/ansa --self-check
-./build-ansa/ansa --offline-demo
-```
-
-В M9 Nix default выбирает Rust release candidate. Он предоставляет `ansa` и
-совместимый `ansa-rs`; явный Rust package остаётся `.#ansa-rust`. C++ fallback
-доступен через `nix run .#ansa-cpp` или `nix build .#ansa-cpp -o result-cpp`.
-Код C++ и CMake-команды выше сохранены. Статус приёмки - [M9](docs/migration/M9.md).
-
-Сборка installable Nix package с обязательными тестами:
+Production runtime написан на Rust. C++ sources/CMake удалены из текущей
+сборки; проверенный rollback сохранён в tag `migration/m9-cutover` и Nix GC root
+`~/Workspace/pet/ansa-baselines/m9-742d29c/cpp-package`.
+`ansa` - имя Cargo binary и default Nix package; `.#ansa-rust` и alias `ansa-rs`
+сохранены для совместимости. Новые зависимости и schema changes не добавлены.
 
 ```sh
+nix develop --no-update-lock-file -c cargo test --manifest-path rust/Cargo.toml --workspace --locked
+nix develop --no-update-lock-file -c cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+nix develop --no-update-lock-file -c cargo clippy --manifest-path rust/Cargo.toml \
+  --workspace --all-targets --all-features --locked -- -D warnings
+nix flake check --no-update-lock-file
 nix build --no-update-lock-file
 ./result/bin/ansa --self-check
 ./result/bin/ansa --offline-demo
 ```
 
-Проверка JSONL startup без реальных credentials и модельных вызовов: synthetic
-профили, повторные старты, отсутствие сети до Submit и отмена подготовки auth
-через SIGINT/SIGTERM. Локальный proxy удерживает CONNECT до TLS; rotating refresh
-POST этим сценарием не проверяется. Выходной каталог должен быть новым.
-
-```sh
-nix develop --no-update-lock-file -c python tests/cli_live_startup.py \
-  --binary ./result/bin/ansa --output /tmp/ansa-startup-check --repeat 256
-```
-
-PTY-регрессия полноэкранного просмотра, ввода, копирования, таймера и tools использует production offline CLI
-и synthetic frontend fixture. Прогон не обращается к реальным profiles или модели:
+Полный обязательный inventory и границы - [M10](docs/migration/M10.md).
+Native tests проверяют protocol/admission/replay, v1 journal/auth, crash/recovery,
+`effect_unknown`, адресную отмену, process cleanup и frontend. Дополнительные
+installed CLI gates используют только synthetic profiles и собственные процессы:
 
 ```sh
 nix develop --no-update-lock-file -c cargo build --manifest-path rust/Cargo.toml \
-  --example frontend_adapter --features frontend-test-adapter --locked
-nix develop --no-update-lock-file -c python tests/cli_progress_pty.py \
+  --workspace --all-targets --all-features --locked
+nix develop --no-update-lock-file -c python -B tests/rust_acceptance.py \
   --binary ./result/bin/ansa --fixture-binary rust/target/debug/examples/frontend_adapter \
-  --output /tmp/ansa-progress-check
+  --output /tmp/ansa-rust-acceptance
+nix develop --no-update-lock-file -c python -B tests/cli_progress_pty.py \
+  --binary ./result/bin/ansa --fixture-binary rust/target/debug/examples/frontend_adapter \
+  --output /tmp/ansa-pty-check
+nix develop --no-update-lock-file -c python -B tests/cli_output_drain.py \
+  --fixture-binary rust/target/debug/examples/frontend_adapter --output /tmp/ansa-drain-check
+nix develop --no-update-lock-file -c python -B tests/cli_live_startup.py \
+  --binary ./result/bin/ansa --output /tmp/ansa-startup-check --repeat 256
+nix develop --no-update-lock-file -c python -B tests/replay_mutation.py \
+  --output /tmp/ansa-replay-mutations
+nix develop --no-update-lock-file .#quality -c python -B tests/parity/quality.py \
+  --mode address --output /tmp/ansa-rust-asan
 ```
 
-ASan/UBSan, из того же `nix develop`:
+Каталоги evidence должны быть новыми, code checkpoint чистым. Сначала закончить
+сборки и replay mutants, затем выполнять чувствительные к времени PTY/fault gates.
+ASan использует pinned nightly с instrumented std и leak detection. Rust UBSan
+не поддерживается этим toolchain; это ограничение не выдаётся за PASS.
 
-```sh
-cmake -S . -B build-ansa-sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DOMH_SANITIZERS=ON -DOMH_MUTATION_CHILD=ON
-cmake --build build-ansa-sanitize -j 2
-ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
-  ctest --test-dir build-ansa-sanitize --output-on-failure --no-tests=error
-```
-
-Обычный CTest включает protocol, runtime, session, auth, summary, многошаговый loop, локальные tools, ProcessRunner, текстовый CLI и два mutation-теста. Session suites проверяют SIGKILL на durable boundaries, журнал, Resume, дедупликацию, ошибки хранения и compact. Auth suites проверяют JWT/PKCE, refresh между процессами, гонки logout/dispatch и crash при замене credentials. Mutation-тесты меняют копии production replay builder внутри build-каталога и требуют конкретного отказа replay oracle. Ошибка компиляции mutant не считается успешным тестом. Sanitizer-конфигурация пропускает повторные сборки mutants.
-
-Дополнительная Linux-проверка запускает JSONL с терминалом на stdin и заполняет stdout pipe. Она использует стандартную библиотеку Python.
-
-```sh
-nix develop --no-update-lock-file -c ctest --test-dir build-ansa \
-  --output-on-failure --no-tests=error -R '^runtime-' --repeat until-fail:100
-nix develop --no-update-lock-file -c timeout 10 python tests/cli_backpressure.py ./build-ansa/ansa
-```
+`tests/parity/` сохраняет historical differential harness и C++ assertions как
+reference. Старый общий Python/CTest gate требует pre-M10 checkout и frozen
+C++ binaries; он не входит в текущий Rust-only inventory. Для воспроизведения
+старой миграционной матрицы используй её tag и документированные prerequisites.
+Текущие legacy golden readers не запускают C++.
 
 ## Вход и live JSONL
 
 ```sh
-./build-ansa/ansa --login
-./build-ansa/ansa --auth-status
-./build-ansa/ansa --models
-./build-ansa/ansa --live-jsonl --session .omh-live-session --model gpt-6.1-sol
+./result/bin/ansa --login
+./result/bin/ansa --auth-status
+./result/bin/ansa --models
+./result/bin/ansa --live-jsonl --session .omh-live-session --model gpt-6.1-sol
 ```
 
 Собственная регистрация использует браузер, PKCE S256, state и nonce. Если Firefox предлагает выбрать профиль, выбери его и заверши вход. CLI также печатает ссылку для ручного открытия в браузере на той же машине. Callback слушает только `127.0.0.1` и ждёт до пяти минут. Для повторного запроса разрешения использовать ChatGPT plan есть `--login-consent`.
@@ -168,8 +157,8 @@ Live JSONL использует команды из таблицы ниже и `
 `--compact-bytes N` задаёт мягкий порог активного JSON-контекста (по умолчанию 262144). Live compact - обычный Responses-запрос со специальным prompt и пустым списком tools. Он создаёт сводку старой части разговора, сохраняя два последних завершённых turn и текущий запрос полностью. Сводка и её provenance синхронизируются до применения новой context epoch; полная история остаётся в журнале. Ошибка compact приостанавливает turn до Resume. До накопления трёх завершённых turns compact не применяется. Это JSON budget, оценка tokens пока не реализована.
 
 ```sh
-./build-ansa/ansa --refresh-auth
-./build-ansa/ansa --logout
+./result/bin/ansa --refresh-auth
+./result/bin/ansa --logout
 ```
 
 Вход сохраняется между запусками. Rotating refresh сериализуется файловой блокировкой и выполняется перед истечением access token. Явный `--refresh-auth` также соблюдает серверный `earliest_refresh_at`; до этого времени он возвращает `auth_refresh_not_ready`. При неопределённом результате обмена токен не используется повторно, требуется новый вход. Logout немедленно запрещает новый dispatch, удаляет локальные токены и пытается отозвать refresh token. Поле `remote_revocation_confirmed` сообщает результат. Сеть недоступна, неизвестен результат предыдущего обмена или повторный вход заменил ещё активную сессию - подтверждение полного отзыва остаётся `false`. Забытые сессии можно отозвать через настройки ChatGPT.
@@ -195,7 +184,7 @@ Snapshot дополнительно содержит mode, transcript_size и nu
 ## Сохранённая сессия
 
 ```sh
-./build-ansa/ansa --offline-jsonl --session .omh-session
+./result/bin/ansa --offline-jsonl --session .omh-session
 ```
 
 Каталог создаётся с правами `0700`, journal parts - `0600`. `.omh-session/` исключён из Git. Повторный запуск с тем же каталогом восстанавливает сессию и выдаёт новую runtime incarnation. Перенеси её из начального snapshot в команды текущего подключения. Незавершённый turn получает состояние `paused` и ждёт явный `resume`. Поля `request_id`, `turn` и `resume_available` доступны в snapshot.
@@ -214,7 +203,7 @@ Runtime накапливает контекст между завершённы�
 
 ## Границы реализации
 
-- HTTPS bytes обслуживает Hyper/rustls в Rust и libcurl в C++ fallback; bounded SSE framer отвечает за события, Responses reducer - за semantic admission.
+- HTTPS bytes обслуживает Hyper/rustls; bounded SSE framer отвечает за события, Responses reducer - за semantic admission.
 - Admission требует successful terminal, согласованных IDs/model/items/arguments и завершённого framing. До проверки всего batch executors недоступны.
 - Owning JSON сохраняет порядок native items, opaque strings и числовые tokens без округления. Replay использует исходные prefix, context epoch и advertised tool snapshot.
 - `ToolRegistry` хранит compiled descriptor/schema/validator/executor/revision. Provider получает только descriptions. Обычный CLI регистрирует `list_directory`, `read_file`, `search_files`, `run_command` и детерминированный `get_test_value`; JSONL сохраняет прежний pure snapshot.
@@ -224,7 +213,7 @@ CLI предоставляет self-check, offline round trip и live SIWC. Mock
 
 Сетевой adapter проверяет TLS, ограничивает размер и длительность transfer и не следует redirects. Политика MIME по умолчанию строгая; отсутствие MIME разрешается явно только для точного `POST https://api.openai.com/v1/responses`, `stream:true`, `store:false`, HTTP 200. Неверный или повторный MIME всегда приводит к отказу. Production live путь подаёт chunks в общий SSE reducer во время transfer. Preview предварительный; `CompletedResponse` появляется только после successful transfer, terminal и EOF. Тестовый injectable buffered adapter сохраняется.
 
-Поддерживается закрытое подмножество Responses events: lifecycle, function arguments, message text/refusal, reasoning summary и неисполняемый `response.metadata` с явным matching response ID. Неизвестные events/items отклоняются. Требуются `response.created`, непрерывные unsigned sequence numbers с нуля и точное совпадение returned model с явно выбранной policy. Для reasoning обязательно непустое `encrypted_content`. Это консервативный adapter, а не полная реализация всех Responses capabilities.
+Поддерживается закрытое подмножество Responses events: lifecycle, function arguments, message text/refusal, reasoning summary и неисполняемый `response.metadata` с явным matching response ID. Неизвестные events/items отклоняются. Требуются `response.created`, непрерывные unsigned sequence numbers с нуля и точное совпадение returned model с явно выбранной policy. Для окончательного reasoning item обязательно непустое `encrypted_content`; промежуточное значение added может быть неполным. Это консервативный adapter, а не полная реализация всех Responses capabilities.
 
 Для нового pure tool достаточно `ToolDefinition` и регистрации; пример с аргументами есть в suite `tools`. Поддерживаемая локальная schema: object/array/string/integer/number/boolean/null, все properties обязательны, `additionalProperties:false`; domain validation задаётся compiled validator. Неизвестные schema keywords отклоняются. При изменении реализации нужно менять `implementation_revision`.
 

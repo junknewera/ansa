@@ -50,7 +50,12 @@ def source_hash(path):
     path=Path(path);need(str(path).startswith('/nix/store/') and not any(p=='.env' or p.startswith('.env.') for p in path.parts) and path==path.resolve(),'Nix source path')
     with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC),'rb') as stream:
         meta=os.fstat(stream.fileno());need(stat.S_ISREG(meta.st_mode) and meta.st_size<=64*1024*1024,'Nix source file type/size');return hashlib.sha256(stream.read(64*1024*1024+1)).hexdigest()
-CPP_PACKAGE_SELECTOR='packages: (packages.ansa-cpp or packages.default).drvPath'
+CPP_PACKAGE_SELECTOR='''packages:
+  if packages ? ansa-cpp then packages.ansa-cpp.drvPath
+  else if packages.default ? cmakeFlags
+    && builtins.elem "-DBUILD_TESTING=ON" packages.default.cmakeFlags
+  then packages.default.drvPath
+  else throw "No C++ reference package: use a frozen pre-M10 revision"'''
 def expected_derivation(language,head):
     need(language in ('cpp','rust') and re.fullmatch('[0-9a-f]{40}',head),'pinned package source revision')
     reference='git+file://'+str(common.ROOT)+'?rev='+head+'#packages.aarch64-linux'

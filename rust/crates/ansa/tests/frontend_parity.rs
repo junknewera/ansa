@@ -391,7 +391,7 @@ fn ca_loader_checks_regular_type_size_and_public_symlink() {
 fn cli(root: &Root, args: &[&str]) -> std::process::Output {
     let home = root.0.join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::process::Command::new(env!("CARGO_BIN_EXE_ansa-rs"))
+    std::process::Command::new(env!("CARGO_BIN_EXE_ansa"))
         .args(args)
         .arg("--cwd")
         .arg(&home)
@@ -424,7 +424,7 @@ fn executable_rejects_non_submitting_one_shot_prompts() {
 #[test]
 fn executable_invalid_utf8_argv_is_a_controlled_diagnostic() {
     use std::os::unix::ffi::OsStrExt;
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ansa-rs"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ansa"))
         .args([
             std::ffi::OsStr::new("--offline"),
             std::ffi::OsStr::from_bytes(b"\xff"),

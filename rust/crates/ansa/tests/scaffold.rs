@@ -3,7 +3,7 @@
 #[test]
 fn executable_exposes_local_help_and_a_real_offline_roundtrip() {
     for args in [vec!["--help"], vec!["--offline-demo"]] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ansa-rs"))
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ansa"))
             .args(&args)
             .output()
             .expect("run scaffold executable");

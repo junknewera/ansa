@@ -2,40 +2,52 @@
 
 ## Ответственности
 
+Production - Cargo workspace `rust/`, crates `ansa` и `ansa-linux`. Пути в таблице
+относительны `rust/crates/ansa/src/`, кроме явно указанного `ansa-linux`.
+
 | Файлы | Ответственность |
 |---|---|
-| `json.hpp`, `json.cpp` | Owning immutable yyjson documents, bounds, duplicate keys, finite numbers, lossless numeric tokens, fixed-code diagnostics, OpenSSL EVP digest |
-| `sse.hpp`, `sse.cpp` | Incremental UTF-8/SSE framing без HTTP/provider semantics |
-| `responses.hpp`, `responses.cpp` | SIWC request profile, Responses reducer, admission, ordered native replay |
-| `tools.hpp`, `tools.cpp` | Compiled registry, immutable snapshot, schema/domain validation, runtime operation IDs, consume-once batch |
-| `transport.hpp`, `transport.cpp` | libcurl RAII, header/MIME admission, bounded byte callbacks, provider completion gate, offline byte injection |
-| `contracts.hpp` | Commands/events v1, distinct IDs, targeted Cancel и frontend snapshot/resync types |
-| `runtime.cpp`, `runtime_inbox.hpp` | Serialized turn state, bounded mailboxes, dispatch и cancellation |
-| `journal.hpp`, `journal.cpp` | Exclusive session lock, append-only framed records, hashes, fsync и восстановление оборванного хвоста |
-| `session.hpp`, `session.cpp` | Canonical session reducer, history и durable command identity |
-| `context_codec.hpp`, `context_codec.cpp` | Owning request/response codecs и восстановление Responses через production admission |
-| `compaction.hpp`, `compaction.cpp` | Prompt summary, admission результата compact и новая exact context epoch |
-| `auth.hpp`, `auth.cpp`, `auth_crypto.cpp` | Собственный SIWC/OIDC lifecycle, PKCE/JWT/JWKS, приватное хранилище и rotating refresh |
-| `offline.cpp` | Детерминированный mock через production framer и reducer |
-| `local_storage.cpp`, `process.cpp` | Приватные evidence records, отдельный process supervisor/subreaper, cancellation и recovery |
-| `agent_config.cpp`, `local_tools.cpp` | Детерминированные settings, иерархия AGENTS и compiled локальные tools |
-| `main.cpp`, `cli.cpp`, `auth_cli.cpp`, `agent_cli.cpp` | Текстовый CLI, dependency self-check, offline/live JSONL и команды входа |
+| `protocol/json.rs`, `legacy_json_v1.rs`, `sse.rs` | Owning JSON, точные numeric tokens и legacy hashes, incremental UTF-8/SSE framing |
+| `provider/request.rs`, `responses.rs`, `replay.rs` | Request profile, semantic admission, ordered native replay |
+| `tools/registry.rs`, `admission.rs` | Immutable descriptors, full batch validation и consume-once dispatch |
+| `transport/client.rs`, `http.rs` | Hyper/rustls, bounded headers/body, MIME/EOF и completion gate |
+| `runtime/owner.rs`, `work.rs`, `dispatch.rs`, `outbox.rs` | Serialized state, bounded mailboxes, blocking workers, targeted Cancel |
+| `session/journal_v1.rs`, `codec_v1.rs`, `state.rs`, `store.rs` | Canonical v1 journal, fsync, recovery, exact contexts и command identities |
+| `session/transcript.rs`, `catalog.rs` | Производная история и выбор сессии |
+| `context/` | Exact epochs, prompt summary и legacy compact codecs |
+| `auth/` | SIWC/OIDC, PKCE/JWT, own private store, rotating refresh и dispatch lease |
+| `process/runner.rs`, `supervisor.rs`, `ansa-linux/src/` | Process cleanup/evidence, terminal/signals и узкие Linux wrappers |
+| `config/`, `tools/` | Settings, AGENTS и compiled local tools |
+| `bin/ansa.rs`, `frontend/` | Production CLI/JSONL, Carbon, input и deterministic offline provider |
 
-Core - статическая CMake library `omh_core`. Сторонние runtime dependencies: libcurl, yyjson и libcrypto с их системной closure. Node/Python/agent CLI не участвуют в работе executable. CMake и Nix нужны для сборки.
+Cargo/Nix нужны для сборки; Python/C++ helpers не участвуют в работе executable.
+Runtime использует Tokio, Hyper/rustls/ring и owning JSON поверх serde. Собственный
+unsafe запрещён в `ansa`; узкие обоснованные Linux boundaries находятся в `ansa-linux`.
+Текущий production graph не включает CMake/libcurl/yyjson/OpenSSL.
 
 ## Admission и ownership
 
-`SiwcProvider::generate` создаёт `ResponseStream`, передаёт ему decoded HTTP bytes и вызывает `finish` только после успешного libcurl transfer и проверки финальных headers. Offline adapter использует те же framer, reducer и request builder. Ни curl callback, ни `output_item.done` не дают разрешения на tools.
+HTTP client передаёт проверенные chunks общему Responses decoder. Успешный transfer,
+финальные headers, terminal response и EOF обязательны для `AdmittedResponse`.
+Offline provider использует тот же decoder и request builder. Ни chunk callback,
+ни `output_item.done` не разрешают исполнение tools.
 
-Live AuthManager удерживает lease профиля и logout watcher во время HTTP и передаёт проверенные транспортом chunks в общий decoder. Reducer может выдавать накопленный упорядоченный preview текста, ограниченный 64 KiB. Preview не является admission: EOF/terminal gate и полная проверка batch сохраняются. SIWC `response.metadata` допускается только с явным совпадающим response ID и объектом metadata, проходит общие sequence/size проверки и не добавляется в executable output.
+Preview ограничен 64 KiB и не является admission. `response.metadata` допускается
+только с matching response ID и object metadata, проходит sequence/size checks и
+не становится executable output. Added reasoning envelope может быть неполным;
+только проверенное окончательное encrypted value попадает в replay.
 
-Reducer требует created identity/model, последовательных sequence numbers, уникальных item/call IDs и согласованных output indices. Added/delta/done/terminal representations сверяются. Function arguments проверяются и при final-only delivery. Item order должен совпадать в done events и completed response. Для text/summary parts отдельно проверяются IDs, indices, deltas и final values. Unknown executable types и unknown events приводят к отказу.
+Reducer требует created, ordered contiguous sequence и output indices, проверяет
+request/response/model identities и окончательные native items. Неизвестные event/item
+типы и несовпадение done/terminal отклоняются. `AdmittedResponse` имеет закрытый
+constructor, владеет исходным Request и ordered native items. `PreparedBatch::prepare`
+валидирует весь immutable tool snapshot и batch до executor. Rust ownership не
+позволяет скопировать и повторно consume подготовленный batch.
 
-SSE parser обрабатывает произвольные chunks, fragmented BOM/UTF-8, CR/LF/CRLF, comments, multiline data и reset event name. EOF не дописывает события. Незавершённое событие, неполный UTF-8 и semantic error от sink закрывают поток. Parser/reducer exceptions не могут быть подавлены с последующим успешным admission.
-
-`CompletedResponse` имеет закрытый constructor и появляется только после successful terminal и EOF. Он владеет исходным `Request`, native items и thin function-call view. `PreparedBatch::prepare` принимает только этот тип, сверяет полный tool snapshot и валидирует весь batch до первого executor. Перед dispatch подготовлены operation IDs, result identities и аварийные results. Batch нельзя копировать или исполнить повторно после move/consume.
-
-`Json` не выдаёт borrowed pointers. Значения на всех публичных границах владеют yyjson documents. Числа сохраняются как проверенные JSON numeric tokens; integer indices разбираются отдельно через `from_chars`, поэтому boolean, negative, fractional и overflowing indices не допускаются. Float tokens вне конечного диапазона double отклоняются; исходные конечные decimal tokens сохраняются без округления.
+`Json` владеет immutable `Arc` nodes и сохраняет порядок объектов/массивов и числовые
+lexemes. Decoded duplicate keys и превышение depth/nodes/bytes отклоняются. Unsigned
+indices разбираются отдельно; boolean, negative, fractional и overflow не принимаются.
+Legacy serializer отдельно сохраняет C++ v1 dump bytes, участвующие в hashes.
 
 ## Лимиты
 
@@ -50,7 +62,7 @@ SSE parser обрабатывает произвольные chunks, fragmented 
 | Tool result для replay | 128 KiB |
 | HTTP headers / fields | 64 KiB суммарно / 256 на block |
 
-Лимиты проверяются до append/parse соответствующего payload; depth проверяется также до yyjson parse. JSON/SSE input bytes ограничивают и объём внутренних parser allocations. Node/duplicate-key validation выполняется после parse. Одновременные owning copies увеличивают peak memory относительно body limit; это не обещание RSS ≤16 MiB. Overflow не приводит к усечённому executable JSON.
+Лимиты проверяются при incremental framing и JSON validation. JSON/SSE input bytes ограничивают объём parser allocations; depth, nodes и duplicate keys проверяются при построении owning значений. Одновременные owning copies увеличивают peak memory относительно body limit; это не обещание RSS ≤16 MiB. Overflow не приводит к усечённому executable JSON.
 
 ## Replay и provenance
 
@@ -64,7 +76,7 @@ Consume-once batch защищает конкретный подготовлен�
 
 ## Offline AgentRuntime
 
-Один control owner меняет публичное состояние одного turn за раз. Worker строит Request и continuation, вызывает mock и проверяет весь batch перед исполнением. Storage worker строит records, применяет session reducer, восстанавливает provider responses и выполняет disk I/O. Он получает immutable owning state и возвращает новый state. Owner заменяет state после completion. Stop worker вызывает `request_stop()`, поскольку registered stop callbacks исполняются синхронно. Cancel и GetSnapshot доступны во время ожидания диска и stop callbacks.
+Один control owner меняет публичное состояние одного turn за раз. Worker строит Request и continuation, вызывает mock и проверяет весь batch перед исполнением. Storage worker строит records, применяет session reducer, восстанавливает provider responses и выполняет disk I/O. Он получает immutable owning state и возвращает новый state. Owner заменяет state после completion. Отдельный stop worker передаёт отмену blocking callbacks без выполнения их в owner. Cancel и GetSnapshot доступны во время ожидания диска и stop callbacks.
 
 Submit FIFO вмещает 16 команд по умолчанию, ещё по одному слоту выделено для адресного Cancel, GetSnapshot и Resume. Runtime хранит до 4096 Submit ID и явно отклоняет новые при исчерпании лимита. Lookups повторных команд также ограничены размером FIFO. Storage, checkpoint и worker mailboxes имеют по одному слоту. Приём Cancel и допуск к каждому provider callback и executor сериализуются под одним mutex. Если matching Cancel уже принят, владелец обрабатывает его перед pending completion. Поздний completion отменённого turn сохраняет известные outcomes, дальнейший dispatch прекращается.
 
@@ -76,7 +88,7 @@ Session directory удерживается через advisory `flock`. Нова
 
 Journal version 1 содержит framed JSON records с length/complement, SHA-256 и последовательной hash chain. Максимальный record - 32 MiB. Parts образуют цепочку по digest всего предыдущего файла, включая оборванные байты. Частичная последняя запись восстанавливает проверенный prefix; новый part сохраняет связь с исходными байтами. Поддерживается до 4096 parts. Существующие bytes сохраняются. Ошибка checksum, sequence, semantic replay или configuration блокирует запись и dispatch.
 
-Session reducer хранит исходные binding, requested/returned model policy, полную epoch, tool descriptors/revisions, native items и результаты. Восстановление CompletedResponse снова проходит через production decoder/reducer. История завершённых turns образует следующий input. Frontend snapshot остаётся производным публичным представлением.
+Session reducer хранит исходные binding, requested/returned model policy, полную epoch, tool descriptors/revisions, native items и результаты. Восстановление AdmittedResponse снова проходит через production decoder/reducer. История завершённых turns образует следующий input. Frontend snapshot остаётся производным публичным представлением.
 
 На restart любой незавершённый turn приостановлен до Resume. Завершённый prefix tools используется с прежними operation IDs. Для незавершённого process intent recovery проверяет синхронизированное свидетельство supervisor и дописывает outcome в canonical journal. Без достоверного результата intent блокирует Resume как effect_unknown. Outcome хранит факт фактического dispatch, поэтому отменённый до executor intent не создаёт ложных ToolStarted/ToolFinished. Известный результат при storage failure остаётся в snapshot с `durable:false`. Ручное reconciliation неизвестных эффектов относится к следующей границе.
 
@@ -106,7 +118,7 @@ Live compact выполняется обычным Responses-запросом с
 
 ## Собственный SIWC профиль
 
-AuthManager создаёт own registration с постоянным opaque host UUID. Первый вход использует dynamic client registration, последующие - выданный client ID. Loopback callback, свежие state/nonce и PKCE S256 проверяются до code exchange. Discovery ограничен доверенными endpoint URLs. OpenSSL проверяет RS256/JWK, signature, issuer, audience/azp, время, nonce и неизменность subject. Identity привязана к issuer, issued client и subject; workspace не выводится из email.
+AuthManager создаёт own registration с постоянным opaque host UUID. Первый вход использует dynamic client registration, последующие - выданный client ID. Loopback callback, свежие state/nonce и PKCE S256 проверяются до code exchange. Discovery ограничен доверенными endpoint URLs. ring проверяет RS256/JWK, signature, issuer, audience/azp, время, nonce и неизменность subject. Identity привязана к issuer, issued client и subject; workspace не выводится из email.
 
 Auth directory и файлы проверяются по owner, permissions, type и link count. Записи проходят temporary file fsync, atomic rename и directory fsync. Один stop-aware flock сериализует обмены между процессами. JWT и access/refresh tokens находятся только в auth profile, отдельно от session journal и логов. Public binding хранит хеш identity. Identity-only scope сохраняется, но inference требует всех plan scopes. Текущая реализация ожидает полный token response с access/refresh token и expires_in, ID-token-only response без них отклоняется.
 
@@ -128,7 +140,7 @@ Worker передаёт cumulative preview через один заменяем�
 
 Терминальный frontend редактирует ввод в noncanonical режиме и перерисовывает ограниченную область основного буфера отдельным writer. Заблокированный stdout не задерживает input/control. RAII восстанавливает termios; job control временно возвращает исходные настройки. Рендерер обрабатывает ширину UTF-8 символов и обезвреживает terminal controls в пользовательском и model тексте. Pipe, one-shot и JSONL используют общий typed runtime без интерактивного рендера.
 
-Структурированный `TerminalEntry` отделяет роль от содержимого. Markdown и fences разбираются для assistant, а пользовательский текст сохраняется буквально. Высота растёт и сокращается по содержимому; writer очищает прежние хвостовые строки. Word wrapping и стили учитывают ширину glyphs. Подтверждённый финальный preview остаётся до получения transcript page без дублирования; committed tool-response не считается завершённым turn.
+Структурированный `TerminalEntry` отделяет роль от содержимого. Markdown и fences разбираются для assistant, а пользовательский текст сохраняется буквально. Диалог занимает всю высоту терминала, ввод и текущие уведомления закреплены внизу; delta writer сохраняет неподвижные строки при чтении истории. Word wrapping и стили учитывают ширину glyphs. Подтверждённый финальный preview остаётся до получения transcript page без дублирования; committed tool-response не считается завершённым turn.
 
 Запуск live CLI строит binding из локального `AuthStatus`, включая opaque auth session ID без bearer. `AgentAuthorization` откладывает access/refresh и каталог моделей до serialized dispatch worker. Он проверяет account/session до generation и tools, принимает смену session только при явном Resume и кеширует успешную проверку model catalog на auth epoch. `AuthManager::generate` и execution lease продолжают независимо проверять допуск. Сетевые запросы больше не предшествуют первому кадру.
 
