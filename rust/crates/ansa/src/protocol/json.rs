@@ -331,6 +331,9 @@ impl Json {
     pub fn is_object(&self) -> bool {
         matches!(self.value(), Value::Object(_))
     }
+    pub fn is_null(&self) -> bool {
+        matches!(self.value(), Value::Null)
+    }
     pub fn is_array(&self) -> bool {
         matches!(self.value(), Value::Array(_))
     }

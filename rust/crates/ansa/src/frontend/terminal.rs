@@ -30,10 +30,27 @@ struct Shared {
     inflight: AtomicBool,
     changed: tokio::sync::Notify,
     repaint: AtomicBool,
+    written: AtomicU64,
 }
 pub struct Writer {
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
+}
+#[derive(Default)]
+pub(super) struct Drain {
+    written: u64,
+    deadline: Option<Instant>,
+}
+impl Drain {
+    pub fn stalled(&mut self, written: u64, idle: bool, now: Instant) -> bool {
+        if idle {
+            self.deadline = None;
+        } else if self.deadline.is_none() || written != self.written {
+            self.deadline = Some(now + Duration::from_millis(250));
+        }
+        self.written = written;
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
 }
 impl Writer {
     pub fn new(output: Descriptor) -> Result<Self> {
@@ -52,6 +69,7 @@ impl Writer {
             inflight: AtomicBool::new(false),
             changed: tokio::sync::Notify::new(),
             repaint: AtomicBool::new(false),
+            written: AtomicU64::new(0),
         });
         let state = shared.clone();
         let join = thread::Builder::new()
@@ -107,7 +125,10 @@ impl Writer {
                                 state.failed.store(true, Ordering::Release);
                                 break;
                             }
-                            Ok(n) => remaining = &remaining[n..],
+                            Ok(n) => {
+                                state.written.fetch_add(n as u64, Ordering::Relaxed);
+                                remaining = &remaining[n..];
+                            }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 thread::sleep(Duration::from_millis(5))
@@ -194,6 +215,9 @@ impl Writer {
     pub fn failed(&self) -> bool {
         self.shared.failed.load(Ordering::Acquire)
     }
+    pub fn written(&self) -> u64 {
+        self.shared.written.load(Ordering::Relaxed)
+    }
     pub fn idle(&self) -> bool {
         let p = self
             .shared
@@ -210,7 +234,7 @@ impl Writer {
         self.shared.abort.store(true, Ordering::Release);
         self.shared.wake.notify_one();
     }
-    /// Drain normally; permanently blocked output must still join within 300ms.
+    /// Normal drain belongs to the async controller; Drop/error cleanup is bounded.
     pub fn finish(&mut self) -> bool {
         {
             let mut p = self
@@ -300,5 +324,28 @@ impl Drop for Io {
         if let Some(raw) = &mut self.raw {
             raw.restore();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn drain_ignores_idle_encoding_time_and_requires_pending_write_progress() {
+        let start = Instant::now();
+        let mut drain = Drain::default();
+        assert!(!drain.stalled(0, true, start));
+        // Serialization or scheduling may take arbitrarily long before any
+        // bytes are enqueued. That time does not consume the writer's budget.
+        let enqueued = start + Duration::from_secs(2);
+        assert!(!drain.stalled(0, false, enqueued));
+        assert!(!drain.stalled(0, false, enqueued + Duration::from_millis(249)));
+        assert!(drain.stalled(0, false, enqueued + Duration::from_millis(250)));
+        assert!(!drain.stalled(0, true, enqueued + Duration::from_secs(1)));
+        let enqueued = start + Duration::from_secs(4);
+        assert!(!drain.stalled(0, false, enqueued));
+        assert!(!drain.stalled(4096, false, enqueued + Duration::from_millis(200)));
+        assert!(!drain.stalled(4096, false, enqueued + Duration::from_millis(449)));
+        assert!(drain.stalled(4096, false, enqueued + Duration::from_millis(450)));
     }
 }

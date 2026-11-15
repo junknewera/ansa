@@ -679,15 +679,9 @@ fn compatible_added(added: &Json, final_item: &Json) -> Result<(), &'static str>
             return Err("added_metadata_conflict");
         }
     }
-    if added.has("type")
-        && added.text_field("type")? == "reasoning"
-        && added.has("encrypted_content")
-    {
-        let initial = added.text_field("encrypted_content")?;
-        if !initial.is_empty() && initial != final_item.text_field("encrypted_content")? {
-            return Err("opaque_conflict");
-        }
-    }
+    // A reasoning item's added encrypted_content may be incomplete. Only the
+    // done item, checked against terminal output, is admitted and replayed.
+    // https://developers.openai.com/api/reference/resources/responses/methods/retrieve
     Ok(())
 }
 
@@ -747,7 +741,9 @@ fn validate_item(
             }
         }
         "reasoning" => {
-            if item.has("encrypted_content") {
+            if item.has("encrypted_content")
+                && (final_item || !item.field("encrypted_content")?.is_null())
+            {
                 item.text_field("encrypted_content")?;
             }
             for p in item.field("summary")?.elements()? {

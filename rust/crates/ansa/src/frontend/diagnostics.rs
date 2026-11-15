@@ -67,6 +67,43 @@ mod tests {
             assert!(!text.contains('\u{1b}'));
             assert!(text.len() < 2048);
         }
+        for (storage, diagnostic, recovery, expected) in [
+            (false, "http_timeout", None, "http_timeout"),
+            (false, "http_timeout", Some("run:op:1"), "effect_unknown"),
+            (
+                true,
+                "journal_checksum",
+                Some("run:op:1"),
+                "journal_checksum",
+            ),
+        ] {
+            v.storage_failed = storage;
+            v.diagnostic = diagnostic.into();
+            v.recovery_operation = recovery.map(Into::into);
+            let status = format!(
+                "basic\n{}\n{}",
+                pause_notice(&v),
+                status_notice(&v, "/resume недоступен")
+            );
+            for cols in [20, 80] {
+                let frame = super::super::carbon::layout_full(
+                    &[],
+                    b"draft",
+                    2,
+                    &status,
+                    0,
+                    "",
+                    (cols, 10),
+                    false,
+                )
+                .unwrap();
+                let screen = frame.lines.join("\n");
+                assert_eq!(screen.matches(expected).count(), 1, "{screen}");
+                if recovery.is_some() {
+                    assert_eq!(screen.matches("effect_unknown").count(), 1, "{screen}");
+                }
+            }
+        }
     }
     #[test]
     fn refresh_does_not_restart_stage_elapsed_or_redraw_subseconds() {
@@ -93,7 +130,10 @@ mod tests {
 }
 pub(crate) fn error(code: &str) -> String {
     let code = safe_code(code);
-    let explanation = match code {
+    format!("{} ({code})", explanation(code))
+}
+fn explanation(code: &str) -> &'static str {
+    match code {
         "http_timeout" => "Истёк таймаут HTTP-запроса",
         "http_connect" | "http_handshake" => "Не удалось установить соединение с сервером",
         "http_transfer" => "Соединение оборвалось или ответ получен не полностью",
@@ -105,12 +145,35 @@ pub(crate) fn error(code: &str) -> String {
         "provider_policy_denied" => "Провайдер запретил запрос",
         "provider_usage_limit" => "Достигнут лимит использования провайдера",
         "session_interrupted" => "Незавершённый запрос восстановлен после перезапуска",
+        "opaque_conflict" => "Зашифрованный блок ответа изменился во время получения",
+        "cli_output_stalled" => "Приём вывода остановился; сообщение передано не полностью",
+        "cli_output_interrupted" => "Передача вывода прервана пользователем",
+        "cli_output" => "Не удалось завершить передачу вывода",
         _ => "Ошибка выполнения",
-    };
-    format!("{explanation} ({code})")
+    }
+}
+pub(crate) fn pause_notice(view: &Snapshot) -> String {
+    if view.storage_failed {
+        return format!("{}: Ошибка хранения сессии", safe_code(&view.diagnostic));
+    }
+    if view.recovery_operation.is_some() {
+        return "effect_unknown: Результат инструмента неизвестен".into();
+    }
+    if view.diagnostic.is_empty() {
+        return "runtime_failure: Причина паузы не сообщена".into();
+    }
+    let code = safe_code(&view.diagnostic);
+    format!("{code}: {}", explanation(code))
 }
 pub(crate) fn needs_attention(view: &Snapshot) -> bool {
     view.state == "paused" || view.storage_failed || view.recovery_operation.is_some()
+}
+pub(crate) fn status_notice(view: &Snapshot, detail: &str) -> String {
+    if view.storage_failed && view.recovery_operation.is_some() {
+        format!("effect_unknown: {detail}")
+    } else {
+        detail.to_owned()
+    }
 }
 pub(crate) fn pause(view: &Snapshot) -> String {
     let mut text = if view.storage_failed {
