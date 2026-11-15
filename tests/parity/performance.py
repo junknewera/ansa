@@ -95,14 +95,15 @@ def startup(binaries,directory,adapter,counts=(0,100,4096),samples=20):
             need(value['generation_count']==2*count and value['summary_count']==max(0,(count-2)//2) and value['snapshot']['transcript_size']==2*count,'history seed canonical counts')
             home=root/'home';cwd=home/'workspace';catalog=home/'.ansa/sessions/e2e';catalog.mkdir(mode=0o700,parents=True)
             for parent in (home/'.ansa',home/'.ansa/sessions'):parent.chmod(0o700)
-            info=catalog/'info.json';info.write_text(json.dumps({'schema_version':1,'id':'e2e','cwd':str(cwd),'profile':'offline'}));info.chmod(0o600)
+            info=catalog/'info.json';metrics.synced_write(info,json.dumps({'schema_version':1,'id':'e2e','cwd':str(cwd),'profile':'offline'}).encode())
             retained=directory/'datasets'/str(count);retained.mkdir(parents=True)
             parts={}
             for source in sorted((root/'journal').glob('part-*.log')):
                 # A complete 4096-submit journal is about 100MiB. This is an
                 # artifact-file bound, independent of the 32MiB record limit.
-                data=protocol.owned_bytes(source,256*1024*1024,single_link=True);target=retained/source.name;target.write_bytes(data);target.chmod(0o600)
-                destination=catalog/source.name;destination.write_bytes(data);destination.chmod(0o600);parts[source.name]=common.sha(target)
+                data=protocol.owned_bytes(source,256*1024*1024,single_link=True);target=retained/source.name;metrics.synced_write(target,data)
+                destination=catalog/source.name;metrics.synced_write(destination,data);parts[source.name]=common.sha(target)
+            for parent in (retained,catalog,catalog.parent,catalog.parent.parent):metrics.sync_directory(parent)
             need(parts,'empty history seed');datasets.append({'submits':count,'root':str(root),'parts':parts,'seed':seed})
             for index in range(samples):
                 for language,binary in binaries.items():

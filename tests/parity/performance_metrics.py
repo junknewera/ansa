@@ -24,6 +24,14 @@ def need(value,message):
     if not value:raise ValueError(message)
 def stats(values):return perf_measure.stats([{'value':value} for value in values],'value')
 def artifact(path):return {'path':path.name,'sha256':common.sha(path)}
+def synced_write(path,data):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+    with os.fdopen(fd,'wb') as file:
+        file.write(data);file.flush();os.fchmod(file.fileno(),0o600);os.fsync(file.fileno())
+def sync_directory(path):
+    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:os.fsync(fd)
+    finally:os.close(fd)
 class ObservedPty(frontend_io.Pty):
     def __init__(self,*args,**kwargs):
         self.trace={'start_ns':time.perf_counter_ns(),'reads':[],'sends':[],'signals':[],'rss_bytes':[]}
@@ -113,15 +121,17 @@ def pipeline(adapters,directory,counts=COUNTS,samples=SAMPLES):
             # At the hard cap measure the 4096th Submit from its 4095-turn prefix.
             prefix=max(0,count-1);parts,command=seed(adapters['cpp'],root,prefix,directory,f'pipeline-seed-{count}')
             home=root/'home';cwd=home/'workspace';retained=directory/f'pipeline-seed-{count}';retained.mkdir()
-            for name,data in parts.items():(retained/name).write_bytes(data)
+            for name,data in parts.items():synced_write(retained/name,data)
+            sync_directory(retained)
             datasets.append({'submits':count,'prefix_submits':prefix,'root':str(root),'seed':command,'parts':{name:{'path':str((retained/name).relative_to(directory)),'sha256':hashlib.sha256(data).hexdigest()} for name,data in parts.items()}})
             prior=decode(parts)
             for index in range(samples):
                 for kind in ('turn','cancel'):
                     for language,binary in adapters.items():
                         scope=f'metrics_{count}_{index}_{kind}_{language}';store=root/scope;work=cwd/scope
-                        store.mkdir(mode=0o700);work.mkdir(mode=0o700);(work/'value.txt').write_bytes(b'SOURCE_VALUE\n');(work/'value.txt').chmod(0o600)
-                        for name,data in parts.items():(store/name).write_bytes(data);(store/name).chmod(0o600)
+                        store.mkdir(mode=0o700);work.mkdir(mode=0o700);synced_write(work/'value.txt',b'SOURCE_VALUE\n')
+                        for name,data in parts.items():synced_write(store/name,data)
+                        sync_directory(store);sync_directory(work);sync_directory(root)
                         row={'language':language,'submits':count,'sample':index,'kind':kind,'scope':scope,'root':str(root),'status':'FAIL'};runs.append(row);screen=None;fds=[]
                         try:
                             screen=ObservedPty(str(binary),root,home,cwd,'',True,argv=['--e2e-frontend',str(root),kind,scope])
@@ -182,7 +192,7 @@ def pipeline(adapters,directory,counts=COUNTS,samples=SAMPLES):
             for kind,fields in FIELDS.items():
                 selected=[r for r in runs if r['language']==language and r['submits']==count and r['kind']==kind]
                 summary[f'{language}-{count}-{kind}']={field:stats([r[field] for r in selected]) if field!='fsync_seconds' else stats([n/1e9 for r in selected for n in r['native']['metrics']['fsync_ns']]) for field in fields}
-    return {'datasets':datasets,'runs':runs,'summary':summary,'method':'20 interleaved samples/client/dataset/kind; new owned scopes append once to a shared immutable prefix. 100/4096 measure the 100th/4096th Submit. Final terminal delivery paced800ms equally so the actual500ms transcript refresh exposes preview. Native monotonic clocks start AFTER terminal admission; fsync is before_sync..after_sync. Parent PTY and pinned descendant pidfds measure visible cancel and cleanup before harness intervention.'}
+    return {'datasets':datasets,'runs':runs,'summary':summary,'method':'20 interleaved samples/client/dataset/kind; new owned scopes append once to a shared immutable prefix. Cloned parts/value and directories fsynced before CLI launch; retained seeds also synchronously written, no dirty prefix charged to measured fsync. 100/4096 measure the 100th/4096th Submit. Final terminal delivery paced800ms equally so the actual500ms transcript refresh exposes preview. Native monotonic clocks start AFTER terminal admission; fsync is before_sync..after_sync. Parent PTY and pinned descendant pidfds measure visible cancel and cleanup before harness intervention.'}
 def wire():
     response={'id':'bench_response','model':'gpt-6.1-sol','status':'in_progress','output':[]}
     reasoning={'id':'bench_reasoning','type':'reasoning','status':'in_progress','summary':[],'encrypted_content':'x'*(256*1024)}

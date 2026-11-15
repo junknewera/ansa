@@ -113,6 +113,11 @@ class PerformanceControls(unittest.TestCase):
         with patch.object(performance.m,'OUT',self.path),patch.object(performance.m,'RUNS',[]):
             row=performance.m.run('metadata-proof',[self.binaries['cpp'],'--self-check'],self.path,metadata={'cache_condition':'observed','changed_source_sha256':'a'*64})
             self.assertEqual(json.loads((self.path/'progress.jsonl').read_bytes()),row)
+    def test_prefix_sync_failure_stops_before_frontend_launch(self):
+        out=self.path/'unsynced-prefix';out.mkdir()
+        with patch.object(measure.os,'fsync',side_effect=OSError('synthetic fsync failure')),patch.object(measure,'ObservedPty') as frontend:
+            with self.assertRaisesRegex(OSError,'synthetic fsync failure'):measure.pipeline({k:Path(p) for k,p in self.adapters.items()},out,counts=(0,),samples=1)
+            frontend.assert_not_called()
     def test_release_profile_rejects_debug_launcher_and_link_flags(self):
         cache=(Path(__file__).resolve().parents[2]/'build-ansa-release/CMakeCache.txt').read_bytes()
         compiler=next(line.split('=',1)[1] for line in cache.decode().splitlines() if line.startswith('CMAKE_CXX_COMPILER:'))
