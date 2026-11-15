@@ -31,7 +31,7 @@ pub fn preview_visible(
         && request.is_some()
         && preview.is_some_and(|p| !p.text.is_empty() && (p.state != "committed" || completed))
 }
-type Replies = JoinSet<(CommandId, bool, Result<PostStatus>)>;
+type Replies = JoinSet<(CommandId, bool, bool, Result<PostStatus>)>;
 pub struct State {
     pub snapshot: Option<Snapshot>,
     pub turn: TurnId,
@@ -103,6 +103,27 @@ impl State {
         }
     }
     fn post(&mut self, handle: &Handle, payload: CommandPayload, replies: &mut Replies) -> bool {
+        self.post_with_origin(handle, payload, replies, false)
+    }
+    fn post_read(
+        &mut self,
+        handle: &Handle,
+        payload: CommandPayload,
+        replies: &mut Replies,
+    ) -> bool {
+        debug_assert!(matches!(
+            payload,
+            CommandPayload::GetSnapshot(_) | CommandPayload::GetTranscript(_)
+        ));
+        self.post_with_origin(handle, payload, replies, true)
+    }
+    fn post_with_origin(
+        &mut self,
+        handle: &Handle,
+        payload: CommandPayload,
+        replies: &mut Replies,
+        internal_read: bool,
+    ) -> bool {
         if replies.len() >= 64 {
             return false;
         }
@@ -114,7 +135,7 @@ impl State {
         let h = handle.clone();
         replies.spawn(async move {
             let id = command.command.clone();
-            (id, submit, h.post(command).await)
+            (id, submit, internal_read, h.post(command).await)
         });
         true
     }
@@ -170,7 +191,7 @@ impl State {
             "/cancel" => {
                 if self.awaiting() {
                     self.deferred_cancel = true;
-                    self.post(handle, CommandPayload::GetSnapshot(0), replies);
+                    self.post_read(handle, CommandPayload::GetSnapshot(0), replies);
                 } else if let Some(target) = self.snapshot.as_ref().and_then(|v| v.request.clone())
                 {
                     self.post(handle, CommandPayload::Cancel(target), replies);
@@ -456,8 +477,11 @@ pub async fn run(
         let mut signal_guard = None;
         tokio::select! {biased;
             reply=replies.join_next(),if !replies.is_empty()=>{
-                if let Some(reply)=reply {dirty=true;let (id,submit,result)=reply.map_err(|_|"cli_post_task")?;
-                    let code=match result {Ok(PostStatus::Accepted|PostStatus::Duplicate)=>None,Ok(PostStatus::QueueFull)=>Some("command_queue_full"),Ok(PostStatus::Closed)=>Some("runtime_closed"),Ok(PostStatus::StaleTarget)=>Some("stale_cancel_target"),Ok(PostStatus::StaleIncarnation)=>Some("stale_incarnation"),Ok(PostStatus::CommandIdLimit)=>Some("submit_id_limit"),Ok(PostStatus::CommandConflict)=>Some("command_id_conflict"),Err(code)=>Some(code)};
+                if let Some(reply)=reply {dirty=true;let (id,submit,internal_read,result)=reply.map_err(|_|"cli_post_task")?;
+                    // An internal read already queued at a local shutdown can
+                    // lose its reply. Explicit/user commands still report Closed.
+                    let expected_close=internal_read&&(closed||finished)&&matches!(&result,Ok(PostStatus::Closed));
+                    let code=if expected_close {None}else{match result {Ok(PostStatus::Accepted|PostStatus::Duplicate)=>None,Ok(PostStatus::QueueFull)=>Some("command_queue_full"),Ok(PostStatus::Closed)=>Some("runtime_closed"),Ok(PostStatus::StaleTarget)=>Some("stale_cancel_target"),Ok(PostStatus::StaleIncarnation)=>Some("stale_incarnation"),Ok(PostStatus::CommandIdLimit)=>Some("submit_id_limit"),Ok(PostStatus::CommandConflict)=>Some("command_id_conflict"),Err(code)=>Some(code)}};
                     if state.pending_draft.as_ref().is_some_and(|(draft,_,_)|draft==&id){let (_,bytes,cursor)=state.pending_draft.take().expect("checked");if code.is_some(){state.editor.bytes=bytes;state.editor.cursor=cursor;}}
                     if let Some(code)=code {
                         if submit && state.pending.as_ref()==Some(&id) {
@@ -497,7 +521,7 @@ pub async fn run(
                     if !state.cancelled && state.awaiting() {
                         state.cancelled = true;
                         state.deferred_cancel = true;
-                        state.post(&handle, CommandPayload::GetSnapshot(0), &mut replies);
+                        state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                     } else if !state.cancelled
                         && state.snapshot.as_ref().is_some_and(|v| {
                             v.request.is_some()
@@ -540,13 +564,13 @@ pub async fn run(
             }
         }
         let ready = state.snapshot.is_some();
-        if !jsonl_mode && ready {
+        if !jsonl_mode && ready && !closed && !finished && !actor_done {
             if resync {
-                state.post(&handle, CommandPayload::GetSnapshot(0), &mut replies);
+                state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                 resync = false;
             }
             if io.raw.is_some() && Instant::now() >= next_history {
-                state.post(
+                state.post_read(
                     &handle,
                     CommandPayload::GetTranscript(state.query.clone()),
                     &mut replies,
@@ -560,7 +584,7 @@ pub async fn run(
                     }
                     state.deferred_cancel = false;
                 } else if Instant::now() >= next_cancel {
-                    state.post(&handle, CommandPayload::GetSnapshot(0), &mut replies);
+                    state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                     next_cancel = Instant::now() + Duration::from_millis(40);
                 }
             }
@@ -836,7 +860,7 @@ fn post_line(bytes: &[u8], handle: &Handle, io: &Io, replies: &mut Replies) {
                 io.status(&(jsonl::error("command_queue_full", correlated).dump() + "\n"));
             } else {
                 let h = handle.clone();
-                replies.spawn(async move { (id, false, h.post(command).await) });
+                replies.spawn(async move { (id, false, false, h.post(command).await) });
             }
         }
         Err(code) => io.status(&(jsonl::error(code, None).dump() + "\n")),

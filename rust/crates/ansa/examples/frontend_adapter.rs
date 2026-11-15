@@ -490,6 +490,8 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
             let until = Instant::now()
                 + if hold_terminal_for_cancel {
                     Duration::from_secs(5)
+                } else if mode_owned == "eof-drain" {
+                    Duration::from_millis(1200)
                 } else {
                     Duration::from_millis(if mode_owned == "limit" { 10 } else { 500 })
                 };

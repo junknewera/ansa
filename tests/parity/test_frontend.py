@@ -23,6 +23,19 @@ def replace_events(value):value['stdout_hex']=''.join(json.dumps(e,separators=('
 def bridge_fake(name):
     value=control(name);fake=Fake(value);fake.root=Path(json.loads(bytes.fromhex(value['request_hex']))['root']);return fake
 class FrontendEvidenceTests(unittest.TestCase):
+    def test_native_eof_drains_active_turn_without_closed_poll_errors(self):
+        binary=frontend.common.ROOT/'rust/target/debug/examples/frontend_adapter'
+        for plain in (False,True):
+            with self.subTest(plain=plain),tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp') as name:
+                root=Path(name);owner=root/'fixture-owner';owner.write_bytes(b'ansa-m4-synthetic-v1\n');owner.chmod(0o600);root,home,cwd=frontend_io.fixture(root)
+                value=frontend_io.terminal(str(binary),{'case':'eof-drain','plain':plain},root,home,cwd)
+                self.assertEqual(value['exit'],0,bytes.fromhex(value['stdout_hex']))
+                self.assertTrue(value['termios_restored'] and value['flags_restored'])
+                self.assertNotIn(b'runtime_closed',bytes.fromhex(value['stdout_hex']))
+                self.assertEqual((root/'generated').read_bytes(),b'x')
+                groups=frontend.journal_events(value['journals']);self.assertEqual(len(groups),1)
+                records=next(iter(groups.values()));self.assertEqual([e['kind'] for e in records],['init','accepted','response','done'])
+                self.assertEqual(records[1]['text'],'question');self.assertEqual(records[2]['turn'],records[3]['turn'])
     def test_inventory_is_closed_and_unique(self):
         for mode in ('compare','fault'):
             ids=frontend.inventory(mode);self.assertEqual(len(ids),len(set(ids)));self.assertGreater(len(ids),100)
