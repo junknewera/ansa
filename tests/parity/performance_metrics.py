@@ -76,7 +76,7 @@ def call(binary,row,directory,label,env=None,pass_fds=()):
 def seed(binary,root,count,directory,label):
     value,command=call(binary,{'root':str(root),'mode':'plan','turns':count,'start':0,'quiet':True,'compact':True},directory,label)
     need(value['generation_count']==2*count and value['summary_count']==max(0,(count-2)//2) and value['snapshot']['transcript_size']==2*count,'metric seed counts')
-    parts={p.name:protocol.owned_bytes(p,64*1024*1024,single_link=True) for p in sorted((root/'journal').glob('part-*.log'))}
+    parts={p.name:protocol.owned_bytes(p,256*1024*1024,single_link=True) for p in sorted((root/'journal').glob('part-*.log'))}
     need(parts,'metric seed empty')
     return parts,command
 def pin_ancestors(primary,child):
@@ -152,7 +152,7 @@ def pipeline(adapters,directory,counts=COUNTS,samples=SAMPLES):
                                 row.update(cancel_ns=begin,ack_ns=ack,cleanup_ns=cleanup,cancel_ack_seconds=(ack-begin)/1e9,process_cleanup_seconds=(cleanup-begin)/1e9,after_exited=[exited(fd) for fd in fds])
                             screen.memory();row['rss_bytes']=max(screen.trace['rss_bytes']);screen.send(b'\x04');result=screen.finish();need(result['exit']==0 and result['termios_restored'] and result['flags_restored'],'metric PTY restoration')
                             measured=footer(screen.raw);row['native']=measured;row['observations']=result['observations'];row.update(exit_code=0,termios_restored=True,flags_restored=True)
-                            after={p.name:protocol.owned_bytes(p,64*1024*1024,single_link=True) for p in sorted(store.glob('part-*.log'))};deltas={}
+                            after={p.name:protocol.owned_bytes(p,256*1024*1024,single_link=True) for p in sorted(store.glob('part-*.log'))};deltas={}
                             for name,data in after.items():
                                 base=parts.get(name,b'');need(data.startswith(base),'metric rewrote canonical journal');delta=directory/(scope+'-'+name+'.delta');delta.write_bytes(data[len(base):]);deltas[name]=dict(artifact(delta),prefix_bytes=len(base),after_bytes=len(data),after_sha256=hashlib.sha256(data).hexdigest())
                             need(set(parts)<=set(after),'metric lost journal part');row['journal_deltas']=deltas

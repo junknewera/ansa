@@ -99,7 +99,9 @@ def startup(binaries,directory,adapter,counts=(0,100,4096),samples=20):
             retained=directory/'datasets'/str(count);retained.mkdir(parents=True)
             parts={}
             for source in sorted((root/'journal').glob('part-*.log')):
-                data=protocol.owned_bytes(source,64*1024*1024,single_link=True);target=retained/source.name;target.write_bytes(data);target.chmod(0o600)
+                # A complete 4096-submit journal is about 100MiB. This is an
+                # artifact-file bound, independent of the 32MiB record limit.
+                data=protocol.owned_bytes(source,256*1024*1024,single_link=True);target=retained/source.name;target.write_bytes(data);target.chmod(0o600)
                 destination=catalog/source.name;destination.write_bytes(data);destination.chmod(0o600);parts[source.name]=common.sha(target)
             need(parts,'empty history seed');datasets.append({'submits':count,'root':str(root),'parts':parts,'seed':seed})
             for index in range(samples):
