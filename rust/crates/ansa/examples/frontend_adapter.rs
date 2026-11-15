@@ -400,6 +400,7 @@ fn final_response(
 fn fixture(root: &Path, mode: &str) -> Result<i32> {
     ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
     let mut io = Io::open(mode != "backpressure" && mode != "large-jsonl")?;
+    let hold_terminal_for_cancel = mode == "terminal" && io.raw.is_some();
     let tools = app::pure_tools()?;
     let tools = if mode == "large-jsonl" {
         let mut registry = ansa::tools::registry::Registry::new();
@@ -483,13 +484,23 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
                     "```cpp\ndraft\n```\nassistant manager\n**bold alpha bravo charlie delta echo foxtrot** `code` ",
                 )?;
             }
+            // The PTY case inspects preview/busy draft and then cancels. Keep
+            // this fixture response active until that Cancel instead of racing
+            // the frontend's 500ms transcript refresh with terminal delivery.
             let until = Instant::now()
-                + Duration::from_millis(if mode_owned == "limit" { 10 } else { 500 });
+                + if hold_terminal_for_cancel {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(if mode_owned == "limit" { 10 } else { 500 })
+                };
             while Instant::now() < until && !stop.cancelled() {
                 std::thread::sleep(Duration::from_millis(5));
             }
             if stop.cancelled() {
                 return Err("offline_cancelled");
+            }
+            if hold_terminal_for_cancel {
+                return Err("fixture_terminal_cancel_timeout");
             }
             if mode_owned == "preview-invalid" {
                 return Err("fixture_invalid_response");
