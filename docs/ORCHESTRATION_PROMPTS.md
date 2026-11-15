@@ -4,6 +4,8 @@
 
 `ChildSessionBinding`, task/attempt structures, orchestration commands и evidence projections ниже — **предлагаемые** элементы. Их наличие нельзя предполагать в текущем repository. Используй реальные post-migration contracts; не создавай универсальную абстракцию executor backends. Все `{{...}}` заполняет deterministic owner из canonical task state и утверждённой policy. Незаполненная identity, SHA, scope, budget или permissions означает blocker, а не приглашение модели угадать значение.
 
+**Поправка 15 ноября 2026:** на проверенном main `5029b8b8972ea4c64ac213474b37f53a13bd5ab5` M9 принят, Rust выбран по умолчанию, C++ fallback сохранён; M10 остаётся отдельным этапом. Это не обновление runtime исторической ветки PR #3. [Датированное состояние и evidence](PROJECT_STATE.md) не отменяют prerequisite M10/O1–O4 ниже.
+
 ## Общий native contract для всех четырёх prompts
 
 - Один orchestration owner меняет task/attempt/budget/acceptance state. Native child session владеет только собственными model/tool history и outcomes в рамках existing session reducer. Текст модели — proposal/observation, не state transition и не доказательство пройденного теста.
@@ -23,7 +25,7 @@
 
 Прочитай корневой AGENTS.md, docs/PROJECT_STATE.md, docs/RUST_MIGRATION_PLAN.md, docs/adr/0002-self-hosted-orchestration.md, docs/ORCHESTRATION_RESEARCH.md и scoped AGENTS выбранного Rust crate. Выполни read-only inventory актуальных refs, main/HEAD, dirty state, migration checkpoints и evidence. Старый чат, этот prompt и один tag не являются доказательством готовности.
 
-**Обязательный prerequisite — подтверждённый M10 GO.** Нужны проверенный checkpoint `migration/m10-rust-production` или его явно документированный преемник, соответствующий code tree и acceptance evidence, без незакрытых migration blockers. Если фактическое состояние всё ещё M0 pending native X13s либо следующий migration gate не закрыт, верни **BLOCKED**: actual SHA, незакрытый gate, evidence reference и точное требуемое действие. Не выполняй другой milestone вместо этого задания и не переноси Orchestrate в C++.
+**Обязательный prerequisite — подтверждённый M10 GO.** Нужны проверенный checkpoint `migration/m10-rust-production` или его явно документированный преемник, соответствующий code tree и acceptance evidence, без незакрытых migration blockers. Если M10 GO не подтверждён, верни **BLOCKED**: actual SHA, незакрытый gate, evidence reference и точное требуемое действие. Не выполняй другой milestone вместо этого задания и не переноси Orchestrate в C++.
 
 После подтверждения prerequisite используй отдельную implementation branch/worktree от согласованного immutable `{{BASE_SHA}}`. Сохрани пользовательские изменения; не делай stash/reset/force-checkout. Определи путь crate по реальному post-M10 workspace; не предполагается, что префикс `rust/` сохранился. Разрешённый scope, commands и публикация заданы только `{{DEVELOPMENT_POLICY_REF}}`.
 
@@ -78,9 +80,11 @@ Bundle содержит original goal/TaskSpec, authoritative AGENTS/ADR, `base_
 
 ### Выход
 
-Не более восьми существенных findings и пяти verification gaps. Для каждого finding: severity, requirement/invariant ID, file/symbol, конкретный trace/reproduction, consequence, требуемая regression и evidence status. Не включай stylistic замечания без влияния на согласованный scope.
+Не более восьми существенных findings и пяти verification gaps **на одну bounded страницу**, без молчаливого отбрасывания остальных. Для каждого finding: severity, requirement/invariant ID, file/symbol, конкретный trace/reproduction, consequence, требуемая regression и evidence status. Не включай stylistic замечания без влияния на согласованный scope.
 
-Верни bounded JSON по выданной локально валидируемой result schema: `verdict = accept | changes_requested | blocked`, твою review binding, reviewed base/candidate/integration SHA, evidence references, findings и unresolved gates. Если schema не предоставлена, верни blocker; не считай наличие API structured-output guarantee подразумеваемым.
+Верни bounded JSON по выданной локально валидируемой result schema: `verdict = accept | changes_requested | blocked`, твою review binding, reviewed base/candidate/integration SHA, evidence references, findings, unresolved gates и обязательные `more_findings`/`coverage_incomplete`. Если schema не предоставлена, верни blocker; не считай наличие API structured-output guarantee подразумеваемым.
+
+Если findings не поместились, выставь `more_findings=true`; если required coverage ещё не завершено — `coverage_incomplete=true`. Укажи доступные host-provided evidence references и оставшийся review scope. Host сохраняет страницы durably с общей логической task/review binding, immutable target SHA, requirements/manifest и evidence revision. Native child/Submit binding и receipt каждой страницы фактические: новая session использует свой SessionId, новый Submit — свои CommandId/TurnId/RequestId; compatible Resume сохраняет identity исходного accepted turn по native contract. Не переноси native IDs другого Submit/session; RequestId по-прежнему добавляет host из durable receipt. При наличии budget host назначает bounded continuation; ты не создаёшь новые sessions/requests самостоятельно. Material overflow и required gaps запрещают `accept` до закрытия всего aggregate. Отсутствие continuation/evidence или исчерпание budget оставляет `changes_requested`/`blocked`, а не разрешает сократить findings до PASS. Все страницы и continuation расходуют прежний root budget и сохраняют counters через restart/session changes.
 
 `accept` — только твой review verdict. Deterministic coordinator проверяет receipts, policy и integration отдельно. Если builder/reviewer используют одну модель, укажи, что contexts независимы, но ошибки модели могут коррелировать. Ни эта оговорка, ни использование другой модели не заменяют mechanical/behavioral evidence.
 

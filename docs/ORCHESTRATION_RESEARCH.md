@@ -2,6 +2,12 @@
 
 Дата исходного исследования и обязательной архитектурной коррекции: **13 ноября 2026, Europe/Moscow**. Product decision принят пользователем; interfaces, lifecycle additions и roadmap ниже — **PROPOSED**, implementation отсутствует. Это исправление существующего docs-only PR #3, не новый аудит и не изменение Rust migration M0–M10.
 
+## Обновление состояния — 15 ноября 2026
+
+Проверенный `main` — `5029b8b8972ea4c64ac213474b37f53a13bd5ab5`: M9 имеет **GO**, Rust выбран default package, C++ сохранён как fallback; **M10 остаётся отдельным незавершённым этапом** ([PROJECT_STATE][A13], [flake][A14]). Это состояние main, а не перенос нового runtime в историческую ветку PR #3. D1 и ссылки на M0 ниже сохраняют snapshot 13 ноября и его evidence; прежние test results не являются новыми запусками.
+
+Технический фундамент продвинулся, но согласованная последовательность не меняется: production Orchestrate — после verified M10 GO и собственных O1–O4 gates. Эта docs-only поправка уточняет overflow reviewer и сравнения eval; она не разрешает implementation или новый live pilot.
+
 ## Обязательное решение
 
 **DECISION: Native ANSA multi-agent orchestration via direct SIWC Responses. No Codex runtime dependency.**
@@ -23,13 +29,13 @@ Default production implementation — отдельная feature после veri
 | PROPOSED | Новое решение/контракт; не существующее API и не выполненный runtime. |
 | UNKNOWN | Требует будущего допуска/измерения; не подменяется предположением. |
 
-Все новые Rust types и CLI shapes ниже — sketches. Здесь нет live model discovery, inference, чтения реальных credentials, native X13s orchestration acceptance или измеренного выигрыша multi-agent. Сохранён исходный repository audit; повторная проверка correction подтвердила прежние main/PR #2 refs.
+Все новые Rust types и CLI shapes ниже — sketches. Здесь нет live model discovery, inference, чтения реальных credentials, native X13s orchestration acceptance или измеренного выигрыша multi-agent. Сохранён исходный repository audit; повторная проверка correction 13 ноября подтвердила прежние main/PR #2 refs. Более поздний main отмечен отдельно выше.
 
 Пакет: этот отчёт — D1–D5, D7–D8; [четыре prompts](ORCHESTRATION_PROMPTS.md) — D6; [ADR 0002](adr/0002-self-hosted-orchestration.md) — обязательное product decision и предложенные implementation contracts.
 
 ## D1. Current State Audit
 
-### Проверенный GitHub snapshot
+### Проверенный GitHub snapshot — исторический, 13 ноября 2026
 
 Репозиторий исследован через GitHub connector. Immutable main: `ca851c99d4887a121300f0bcee8687ed9d055071`. При повторном использовании отчёта сначала обновить snapshot; наличие этого документа не доказывает, что ветки всё ещё стоят на тех же SHA.[A1][A2]
 
@@ -211,8 +217,12 @@ struct ReviewReport {
     verdict: ReviewVerdict,
     findings: Vec<Finding>,
     unverified: Vec<RequirementId>,
+    more_findings: bool,
+    coverage_incomplete: bool,
 }
 ```
+
+`ReviewReport` ограничивает одну страницу восемью существенными findings и пятью verification gaps; это не разрешение отбросить остальные. `more_findings` отмечает оставшиеся findings, `coverage_incomplete` — незавершённое покрытие requirements/evidence. Host durably сохраняет страницы с общей логической task/review binding, immutable target SHA, requirements/manifest и evidence revision; при overflow он планирует bounded continuation с оставшимся scope. Каждая страница сохраняет собственную фактическую native child/Submit binding и durable receipt: Новая session использует свой SessionId, новый Submit — свои CommandId/TurnId/RequestId; IDs другого Submit/session не переносятся. Compatible Resume сохраняет identity исходного accepted turn по native contract. До закрытия material overflow, blocking findings и required gaps `accept` запрещён. При отсутствии continuation/evidence либо исчерпанном root budget результат остаётся `changes_requested` или `blocked`; число страниц, их размер и дополнительные requests ограничены той же policy, без сброса counters при новой странице/session. Полноту aggregate и возможность integration проверяет host, а не только последний verdict модели.
 
 `OwnedChild` owns обычный runtime handle, bounded event drain, join/result lifecycle и cancellation linkage. Он предоставляет существующие typed command operations, не второй execution engine. Не блокировать orchestration owner на `next_event()` или join: их обслуживает bounded native job/event bridge. Drop не является receipt о quiescence. Размер task graph, children, queues и artifacts ограничен policy.
 
@@ -286,7 +296,7 @@ Native child живёт как owned runtime job внутри ANSA process, не
 | Executing → Reconciling | Native terminal, cancellation, crash, timeout, transport/storage failure. |
 | Reconciling → Verifying | Known/reconciled effects, confirmed local quiescence, full inventory и immutable candidate. |
 | Verifying → Reviewing | Required tests реально прошли на exact candidate SHA; no required skip/empty PASS. |
-| Reviewing → Integrating | Нет blocking findings/gaps; validator принимает ReviewReport, не строку «approved». |
+| Reviewing → Integrating | Нет blocking findings/gaps и незакрытого material overflow/coverage; validator принимает весь ReviewReport aggregate, не строку «approved» или только последнюю страницу. |
 | Integrating → Publishing | Required tests/review evidence относятся к final integration SHA. |
 | Publishing → Accepted | Durable PR/patch receipt и final-SHA acceptance. Accepted не означает main merge. |
 | Active → Paused/Blocked | Quota/auth, missing evidence, effect_unknown, cleanup uncertainty, corruption или budget exhaustion. |
@@ -507,18 +517,28 @@ O5 — максимум два native builders после eval и проверк
 
 ## Evals: воспроизводимо проверить пользу
 
-**PROPOSED; live runs здесь не проводились.** Минимальный pilot: четыре реальные задачи × три native serial configurations = **12 runs**. При полезном сигнале восемь задач × три конфигурации × два повторения = 48 runs; parallel subset отдельно. Общий quota/time cap выбирается до начала.
+**PROPOSED; live runs здесь не проводились.** Минимальный pilot: четыре реальные задачи × три основные native serial configurations N0/N1/N2 = **12 runs**. При полезном сигнале восемь задач × те же три конфигурации × два повторения = **48 runs**. Дополнительные controls ниже и parallel subset — отдельные этапы с собственным заранее выделенным бюджетом; в 12/48 они не включены. Общий quota/time cap выбирается до начала.
 
 | ID | Product-native конфигурация |
 |---|---|
 | N0 | Один ordinary native ANSA basic agent; bounded self-checks/repairs. |
-| N1 | Native planner + один native builder + host verification. |
-| N2 | Native coordinator + builder + fresh native reviewer + host verification. |
+| N1 | Deterministic coordinator + native planner + один native builder + host verification. |
+| N2 | Тот же coordinator, planner, builder и host verification, что в N1, плюс fresh native reviewer. |
 | P2 | Только для подходящих tasks: два native builders с теми же N2 gates. |
 
 Codex может участвовать только как **необязательный внешний development baseline**, запускаемый разработчиком вне ANSA orchestration. Он не является backend, prerequisite, dependency или обязательным arm acceptance этого продукта. Product eval полностью исполним без его установки.
 
-Одинаковый внешний final harness/adjudicator оценивает все arms: base SHA, acceptance criteria, tool permissions, model/effort и общий budget совпадают; baseline может делать собственные bounded repairs. Fresh sessions/worktrees, pinned toolchain/resources/cache policy, randomized order, решения между arms не передаются. Benefit planning — N1−N0, review — N2−N1, parallelism — P2−N2.
+Одинаковый внешний final harness/adjudicator оценивает все arms: base SHA, acceptance criteria и tool permissions совпадают; для основных N0/N1/N2 фиксируются одинаковые model/effort и общий budget, baseline может делать собственные bounded repairs. В N1/N2 одинаковы planner prompt/output contract, builder policy, host checks и repair limits; единственное назначенное различие — fresh-review policy и использование её findings в пределах этих лимитов. Fresh sessions/worktrees, pinned toolchain/resources/cache policy, randomized order, решения между arms не передаются. N1−N0 оценивает пакет planning/workflow, N2−N1 — эффект fresh review при одинаковых остальных стадиях, P2−N2 — parallelism.
+
+После screening сравнить N2 с простыми controls, чтобы отделить пользу ролей от дополнительного inference budget:
+
+| Control | Что проверяется |
+|---|---|
+| Single с дополнительным budget | Один native agent направляет сопоставимый полный budget N2, включая его planner/reviewer reserve, на bounded self-checks/repairs; лимиты этой eval policy фиксируются заранее и не меняют product defaults. |
+| Stronger single | Один доступный более сильный model/effort profile, заранее выбранный и проверенный на том же SIWC route, при сопоставимых наблюдаемых ограничениях. Это отдельный model/effort contrast, не часть N2−N1. |
+| Independent attempts / best-of-N | Независимые fresh single-agent attempts без обмена решениями, общий budget на все attempts и заранее определённый selector. Сравнить выбранный candidate тем же final harness. |
+
+В budget входят planning/review, все attempts, selection, retries, tool/verification work и wall-clock. Совпадающие limits и фактический расход публикуются отдельно; при неизвестной token/quota telemetry не заявлять точное compute/cost matching. Если caps нельзя сопоставить, показать качество при нескольких наблюдаемых бюджетах, а не приписывать выигрыш architecture. Oracle-метрика «хотя бы один из N принят external harness» показывает coverage набора; она не доказывает качество deployable selector. Selector не получает hidden final-oracle labels; его доступное evidence, стоимость и ошибочный выбор измеряются отдельно. Все candidate outcomes сохраняются, а финальная acceptance во всех arms остаётся внешней.
 
 ### Реальные задачи ANSA
 
@@ -581,11 +601,11 @@ UNKNOWN до implementation/live gates: точная Rust child factory/receipt 
 | Parallel workers | Сначала 1, затем максимум 2 после eval. |
 | Continuation | Task journal + original child journals + Git/evidence/budgets/handoff. |
 | Migration | Собственные Rust modules M2–M7, gates M8/M9; default feature после M10. |
-| Первый E2E | Сейчас корректный M0 blocker; в O4 useful native diagnostic → verified PR. |
+| Первый E2E | На snapshot 13 ноября корректный M0 blocker; в O4 useful native diagnostic → verified PR. |
 
 ## Источники
 
-Repository evidence сохранено из исходного исследования; correction использует те же immutable SHAs. Нового полного аудита не выполнялось.
+Repository evidence исходного исследования сохранено на прежних immutable SHAs. Поправка 15 ноября добавляет отдельные ссылки на current main; нового полного runtime-аудита и запусков не выполнялось.
 
 ### ANSA
 
@@ -601,6 +621,8 @@ Repository evidence сохранено из исходного исследов�
 [A10]: https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/docs/migration/M0.md
 [A11]: https://github.com/junknewera/ansa/tree/c06b1a839695e0690ead1db88c5e2a2df9a198db/rust
 [A12]: https://github.com/junknewera/ansa/blob/c06b1a839695e0690ead1db88c5e2a2df9a198db/tests/parity/run.py
+[A13]: https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md
+[A14]: https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/flake.nix
 [N1]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/src/runtime.cpp
 [N2]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/include/omh/session.hpp
 [N3]: https://github.com/junknewera/ansa/blob/ca851c99d4887a121300f0bcee8687ed9d055071/include/omh/responses.hpp

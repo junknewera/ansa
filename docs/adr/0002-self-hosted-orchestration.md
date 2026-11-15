@@ -8,7 +8,9 @@ DECISION: Native ANSA multi-agent orchestration via direct SIWC Responses. No Co
 
 ## Context
 
-Проверенный main `ca851c99d4887a121300f0bcee8687ed9d055071` содержит production C++20 и merged Rust migration plan из PR #1. PR #2 с head `c06b1a839695e0690ead1db88c5e2a2df9a198db` содержит M0 scaffold/harness, но остаётся open; native X13s acceptance — NO-GO. Rust runtime ещё не существует. Эти facts относятся к snapshot, не являются обещанием будущего состояния веток.
+Исторический snapshot 13 ноября: main `ca851c99d4887a121300f0bcee8687ed9d055071` содержит production C++20 и merged Rust migration plan из PR #1. PR #2 с head `c06b1a839695e0690ead1db88c5e2a2df9a198db` содержит M0 scaffold/harness, но остаётся open; native X13s acceptance — NO-GO. Rust runtime ещё не существует на этом snapshot.
+
+**Поправка 15 ноября 2026:** [main `5029b8b`](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md) фиксирует M9 GO; [flake](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/flake.nix) выбирает Rust по умолчанию и сохраняет C++ fallback. M10 — отдельный незавершённый этап. Историческая ветка PR #3 этим не переносится на новый runtime; production sequencing после verified M10 GO и O1–O4 остаётся прежним.
 
 ANSA уже владеет native agent loop, bounded owner/mailboxes, canonical session journal, admission и process evidence. Отсутствует workflow goal → implementation → verification → independent review → integration. Нужен небольшой task control plane поверх собственного loop после его Rust migration.
 
@@ -24,7 +26,7 @@ Orchestrate — deterministic module будущего Rust ansa. Parent влад
 
 Child owner единолично изменяет своё session state и сохраняет admitted model/tool outcomes. Parent reducer единолично изменяет task state. Parent не редактирует child journal, child не выставляет task acceptance и не выдаёт себе право создавать другие children. Общий auth state принадлежит одному центральному broker; детям не копируются credential stores или bearer tokens в prompts/artifacts.
 
-Композиционный wrapper над `AgentRuntime`, запрос durable child receipt и новые orchestration commands — **PROPOSED post-migration capabilities**, а не существующие API текущего scaffold. Нельзя добавлять отдельный general agent framework или заново реализовывать native protocol, journal и ProcessRunner ради child sessions.
+Композиционный wrapper над `AgentRuntime`, запрос durable child receipt и новые orchestration commands — **PROPOSED post-migration capabilities**, а не существующие API описанного выше scaffold. Нельзя добавлять отдельный general agent framework или заново реализовывать native protocol, journal и ProcessRunner ради child sessions.
 
 ### 2. Direct SIWC и central auth broker
 
@@ -72,6 +74,8 @@ Parent Cancel останавливает будущие child dispatch и адр
 
 Fresh native reviewer получает original requirements, actual diff/relevant source и immutable evidence через scoped read-only tools. Builder summary не является единственным источником. Reviewer может потребовать новые negative scenarios; их запускает VerificationRunner по разрешённому manifest. Одна модель в разных contexts допустима, но ошибки могут коррелировать; Pro для этого не нужна.
 
+Лимит review — восемь существенных findings и пять verification gaps на bounded страницу. `more_findings` и `coverage_incomplete` запрещают скрывать оставшуюся работу; host durably сохраняет страницы/evidence refs с общей логической task/review binding, immutable target SHA, requirements/manifest и evidence revision. Каждая страница сохраняет собственные фактические native child/Submit IDs и receipt; новая session использует свой SessionId, новый Submit — свои CommandId/TurnId/RequestId; IDs другого Submit/session не переносятся, compatible Resume следует identity исходного accepted turn. Continuation назначается только в оставшемся root budget. Незакрытые material overflow, blocking findings и required gaps запрещают `accept`/integration для всего aggregate; последняя короткая страница не заменяет предыдущие. Невозможность завершить continuation даёт `changes_requested`/`blocked`, counters при смене страницы/session не сбрасываются.
+
 Integrator последовательно собирает собственную branch, повторяет gates на итоговом SHA и публикует draft PR только в пределах policy. Accepted deliverable не равен merged main. Lost push/PR ACK требует reconciliation по exact remote head/PR marker. Default main/release/force-push запрещены. Non-Git Orchestrate MVP возвращает blocker; существующие basic/plan остаются доступны.
 
 ### 7. Полномочия и credentials
@@ -105,6 +109,6 @@ Non-goals: swarms, unbounded recursion, self-modifying skills, framework/plugin 
 
 ## Acceptance этого решения
 
-Architecture review должен подтвердить disjoint parent/child authority, отсутствие второго native loop, durable Submit correlation, v1 RequestId semantics, bounded budgets, central auth lifecycle и отсутствие migration scope creep. Реальная functionality принимается только этапами O1–O4. Принятие docs не закрывает M0 и не подтверждает доступность конкретной модели.
+Architecture review должен подтвердить disjoint parent/child authority, отсутствие второго native loop, durable Submit correlation, v1 RequestId semantics, bounded budgets, central auth lifecycle и отсутствие migration scope creep. Реальная functionality принимается только этапами O1–O4. Принятие docs не закрывает migration/feature gates и не подтверждает доступность конкретной модели.
 
 UNKNOWN до проверки: composition/recovery на native X13s, child receipt wrapper, auth contention/cancellation нескольких sessions, quota/quality overhead, coding quality native builder, полноценный cleanup и устойчивость filesystem при power loss. Ни один из этих пунктов не становится TESTED от публикации ADR.

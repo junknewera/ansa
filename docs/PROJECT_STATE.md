@@ -1,6 +1,14 @@
 # Состояние ansa
 
-## Актуальное архитектурное состояние — 2026-11-13
+## Поправка к PR #3 и состояние main — 2026-11-15
+
+Проверенный main — [`5029b8b8972ea4c64ac213474b37f53a13bd5ab5`](https://github.com/junknewera/ansa/commit/5029b8b8972ea4c64ac213474b37f53a13bd5ab5): [PROJECT_STATE](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md) фиксирует **M9 GO**, [flake](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/flake.nix) выбирает **Rust по умолчанию**; C++ fallback сохранён. **M10 остаётся отдельным незавершённым этапом.** Эти факты относятся к main, а не к runtime исторической ветки [PR #3](https://github.com/junknewera/ansa/pull/3).
+
+Исходный docs checkpoint этой поправки — [`cac4f12c8063f54c032bbd532f59e047a59891f2`](https://github.com/junknewera/ansa/commit/cac4f12c8063f54c032bbd532f59e047a59891f2). Уточнены research, ADR и prompts: лимиты reviewer действуют на bounded страницу с явным overflow/coverage и запретом acceptance при незакрытом material остатке; N1/N2 различаются только fresh-review policy; дополнительные single/stronger/best-of-N controls вынесены за основной screening 12/48 runs. Предлагаемые `CreateNew`/`OpenExisting`, durable identity и общие budgets сохранены.
+
+Это docs-only correction, без новой runtime/native/live acceptance. Исторические результаты ниже относятся к своим SHA и не повторялись в этой поправке. Независимый scoped review и targeted re-review завершены: неоднозначность общей review binding и native IDs каждой страницы устранена, существенных открытых findings нет. Whitespace, Markdown fences, reference definitions, 20 относительных ссылок и один JSON block проверены. Это review документации, не formal GitHub approval. Production implementation остаётся после verified M10 GO и O1–O4; отдельный pilot этой записью не назначается.
+
+## Историческое архитектурное состояние — 2026-11-13
 
 **Production остаётся C++20.** Проверенный через GitHub main: `ca851c99d4887a121300f0bcee8687ed9d055071`; [PR #1](https://github.com/junknewera/ansa/pull/1) с Rust migration plan merged. Code last known good остаётся `28eb41f0af449e943811cfbf9a4053f2dd7983ee`; docs review не является новой runtime acceptance.
 
