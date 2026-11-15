@@ -117,7 +117,7 @@ nix develop --no-update-lock-file -c python tests/cli_live_startup.py \
   --binary ./result/bin/ansa --output /tmp/ansa-startup-check --repeat 256
 ```
 
-PTY-регрессия ввода, общего таймера и tools использует production offline CLI
+PTY-регрессия полноэкранного просмотра, ввода, копирования, таймера и tools использует production offline CLI
 и synthetic frontend fixture. Прогон не обращается к реальным profiles или модели:
 
 ```sh
