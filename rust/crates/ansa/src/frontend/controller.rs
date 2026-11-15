@@ -71,6 +71,7 @@ pub struct State {
     follow_tail: bool,
     reading_total: usize,
     copy: CopyHistory,
+    snapshot_read: Option<CommandId>,
 }
 impl State {
     pub fn new(handle: &Handle) -> Self {
@@ -113,6 +114,7 @@ impl State {
             follow_tail: true,
             reading_total: 0,
             copy: CopyHistory::default(),
+            snapshot_read: None,
         }
     }
     fn command(&mut self, handle: &Handle, payload: CommandPayload) -> RuntimeCommand {
@@ -135,6 +137,9 @@ impl State {
         payload: CommandPayload,
         replies: &mut Replies,
     ) -> bool {
+        if matches!(payload, CommandPayload::GetSnapshot(_)) && self.snapshot_read.is_some() {
+            return false;
+        }
         debug_assert!(matches!(
             payload,
             CommandPayload::GetSnapshot(_) | CommandPayload::GetTranscript(_)
@@ -152,6 +157,9 @@ impl State {
             return false;
         }
         let command = self.command(handle, payload);
+        if internal_read && matches!(command.payload, CommandPayload::GetSnapshot(_)) {
+            self.snapshot_read = Some(command.command.clone());
+        }
         let submit = matches!(command.payload, CommandPayload::Submit(_));
         if submit {
             self.pending = Some(command.command.clone());
@@ -708,10 +716,18 @@ pub async fn run(
         tokio::select! {biased;
             reply=replies.join_next(),if !replies.is_empty()=>{
                 if let Some(reply)=reply {dirty=true;let (id,submit,internal_read,result)=reply.map_err(|_|"cli_post_task")?;
+                    // post() replies only after owner admission, so the single
+                    // snapshot mailbox is free before another internal read.
+                    if state.snapshot_read.as_ref()==Some(&id) {state.snapshot_read=None;}
+                    let retry_read=internal_read&&matches!(&result,Ok(PostStatus::QueueFull));
+                    if retry_read {
+                        state.input_history.retry(Some(&id));
+                        state.copy.retry(Some(&id));
+                    }
                     // An internal read already queued at a local shutdown can
                     // lose its reply. Explicit/user commands still report Closed.
                     let expected_close=internal_read&&(closed||finished)&&matches!(&result,Ok(PostStatus::Closed));
-                    let code=if expected_close {None}else{match result {Ok(PostStatus::Accepted|PostStatus::Duplicate)=>None,Ok(PostStatus::QueueFull)=>Some("command_queue_full"),Ok(PostStatus::Closed)=>Some("runtime_closed"),Ok(PostStatus::StaleTarget)=>Some("stale_cancel_target"),Ok(PostStatus::StaleIncarnation)=>Some("stale_incarnation"),Ok(PostStatus::CommandIdLimit)=>Some("submit_id_limit"),Ok(PostStatus::CommandConflict)=>Some("command_id_conflict"),Err(code)=>Some(code)}};
+                    let code=if expected_close||retry_read {None}else{match result {Ok(PostStatus::Accepted|PostStatus::Duplicate)=>None,Ok(PostStatus::QueueFull)=>Some("command_queue_full"),Ok(PostStatus::Closed)=>Some("runtime_closed"),Ok(PostStatus::StaleTarget)=>Some("stale_cancel_target"),Ok(PostStatus::StaleIncarnation)=>Some("stale_incarnation"),Ok(PostStatus::CommandIdLimit)=>Some("submit_id_limit"),Ok(PostStatus::CommandConflict)=>Some("command_id_conflict"),Err(code)=>Some(code)}};
                     if state.pending_draft.as_ref().is_some_and(|(draft,_,_)|draft==&id){let (_,bytes,cursor)=state.pending_draft.take().expect("checked");if code.is_some(){state.editor.bytes=bytes;state.editor.cursor=cursor;}}
                     if let Some(code)=code {
                         state.input_history.retry(Some(&id));
@@ -1188,5 +1204,32 @@ fn post_line(bytes: &[u8], handle: &Handle, io: &Io, replies: &mut Replies) {
             }
         }
         Err(code) => io.status(&(jsonl::error(code, None).dump() + "\n")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn simultaneous_resync_settle_and_cancel_share_one_snapshot_mailbox() {
+        let mut runtime = super::super::app::offline_runtime(None, false).unwrap();
+        runtime.ready().await.unwrap();
+        let handle = runtime.handle();
+        let mut state = State::new(&handle);
+        let mut replies = Replies::new();
+        // All three housekeeping paths run before the owner can receive any
+        // request. Its snapshot mailbox has capacity one.
+        for accepted in [true, false, false] {
+            assert_eq!(
+                state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies),
+                accepted
+            );
+        }
+        assert_eq!(replies.len(), 1);
+        let (_, _, internal, result) = replies.join_next().await.unwrap().unwrap();
+        assert!(internal);
+        assert_eq!(result.unwrap(), PostStatus::Accepted);
+        assert_eq!(state.exit, 0);
+        runtime.shutdown().await.unwrap();
     }
 }
