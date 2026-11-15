@@ -10,5 +10,7 @@ pub mod jsonl;
 pub mod offline;
 mod progress;
 pub mod protocol_v1;
+pub mod sessions;
 pub mod terminal;
+pub mod workspace;
 pub type Result<T> = std::result::Result<T, &'static str>;

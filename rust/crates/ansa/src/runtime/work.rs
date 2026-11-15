@@ -40,6 +40,9 @@ impl Identity {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
+    Queued,
+    Steered,
+    GenerationSelected,
     Accepted,
     Response,
     Intent,
@@ -65,6 +68,9 @@ pub(crate) struct Receipt {
     durable: bool,
 }
 impl Receipt {
+    pub fn event(&self) -> &Json {
+        &self.event
+    }
     pub fn intent(self) -> Result<DurableIntent> {
         if self.kind != Kind::Intent {
             return Err("intent_receipt_kind");
@@ -135,12 +141,15 @@ pub(crate) enum ToolValue {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthTask {
+    SelectGeneration,
     Generate,
     Compact,
     BeforeIntent,
     ToolLease,
 }
 pub(crate) struct AuthJob {
+    pub selection: Option<GenerationSelection>,
+    pub request: Option<Request>,
     pub identity: Identity,
     pub stop: Cancel,
     pub task: AuthTask,
@@ -249,7 +258,12 @@ impl Workers {
                     let initialized = guarded(|| {
                         let profile_bytes = initial.configuration.json()?.dump().len();
                         if let Some(path) = &init_options.directory {
-                            let store = Store::open(path, initial, init_options.journal.clone())?;
+                            let store = Store::open_with_seed(
+                                path,
+                                initial,
+                                init_options.journal.clone(),
+                                init_options.fork_seed.as_ref(),
+                            )?;
                             let ready = Ready {
                                 state: store.state().clone(),
                                 diagnostic: store.diagnostic(),
@@ -259,7 +273,9 @@ impl Workers {
                             Ok((Some(store), ready))
                         } else {
                             let mut state = initial;
-                            state.apply(&state.initialization()?)?;
+                            state.apply(
+                                &state.initialization_with_seed(init_options.fork_seed.as_ref())?,
+                            )?;
                             Ok((
                                 None,
                                 Ready {
@@ -389,11 +405,12 @@ impl Workers {
                                 }
                                 ProviderTask::Compact => {
                                     let request = Request::new(
-                                        job.state.configuration.binding.clone(),
-                                        job.state.epoch.clone(),
+                                        current.next.binding.clone(),
+                                        current.next.epoch.clone(),
                                         job.state.configuration.tools.clone(),
                                         job.state.history.clone(),
-                                    )?;
+                                    )?
+                                    .with_effort(current.next.effort.clone())?;
                                     let value = provider_options
                                         .compact
                                         .as_ref()
@@ -563,10 +580,27 @@ impl Workers {
                         let identity = job.identity.clone();
                         let mut lease = None;
                         let result = guarded(|| {
+                            if job.task == AuthTask::SelectGeneration {
+                                if job.stop.cancelled() {
+                                    return Err("generation_cancelled");
+                                }
+                                (options.select_generation)(
+                                    job.selection.as_ref().ok_or("generation_selection")?,
+                                    &job.stop,
+                                )?;
+                                return Ok(Cancel::default());
+                            }
                             if job.stop.cancelled() || !gate.begin(&job.identity, None) {
                                 return Err("generation_cancelled");
                             }
                             (options.check_dispatch)(job.identity.resume_epoch, &job.stop)?;
+                            if let Some(request) = &job.request {
+                                (options.check_request)(
+                                    request,
+                                    job.identity.resume_epoch,
+                                    &job.stop,
+                                )?;
+                            }
                             if job.stop.cancelled() || !gate.active(&job.identity) {
                                 return Err("generation_cancelled");
                             }

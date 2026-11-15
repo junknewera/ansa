@@ -35,6 +35,24 @@ pub struct Submit {
     pub text: String,
     pub mode: AgentMode,
 }
+/// A user message for the active task, admitted independently of Submit FIFO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Steer {
+    pub target: RequestId,
+    pub text: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationSelection {
+    pub model: String,
+    pub effort: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Followup {
+    pub command: CommandId,
+    pub target: RequestId,
+    pub text: String,
+    pub state: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetTranscript {
     pub before: usize,
@@ -44,6 +62,10 @@ pub struct GetTranscript {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandPayload {
     Submit(Submit),
+    Steer(Steer),
+    SetGeneration(GenerationSelection),
+    GetContext,
+    GetTimeline(GetTranscript),
     Cancel(RequestId),
     GetSnapshot(u64),
     Resume(RequestId),
@@ -60,6 +82,21 @@ pub struct RuntimeCommand {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventPayload {
+    FollowupQueued {
+        command: CommandId,
+    },
+    FollowupDelivered {
+        commands: Vec<CommandId>,
+    },
+    GenerationSelected {
+        command: CommandId,
+        selection: GenerationSelection,
+    },
+    ContextSnapshot {
+        command: CommandId,
+        seed: crate::session::state::ForkSeed,
+    },
+    TimelinePage(crate::frontend::protocol_v1::TranscriptPage),
     CommandAccepted {
         command: CommandId,
         request: Option<RequestId>,
@@ -136,7 +173,28 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
             }
             Ok(())
         }
-        CommandPayload::GetTranscript(query) if query.limit == 0 || query.limit > 64 => {
+        CommandPayload::Steer(message) => {
+            if !valid_id(&message.target.0)
+                || message.text.is_empty()
+                || message.text.len() > 16 * 1024
+            {
+                return Err("steer_contract");
+            }
+            Ok(())
+        }
+        CommandPayload::SetGeneration(selection) => {
+            if selection.model.is_empty()
+                || selection.model.len() > 256
+                || selection.model.chars().any(char::is_control)
+                || selection.effort.as_ref().is_some_and(|v| !valid_id(v))
+            {
+                return Err("generation_selection");
+            }
+            Ok(())
+        }
+        CommandPayload::GetTranscript(query) | CommandPayload::GetTimeline(query)
+            if query.limit == 0 || query.limit > 64 =>
+        {
             Err("transcript_page_limit")
         }
         _ => Ok(()),

@@ -31,6 +31,8 @@ pub struct Request {
     pub epoch: Epoch,
     pub tools: Advertisement,
     pub input: Vec<Json>,
+    /// Omitted for legacy requests, preserving their exact serialized bytes.
+    pub effort: Option<String>,
 }
 impl Request {
     pub const MAX_ITEMS: usize = 4096;
@@ -69,7 +71,24 @@ impl Request {
             epoch,
             tools,
             input,
+            effort: None,
         })
+    }
+    pub fn with_effort(mut self, effort: Option<String>) -> Result<Self, &'static str> {
+        if effort
+            .as_ref()
+            .is_some_and(|value| !crate::provider::contracts::valid_id(value))
+        {
+            return Err("reasoning_effort");
+        }
+        self.effort = effort;
+        Ok(self)
+    }
+    pub fn with_input(self, input: Vec<Json>) -> Result<Self, &'static str> {
+        Self::new(self.binding, self.epoch, self.tools, input)?.with_effort(self.effort)
+    }
+    pub fn with_input_bounds(self) -> Result<Self, &'static str> {
+        Self::new(self.binding, self.epoch, self.tools, self.input)?.with_effort(self.effort)
     }
     pub fn json(&self) -> Result<Json, &'static str> {
         let functions = self
@@ -96,7 +115,7 @@ impl Request {
                 ("tools", Json::array(functions)?),
             ])?])?
         };
-        Json::object(vec![
+        let value = Json::object(vec![
             ("model", Json::string(&self.binding.requested_model)?),
             ("store", Json::parse("false")?),
             ("stream", Json::parse("true")?),
@@ -107,7 +126,15 @@ impl Request {
                 "include",
                 Json::array(vec![Json::string("reasoning.encrypted_content")?])?,
             ),
-        ])
+        ])?;
+        if let Some(effort) = &self.effort {
+            value.with(
+                "reasoning",
+                Json::object(vec![("effort", Json::string(effort)?)])?,
+            )
+        } else {
+            Ok(value)
+        }
     }
     pub(crate) fn fingerprint(&self) -> Result<String, &'static str> {
         let descriptors = self
@@ -180,12 +207,17 @@ impl Request {
             ("revision", Json::string(&self.tools.revision)?),
             ("descriptors", Json::array(descriptors)?),
         ])?;
-        Json::object(vec![
+        let value = Json::object(vec![
             ("binding", binding),
             ("epoch", epoch),
             ("tools", tools),
             ("input", Json::array(self.input.clone())?),
-        ])
+        ])?;
+        if let Some(effort) = &self.effort {
+            value.with("effort", Json::string(effort)?)
+        } else {
+            Ok(value)
+        }
     }
     pub fn load(value: &Json) -> Result<Self, &'static str> {
         let b = value.field("binding")?;
@@ -217,7 +249,12 @@ impl Request {
                 descriptors,
             },
             t_placeholder_input(value)?,
-        )
+        )?
+        .with_effort(if value.has("effort") {
+            Some(value.text_field("effort")?.into())
+        } else {
+            None
+        })
     }
 }
 fn t_placeholder_input(value: &Json) -> Result<Vec<Json>, &'static str> {

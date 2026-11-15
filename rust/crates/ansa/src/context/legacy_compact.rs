@@ -43,7 +43,8 @@ pub fn summary_request(original: &Request) -> Result<Request> {
             descriptors: vec![],
         },
         original.input[..prefix].to_vec(),
-    )
+    )?
+    .with_effort(original.effort.clone())
 }
 fn window(original: &Request, response: &AdmittedResponse) -> Result<Vec<Json>> {
     need(

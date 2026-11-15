@@ -50,9 +50,11 @@ pub fn decode(line: &str) -> Result<RuntimeCommand> {
         return Err("command_version");
     }
     let kind = json.text_field("type")?;
-    let fields = if kind == "transcript" {
+    let fields = if matches!(kind, "transcript" | "timeline") {
         if json.has("forward") { 9 } else { 8 }
-    } else if kind == "submit" && json.has("mode") {
+    } else if kind == "context" {
+        6
+    } else if matches!(kind, "steer" | "generation") || kind == "submit" && json.has("mode") {
         8
     } else {
         7
@@ -74,19 +76,39 @@ pub fn decode(line: &str) -> Result<RuntimeCommand> {
             },
         }),
         "cancel" => CommandPayload::Cancel(json.text_field("target")?.into()),
-        "resume" => CommandPayload::Resume(json.text_field("target")?.into()),
-        "snapshot" => CommandPayload::GetSnapshot(json.field("after_sequence")?.index()? as u64),
-        "transcript" => CommandPayload::GetTranscript(GetTranscript {
-            before: json.usize_field("before")?,
-            limit: json.usize_field("limit")?,
-            forward: if json.has("forward") {
-                json.field("forward")?
-                    .boolean()
-                    .map_err(|_| "transcript_direction")?
+        "steer" => CommandPayload::Steer(Steer {
+            target: json.text_field("target")?.into(),
+            text: json.text_field("text")?.into(),
+        }),
+        "generation" => CommandPayload::SetGeneration(GenerationSelection {
+            model: json.text_field("model")?.into(),
+            effort: if json.field("effort")?.is_null() {
+                None
             } else {
-                false
+                Some(json.text_field("effort")?.into())
             },
         }),
+        "context" => CommandPayload::GetContext,
+        "resume" => CommandPayload::Resume(json.text_field("target")?.into()),
+        "snapshot" => CommandPayload::GetSnapshot(json.field("after_sequence")?.index()? as u64),
+        "transcript" | "timeline" => {
+            let query = GetTranscript {
+                before: json.usize_field("before")?,
+                limit: json.usize_field("limit")?,
+                forward: if json.has("forward") {
+                    json.field("forward")?
+                        .boolean()
+                        .map_err(|_| "transcript_direction")?
+                } else {
+                    false
+                },
+            };
+            if kind == "timeline" {
+                CommandPayload::GetTimeline(query)
+            } else {
+                CommandPayload::GetTranscript(query)
+            }
+        }
         _ => return Err("command_type"),
     };
     Ok(RuntimeCommand {
@@ -177,6 +199,32 @@ pub fn encode(event: &RuntimeEvent) -> Json {
         ),
     ];
     let (kind, extra) = match &event.payload {
+        EventPayload::FollowupQueued { command } => {
+            ("followup_queued", vec![("command_id", s(&command.0))])
+        }
+        EventPayload::FollowupDelivered { commands } => (
+            "followup_delivered",
+            vec![(
+                "command_ids",
+                Json::array(commands.iter().map(|c| s(&c.0)).collect()).expect("bounded commands"),
+            )],
+        ),
+        EventPayload::GenerationSelected { command, selection } => (
+            "generation_selected",
+            vec![
+                ("command_id", s(&command.0)),
+                ("model", s(&selection.model)),
+                ("effort", selection.effort.as_deref().map_or_else(null, s)),
+            ],
+        ),
+        EventPayload::ContextSnapshot { command, seed } => (
+            "context",
+            vec![
+                ("command_id", s(&command.0)),
+                ("source_session", s(&seed.source_session().0)),
+                ("source_turn", s(&seed.source_turn().0)),
+            ],
+        ),
         EventPayload::FrontendSnapshot(v) => (
             "snapshot",
             vec![
@@ -204,6 +252,34 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                 ("mode", s(mode(v.mode))),
                 ("transcript_size", n(v.transcript_size as u64)),
                 ("preview", v.preview.as_ref().map_or_else(null, preview)),
+                ("timeline_size", n(v.timeline_size as u64)),
+                (
+                    "generation",
+                    object(vec![
+                        ("model", s(&v.generation.model)),
+                        (
+                            "effort",
+                            v.generation.effort.as_deref().map_or_else(null, s),
+                        ),
+                    ]),
+                ),
+                (
+                    "followups",
+                    Json::array(
+                        v.followups
+                            .iter()
+                            .map(|f| {
+                                object(vec![
+                                    ("command_id", s(&f.command.0)),
+                                    ("target", s(&f.target.0)),
+                                    ("text", s(&f.text)),
+                                    ("state", s(&f.state)),
+                                ])
+                            })
+                            .collect(),
+                    )
+                    .expect("bounded followups"),
+                ),
             ],
         ),
         EventPayload::Preview(v) => (
@@ -214,8 +290,12 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                 ("state", s(&v.state)),
             ],
         ),
-        EventPayload::TranscriptPage(v) => (
-            "transcript",
+        EventPayload::TranscriptPage(v) | EventPayload::TimelinePage(v) => (
+            if matches!(event.payload, EventPayload::TimelinePage(_)) {
+                "timeline"
+            } else {
+                "transcript"
+            },
             vec![
                 ("begin", n(v.begin as u64)),
                 ("end", n(v.end as u64)),

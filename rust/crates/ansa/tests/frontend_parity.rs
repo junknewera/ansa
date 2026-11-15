@@ -136,8 +136,8 @@ fn editor_preserves_utf8_boundaries_and_escape_following_text() {
         editor.feed(ch, true);
     }
     assert_eq!(editor.text(), Ok("abc"));
-    assert_eq!(editor.feed(9, true), Some(Action::ToggleMode));
-    assert_eq!(editor.feed(6, true), Some(Action::ToggleHistory));
+    assert_eq!(editor.feed(9, true), Some(Action::FocusNext));
+    assert_eq!(editor.feed(6, true), None);
     for (sequence, expected) in [
         (b"\x1b[A", Action::HistoryOlder),
         (b"\x1b[B", Action::HistoryNewer),
@@ -450,6 +450,12 @@ fn large_valid_snapshot_is_encoded_with_complete_tool_results() {
         })
         .collect();
     let snapshot = Snapshot {
+        timeline_size: 0,
+        generation: GenerationSelection {
+            model: "fixture-model".into(),
+            effort: None,
+        },
+        followups: vec![],
         through_sequence: 1,
         state: "completed".into(),
         request: Some("request".into()),

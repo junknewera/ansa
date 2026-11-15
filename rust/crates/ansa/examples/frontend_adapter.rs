@@ -63,12 +63,30 @@ fn command(c: &RuntimeCommand) -> Json {
             ("mode", s(jsonl::mode(v.mode))),
         ]),
         CommandPayload::Cancel(v) => f.extend([("type", s("cancel")), ("target", s(&v.0))]),
+        CommandPayload::Steer(v) => f.extend([
+            ("type", s("steer")),
+            ("target", s(&v.target.0)),
+            ("text", s(&v.text)),
+        ]),
+        CommandPayload::SetGeneration(v) => f.extend([
+            ("type", s("generation")),
+            ("model", s(&v.model)),
+            ("effort", v.effort.as_deref().map_or_else(null, s)),
+        ]),
+        CommandPayload::GetContext => f.push(("type", s("context"))),
         CommandPayload::Resume(v) => f.extend([("type", s("resume")), ("target", s(&v.0))]),
         CommandPayload::GetSnapshot(v) => {
             f.extend([("type", s("snapshot")), ("after_sequence", n(*v as usize))])
         }
-        CommandPayload::GetTranscript(v) => f.extend([
-            ("type", s("transcript")),
+        CommandPayload::GetTranscript(v) | CommandPayload::GetTimeline(v) => f.extend([
+            (
+                "type",
+                s(if matches!(c.payload, CommandPayload::GetTimeline(_)) {
+                    "timeline"
+                } else {
+                    "transcript"
+                }),
+            ),
             ("before", n(v.before)),
             ("limit", n(v.limit)),
             ("forward", b(v.forward)),
@@ -288,6 +306,12 @@ fn events() -> Result<Json> {
         output: Arc::new("result".into()),
     };
     let snapshot = Snapshot {
+        timeline_size: 0,
+        generation: GenerationSelection {
+            model: "fixture-model".into(),
+            effort: None,
+        },
+        followups: vec![],
         through_sequence: 7,
         state: "paused".into(),
         request: Some("request".into()),

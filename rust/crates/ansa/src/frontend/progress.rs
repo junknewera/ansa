@@ -277,6 +277,12 @@ mod tests {
     use std::{sync::Arc, time::Duration};
     fn view() -> Snapshot {
         Snapshot {
+            timeline_size: 0,
+            generation: super::super::protocol_v1::GenerationSelection {
+                model: "fixture-model".into(),
+                effort: None,
+            },
+            followups: vec![],
             through_sequence: 1,
             state: "generating".into(),
             request: Some("request".into()),

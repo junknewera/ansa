@@ -97,6 +97,18 @@ impl Nonblocking {
         }
         Ok(value)
     }
+    pub fn restore(&self) -> io::Result<()> {
+        for (fd, flags) in &self.entries {
+            rustix::fs::fcntl_setfl(fd, *flags)?;
+        }
+        Ok(())
+    }
+    pub fn resume(&self) -> io::Result<()> {
+        for (fd, flags) in &self.entries {
+            rustix::fs::fcntl_setfl(fd, *flags | rustix::fs::OFlags::NONBLOCK)?;
+        }
+        Ok(())
+    }
 }
 impl Drop for Nonblocking {
     fn drop(&mut self) {
@@ -124,6 +136,13 @@ impl RawMode {
     }
     pub fn resume(&mut self) -> io::Result<()> {
         let mut raw = self.saved.clone();
+        // Keep CR (Enter) distinct from LF (Ctrl+J / multiline input). The
+        // caller's original mappings are retained in `saved` for handoff/exit.
+        raw.input_modes.remove(
+            rustix::termios::InputModes::ICRNL
+                | rustix::termios::InputModes::INLCR
+                | rustix::termios::InputModes::IGNCR,
+        );
         raw.local_modes
             .remove(rustix::termios::LocalModes::ICANON | rustix::termios::LocalModes::ECHO);
         raw.special_codes[rustix::termios::SpecialCodeIndex::VMIN] = 1;
@@ -133,14 +152,18 @@ impl RawMode {
         Ok(())
     }
     pub fn restore(&mut self) {
+        let _ = self.restore_checked();
+    }
+    pub fn restore_checked(&mut self) -> io::Result<()> {
         if self.active {
-            let _ = rustix::termios::tcsetattr(
+            rustix::termios::tcsetattr(
                 &self.fd,
                 rustix::termios::OptionalActions::Now,
                 &self.saved,
-            );
+            )?;
             self.active = false;
         }
+        Ok(())
     }
 }
 impl Drop for RawMode {
@@ -319,5 +342,399 @@ mod tests {
         drop(c);
         drop(flags);
         assert_eq!(rustix::fs::fcntl_getfl(&read).unwrap(), initial);
+    }
+}
+
+/// Foreground handoff retains a waitable leader until its process group has
+/// been signalled. It never targets the harness's own process group.
+/// Detached descendants are outside this boundary and remain cleanup-unknown.
+pub struct ForegroundEditor {
+    child: Option<std::process::Child>,
+    terminal: Descriptor,
+    parent_group: rustix::process::Pid,
+    group: rustix::process::Pid,
+    foreground: bool,
+    startup_read_pending: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorExit {
+    pub code: i32,
+    pub cleanup_unknown: bool,
+}
+fn foreground(terminal: &Descriptor, group: rustix::process::Pid) -> io::Result<()> {
+    // SAFETY: initialized per-thread masks stay live until restoration. The
+    // temporary mask permits tcsetpgrp while this thread is in the background;
+    // it does not change another thread's mask or install a signal handler.
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGTTOU);
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        let status = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old);
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        let result = rustix::termios::tcsetpgrp(&terminal.fd, group).map_err(io::Error::from);
+        let restore = libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        if restore != 0 {
+            return Err(io::Error::from_raw_os_error(restore));
+        }
+        result
+    }
+}
+fn spawn_editor_command(mut command: std::process::Command) -> io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: both libc plain-data structures permit all-zero initialization;
+    // their signal set/action fields are fully populated before any syscall.
+    let (mut action, mut empty): (libc::sigaction, libc::sigset_t) =
+        unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    // SAFETY: these initialized masks/actions are prepared before fork and
+    // captured by value. They contain no borrowed pointers or owned allocator
+    // state; only libc signal syscalls and checked integer arithmetic run in
+    // the child callback. managed::spawn then installs group/PDEATHSIG/NNP,
+    // clears capabilities and marks inherited non-stdio descriptors CLOEXEC.
+    unsafe {
+        libc::sigemptyset(&mut empty);
+        action.sa_sigaction = libc::SIG_DFL;
+        action.sa_mask = empty;
+        let upper = libc::SIGRTMIN();
+        command.pre_exec(move || {
+            for signal in 1..upper {
+                if matches!(signal, libc::SIGKILL | libc::SIGSTOP | 32 | 33) {
+                    continue;
+                }
+                if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    crate::managed::spawn(command, None, Some(std::process::id()))
+}
+impl ForegroundEditor {
+    pub fn spawn(command: std::process::Command, terminal: &Descriptor) -> io::Result<Self> {
+        let terminal = terminal.duplicate()?;
+        let parent_group = rustix::termios::tcgetpgrp(&terminal.fd)?;
+        if parent_group != rustix::process::getpgrp() {
+            return Err(io::Error::other("editor_parent_not_foreground"));
+        }
+        let mut child = spawn_editor_command(command)?;
+        let Some(group) = rustix::process::Pid::from_raw(child.id() as i32) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other("editor_pid"));
+        };
+        let mut value = Self {
+            child: Some(child),
+            terminal,
+            parent_group,
+            group,
+            foreground: false,
+            startup_read_pending: true,
+        };
+        foreground(&value.terminal, group)?;
+        value.foreground = true;
+        value.handle_stop()?;
+        Ok(value)
+    }
+    fn handle_stop(&mut self) -> io::Result<()> {
+        let Some(child) = &self.child else {
+            return Ok(());
+        };
+        let pid = rustix::process::Pid::from_raw(child.id() as i32)
+            .ok_or_else(|| io::Error::other("editor_pid"))?;
+        // Observe exits without reaping the leader before group cleanup.
+        // WSTOPPED alone can report ECHILD once the child is already exited.
+        let status = rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::STOPPED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        )?;
+        if status.is_some_and(|status| status.stopped()) {
+            // Consume only the stop, never an exit. If it was killed between
+            // observations, leave the exited leader for poll's owned cleanup.
+            let status = match rustix::process::waitid(
+                rustix::process::WaitId::Pid(pid),
+                rustix::process::WaitIdOptions::STOPPED | rustix::process::WaitIdOptions::NOHANG,
+            ) {
+                Ok(Some(status)) => status,
+                Ok(None) | Err(rustix::io::Errno::CHILD) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+            // A startup read may stop on TTIN before tcsetpgrp; STOP/TSTP
+            // must never resume, even when they happen before the handoff.
+            let recover_read =
+                self.startup_read_pending && status.stopping_signal() == Some(libc::SIGTTIN);
+            self.startup_read_pending = false;
+            if recover_read {
+                match rustix::process::kill_process_group(self.group, rustix::process::Signal::CONT)
+                {
+                    Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                self.cancel()?;
+            }
+        }
+        Ok(())
+    }
+    fn restore_foreground(&mut self) -> io::Result<()> {
+        if self.foreground {
+            foreground(&self.terminal, self.parent_group)?;
+            self.foreground = false;
+        }
+        Ok(())
+    }
+    pub fn cancel(&mut self) -> io::Result<()> {
+        let Some(child) = &self.child else {
+            return Ok(());
+        };
+        let pid = rustix::process::Pid::from_raw(child.id() as i32)
+            .ok_or_else(|| io::Error::other("editor_pid"))?;
+        // Prove the leader is still our waitable child before group signalling;
+        // keeping it unreaped prevents the group identity from being recycled.
+        rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        )?;
+        if self.group == rustix::process::getpgrp() {
+            return Err(io::Error::other("editor_group_identity"));
+        }
+        crate::process::kill_group(self.group.as_raw_nonzero().get() as u32)?;
+        crate::process::kill_owned(pid)
+    }
+    /// Nonblocking: stopped editors are cancelled rather than left detached.
+    pub fn poll(&mut self) -> io::Result<Option<EditorExit>> {
+        use std::os::unix::process::ExitStatusExt;
+        self.handle_stop()?;
+        let Some(child) = &self.child else {
+            return Ok(None);
+        };
+        let pid = rustix::process::Pid::from_raw(child.id() as i32)
+            .ok_or_else(|| io::Error::other("editor_pid"))?;
+        let status = rustix::process::waitid(
+            rustix::process::WaitId::Pid(pid),
+            rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT,
+        )?;
+        let Some(_) = status else {
+            return Ok(None);
+        };
+        self.cancel()?;
+        self.restore_foreground()?;
+        let mut child = self.child.take().expect("owned child");
+        // waitid observed the terminal status with NOWAIT, so this wait only
+        // reaps the already exited leader and cannot wait on a running editor.
+        let status = child.wait()?;
+        Ok(Some(EditorExit {
+            code: status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+            cleanup_unknown: true,
+        }))
+    }
+    /// Emergency shutdown only. After the caller's finite cancel budget,
+    /// reclaim the terminal and attempt a nonblocking reap. An unreapable
+    /// primary is deliberately removed from Drop's wait path: the harness
+    /// MUST terminate next, cannot resume dispatch, and cannot claim cleanup.
+    pub fn abandon_for_exit(&mut self) -> io::Result<EditorExit> {
+        use std::os::unix::process::ExitStatusExt;
+        let mut error = self.cancel().err();
+        if let Err(restore) = self.restore_foreground() {
+            error.get_or_insert(restore);
+        }
+        let mut status = None;
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(value) => status = value,
+                Err(wait) => {
+                    error.get_or_insert(wait);
+                }
+            }
+            // Child::drop never waits. If the kernel has not delivered a
+            // terminal status, imminent harness exit/PDEATHSIG and eventual
+            // kernel reparenting own the remaining unknown cleanup.
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(EditorExit {
+            code: status.map_or(1, |status| {
+                status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+            }),
+            cleanup_unknown: true,
+        })
+    }
+}
+impl Drop for ForegroundEditor {
+    fn drop(&mut self) {
+        let _ = self.cancel();
+        let _ = self.restore_foreground();
+        if let Some(mut child) = self.child.take() {
+            // Error/owner-drop cleanup still owns and reaps the primary. The
+            // ordinary UI path uses nonblocking poll until terminal completion.
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+    use std::{
+        os::unix::process::ExitStatusExt,
+        process::{Command, Stdio},
+    };
+    struct Mask(libc::sigset_t);
+    impl Mask {
+        fn blocked() -> Self {
+            // SAFETY: synthetic tests affect only this calling test thread;
+            // initialized masks are restored by this thread's local guard.
+            unsafe {
+                let mut mask = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                for signal in [SIGINT, SIGTERM, SIGHUP, SIGTSTP] {
+                    libc::sigaddset(&mut mask, signal);
+                }
+                let mut old = std::mem::zeroed();
+                assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old), 0);
+                Self(old)
+            }
+        }
+    }
+    impl Drop for Mask {
+        fn drop(&mut self) {
+            // SAFETY: original initialized mask remains owned by this thread.
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+            }
+        }
+    }
+    #[test]
+    fn editor_child_signal_fixture() {
+        if !std::env::args().any(|arg| arg == "--exact") {
+            return;
+        }
+        assert_eq!(rustix::process::getpgrp(), rustix::process::getpid());
+        // SAFETY: querying the current test thread's mask writes an initialized
+        // sigset only; no disposition or other thread is changed.
+        unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask),
+                0
+            );
+            for signal in [SIGINT, SIGTERM, SIGHUP, SIGTSTP] {
+                assert_eq!(libc::sigismember(&mask, signal), 0);
+            }
+        }
+    }
+    #[test]
+    fn editor_exec_resets_blocked_signals_and_uses_a_distinct_group() {
+        let _mask = Mask::blocked();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "terminal::editor_tests::editor_child_signal_fixture",
+            ])
+            .stdout(Stdio::null());
+        let status = spawn_editor_command(command).unwrap().wait().unwrap();
+        assert!(status.success());
+        let mut command = Command::new("sh");
+        command.args(["-c", "kill -TERM $$"]);
+        let status = spawn_editor_command(command).unwrap().wait().unwrap();
+        assert_eq!(status.signal(), Some(SIGTERM));
+    }
+    #[test]
+    fn editor_open_file_flags_can_be_restored_and_reentered() {
+        let (read, _) = rustix::pipe::pipe().unwrap();
+        let original = rustix::fs::fcntl_getfl(&read).unwrap();
+        let descriptor = Descriptor::new(read.as_raw_fd()).unwrap();
+        let flags = Nonblocking::new(&[&descriptor]).unwrap();
+        flags.restore().unwrap();
+        assert_eq!(rustix::fs::fcntl_getfl(&read).unwrap(), original);
+        flags.resume().unwrap();
+        assert!(
+            rustix::fs::fcntl_getfl(&read)
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK)
+        );
+        drop(flags);
+        assert_eq!(rustix::fs::fcntl_getfl(&read).unwrap(), original);
+    }
+    #[test]
+    fn editor_startup_only_resumes_observed_background_reads() {
+        use std::{
+            io::Read,
+            time::{Duration, Instant},
+        };
+        for (name, signal, resumed) in [
+            ("STOP", libc::SIGSTOP, false),
+            ("TSTP", libc::SIGTSTP, false),
+            ("TTIN", libc::SIGTTIN, true),
+        ] {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", &format!("kill -{name} $$; printf resumed")])
+                .stdout(Stdio::piped());
+            let mut child = spawn_editor_command(command).unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+            let (read, _) = rustix::pipe::pipe().unwrap();
+            // Exercise the production handoff observer after a real child stop,
+            // deterministically before any continuation. This owner never takes
+            // the test runner's tty; foreground=false makes restoration a no-op.
+            let mut owner = ForegroundEditor {
+                child: Some(child),
+                terminal: Descriptor::new(read.as_raw_fd()).unwrap(),
+                parent_group: rustix::process::getpgrp(),
+                group,
+                foreground: false,
+                startup_read_pending: true,
+            };
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                if let Some(status) = rustix::process::waitid(
+                    rustix::process::WaitId::Pid(group),
+                    rustix::process::WaitIdOptions::STOPPED
+                        | rustix::process::WaitIdOptions::NOHANG
+                        | rustix::process::WaitIdOptions::NOWAIT,
+                )
+                .unwrap()
+                {
+                    assert_eq!(status.stopping_signal(), Some(signal));
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{name}: child did not stop");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            owner.handle_stop().unwrap();
+            let exit = loop {
+                if let Some(exit) = owner.poll().unwrap() {
+                    break exit;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{name}: stopped editor cleanup stalled"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let mut output = String::new();
+            stdout.read_to_string(&mut output).unwrap();
+            assert_eq!(output, if resumed { "resumed" } else { "" }, "{name}");
+            assert_eq!(exit.code, if resumed { 0 } else { 128 + libc::SIGKILL });
+        }
     }
 }
