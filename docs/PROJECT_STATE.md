@@ -1,5 +1,44 @@
 # Состояние ansa
 
+## M10: Rust production, C++ выведен из сборки
+
+**GO**, проверенный code checkpoint
+[`6ec8073`](https://github.com/junknewera/ansa/commit/6ec8073897c49f113e56a600c8e346f9a76aadd6),
+X13s/NixOS/aarch64. Production `src/`, `include/omh/`, CMake и C++ package/check
+удалены; Cargo binary и default Nix package называются `ansa`. `.#ansa-rust` и
+установленный alias `ansa-rs` сохранены. Dependencies/lock, runtime semantics и
+v1 schemas не менялись. Обязательные gates больше не вызывают C++ oracle.
+Исторические `.cpp` assertions остаются как reference/test-data, включая Nix
+test inputs; C++ compile/link/runtime dependency отсутствует.
+
+Debug и Nix Release из свежего checkout без C++ runtime/build/oracles прошли
+**130 native + 9 doctests** каждый. fmt/clippy all targets/features, all-target
+adapter build, Cargo offline build с уже заполненным cache, default Nix build
+и flake check PASS. Flake check использовал уже проверенную package derivation;
+её полный cargoCheckHook реально выполнил 130+9 tests. Cargo/ASan jobs=2,
+Nix builder использовал штатные jobs=8. Build RSS/time budgets заново не измерялись.
+
+Pinned ASan с instrumented std/leak detection **130/130**. Rust-only acceptance
+**12/12 Debug и 12/12 installed Release**: старый C++ v1 journal читается без
+изменения part bytes/dispatch, synthetic credential canaries отсутствуют в
+stdout/stderr/journal/auth-status, семь I/O faults и три continuous TTY floods
+с canonical Cancel и восстановлением terminal state. Replay baseline проходит,
+drop/reorder mutants падают на нужных compiled assertions (**2/2 killed**).
+PTY **10/10 Debug и 10/10 installed Release**, drain **4/4**, installed startup
+**259/259**, self-check, offline demo, alias, one-shot/pipeline/NO_COLOR PASS.
+ELF **6,39 MiB**, closure **63,52 MiB**; DT_NEEDED содержит только libc/libgcc/loader.
+
+Независимый native review PASS. Исправлен найденный review путь fixture в
+mutation runner; failed setup/test-contract attempts сохранены. Исторические
+Python/CTest и C++ differential captures не объявляются новым PASS на M10.
+Rust UBSan/full TSan/Miri, x86_64 и hardware power loss остаются ограничениями;
+новых live calls не было. [Inventory, команды и rollback](migration/M10.md).
+Проверенный C++ source tag `migration/m9-cutover`, executable и Nix GC root
+`~/Workspace/pet/ansa-baselines/m9-742d29c/` сохранены; старые credentials/journal
+не восстанавливаются после новых effects. Evidence и новый package GC root:
+`~/Workspace/pet/ansa-baselines/m10-6ec8073/`.
+Следующий шаг - UX из TODO: убрать указанные подсказки и бинд Ctrl+F.
+
 ## Исправление opaque_conflict и завершения вывода
 
 Проверенный code checkpoint
@@ -31,7 +70,7 @@ installed startup **259/259**, production self-check/offline demo PASS.
 Независимый native review завершён без открытых замечаний. Failed Nix attempt
 и диагностика fixture race сохранены. C++ inputs не менялись; прежние C++ gates
 не пересобирались. Evidence и GC root: `~/Workspace/pet/ansa-baselines/stream-output-c5656ea/`.
-Следующий согласованный шаг - M10, удаление C++ из production build с сохранением rollback.
+M10 с сохранением rollback закрыт выше.
 
 ## Carbon: полноэкранный диалог и прозрачность задачи
 

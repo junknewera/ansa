@@ -18,9 +18,10 @@ M9 прошёл bounded live acceptance. Пользователь отдельн
    Nix-сборки, ASan и полной acceptance-матрицы. Передавай reviewer текущий diff,
    критерии и результаты регрессий; исправления проверяй адресно.
 2. Перед выбранными suites выполни один общий preflight подготовки: нужный
-   toolchain, добавленные в Git новые modules, C++/Rust binaries и adapters,
-   соответствие CMake cache текущему source path и build profile, требования
-   evidence к именам, типам, hashes и числу hard links. Недостающие prerequisites
+   toolchain, добавленные в Git новые modules, Rust binaries и adapters,
+   соответствие build profile, требования evidence к именам, типам, hashes и
+   числу hard links. C++ binaries и CMake cache нужны только для исторических
+   comparisons из pre-M10 checkout. Недостающие prerequisites
    подготовь до capture; при ошибке подготовки не запускай весь набор.
    Используй новые уникальные output directories и Python `-B` либо
    `PYTHONDONTWRITEBYTECODE=1`. Если adapter нужен как самостоятельный файл,
@@ -78,7 +79,7 @@ M9 прошёл bounded live acceptance. Пользователь отдельн
 2. Начальная граница — `rust/` Cargo workspace с `ansa` и `ansa-linux`; module boundaries определяет план. Edition 2024, compiler/MSRV из pinned Nix, согласованные manifest/toolchain и committed Cargo.lock. Core использует owned values, typed IDs и закрытые admission/durable receipt constructors; не вводи framework или crate на каждый module без необходимости.
 3. Один owner владеет mutable runtime state. Tasks/jobs/results имеют явного владельца и join lifecycle; каналы bounded. Blocking journal, file/search/AGENTS и auth I/O не находятся в owner; медленное чтение tool не занимает единственный journal writer. Cancel независим от Submit/backpressure, прекращает будущий dispatch и сохраняет late known outcome. Drop/abort future не означает process cleanup, durable outcome или rollback side effect. Общий Arc<Mutex<Everything>> не используется.
 4. В `ansa` запрещён собственный unsafe. В `ansa-linux` сначала safe std/rustix APIs; каждый необходимый unsafe block требует узкой границы, safety argument, native adversarial tests и independent review. Особенно проверяй fork/pre_exec, signals, FD ownership и supervisor lifecycle. Language memory safety не заменяет admission, permissions или durable ordering.
-5. Сохраняй legacy v1 journal/auth/process-evidence codecs, identities, exact epochs и provider provenance. Различай native JSON values/number lexemes и C++ dump bytes, участвующие в hashes: Value/RawValue сами по себе parity не доказывают. Сверяй production builders и оба направления C++↔Rust read/append/reopen. Unknown/unsupported state не исправляется overwrite или автоматическим replay.
+5. Сохраняй legacy v1 journal/auth/process-evidence codecs, identities, exact epochs и provider provenance. Различай native JSON values/number lexemes и C++ dump bytes, участвующие в hashes: Value/RawValue сами по себе parity не доказывают. Проверяй production builders и committed legacy golden data. Исторические C++↔Rust captures сверяют отдельно с frozen pre-M10 reference; обычный Rust gate не требует C++ executable. Unknown/unsupported state не исправляется overwrite или автоматическим replay.
 6. До разрешённого live pilot используй synthetic stores/fixtures. Не открывай реальные credentials ради planning/inspection. После rotating refresh запрещён rollback старого credential backup; после side effects нельзя откатывать journal к старой копии и автоматически продолжать. Fallback C++ читает наиболее свежий совместимый state; иначе остановка dispatch и явное восстановление.
 7. Rust gate: locked build/test, fmt, clippy, native aarch64, meaningful differential/fault tests и контроль зависимостей/ресурсов по milestone. Пустой, skipped либо неподдерживаемый required suite не считается PASS. Исторические C++ comparisons выполняй отдельно на frozen reference; они не входят в текущий Rust-only gate. Сравнивай одинаковые build profiles. Исправление oracle ошибки требует отдельного safety assertion, не ослабления проверки.
 8. C++ удаляется только после полного offline/live parity, двунаправленной совместимости, проверенного rollback, independent review и разрешения на cutover/удаление. Handoff различает C++ last known good, Rust last verified SHA, WIP и незакрытые gates. Ни docs-only PR, ни наличие Rust UI не меняют production language.
