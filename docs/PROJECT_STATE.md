@@ -454,6 +454,25 @@ Crash tests посылают SIGKILL собственным дочерним п�
 - Reconciliation неизвестных эффектов и отдельный compiled file replacement tool требуют самостоятельного контракта. Произвольный shell не обещает preimage/conflict semantics или atomic CAS с внешними writers. Advisory lock и проверки inode/size имеют те же границы.
 - Изменение effective config или начальных AGENTS требует новой сессии из-за exact context epoch; basic/plan задаются отдельно на turn. Полная модельная история по-прежнему восстанавливается replay, стоимость копирования submit map и длительные сессии требуют отдельной проверки. Следующий спринт - orchestrate; MCP, hooks, Ask, интерактивный sudo, отдельный TUI и token-aware budget остаются в [TODO](TODO.md).
 
+## Предложение native terminal sessions (docs-only)
+
+Добавлен [system design постоянных терминалов](NATIVE_TERMINALS_DESIGN.md),
+2026-11-15. Зафиксированный runtime baseline —
+[`a6f2031`](https://github.com/junknewera/ansa/commit/a6f203173969c72f9b9e9b0a8ad873958215db6d)
+после startup fix #16; M9 GO и отдельный статус M10 сохраняются.
+
+Proposal описывает native PTY/TerminalHost рядом с `run_command`, разные input
+и workspace ownership, human handoff, durable delivery receipts, unknown/recovery,
+bounded screen/output и NT0–NT4 gates. Сверены source contracts ANSA и experimental
+Pi P2, а также proposals #3/#8/#14 на их текущих pinned heads. Проведены два
+независимых review: lifecycle/ownership/recovery и sources/PTY/UX/compatibility.
+Замечания исправлены; блокирующих замечаний к NT0/docs-only не осталось.
+Проверены diff/whitespace, reference links и сохранение исходного текста
+сопутствующих документов. Следующий implementation slice — NT1 по согласованной
+очереди после проверенного M10 и применимых gates. Ни runtime, ни native/live
+acceptance здесь не выполнены; будущие acceptance cases не являются результатами
+тестов. Текущий runtime checkpoint остаётся указанным выше `a6f2031`.
+
 ## Первоисточники
 
 Начинай с `src/`, `include/omh/`, `tests/`, [README](../README.md), [architecture.md](architecture.md) и [implementation-report.md](implementation-report.md). Внешние справочные материалы на X13s читай для конкретного вопроса.

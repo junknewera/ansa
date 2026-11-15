@@ -183,4 +183,8 @@ CLI предоставляет self-check, offline round trip и live SIWC. Mock
 
 Архитектура и ограничения: [docs/architecture.md](docs/architecture.md). Фактические gates: [docs/implementation-report.md](docs/implementation-report.md).
 
+Предложение постоянных native PTY-терминалов, общего доступа пользователя и агента,
+detach/reconnect и передачи ввода: [system design](docs/NATIVE_TERMINALS_DESIGN.md).
+Статус — docs-only proposal; текущий `run_command` остаётся noninteractive.
+
 Request profile следует [официальному SIWC Preview contract](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) и [models/inference contract](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference), сверенным 2026-11-11.

@@ -32,5 +32,10 @@
 - Orchestrate: координатор и дочерние агенты, распределение задач, bounded lifecycle и отмена, владение файлами, события состояний, сбор и проверка результатов. После реализации становится третьим режимом в переключателе Tab рядом с basic/plan. Визуальная основа остаётся Carbon; сведения об агентах раскрываются в области диалога.
 - Отдельный TUI поверх общего typed frontend/runtime API; Carbon CLI уже использует производный transcript canonical journal и preview/commit/discard со snapshot/resync.
 - Token-aware context budget и проверка качества compact на длинных задачах.
+- Постоянные native PTY-терминалы: живой shell между calls/turns, общий screen,
+  detach/reconnect и явная передача ввода пользователю. [System design и NT0–NT4
+  gates](NATIVE_TERMINALS_DESIGN.md); отдельная подсистема рядом с `run_command`.
+  Implementation по согласованной очереди после проверенного M10 и применимых
+  gates; полный Orchestrate/LE/HE не является техническим prerequisite базового PTY.
 
 Другие открытые технические ограничения и результаты предыдущих milestones - в [PROJECT_STATE.md](PROJECT_STATE.md).
