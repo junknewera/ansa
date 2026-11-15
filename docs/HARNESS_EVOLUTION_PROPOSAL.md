@@ -2,10 +2,20 @@
 
 - Дата: 2026-11-15.
 - Статус: **PROPOSED, docs-only**. Реализация и модельный сравнительный eval не выполнены.
-- Baseline: [ANSA `9e6e6de`][ansa-base], после merge PR #13 с Rust SIWC streaming hotfix.
+- Исторический baseline предложения: [ANSA `9e6e6de`][ansa-base], после merge PR #13 с Rust SIWC streaming hotfix.
 - Источники: [Harness² `6868817`][h2-base] и [Hermes `fd8a6c4`][hermes-base].
 - Связанные документы: [PROJECT_STATE](PROJECT_STATE.md), [TODO](TODO.md),
   [migration plan](RUST_MIGRATION_PLAN.md), открытые [PR #3][pr3] и [PR #8][pr8].
+
+## Уточнение состояния main — 2026-11-15
+
+На [main `5029b8b`][ansa-main-state] M9 принят (GO); [default package][ansa-main-flake]
+уже Rust, C++ sources и fallback сохранены. M10 остаётся отдельным незакрытым
+этапом. Ниже сохранены наблюдения и evidence исходного `9e6e6de`: они описывают
+исторический baseline этой ветки. Эта docs-only поправка не переносит в неё
+код cutover и не объявляет повторную runtime-приёмку.
+Согласованный порядок production implementation после verified M10 и применимых
+O/LE gates сохраняется; карта технических зависимостей ниже уточняет scope этих gates.
 
 ## Решение для обсуждения
 
@@ -29,7 +39,7 @@ session journal, process supervisor и direct SIWC Responses.
 | Versioned HarnessProfile | Harness² | Точный состав инструкций, навыков и памяти каждой сессии |
 | Review, candidate, eval, adoption | Оба | Проверяемое изменение следующей версии harness с допустимым no-op |
 
-## Проверенное состояние baseline
+## Проверенное состояние исторического baseline
 
 [PROJECT_STATE][ansa-state] фиксирует M8 GO и последующий целевой Rust hotfix P1.
 Default package остаётся C++20; M9 live acceptance/cutover отдельно не закрыт.
@@ -329,6 +339,19 @@ guidance нужны новые model runs; cached responses не выдаютс�
 Probes выполняются на owned resettable data. Повтор реального внешнего side effect
 ради A/B запрещён; lost ACK сверяется по прежней session/operation identity.
 
+### Простые сравнения для каждого компонента
+
+| Проверяемая гипотеза | Контроль перед усложнением |
+|---|---|
+| Summary помогает длинным задачам | Сравнить с маскированием старых observations и с сохранением хвоста плюс retrieval исходных сообщений при одинаковых задачах, model/effort и доступных исходных данных; все варианты сохраняют описанные native-item/tool-pair/epoch контракты |
+| Lazy skills полезнее постоянных инструкций | Сравнить статическую загрузку и загрузку по запросу одного и того же набора skills с одинаковыми bytes/revisions; учитывать стоимость каталога, чтения и reload |
+| PPC окупает дополнительные прогоны | Сначала baseline/no-op и простой propose/eval одного candidate; затем PPC при общем budget, с тем же frozen evaluator и независимым holdout |
+
+Ограничения на расход и final acceptance фиксируются одинаково для сравниваемых
+arms; фактические calls, tokens и latency сохраняются раздельно. Порог пользы
+выбирается до trials. Превосходство над no-op само по себе не доказывает пользу
+PPC относительно простого propose/eval.
+
 ### Что адаптировать в Harness²
 
 - Его полный `k=1` — **4 task rollouts + 3 improver sessions**, reflection/retries
@@ -364,6 +387,23 @@ plugins, удалённые execution backends, большой memory framework 
 recursive optimizer остаются вне первого scope. Skills MVP загружает документы;
 новый tool snapshot lifecycle проектируется отдельно вместе с MCP.
 
+## Технические зависимости компонентов
+
+| Компонент | Необходимые контракты |
+|---|---|
+| Manifest/profile и evidence export | Существующие session/turn/request identities, exact epoch и read-only проекция session journal; manifest/profile binding добавляется как новый контракт, native child lifecycle для самого экспорта не требуется |
+| Usage и request accounting | Production request builder, admitted response с typed optional usage, сохраняемые бюджеты и provenance |
+| Mid-turn compact | Полный request accounting, versioned context policy и durable граница после известных outcomes |
+| Output spool/readback | Process runner, bounded storage, ссылки из supervisor evidence/journal, quota и recovery |
+| Curated skills, session search и memory snapshots | Read-only loaders, pinned revisions, scope и journal-derived index; optimizer для их чтения не требуется |
+| Review и learning/adoption | Дополнительно native child lifecycle, frozen evaluator, staged candidate и durable adoption/reconciliation; здесь применимы соответствующие O/LE контракты |
+| Propose–Probe–Compose | Проверенный простой propose/eval и измеренное преимущество над ним при общем budget |
+
+Эта карта определяет технический scope каждого компонента. Согласованная
+очередность M/O/LE/HE сохраняется отдельно: production implementation начинается
+после verified M10 и применимых gates, а более ранняя реализация или pilot
+требуют отдельного решения. Наличие независимого компонента не закрывает чужие gates.
+
 ## Предлагаемая последовательность
 
 HE обозначает будущие feature gates и не заменяет migration M, Orchestrate O или
@@ -383,6 +423,10 @@ O/LE prerequisites; данный PR не назначает live pilot и не �
 
 HE2–HE4 — приоритет по непосредственной пользовательской пользе. HE1 обеспечивает
 проверяемость новых profiles и learning; curated skills не требуют HE7.
+Внутри HE1 можно отдельно проверить manifest/identity, read-only export и offline
+baseline/candidate driver. Внутри HE5 — curated read-only catalog, session search
+и scoped memory snapshots. Эти части получают отдельные минимальные diffs;
+номера HE1/HE5 и полные критерии выхода соответствующих gates сохраняются.
 Заимствование child machinery не меняет порядок O1–O4. Каждый этап получает
 собственный минимальный diff и acceptance; увеличение scope требует нового решения.
 
@@ -413,6 +457,8 @@ Core Harness² распространяется под [Apache-2.0][h2-license],
 
 [ansa-base]: https://github.com/junknewera/ansa/tree/9e6e6dec451e4b3f8c6c72481b3df1e5f8a10e88
 [ansa-state]: https://github.com/junknewera/ansa/blob/9e6e6dec451e4b3f8c6c72481b3df1e5f8a10e88/docs/PROJECT_STATE.md
+[ansa-main-state]: https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md
+[ansa-main-flake]: https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/flake.nix
 [ansa-epoch]: https://github.com/junknewera/ansa/blob/9e6e6dec451e4b3f8c6c72481b3df1e5f8a10e88/rust/crates/ansa/src/config/agents.rs
 [ansa-owner]: https://github.com/junknewera/ansa/blob/9e6e6dec451e4b3f8c6c72481b3df1e5f8a10e88/rust/crates/ansa/src/runtime/owner.rs
 [ansa-compact]: https://github.com/junknewera/ansa/blob/9e6e6dec451e4b3f8c6c72481b3df1e5f8a10e88/rust/crates/ansa/src/context/legacy_compact.rs

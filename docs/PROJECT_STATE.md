@@ -1,5 +1,27 @@
 # Состояние ansa
 
+## Уточнение main и design PR #14 — 2026-11-15
+
+На [main `5029b8b`](https://github.com/junknewera/ansa/commit/5029b8b8972ea4c64ac213474b37f53a13bd5ab5)
+M9 принят (GO): [состояние приёмки](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md).
+[Default package](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/flake.nix)
+уже Rust; C++ sources/fallback сохранены. M10 остаётся отдельным незакрытым этапом.
+Секции M8/P1 и более ранние checkpoints ниже — исторический handoff этой ветки,
+с исходными evidence и результатами; docs-only уточнение не переносит код main
+в ветку предложения и не выполняет новую runtime/native/live приёмку.
+
+[Предложение PR #14](HARNESS_EVOLUTION_PROPOSAL.md) уточнено относительно
+[исходного design checkpoint `6fe9cde`](https://github.com/junknewera/ansa/commit/6fe9cde82090f08501ffecb5ffd56eeee6d4e096):
+добавлены зависимости компонентов, отдельные части HE1/HE5 и сравнения compact,
+skills и PPC с простыми контролями. HE2–HE4 сохраняют приоритет; номера gates,
+baseline/no-op и единственный durable adoption authority сохранены.
+Production implementation по-прежнему следует verified M10 и применимым O/LE
+gates. Независимый review документационной поправки завершён без существенных
+открытых findings; whitespace, Markdown fences, reference definitions и 27
+относительных ссылок проверены. Это design review, не formal GitHub approval
+или runtime acceptance. Следующий шаг — отдельный выбор implementation scope;
+checkpoint и результаты публикации фиксируются в PR body.
+
 ## Rust hotfix P1: SIWC streaming и причины паузы
 
 UX-правка по обратной связи пользователя:
