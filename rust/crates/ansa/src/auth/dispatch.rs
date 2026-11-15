@@ -17,9 +17,19 @@ pub struct ModelCapability {
 /// Only explicit catalog metadata authorizes effort values. Slugs and the
 /// illustrative UI levels are never a capability oracle.
 pub fn model_capabilities(catalog: &Json) -> Result<Vec<ModelCapability>> {
+    catalog_models(catalog, None)
+}
+fn catalog_models(catalog: &Json, selected: Option<&str>) -> Result<Vec<ModelCapability>> {
     let mut models = Vec::new();
     let mut names = std::collections::BTreeSet::new();
     for model in catalog.field("models")?.elements()? {
+        // Authorization preserves the legacy selected-model short circuit.
+        // Unrelated catalog entries cannot invalidate an admitted selection.
+        if let Some(selected) = selected
+            && model.text_field("slug")? != selected
+        {
+            continue;
+        }
         if model.text_field("visibility")? != "list" {
             continue;
         }
@@ -56,6 +66,9 @@ pub fn model_capabilities(catalog: &Json) -> Result<Vec<ModelCapability>> {
             },
             efforts,
         });
+        if selected.is_some() {
+            break;
+        }
     }
     Ok(models)
 }
@@ -119,7 +132,7 @@ impl Authorization {
         if current.session != self.session {
             return Err("auth_required");
         }
-        let models = model_capabilities(&self.auth.models(cancel)?)?;
+        let models = catalog_models(&self.auth.models(cancel)?, Some(&selection.model))?;
         allowed(&models, selection)?;
         let verified = self.auth.access(cancel, false)?;
         if verified.account != self.account {
@@ -136,8 +149,16 @@ impl Authorization {
             return Err("auth_account_mismatch");
         }
         self.check_account(epoch, cancel)?;
-        if !self.model_checked {
-            self.models = model_capabilities(&self.auth.models(cancel)?)?;
+        if !self.model_checked
+            || !self
+                .models
+                .iter()
+                .any(|model| model.model == request.binding.requested_model)
+        {
+            self.models = catalog_models(
+                &self.auth.models(cancel)?,
+                Some(&request.binding.requested_model),
+            )?;
         }
         allowed(
             &self.models,
@@ -184,7 +205,7 @@ impl Authorization {
         }
         if !self.model_checked || epoch != self.epoch {
             let catalog = self.auth.models(cancel)?;
-            let models = model_capabilities(&catalog)?;
+            let models = catalog_models(&catalog, Some(&self.model))?;
             allowed(
                 &models,
                 &GenerationSelection {
