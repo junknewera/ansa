@@ -1,6 +1,6 @@
 # ansa
 
-Локальный C++20 агент с собственным многошаговым loop, чтением и поиском файлов, управляемыми командами и сохраняемыми сессиями. Запускается в любом каталоге, Git не требуется. Executable `ansa`; внутренний namespace `omh` и typed JSONL сохранены для совместимости.
+Локальный агент с собственным многошаговым loop, чтением и поиском файлов, управляемыми командами и сохраняемыми сессиями. Запускается в любом каталоге, Git не требуется. Executable `ansa`; внутренний namespace `omh` и typed JSONL сохранены для совместимости.
 
 Новая инженерная сессия начинается с [AGENTS.md](AGENTS.md) и [текущего состояния проекта](docs/PROJECT_STATE.md).
 
@@ -57,6 +57,11 @@ ctest --test-dir build-ansa --output-on-failure --no-tests=error
 ./build-ansa/ansa --self-check
 ./build-ansa/ansa --offline-demo
 ```
+
+В M9 Nix default выбирает Rust release candidate. Он предоставляет `ansa` и
+совместимый `ansa-rs`; явный Rust package остаётся `.#ansa-rust`. C++ fallback
+доступен через `nix run .#ansa-cpp` или `nix build .#ansa-cpp -o result-cpp`.
+Код C++ и CMake-команды выше сохранены. Статус приёмки - [M9](docs/migration/M9.md).
 
 Сборка installable Nix package с обязательными тестами:
 

@@ -30,6 +30,9 @@
           cargoBuildFlags = [ "--workspace" ];
           cargoTestFlags = [ "--workspace" ];
           doCheck = true;
+          postInstall = ''
+            ln -s ansa-rs "$out/bin/ansa"
+          '';
           ANSA_PARITY_ROOT = ./tests/parity;
           ANSA_PROTOCOL_FIXTURES = ./tests/fixtures;
           ANSA_AUTH_FIXTURES = ./tests/fixtures/auth;
@@ -37,11 +40,12 @@
           preBuild = ''
             python3 ${./tests/parity/check_toolchain.py} --workspace .
           '';
-          meta.mainProgram = "ansa-rs";
+          meta.mainProgram = "ansa";
         };
     in {
       packages = each (system: {
-        default = package system;
+        default = rustPackage system;
+        ansa-cpp = package system;
         ansa-rust = rustPackage system;
       });
       checks = each (system: {

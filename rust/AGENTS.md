@@ -3,6 +3,18 @@
 Read the repository AGENTS.md, docs/PROJECT_STATE.md and the current milestone in
 docs/RUST_MIGRATION_PLAN.md before changes here. Production remains C++.
 
+## M9 boundary
+
+- The current user authorized the bounded M9 plan recorded in docs/migration/M9.md:
+  current ansa profile, gpt-6.1-sol, at most 12 model generation/summary requests,
+  owned temporary workspace, one explicit refresh, no logout/login.
+- Only production ansa opens its auth store. No secret values, credential copies,
+  environment dumps, automatic request retries or old credential restoration.
+- Run offline E2E first on the exact checkpoint. Preserve native replay,
+  targeted Cancel, known outcomes, canonical journal bytes and C++ fallback.
+- Rust becomes the default candidate package only after successful acceptance;
+  no global shell/package changes. C++ removal and benchmark runner are separate.
+
 ## M8 boundary
 
 - M7 is merged and GO. M8 authorizes offline E2E, repeated races, quality
