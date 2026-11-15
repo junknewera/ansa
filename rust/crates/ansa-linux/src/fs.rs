@@ -216,9 +216,18 @@ pub fn record(directory: &File, name: &str, text: &str) -> io::Result<()> {
     {
         return Err(io::Error::other("fixture_record_contract"));
     }
+    publish_record(directory, name, |file| file.write_all(text.as_bytes()))
+}
+
+fn publish_record(
+    directory: &File,
+    name: &str,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let pending = format!(".{name}.pending");
     let fd = rustix::fs::openat(
         directory,
-        name,
+        &pending,
         rustix::fs::OFlags::WRONLY
             | rustix::fs::OFlags::CREATE
             | rustix::fs::OFlags::EXCL
@@ -227,9 +236,26 @@ pub fn record(directory: &File, name: &str, text: &str) -> io::Result<()> {
         rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
     )?;
     let mut file = File::from(fd);
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
-    directory.sync_all()
+    // The ready name must never expose the create-before-write window. The
+    // directory FD anchors publication; NOREPLACE keeps consume-once claims.
+    let mut published = false;
+    let result = (|| {
+        write(&mut file)?;
+        file.sync_all()?;
+        rustix::fs::renameat_with(
+            directory,
+            &pending,
+            directory,
+            name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?;
+        published = true;
+        directory.sync_all()
+    })();
+    if result.is_err() && !published {
+        let _ = rustix::fs::unlinkat(directory, &pending, rustix::fs::AtFlags::empty());
+    }
+    result
 }
 
 pub fn read_record(directory: &File, name: &str) -> io::Result<Option<String>> {
@@ -271,4 +297,47 @@ pub fn read_record(directory: &File, name: &str) -> io::Result<Option<String>> {
         return Err(io::Error::other("fixture_record_limit"));
     }
     Ok(Some(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn readiness_record_is_invisible_until_complete_and_cannot_replace_a_claim() {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = std::env::temp_dir().join(format!("ansa-m1-publication-{}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let directory = private_directory(&root).unwrap();
+        publish_record(&directory, "detached.pid", |file| {
+            file.write_all(b"12")?;
+            assert_eq!(read_record(&directory, "detached.pid")?, None);
+            file.write_all(b"345")?;
+            assert_eq!(read_record(&directory, "detached.pid")?, None);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            read_record(&directory, "detached.pid").unwrap().as_deref(),
+            Some("12345")
+        );
+        assert!(record(&directory, "detached.pid", "987").is_err());
+        assert_eq!(
+            read_record(&directory, "detached.pid").unwrap().as_deref(),
+            Some("12345")
+        );
+        assert!(!root.join(".detached.pid.pending").exists());
+        assert!(
+            publish_record(&directory, "primary.started", |file| {
+                file.write_all(b"partial")?;
+                Err(io::Error::other("injected_write_failure"))
+            })
+            .is_err()
+        );
+        assert_eq!(read_record(&directory, "primary.started").unwrap(), None);
+        assert!(!root.join(".primary.started.pending").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -68,9 +68,9 @@ class QualityControls(unittest.TestCase):
             self.assertEqual(env['MIRIFLAGS'],'-Zmiri-strict-provenance')
 
     def test_missing_ignored_failed_and_filtered_tests_never_pass(self):
-        valid=b'test result: ok. 129 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;'
-        self.assertEqual(quality.executed_tests(valid,'address'),129)
-        for mutation in [b'',valid.replace(b'129 passed',b'0 passed'),valid.replace(b'0 ignored',b'1 ignored'),valid.replace(b'0 failed',b'1 failed'),valid.replace(b'0 filtered',b'1 filtered')]:
+        valid=b'test result: ok. 130 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;'
+        self.assertEqual(quality.executed_tests(valid,'address'),130)
+        for mutation in [b'',valid.replace(b'130 passed',b'0 passed'),valid.replace(b'0 ignored',b'1 ignored'),valid.replace(b'0 failed',b'1 failed'),valid.replace(b'0 filtered',b'1 filtered')]:
             with self.subTest(mutation=mutation):
                 with self.assertRaises(ValueError):quality.executed_tests(mutation,'address')
         with self.assertRaises(ValueError):quality.executed_tests(valid,'miri')
