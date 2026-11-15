@@ -173,6 +173,40 @@ fn read_only_corruption_and_transactional_reducer() {
     assert_eq!(s.apply(&invalid), Err("session_request_conflict"));
     assert_eq!(s.next_request, 0);
     assert_eq!(before.len(), s.transcript().len());
+
+    // A late rejection after a candidate changed its transcript/history must
+    // preserve both the live index and all previously published snapshots.
+    let trace = events("completed");
+    let mut s = state();
+    for event in &trace[..trace.len() - 1] {
+        s.apply(event).unwrap();
+    }
+    let key = s.turn.as_ref().unwrap().receipt.command.0.clone();
+    let receipt = s.submits[&key].clone();
+    for index in 0..128 {
+        let mut past = receipt.clone();
+        past.command.0 = format!("past_{index}");
+        past.state = "completed".into();
+        s.submits.insert(past.command.0.clone(), past);
+    }
+    let published = s.clone();
+    s.submits.remove(&key);
+    let before = format!("{s:?}");
+    assert_eq!(s.apply(trace.last().unwrap()), Err("session_submit"));
+    assert_eq!(format!("{s:?}"), before);
+    s.submits.insert(key.clone(), receipt);
+    s.apply(trace.last().unwrap()).unwrap();
+    assert_eq!(s.submits[&key].state, "completed");
+    for index in 0..128 {
+        let key = format!("past_{index}");
+        assert_eq!(s.submits[&key].state, published.submits[&key].state);
+        assert!(Arc::ptr_eq(
+            &s.submits[&key].text,
+            &published.submits[&key].text
+        ));
+    }
+    assert_eq!(published.transcript().len(), 1);
+    assert_eq!(s.transcript().len(), 2);
 }
 #[test]
 fn scan_conflict_cannot_adopt_unreplayed_size() {

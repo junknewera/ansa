@@ -138,12 +138,41 @@ impl State {
             })
     }
     pub fn apply(&mut self, event: &Json) -> Result<()> {
-        let mut next = self.clone();
-        next.reduce(event)?;
+        // Validate against the immutable index; a record changes at most one
+        // receipt. Cloning every historical receipt here makes replay quadratic.
+        let mut next = Self {
+            session: self.session.clone(),
+            configuration: self.configuration.clone(),
+            epoch: self.epoch.clone(),
+            history: self.history.clone(),
+            history_bytes: self.history_bytes,
+            submits: BTreeMap::new(),
+            turn: self.turn.clone(),
+            next_request: self.next_request,
+            compactions: self.compactions,
+            initialized: self.initialized,
+            plan_tools: self.plan_tools.clone(),
+            transcript: self.transcript.clone(),
+        };
+        let receipt = next.reduce(event, &self.submits)?;
+        // All fallible validation completed. Move the existing index only at
+        // commit, preserving the original state on every rejected record.
+        next.submits = std::mem::take(&mut self.submits);
+        if let Some(receipt) = receipt {
+            if let Some(previous) = next.submits.get_mut(&receipt.command.0) {
+                previous.state = receipt.state;
+            } else {
+                next.submits.insert(receipt.command.0.clone(), receipt);
+            }
+        }
         *self = next;
         Ok(())
     }
-    fn reduce(&mut self, event: &Json) -> Result<()> {
+    fn reduce(
+        &mut self,
+        event: &Json,
+        submits: &BTreeMap<String, Receipt>,
+    ) -> Result<Option<Receipt>> {
         let kind = event.text_field("kind")?;
         if kind == "init" {
             need(
@@ -155,7 +184,7 @@ impl State {
                 "session_configuration_mismatch",
             )?;
             self.initialized = true;
-            return Ok(());
+            return Ok(None);
         }
         need(self.initialized, "session_missing_init")?;
         if kind == "accepted" {
@@ -175,8 +204,8 @@ impl State {
                     && valid_id(request)
                     && !text.is_empty()
                     && text.len() <= 16 * 1024
-                    && !self.submits.contains_key(id)
-                    && self.submits.len() < 65536
+                    && !submits.contains_key(id)
+                    && submits.len() < 65536
                     && event.usize_field("request_number")?
                         == self.next_request.checked_add(1).ok_or("session_submit")?,
                 "session_submit",
@@ -252,9 +281,8 @@ impl State {
                 resume_round: 0,
                 resume_operation: 0,
             });
-            self.submits.insert(id.into(), receipt);
             self.next_request += 1;
-            return Ok(());
+            return Ok(Some(receipt));
         }
         need(
             self.turn.as_ref().is_some_and(|t| {
@@ -504,10 +532,10 @@ impl State {
         if kind != "done" {
             Arc::make_mut(&mut self.transcript).set_last(&current.receipt.state);
         }
-        self.submits
-            .get_mut(&current.receipt.command.0)
-            .ok_or("session_submit")?
-            .state = current.receipt.state.clone();
-        Ok(())
+        need(
+            submits.contains_key(&current.receipt.command.0),
+            "session_submit",
+        )?;
+        Ok(Some(current.receipt.clone()))
     }
 }
