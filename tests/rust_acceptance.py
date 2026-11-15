@@ -78,6 +78,8 @@ def legacy(binary, output):
             (output/'legacy.stdout').write_bytes(lines.out)
             (output/'legacy.stderr').write_bytes(lines.err)
         finally:
+            (output/'legacy.stdout').write_bytes(lines.out)
+            (output/'legacy.stderr').write_bytes(lines.err)
             close(child)
     return dict(id='legacy-reopen', status='PASS', parts=manifest['files'],
                 reference_binary_sha256=manifest['reference_binary_sha256'])
@@ -151,6 +153,9 @@ def canaries(binary, output):
                 (output/'canary-status.stderr').write_bytes(status.stderr)
                 (output/'canary-journal.json').write_text(json.dumps({k:v.hex() for k,v in parts.items()})+'\n')
             finally:
+                (output/'canary.stdout').write_bytes(lines.out)
+                (output/'canary.stderr').write_bytes(lines.err)
+                common.write_json(output/'canary-journal.json', io.journals(root))
                 close(child)
     return dict(id='credential-canaries', status='PASS', scanned_canaries=len(secrets))
 
@@ -158,13 +163,13 @@ def canaries(binary, output):
 def fault(binary, fixture, case, output):
     with owned() as (root, home, cwd):
         result = io.fault(str(binary), dict(case=case, fixture_binary=str(fixture)), root, home, cwd)
+    common.write_json(output/(case+'.json'), result)
     class Observation:
         def driver(self, adapter, row):
             assert adapter == 'rustcli' and row == dict(kind='fault', case=case)
             return result
     # Reuse the established independent safety assertions, without its C++ capture.
     frontend.fault_case(Observation(), case)
-    common.write_json(output/(case+'.json'), result)
     return dict(id=case, status='PASS')
 
 
