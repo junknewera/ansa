@@ -401,6 +401,13 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
     ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
     let mut io = Io::open(mode != "backpressure" && mode != "large-jsonl")?;
     let hold_terminal_for_cancel = mode == "terminal" && io.raw.is_some();
+    let failure = match mode {
+        "fail-timeout" => Some("http_timeout"),
+        "fail-connect" => Some("http_connect"),
+        "fail-transfer" => Some("http_transfer"),
+        "fail-mime" => Some("http_content_type_count"),
+        _ => None,
+    };
     let tools = app::pure_tools()?;
     let tools = if mode == "large-jsonl" {
         let mut registry = ansa::tools::registry::Registry::new();
@@ -490,7 +497,7 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
             let until = Instant::now()
                 + if hold_terminal_for_cancel {
                     Duration::from_secs(5)
-                } else if mode_owned == "eof-drain" {
+                } else if mode_owned == "eof-drain" || failure.is_some() {
                     Duration::from_millis(1200)
                 } else {
                     Duration::from_millis(if mode_owned == "limit" { 10 } else { 500 })
@@ -500,6 +507,9 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
             }
             if stop.cancelled() {
                 return Err("offline_cancelled");
+            }
+            if let Some(code) = failure {
+                return Err(code);
             }
             if hold_terminal_for_cancel {
                 return Err("fixture_terminal_cancel_timeout");

@@ -2,6 +2,7 @@ pub mod app;
 pub mod args;
 pub mod carbon;
 pub mod controller;
+mod diagnostics;
 pub mod input;
 pub mod jsonl;
 pub mod offline;

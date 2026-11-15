@@ -79,21 +79,39 @@ async fn respond(
         let mut trailer = hyper::HeaderMap::new();
         trailer.insert("x-check", hyper::header::HeaderValue::from_static("1"));
         frames.push_back(Ok(Frame::trailers(trailer)));
-    } else if case == "h2-mime-trailer" {
+    } else if case == "h2-mime-trailer" || case == "h2-missing-mime-trailer" {
         let mut trailer = hyper::HeaderMap::new();
         trailer.insert(
             "content-type",
             hyper::header::HeaderValue::from_static("text/event-stream"),
         );
         frames.push_back(Ok(Frame::trailers(trailer)));
-    } else if case == "h2-reset" {
+    } else if case == "h2-reset" || case == "h2-missing-timeout" {
         frames.push_back(Err(io::Error::other("synthetic_transfer_failure")));
     }
-    let mut response = Response::new(Frames(frames, None));
+    let delay = if case == "h2-missing-timeout" {
+        Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(600),
+        )))
+    } else {
+        None
+    };
+    let mut response = Response::new(Frames(frames, delay));
     response.headers_mut().insert(
         "content-type",
         hyper::header::HeaderValue::from_static("text/event-stream"),
     );
+    if matches!(
+        case.as_str(),
+        "h2-missing-mime" | "h2-missing-mime-trailer" | "h2-missing-timeout"
+    ) {
+        response.headers_mut().remove("content-type");
+    } else if case == "h2-wrong-mime" {
+        response.headers_mut().insert(
+            "content-type",
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
+    }
     if case == "h2-duplicate-mime" {
         response.headers_mut().append(
             "content-type",

@@ -2,6 +2,7 @@
 use super::{
     Result,
     carbon::{self, Entry},
+    diagnostics::{self, WaitClock},
     input::{Action, Editor},
     jsonl,
     protocol_v1::*,
@@ -57,6 +58,9 @@ pub struct State {
     printed: Option<RequestId>,
     first: bool,
     pending_draft: Option<(CommandId, Vec<u8>, usize)>,
+    last_pause: String,
+    wait_clock: WaitClock,
+    explicit_status: bool,
 }
 impl State {
     pub fn new(handle: &Handle) -> Self {
@@ -89,6 +93,9 @@ impl State {
             printed: None,
             first: true,
             pending_draft: None,
+            last_pause: String::new(),
+            wait_clock: WaitClock::default(),
+            explicit_status: false,
         }
     }
     fn command(&mut self, handle: &Handle, payload: CommandPayload) -> RuntimeCommand {
@@ -159,6 +166,22 @@ impl State {
             io.status(text);
         }
     }
+    fn status_text(&self) -> String {
+        let Some(view) = &self.snapshot else {
+            return "ansa: loading\n".into();
+        };
+        let mut text = format!("ansa: {} tools={}", view.state, view.completed_tools);
+        if diagnostics::needs_attention(view) {
+            text.push('\n');
+            text.push_str(&diagnostics::pause(view));
+        }
+        if let Some(wait) = self.wait_clock.text() {
+            text.push('\n');
+            text.push_str(&wait);
+        }
+        text.push('\n');
+        text
+    }
     fn text(
         &mut self,
         text: &str,
@@ -166,6 +189,9 @@ impl State {
         io: &Io,
         replies: &mut Replies,
     ) -> (bool, bool) {
+        if text != "/status" {
+            self.explicit_status = false;
+        }
         match text {
             "/exit" | "/quit" => {
                 handle.request_shutdown();
@@ -182,9 +208,14 @@ impl State {
                 return (true, false);
             }
             "/status" => {
-                if let Some(v) = &self.snapshot {
-                    let text = format!("ansa: {} tools={}\n", v.state, v.completed_tools);
-                    self.report(io, &text);
+                self.wait_clock.tick(Instant::now());
+                if self.snapshot.is_some() {
+                    let text = self.status_text();
+                    if io.raw.is_some() {
+                        self.explicit_status = true;
+                    } else {
+                        io.status(&text);
+                    }
                 }
                 return (true, false);
             }
@@ -216,8 +247,9 @@ impl State {
             "" => return (true, false),
             _ => {}
         }
-        if self.snapshot.as_ref().is_some_and(|v| v.state == "paused") {
-            self.report(io, "ansa: paused; use /resume, /cancel or a new session\n");
+        if let Some(view) = self.snapshot.as_ref().filter(|v| v.state == "paused") {
+            let message = format!("ansa: {}\n", diagnostics::pause(view));
+            self.report(io, &message);
             self.exit = 1;
             return (false, false);
         }
@@ -253,6 +285,31 @@ impl State {
     pub fn apply(&mut self, event: &RuntimeEvent, io: &Io) {
         match &event.payload {
             EventPayload::FrontendSnapshot(v) => {
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|old| old.state != v.state || old.request != v.request)
+                {
+                    self.explicit_status = false;
+                }
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(diagnostics::needs_attention)
+                    && !diagnostics::needs_attention(v)
+                {
+                    self.status.clear();
+                }
+                self.wait_clock.observe(v, Instant::now());
+                if diagnostics::needs_attention(v) {
+                    let message = diagnostics::pause(v);
+                    if io.raw.is_none() && self.last_pause != message {
+                        io.status(&format!("ansa: {message}\n"));
+                    }
+                    self.last_pause = message;
+                } else {
+                    self.last_pause.clear();
+                }
                 let fallback = !self.first
                     && v.state == "completed"
                     && !v.text.is_empty()
@@ -310,7 +367,7 @@ impl State {
                 }
             }
             EventPayload::RuntimeError { diagnostic, .. } => {
-                self.report(io, &format!("ansa: {diagnostic}\n"))
+                self.report(io, &format!("ansa: {}\n", diagnostics::error(diagnostic)))
             }
             _ => {}
         }
@@ -373,10 +430,21 @@ impl State {
                 ),
             });
         }
-        if !self.status.is_empty() {
+        if diagnostics::needs_attention(view) {
+            entries.push(Entry {
+                role: "status".into(),
+                text: diagnostics::pause(view),
+            });
+        } else if !self.status.is_empty() {
             entries.push(Entry {
                 role: "status".into(),
                 text: self.status.clone(),
+            });
+        }
+        if self.explicit_status {
+            entries.push(Entry {
+                role: "status".into(),
+                text: self.status_text().trim_end().into(),
             });
         }
         let phase = match view.state.as_str() {
@@ -785,6 +853,9 @@ pub async fn run(
                     ) => {}
                 Err(_) => return Err("cli_input_read"),
             }
+        }
+        if io.raw.is_some() && state.explicit_status && state.wait_clock.tick(Instant::now()) {
+            dirty = true;
         }
         if io.raw.is_some() && dirty {
             if let Some(frame) = state.render(io, context)
