@@ -2,7 +2,20 @@
 
 ## Rust hotfix P1: SIWC streaming и причины паузы
 
-Проверенный code checkpoint
+UX-правка по обратной связи пользователя:
+[`edd547f`](https://github.com/junknewera/ansa/commit/edd547f050467c2d9cea547cedc653600a888b22).
+Отдельная строка ожидания и пояснения HTTP-лимита удалены из обычного CLI.
+Стадия и прошедшее время доступны только по `/status`. Причины паузы и
+доступность Resume/Cancel сохранены. Удалён тест упразднённой HTTP-подсказки,
+точный quality inventory обновлён до 117.
+
+X13s/NixOS/aarch64: Cargo workspace **117 native + 9 doctests**, Release build,
+fmt/clippy all targets/features, frontend PTY **35/35**, quality/fixture
+controls **15/15**, Release `--self-check`/`--offline-demo` PASS.
+Evidence и обновлённый binary: `~/Workspace/pet/ansa-baselines/live-p1-ui-edd547f/`.
+Следующие Nix/ASan результаты относятся к исходной приёмке P1 до этой UX-правки.
+
+Исходный проверенный code checkpoint
 [`fba5200`](https://github.com/junknewera/ansa/commit/fba52003ee9825b51af880d22fe1a62060135023),
 2026-11-15. После ручного сбоя `http_content_type_count` исправлена
 несовместимость Rust streaming: SIWC Responses допускает отсутствующий MIME
@@ -12,10 +25,9 @@ HTTP/1.1 и TLS HTTP/2 регрессии проверяют полный produc
 4 положительных, 24 отклонённых и 4 preconnect controls; при отказах ноль
 executors, в том числе при timeout после полного terminal body.
 
-CLI показывает сохранённую причину паузы, стадию, elapsed и доступность
+CLI показывает сохранённую причину паузы и доступность
 Resume/Cancel; `/status`, rejected Submit и restart сохраняют diagnostic.
-Live CLI сообщает о 75 с на один HTTP transfer, не на всю задачу. Отдельные
-DNS/headers/first-token стадии не определяются. Storage diagnostic приоритетнее
+Отдельные DNS/headers/first-token стадии не определяются. Storage diagnostic приоритетнее
 сохранённой причины turn; `effect_unknown` не скрывается. Auto retry не добавлен.
 
 X13s/NixOS/aarch64, stable rustc 1.98.1: workspace **118 native + 9 doctests**,
@@ -31,8 +43,8 @@ Evidence, failed attempts, reviews, installed binary и GC root:
 C++ sources/default, Cargo.lock и dependency/toolchain pins неизменны;
 неизменённые C++ reference binaries переиспользованы из M8.
 Это целевой hotfix, не новая полная приёмка M8/M9. Фактические headers сбоя
-пользователя не снимались; ответ реального провайдера после исправления ещё не
-подтверждён. M9 live acceptance/cutover требует отдельного согласования.
+пользователя не снимались. После исправления пользователь сообщил об успешном
+ответе «Привет». M9 live acceptance/cutover требует отдельного согласования.
 UX-анализ Codex/OpenCode и история ввода остаются в [TODO](TODO.md).
 
 ## Rust migration: M8 закрыт (GO)
