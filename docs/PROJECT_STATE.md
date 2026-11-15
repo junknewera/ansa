@@ -383,6 +383,21 @@ Crash tests посылают SIGKILL собственным дочерним п�
 - Reconciliation неизвестных эффектов и отдельный compiled file replacement tool требуют самостоятельного контракта. Произвольный shell не обещает preimage/conflict semantics или atomic CAS с внешними writers. Advisory lock и проверки inode/size имеют те же границы.
 - Изменение effective config или начальных AGENTS требует новой сессии из-за exact context epoch; basic/plan задаются отдельно на turn. Полная модельная история по-прежнему восстанавливается replay, стоимость копирования submit map и длительные сессии требуют отдельной проверки. Следующий спринт - orchestrate; MCP, hooks, Ask, интерактивный sudo, отдельный TUI и token-aware budget остаются в [TODO](TODO.md).
 
+## Предложение по развитию harness — 2026-11-15
+
+[HARNESS_EVOLUTION_PROPOSAL.md](HARNESS_EVOLUTION_PROPOSAL.md) подготовлен по
+[baseline `9e6e6de`](https://github.com/junknewera/ansa/commit/9e6e6dec451e4b3f8c6c72481b3df1e5f8a10e88)
+после P1 hotfix. Статус — PROPOSED, docs-only. Описаны versioned profiles/eval,
+token-aware mid-turn compact, durable output readback, skills/scoped memory и
+review/adoption с evidence и no-op. Sources закреплены на commits Hermes/Harness²;
+предложение учитывает native-only/direct SIWC границы открытых PR #3/#8.
+
+HE acceptance cases специфицированы для будущих feature PR. Этот документ не
+закрывает runtime/live gates и не меняет M8/P1 evidence или M9/M10 status.
+Default production features следуют verified M10 и применимым O/LE gates;
+следующий шаг по предложению — review и отдельный выбор implementation scope.
+Фактические проверки documentation diff фиксируются в его PR body.
+
 ## Первоисточники
 
 Начинай с `src/`, `include/omh/`, `tests/`, [README](../README.md), [architecture.md](architecture.md) и [implementation-report.md](implementation-report.md). Внешние справочные материалы на X13s читай для конкретного вопроса.

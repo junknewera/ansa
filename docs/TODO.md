@@ -33,4 +33,13 @@
 - Отдельный TUI поверх общего typed frontend/runtime API; Carbon CLI уже использует производный transcript canonical journal и preview/commit/discard со snapshot/resync.
 - Token-aware context budget и проверка качества compact на длинных задачах.
 
+## Предложение по развитию harness
+
+[HARNESS_EVOLUTION_PROPOSAL.md](HARNESS_EVOLUTION_PROPOSAL.md) сопоставляет Hermes
+и Harness² с native ANSA: versioned profiles и task-level eval, token-aware
+mid-turn compact, сохраняемый output, lazy skills/scoped memory и evidence-backed
+review с допустимым `NO_ENTRY`. Документ предлагает HE0–HE7 и отдельные acceptance
+gates; реализация не начата. Native-only/direct SIWC и последовательность migration,
+Orchestrate и loop-engineering сохраняются. Текущие UX-задачи выше не заменяются.
+
 Другие открытые технические ограничения и результаты предыдущих milestones - в [PROJECT_STATE.md](PROJECT_STATE.md).
