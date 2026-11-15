@@ -369,6 +369,8 @@ def main():
             future.add_argument("--cpp", required=True)
             future.add_argument("--rust", required=True)
     args = parser.parse_args()
+    if args.action in ('capture', 'compare', 'fault', 'perf') and not (ROOT/'CMakeLists.txt').is_file():
+        parser.error('historical C++ differential capture requires a pre-M10 checkout (migration/m9-cutover); current Rust-only gates are documented in README.md')
     if args.action == "perf":
         import performance
         return performance.capture(args)
