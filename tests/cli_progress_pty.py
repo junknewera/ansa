@@ -281,13 +281,13 @@ def reading_failure(adapter, output):
             body=frozen_body(screen.vt)
             screen.wait('http_timeout');screen.wait('пауза')
             editor(screen,'DRAFT Ж界😀');screen.vt.update(screen.raw)
-            assert screen.vt.line(-4).startswith('http_timeout'),screen.vt.line(-4)
+            assert 'http_timeout' in screen.vt.line(-4),screen.vt.line(-4)
             assert body==frozen_body(screen.vt),'failure moved the frozen conversation'
             at=len(screen.raw);screen.send(b'\x19')
             assert copied(screen,at)=='Вы:\nquestion\n\n'
             screen.wait('Диалог отправлен',at);editor(screen,'DRAFT Ж界😀')
             screen.vt.update(screen.raw)
-            assert screen.vt.line(-4).startswith('http_timeout')
+            assert 'http_timeout' in screen.vt.line(-4)
             assert screen.vt.line(-3).startswith('Диалог отправлен')
             screen.send(b'\x7f'*len('DRAFT Ж界😀')+b'\x04')
             return save(screen,output,'reading-failure-copy',(1,))
@@ -322,6 +322,18 @@ def cancel_tool(adapter, output):
             (output/'cancel-tool-live.pty').write_bytes(screen.raw);screen.close()
 
 
+def paused_signal(adapter, output, number):
+    with tempfile.TemporaryDirectory(prefix='ansa-m4-',dir='/tmp') as name:
+        root=Path(name);home,cwd=roots(root)
+        screen=Pty(str(adapter),root,home,cwd,'fail-timeout',True)
+        case='paused-sigterm' if number==signal.SIGTERM else 'paused-sighup'
+        try:
+            screen.wait('basic');screen.send('question\r');screen.wait('http_timeout');screen.wait('пауза')
+            screen.child.send_signal(number)
+            return save(screen,output,case,(128+number,))
+        finally:
+            (output/(case+'-live.pty')).write_bytes(screen.raw);screen.close()
+
 def main():
     # Prove that the independent checker rejects in-place dialogue repaint.
     terminal=Terminal();raw=b'\x1b[2;1Horiginal';terminal.update(raw)
@@ -338,7 +350,8 @@ def main():
     rows = recall(binary, args.output)
     rows += [busy(adapter, args.output), tools(adapter, args.output),
              tools(adapter, args.output, plain=False), tools(adapter, args.output, failed=True),
-             reading_failure(adapter,args.output),cancel_tool(adapter,args.output)]
+             reading_failure(adapter,args.output),cancel_tool(adapter,args.output),
+             paused_signal(adapter,args.output,signal.SIGTERM),paused_signal(adapter,args.output,signal.SIGHUP)]
     report = {"passed": len(rows), "cases": rows}
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

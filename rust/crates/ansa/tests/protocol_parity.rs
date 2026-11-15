@@ -1034,6 +1034,98 @@ fn replay_results_are_bound_to_the_exact_admitted_response() {
 }
 
 #[test]
+fn incomplete_added_reasoning_uses_only_the_verified_final_payload() {
+    let original = decode("round1.sse").unwrap();
+    for initial in [
+        Json::string("partial:encrypted").unwrap(),
+        Json::parse("null").unwrap(),
+        Json::string("").unwrap(),
+    ] {
+        let mut events = fixture_events("round1.sse");
+        events[1] = with(
+            &events[1],
+            "item",
+            with(
+                events[1].field("item").unwrap(),
+                "encrypted_content",
+                initial,
+            ),
+        );
+        let decode = |events: &[Json]| {
+            decode_synthetic(
+                request(),
+                Head {
+                    status: 200,
+                    content_types: vec!["text/event-stream".into()],
+                },
+                &[&wire(events)],
+            )
+        };
+        let admitted = decode(&events).unwrap();
+        assert_eq!(admitted.items()[0].value(), original.items()[0].value());
+        let mut registry = Registry::new();
+        registry
+            .register(Definition {
+                descriptor: admitted.request().tools.descriptors[0].clone(),
+                validator: Arc::new(|_| true),
+                executor: Arc::new(|_| Outcome::succeeded("ok".into())),
+            })
+            .unwrap();
+        let mut ids = OperationIds::new("runtime", 0).unwrap();
+        let results = PreparedBatch::prepare(&admitted, registry.snapshot(), &mut ids)
+            .unwrap()
+            .execute(false);
+        let replay = continuation(&admitted, &results).unwrap();
+        assert_eq!(replay.input[2], *original.items()[0].value());
+        // The final boundary remains strict; a changing initial envelope does
+        // not authorize terminal substitution, missing data or incomplete EOF.
+        let mut bad = events.clone();
+        let terminal = bad.last().unwrap().field("response").unwrap();
+        let mut output = terminal
+            .field("output")
+            .unwrap()
+            .elements()
+            .unwrap()
+            .to_vec();
+        output[0] = with(
+            &output[0],
+            "encrypted_content",
+            Json::string("different-final").unwrap(),
+        );
+        let last = bad.len() - 1;
+        bad[last] = with(
+            &bad[last],
+            "response",
+            with(terminal, "output", Json::array(output).unwrap()),
+        );
+        assert!(decode(&bad).is_err());
+        let mut bad = events.clone();
+        bad[1] = with(
+            &bad[1],
+            "item",
+            with(
+                bad[1].field("item").unwrap(),
+                "id",
+                Json::string("another_item").unwrap(),
+            ),
+        );
+        assert!(decode(&bad).is_err());
+        assert!(decode(&events[..events.len() - 1]).is_err());
+        let mut bad = events.clone();
+        bad[2] = with(
+            &bad[2],
+            "item",
+            with(
+                bad[2].field("item").unwrap(),
+                "encrypted_content",
+                Json::string("").unwrap(),
+            ),
+        );
+        assert!(decode(&bad).is_err());
+    }
+}
+
+#[test]
 fn saved_response_revalidates_through_synthetic_sse_decoder() {
     let response = decode("round1.sse").unwrap();
     let saved = provider::native::save(&response).unwrap();

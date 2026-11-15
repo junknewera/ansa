@@ -9,7 +9,7 @@ use super::{
     jsonl,
     progress::Progress,
     protocol_v1::*,
-    terminal::Io,
+    terminal::{Drain, Io},
 };
 use crate::{
     runtime::{Handle, PostStatus, Runtime},
@@ -273,6 +273,10 @@ impl State {
         if text != "/status" {
             self.explicit_status = false;
         }
+        if matches!(text.split_whitespace().next(), Some("/model" | "/thinking")) {
+            self.report(io, "Команды /model и /thinking пока недоступны; используйте --model при запуске новой сессии\n");
+            return (true, false);
+        }
         match text {
             "/copy" => {
                 self.start_copy(io);
@@ -334,7 +338,11 @@ impl State {
         }
         if let Some(view) = self.snapshot.as_ref().filter(|v| v.state == "paused") {
             let message = format!("ansa: {}\n", diagnostics::pause(view));
-            self.report(io, &message);
+            if io.raw.is_none() {
+                self.report(io, &message);
+            } else {
+                self.status.clear();
+            }
             self.exit = 1;
             return (false, false);
         }
@@ -374,6 +382,17 @@ impl State {
         match &event.payload {
             EventPayload::FrontendSnapshot(v) => {
                 self.progress.observe(v, Instant::now());
+                if diagnostics::needs_attention(v)
+                    && self.snapshot.as_ref().is_none_or(|old| {
+                        !diagnostics::needs_attention(old)
+                            || old.diagnostic != v.diagnostic
+                            || old.request != v.request
+                            || old.storage_failed != v.storage_failed
+                            || old.recovery_operation != v.recovery_operation
+                    })
+                {
+                    self.status.clear();
+                }
                 if self
                     .snapshot
                     .as_ref()
@@ -553,23 +572,6 @@ impl State {
                 ),
             });
         }
-        if diagnostics::needs_attention(view) {
-            entries.push(Entry {
-                role: "status".into(),
-                text: diagnostics::pause(view),
-            });
-        } else if !self.status.is_empty() {
-            entries.push(Entry {
-                role: "status".into(),
-                text: self.status.clone(),
-            });
-        }
-        if self.explicit_status {
-            entries.push(Entry {
-                role: "status".into(),
-                text: self.status_text().trim_end().into(),
-            });
-        }
         let preview = self
             .preview
             .as_ref()
@@ -601,27 +603,25 @@ impl State {
         // A live notice has a reserved row outside the frozen conversation.
         // Keep the code first so even a narrow terminal shows the failure.
         let notice = if diagnostics::needs_attention(view) {
-            format!(
-                "{}{}: {}",
-                diagnostics::safe_code(&view.diagnostic),
-                if view.recovery_operation.is_some() {
-                    " effect_unknown"
-                } else {
-                    ""
-                },
-                diagnostics::pause(view)
-            )
+            diagnostics::pause_notice(view)
         } else {
             String::new()
         };
         status.push('\n');
         status.push_str(&notice);
         status.push('\n');
-        status.push_str(&if self.explicit_status {
-            self.status_text().replace('\n', "  ")
+        let detail = if self.explicit_status {
+            format!("ansa: {} tools={}", view.state, view.completed_tools)
+        } else if self.status.is_empty() && diagnostics::needs_attention(view) {
+            if view.resume_available && !view.storage_failed && view.recovery_operation.is_none() {
+                "/resume - продолжить; /cancel - отменить запрос".into()
+            } else {
+                "/resume недоступен; /cancel - отменить запрос".into()
+            }
         } else {
             self.status.trim().to_owned()
-        });
+        };
+        status.push_str(&diagnostics::status_notice(view, &detail));
         let visible = self.reading.as_deref().unwrap_or(&entries);
         let frame = carbon::layout_full(
             visible,
@@ -667,7 +667,9 @@ pub async fn run(
     let mut prompt_id = None;
     let mut deferred_input = std::collections::VecDeque::new();
     let mut first_frame = None;
-    let mut actor_deadline = None;
+    let mut drain = Drain::default();
+    let mut force_drain = false;
+    let mut output_error = None;
     let mut resync = false;
     let mut next_history = Instant::now();
     let mut next_cancel = Instant::now();
@@ -692,14 +694,19 @@ pub async fn run(
         if finished || io.writer.failed() {
             handle.request_shutdown();
         }
-        if actor_done
-            && ((events_done && io.writer.idle())
-                || actor_deadline.is_some_and(|v| Instant::now() >= v))
-        {
-            if !io.writer.idle() {
-                io.writer.abort();
+        if actor_done {
+            if io.writer.failed() || (events_done && io.writer.idle()) {
+                break;
             }
-            break;
+            if force_drain || drain.stalled(io.writer.written(), io.writer.idle(), Instant::now()) {
+                output_error = Some(if force_drain {
+                    "cli_output_interrupted"
+                } else {
+                    "cli_output_stalled"
+                });
+                io.writer.abort();
+                break;
+            }
         }
         let can_read = !eof
             && !finished
@@ -748,7 +755,7 @@ pub async fn run(
             event=handle.next_event(),if !events_done && io.writer.capacity()=>{
                 if let Some(event)=event {dirty=true;if jsonl_mode {io.writer.text(jsonl::encode(&event).dump()+"\n");}else{if matches!(event.payload,EventPayload::ResyncRequired {..}){resync=true;}state.apply(&event,io);}}else{events_done=true;}
             },
-            result=runtime.join(),if !actor_done=>{result?;actor_done=true;actor_deadline=Some(Instant::now()+Duration::from_millis(250));},
+            result=runtime.join(),if !actor_done=>{result?;actor_done=true;},
             ready=async {input_events.as_ref().expect("enabled").readable().await},if can_read&&input_events.is_some()=>{input_guard=Some(ready.map_err(|_|"cli_input_poll")?);},
             ready=signal_events.readable()=>{signal_guard=Some(ready.map_err(|_|"cli_signal_poll")?);},
             _=io.writer.changed()=>{},
@@ -761,9 +768,11 @@ pub async fn run(
                 SIGTERM | SIGHUP => {
                     state.exit = 128 + signal;
                     finished = true;
+                    force_drain = true;
                     handle.request_shutdown();
                 }
                 SIGINT => {
+                    force_drain |= actor_done || finished || state.cancelled;
                     if prompt.is_some() || jsonl_mode {
                         state.exit = 130;
                     }
@@ -1161,7 +1170,7 @@ pub async fn run(
     if io.raw.is_some() {
         io.writer.text("\x1b[1B\r\n".into());
     }
-    if state.exit != 130
+    if state.exit < 128
         && state
             .snapshot
             .as_ref()
@@ -1169,8 +1178,16 @@ pub async fn run(
     {
         state.exit = 1;
     }
-    if !io.writer.finish() && state.exit == 0 {
-        state.exit = 1;
+    if !io.writer.finish() {
+        let code = output_error.unwrap_or("cli_output");
+        if jsonl_mode {
+            io.status(&(jsonl::error(code, None).dump() + "\n"));
+        } else {
+            io.status(&format!("ansa: {}\n", diagnostics::error(code)));
+        }
+        if state.exit == 0 {
+            state.exit = 1;
+        }
     }
     Ok(state.exit)
 }
