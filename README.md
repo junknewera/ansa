@@ -193,6 +193,8 @@ installed CLI gates используют только synthetic profiles и со
 ```sh
 nix develop --no-update-lock-file -c cargo build --manifest-path rust/Cargo.toml \
   --workspace --all-targets --all-features --locked
+nix develop --no-update-lock-file -c cargo build --manifest-path rust/Cargo.toml \
+  --release --example frontend_adapter --features frontend-test-adapter --locked -j 2
 nix develop --no-update-lock-file -c python -B tests/rust_acceptance.py \
   --binary ./result/bin/ansa --fixture-binary rust/target/debug/examples/frontend_adapter \
   --output /tmp/ansa-rust-acceptance
@@ -201,6 +203,9 @@ nix develop --no-update-lock-file -c python -B tests/cli_progress_pty.py \
   --output /tmp/ansa-pty-check
 nix develop --no-update-lock-file -c python -B tests/carbon_workspace_pty.py \
   --binary ./result/bin/ansa --output /tmp/ansa-workspace-check
+nix develop --no-update-lock-file -c python -B tests/carbon_visual_pty.py \
+  --binary ./result/bin/ansa --fixture-binary rust/target/release/examples/frontend_adapter \
+  --output /tmp/ansa-visual-check
 nix develop --no-update-lock-file -c python -B tests/editor_setup_pty.py \
   --binary ./result/bin/ansa --output /tmp/ansa-editor-setup-check
 nix develop --no-update-lock-file -c python -B tests/cli_output_drain.py \
