@@ -76,6 +76,8 @@ pub struct State {
     reading_total: usize,
     copy: CopyHistory,
     snapshot_read: Option<CommandId>,
+    page_read: Option<CommandId>,
+    read_lane: std::sync::Arc<tokio::sync::Mutex<()>>,
     delivered: BTreeSet<String>,
 }
 impl State {
@@ -120,6 +122,8 @@ impl State {
             reading_total: 0,
             copy: CopyHistory::default(),
             snapshot_read: None,
+            page_read: None,
+            read_lane: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             delivered: BTreeSet::new(),
         }
     }
@@ -146,6 +150,13 @@ impl State {
         if matches!(payload, CommandPayload::GetSnapshot(_)) && self.snapshot_read.is_some() {
             return false;
         }
+        if matches!(
+            payload,
+            CommandPayload::GetTranscript(_) | CommandPayload::GetTimeline(_)
+        ) && self.page_read.is_some()
+        {
+            return false;
+        }
         debug_assert!(matches!(
             payload,
             CommandPayload::GetSnapshot(_)
@@ -153,6 +164,14 @@ impl State {
                 | CommandPayload::GetTimeline(_)
         ));
         self.post_with_origin(handle, payload, replies, true)
+    }
+    fn read_replied(&mut self, id: &CommandId) {
+        if self.snapshot_read.as_ref() == Some(id) {
+            self.snapshot_read = None;
+        }
+        if self.page_read.as_ref() == Some(id) {
+            self.page_read = None;
+        }
     }
     fn post_with_origin(
         &mut self,
@@ -165,9 +184,45 @@ impl State {
             return false;
         }
         let command = self.command(handle, payload);
+        self.post_command(handle, command, replies, internal_read)
+    }
+    fn post_command(
+        &mut self,
+        handle: &Handle,
+        command: RuntimeCommand,
+        replies: &mut Replies,
+        internal_read: bool,
+    ) -> bool {
+        if replies.len() >= 64 {
+            return false;
+        }
+        if internal_read
+            && matches!(
+                command.payload,
+                CommandPayload::GetTranscript(_) | CommandPayload::GetTimeline(_)
+            )
+            && self.page_read.is_some()
+        {
+            return false;
+        }
         if internal_read && matches!(command.payload, CommandPayload::GetSnapshot(_)) {
             self.snapshot_read = Some(command.command.clone());
         }
+        if internal_read
+            && matches!(
+                command.payload,
+                CommandPayload::GetTranscript(_) | CommandPayload::GetTimeline(_)
+            )
+        {
+            self.page_read = Some(command.command.clone());
+        }
+        let read_lane = matches!(
+            command.payload,
+            CommandPayload::GetTranscript(_)
+                | CommandPayload::GetTimeline(_)
+                | CommandPayload::GetContext
+        )
+        .then(|| self.read_lane.clone());
         let new_turn = matches!(command.payload, CommandPayload::Submit(_));
         let submit = matches!(
             command.payload,
@@ -182,6 +237,13 @@ impl State {
         }
         let h = handle.clone();
         replies.spawn(async move {
+            // These read kinds share one capacity-one runtime mailbox. Hold
+            // the fair permit through owner admission, including context reads.
+            let _permit = if let Some(lane) = read_lane {
+                Some(lane.lock_owned().await)
+            } else {
+                None
+            };
             let id = command.command.clone();
             (id, submit, internal_read, h.post(command).await)
         });
@@ -238,12 +300,10 @@ impl State {
             return;
         };
         let command = self.command(handle, CommandPayload::GetTranscript(query));
-        self.input_history.sent(command.command.clone());
-        let h = handle.clone();
-        replies.spawn(async move {
-            let id = command.command.clone();
-            (id, false, true, h.post(command).await)
-        });
+        let id = command.command.clone();
+        if self.post_command(handle, command, replies, true) {
+            self.input_history.sent(id);
+        }
     }
     fn available(&self) -> bool {
         !self.awaiting()
@@ -278,12 +338,10 @@ impl State {
             return;
         };
         let command = self.command(handle, CommandPayload::GetTranscript(query));
-        self.copy.sent(command.command.clone());
-        let h = handle.clone();
-        replies.spawn(async move {
-            let id = command.command.clone();
-            (id, false, true, h.post(command).await)
-        });
+        let id = command.command.clone();
+        if self.post_command(handle, command, replies, true) {
+            self.copy.sent(id);
+        }
     }
     fn report(&mut self, io: &Io, text: &str) {
         if io.raw.is_some() {
@@ -893,7 +951,7 @@ pub async fn run(
                 if let Some(reply)=reply {dirty=true;let (id,submit,internal_read,result)=reply.map_err(|_|"cli_post_task")?;
                     // post() replies only after owner admission, so the single
                     // snapshot mailbox is free before another internal read.
-                    if state.snapshot_read.as_ref()==Some(&id) {state.snapshot_read=None;}
+                    state.read_replied(&id);
                     let retry_read=internal_read&&matches!(&result,Ok(PostStatus::QueueFull));
                     if retry_read {
                         state.input_history.retry(Some(&id));
@@ -999,6 +1057,10 @@ pub async fn run(
                 state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                 resync = false;
             }
+            if io.raw.is_some() {
+                state.recall_page(&handle, &mut replies);
+                state.copy_page(&handle, &mut replies, io);
+            }
             if io.raw.is_some() && Instant::now() >= next_history {
                 state.post_read(
                     &handle,
@@ -1017,10 +1079,6 @@ pub async fn run(
                     state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies);
                     next_cancel = Instant::now() + Duration::from_millis(40);
                 }
-            }
-            if io.raw.is_some() {
-                state.recall_page(&handle, &mut replies);
-                state.copy_page(&handle, &mut replies, io);
             }
             if let Some(prompt) = prompt {
                 if !sent_prompt {
@@ -1399,6 +1457,156 @@ fn post_line(bytes: &[u8], handle: &Handle, io: &Io, replies: &mut Replies) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_and_context_admission_waits_for_owner_ack_without_blocking_cancel() {
+        use std::{future::Future, task::Poll};
+
+        async fn pending(replies: &mut Replies) {
+            let mut next = Box::pin(replies.join_next());
+            std::future::poll_fn(|context| {
+                assert!(matches!(next.as_mut().poll(context), Poll::Pending));
+                Poll::Ready(())
+            })
+            .await;
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (handle, mut mailboxes) = Handle::test_channels();
+            let mut state = State::new(&handle);
+            let mut replies = Replies::new();
+            let page = GetTranscript { before: 0, limit: 32, forward: false };
+            assert!(state.post_read(&handle, CommandPayload::GetTranscript(page.clone()), &mut replies));
+            let first = state.page_read.clone().unwrap();
+            // Wait for the queued envelope without consuming its capacity.
+            while mailboxes.transcript.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let command = state.command(&handle, CommandPayload::GetContext);
+            let context = command.command.clone();
+            assert!(state.post_command(&handle, command, &mut replies, false));
+            let sequence = state.sequence;
+            // History refresh, recall and copy all contend for this one page
+            // slot while GetContext waits behind the unacknowledged page.
+            for payload in [
+                CommandPayload::GetTimeline(page.clone()),
+                CommandPayload::GetTranscript(page.clone()),
+                CommandPayload::GetTranscript(GetTranscript { before: 80, ..page.clone() }),
+            ] {
+                assert!(!state.post_read(&handle, payload, &mut replies));
+            }
+            assert_eq!(state.page_read.as_ref(), Some(&first));
+            assert_eq!(state.sequence, sequence);
+            assert_eq!(replies.len(), 2);
+
+            // These acknowledgements are independent scheduling barriers: the
+            // transcript mailbox is still physically full, and both bypasses
+            // reach their own capacity-one mailbox while the lane is held.
+            assert!(state.post_read(&handle, CommandPayload::GetSnapshot(0), &mut replies));
+            let snapshot = state.snapshot_read.clone().unwrap();
+            assert!(state.post(&handle, CommandPayload::Cancel("active".into()), &mut replies));
+            let snapshot_envelope = mailboxes.snapshot.recv().await.unwrap();
+            let cancel_envelope = mailboxes.cancel.recv().await.unwrap();
+            assert_eq!(snapshot_envelope.command.command, snapshot);
+            assert!(matches!(cancel_envelope.command.payload, CommandPayload::Cancel(_)));
+            assert_eq!(mailboxes.transcript.len(), 1);
+            assert!(state.read_lane.try_lock().is_err());
+            tokio::task::yield_now().await;
+            pending(&mut replies).await;
+
+            snapshot_envelope.reply.send(Ok(PostStatus::Accepted)).unwrap();
+            cancel_envelope.reply.send(Ok(PostStatus::Accepted)).unwrap();
+            for _ in 0..2 {
+                let (id, submit, _, result) = replies.join_next().await.unwrap().unwrap();
+                assert!(!submit);
+                assert_eq!(result, Ok(PostStatus::Accepted));
+                assert_ne!(id, first);
+                assert_ne!(id, context);
+                state.read_replied(&id);
+            }
+
+            let first_envelope = mailboxes.transcript.try_recv().unwrap();
+            assert_eq!(first_envelope.command.command, first);
+            // Consuming the envelope frees the channel capacity. It must not
+            // release the frontend lane before the owner's reply arrives.
+            tokio::task::yield_now().await;
+            pending(&mut replies).await;
+            assert!(matches!(mailboxes.transcript.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+            first_envelope.reply.send(Ok(PostStatus::Accepted)).unwrap();
+            let context_envelope = mailboxes.transcript.recv().await.unwrap();
+            assert_eq!(context_envelope.command.command, context);
+            assert!(matches!(context_envelope.command.payload, CommandPayload::GetContext));
+            let (id, _, internal, result) = replies.join_next().await.unwrap().unwrap();
+            assert_eq!(id, first);
+            assert!(internal);
+            assert_eq!(result, Ok(PostStatus::Accepted));
+            state.read_replied(&id);
+            assert!(state.page_read.is_none());
+
+            let latest = GetTranscript { before: 91, limit: 64, forward: false };
+            assert!(state.post_read(&handle, CommandPayload::GetTimeline(latest.clone()), &mut replies));
+            let second = state.page_read.clone().unwrap();
+            assert_ne!(second, first);
+            state.read_replied(&first);
+            assert_eq!(state.page_read.as_ref(), Some(&second));
+            assert!(!state.post_read(&handle, CommandPayload::GetTranscript(page.clone()), &mut replies));
+            tokio::task::yield_now().await;
+            pending(&mut replies).await;
+            assert!(matches!(mailboxes.transcript.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+            // A dropped owner reply resolves Closed and releases the same lane.
+            drop(context_envelope);
+            let second_envelope = mailboxes.transcript.recv().await.unwrap();
+            assert_eq!(second_envelope.command.command, second);
+            assert!(matches!(&second_envelope.command.payload, CommandPayload::GetTimeline(query) if *query == latest));
+            let (id, _, internal, result) = replies.join_next().await.unwrap().unwrap();
+            assert_eq!(id, context);
+            assert!(!internal);
+            assert_eq!(result, Ok(PostStatus::Closed));
+            state.read_replied(&id);
+            assert_eq!(state.page_read.as_ref(), Some(&second));
+
+            let command = state.command(&handle, CommandPayload::GetContext);
+            let next_context = command.command.clone();
+            assert!(state.post_command(&handle, command, &mut replies, false));
+            second_envelope.reply.send(Ok(PostStatus::Accepted)).unwrap();
+            let next_envelope = mailboxes.transcript.recv().await.unwrap();
+            assert_eq!(next_envelope.command.command, next_context);
+            assert!(matches!(next_envelope.command.payload, CommandPayload::GetContext));
+            let (id, _, internal, result) = replies.join_next().await.unwrap().unwrap();
+            assert_eq!(id, second);
+            assert!(internal);
+            assert_eq!(result, Ok(PostStatus::Accepted));
+            state.read_replied(&id);
+            assert!(state.page_read.is_none());
+
+            assert!(state.post_read(&handle, CommandPayload::GetTranscript(latest.clone()), &mut replies));
+            let third = state.page_read.clone().unwrap();
+            assert!(!state.post_read(&handle, CommandPayload::GetTimeline(latest.clone()), &mut replies));
+            next_envelope.reply.send(Ok(PostStatus::Closed)).unwrap();
+            let third_envelope = mailboxes.transcript.recv().await.unwrap();
+            assert_eq!(third_envelope.command.command, third);
+            assert!(matches!(&third_envelope.command.payload, CommandPayload::GetTranscript(query) if *query == latest));
+            let (id, _, internal, result) = replies.join_next().await.unwrap().unwrap();
+            assert_eq!(id, next_context);
+            assert!(!internal);
+            assert_eq!(result, Ok(PostStatus::Closed));
+            state.read_replied(&id);
+            assert_eq!(state.page_read.as_ref(), Some(&third));
+            third_envelope.reply.send(Ok(PostStatus::Accepted)).unwrap();
+            let (id, _, internal, result) = replies.join_next().await.unwrap().unwrap();
+            assert_eq!(id, third);
+            assert!(internal);
+            assert_eq!(result, Ok(PostStatus::Accepted));
+            state.read_replied(&id);
+            assert!(state.page_read.is_none());
+            assert!(replies.is_empty());
+            assert!(state.read_lane.try_lock().is_ok());
+            assert!(matches!(mailboxes.transcript.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+        })
+        .await
+        .expect("frontend read admission did not release after the owner reply");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn simultaneous_resync_settle_and_cancel_share_one_snapshot_mailbox() {
         let mut runtime = super::super::app::offline_runtime(None, false).unwrap();

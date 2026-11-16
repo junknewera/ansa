@@ -195,9 +195,7 @@ impl Slot {
         while let Some(reply) = self.replies.try_join_next() {
             dirty = true;
             let (id, submit, internal, result) = reply.map_err(|_| "cli_post_task")?;
-            if self.state.snapshot_read.as_ref() == Some(&id) {
-                self.state.snapshot_read = None;
-            }
+            self.state.read_replied(&id);
             let retry = internal && matches!(&result, Ok(PostStatus::QueueFull));
             if retry {
                 if self.ready_snapshot.as_ref() == Some(&id) {
@@ -284,6 +282,8 @@ impl Slot {
             );
             self.settled = now + Duration::from_millis(40);
         }
+        self.state.recall_page(&self.handle, &mut self.replies);
+        self.state.copy_page(&self.handle, &mut self.replies, io);
         let transcript_stale = !self.state.history_ready
             || self
                 .state
@@ -343,8 +343,6 @@ impl Slot {
                 self.settled = now + Duration::from_millis(40);
             }
         }
-        self.state.recall_page(&self.handle, &mut self.replies);
-        self.state.copy_page(&self.handle, &mut self.replies, io);
         if self.input_ready()
             && self.state.available()
             && let Some(prompt) = self.pending_prompt.take()
@@ -791,9 +789,13 @@ impl Workbench {
         let command = slot.state.command(&slot.handle, CommandPayload::GetContext);
         let id = command.command.clone();
         let key = id.0.clone();
-        let handle = slot.handle.clone();
-        slot.replies
-            .spawn(async move { (id, false, false, handle.post(command).await) });
+        if !slot
+            .state
+            .post_command(&slot.handle, command, &mut slot.replies, false)
+        {
+            slot.state.report(io, "Дождитесь текущих запросов");
+            return;
+        }
         self.pending_context.insert(
             key,
             CreateIntent {
