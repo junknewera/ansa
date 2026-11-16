@@ -66,7 +66,7 @@ pub struct FileDocument {
     pub source: String,
     pub truncated: bool,
     pub diff: FileDiff,
-    pub preview: Option<String>,
+    pub preview: Option<super::markdown::Document>,
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +231,7 @@ impl FileHost {
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
             .then(|| markdown_preview(&source));
+        check_cancel(stop)?;
         Ok(FileDocument {
             path,
             source: display_text(&source),
@@ -487,32 +488,8 @@ fn unified_diff(path: &str, before: &str, after: &str) -> (String, bool) {
     (output, false)
 }
 
-/// A deliberately small terminal preview, not a browser or HTML renderer.
-pub fn markdown_preview(source: &str) -> String {
-    let mut output = String::new();
-    let mut code = false;
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            code = !code;
-            output.push('\n');
-            continue;
-        }
-        let line = if code {
-            line.to_string()
-        } else {
-            let heading = trimmed.trim_start_matches('#');
-            let text = if heading.len() != trimmed.len() && heading.starts_with(' ') {
-                heading.trim_start()
-            } else {
-                line
-            };
-            text.replace("**", "").replace("__", "").replace('`', "")
-        };
-        output.push_str(&display_text(&line));
-        output.push('\n');
-    }
-    output
+pub fn markdown_preview(source: &str) -> super::markdown::Document {
+    super::markdown::Document::parse(source)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -113,6 +113,7 @@ mod tests {
                 forward: true,
             },
             entries: vec![crate::session::transcript::Entry {
+                tool: None,
                 turn: "t".into(),
                 request: "r".into(),
                 role: "user".into(),

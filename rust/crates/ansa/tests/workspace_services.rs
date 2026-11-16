@@ -90,7 +90,7 @@ fn file_guards_selection_and_markdown_are_plain_terminal_text() {
     let document = host.open(Path::new("notes.md"), &stop).unwrap();
     assert!(!document.source.contains('\x1b'));
     assert!(document.source.contains("\\u{1b}]52"));
-    let preview = document.preview.unwrap();
+    let preview = document.preview.unwrap().plain();
     assert!(preview.starts_with("Заголовок\n"));
     assert!(!preview.contains("**"));
     assert!(!preview.contains('\x1b'));

@@ -10,8 +10,91 @@ fn feed(editor: &mut Editor, bytes: &[u8]) -> Vec<Action> {
 }
 fn entry(role: &str, text: &str) -> Entry {
     Entry {
+        action: None,
         role: role.into(),
         text: text.into(),
+    }
+}
+
+#[test]
+fn selection_keeps_copy_bytes_while_runtime_diagnostics_update() {
+    let before = carbon::layout_workspace(
+        &[entry("assistant", "ORIGINAL_COPY")],
+        b"draft",
+        5,
+        "готов",
+        0,
+        "",
+        (80, 20),
+        false,
+        &Workspace::default(),
+    )
+    .unwrap();
+    let row = before
+        .plain_lines()
+        .iter()
+        .position(|line| line.contains("ORIGINAL_COPY"))
+        .unwrap();
+    let mut selection = Selection::new(before, 0, row);
+    selection.drag(12, row);
+    let live = carbon::layout_workspace(
+        &[entry("assistant", "NEW_CONTENT")],
+        b"draft",
+        5,
+        "ошибка сохранения\neffect_unknown: проверьте результат",
+        0,
+        "",
+        (80, 20),
+        false,
+        &Workspace::default(),
+    )
+    .unwrap();
+    let mut frame = selection.frame_at((80, 20), false);
+    frame.update_status_from(&live);
+    let lines = frame.plain_lines().join("\n");
+    assert!(lines.contains("ORIGINAL_COPY") && !lines.contains("NEW_CONTENT"));
+    assert!(lines.contains("ошибка сохранения") && lines.contains("effect_unknown"));
+    assert_eq!(selection.finish(12, row).as_deref(), Some("ORIGINAL_COPY"));
+    for size in [(10, 12), (80, 7)] {
+        let before = carbon::layout_workspace(
+            &[entry("assistant", "copy")],
+            b"draft",
+            5,
+            "old",
+            0,
+            "",
+            size,
+            false,
+            &Workspace::default(),
+        )
+        .unwrap();
+        let row = before
+            .plain_lines()
+            .iter()
+            .position(|line| line == "copy")
+            .unwrap();
+        let mut selection = Selection::new(before, 0, row);
+        selection.drag(3, row);
+        let live = carbon::layout_workspace(
+            &[entry("assistant", "next")],
+            b"draft",
+            5,
+            "STATE\nALERT\nHINT",
+            0,
+            "",
+            size,
+            false,
+            &Workspace::default(),
+        )
+        .unwrap();
+        let mut frame = selection.frame_at(size, false);
+        frame.update_status_from(&live);
+        let lines = frame.plain_lines().join("\n");
+        assert!(
+            lines.contains("ALERT") && lines.contains("HINT"),
+            "{size:?}: {lines}"
+        );
+        assert_eq!(selection.finish(3, row).as_deref(), Some("copy"));
     }
 }
 #[test]

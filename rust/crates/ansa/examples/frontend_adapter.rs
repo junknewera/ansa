@@ -151,6 +151,7 @@ fn run(row: &Json) -> Result<Json> {
                     .iter()
                     .map(|v| {
                         Ok(carbon::Entry {
+                            action: None,
                             role: v.text_field("role")?.into(),
                             text: v.text_field("text")?.into(),
                         })
@@ -348,6 +349,7 @@ fn events() -> Result<Json> {
                 forward: false,
             },
             entries: vec![ansa::session::transcript::Entry {
+                tool: None,
                 turn: "turn".into(),
                 request: "request".into(),
                 role: "user".into(),
