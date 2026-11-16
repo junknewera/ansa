@@ -1,5 +1,20 @@
 # Состояние ansa
 
+## Предложение: Ghostty/Kitty, Neovim и графические результаты
+
+**PROPOSED, docs-only**, 2026-11-16. Добавлен
+[system design рабочей среды](TERMINAL_WORKSPACE_DESIGN.md) на baseline
+[`8b6ecb7`](https://github.com/junknewera/ansa/commit/8b6ecb7f4b67250dd28c9ca8f4ec46f7e3383df0).
+Документ отделяет нынешний inspector и legacy JSONL от предлагаемого production
+bridge, описывает два режима интерфейса, editor tools, сохранение артефактов
+и PNG-графики. Учитывает разные API панелей Kitty и Ghostty/Linux/macOS и связь
+с открытым PTY proposal #17. Этапы и acceptance относятся к будущей реализации.
+
+Проверенные Carbon/M10 checkpoints ниже сохраняют свой статус. Runtime, lockfiles
+и зависимости этим изменением не затрагиваются. Следующий шаг этого направления —
+выбрать protocol/caps и границы первого implementation slice по design proposal;
+очередь ранее согласованных работ остаётся прежней.
+
 ## Carbon workspace: согласованный макет и уточнения на границе шага
 
 **GO**, проверенный code checkpoint

@@ -4,6 +4,10 @@
 
 Новая инженерная сессия начинается с [AGENTS.md](AGENTS.md) и [текущего состояния проекта](docs/PROJECT_STATE.md).
 
+Предлагаемая интеграция Ghostty/Kitty, соседнего Neovim, Markdown и графиков
+описана в [system design рабочей среды](docs/TERMINAL_WORKSPACE_DESIGN.md).
+Статус — docs-only proposal; API и этапы реализации перечислены в документе.
+
 ## Обычный CLI
 
 ```sh
