@@ -26,6 +26,76 @@ enum Item {
     Text(Entry),
     Tool(usize),
 }
+use super::diff::EditView;
+fn parsed_edit(tool: &Tool) -> Option<EditView> {
+    use crate::protocol::{json::Json, legacy_json_v1::sha256};
+    if tool.detail.name != "edit_file"
+        || tool.partial_output
+        || tool.uncertain
+        || !matches!(
+            tool.detail.phase,
+            ToolPhase::Finished {
+                execution: Execution::Succeeded,
+                effects: Effects::KnownResult
+            }
+        )
+    {
+        return None;
+    }
+    let value = Json::parse(&tool.output).ok()?;
+    if !value.field("applied").ok()?.boolean().ok()? {
+        return None;
+    }
+    let before = value.text_field("before").ok()?;
+    let after = value.text_field("after").ok()?;
+    if value.text_field("before_hash").ok()? != sha256(before.as_bytes())
+        || value.text_field("after_hash").ok()? != sha256(after.as_bytes())
+    {
+        return None;
+    }
+    Some(EditView {
+        path: value.text_field("path").ok()?.into(),
+        diff: super::diff::between(before, after)?,
+    })
+}
+#[cfg(test)]
+fn edit_view(entries: &[transcript::Entry], key: &str) -> Option<EditView> {
+    let mut output = String::new();
+    let mut first = None;
+    let mut last = false;
+    let mut detail = None;
+    for row in entries {
+        let Some(tool) = &row.tool else {
+            continue;
+        };
+        if format!("{}:{}", row.request.0, tool.operation) != key
+            || tool.name != "edit_file"
+            || !matches!(tool.phase, ToolPhase::Finished { .. })
+        {
+            continue;
+        }
+        first.get_or_insert(tool.continued);
+        last = tool.last_chunk;
+        output.push_str(row.text.get(tool.content_start..)?);
+        if output.len() > 120 * 1024 {
+            return None;
+        }
+        detail = Some((**tool).clone());
+    }
+    parsed_edit(&Tool {
+        key: key.into(),
+        request: String::new(),
+        detail: detail?,
+        arguments: String::new(),
+        output,
+        partial_arguments: false,
+        partial_output: first.unwrap_or(true) || !last,
+        arguments_suffix_missing: false,
+        output_suffix_missing: false,
+        running: false,
+        uncertain: false,
+    })
+}
 
 fn label(name: &str) -> &str {
     match name {
@@ -33,6 +103,7 @@ fn label(name: &str) -> &str {
         "read_file" => "Чтение",
         "search_files" => "Поиск",
         "run_command" => "Запуск",
+        "edit_file" => "Правка",
         _ => name,
     }
 }
@@ -119,24 +190,76 @@ fn entry(text: String, action: Option<String>, role: &str) -> Entry {
         role: role.into(),
         text,
         action,
+        edit: None,
+        status: None,
     }
 }
 fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mut Vec<Entry>) {
     let arrow = if expanded { "v" } else { ">" };
     let target = preview(&tool.detail.target, 140);
-    let title = format!(
-        "{arrow} {}{}{} · {}{}",
-        label(&tool.detail.name),
+    let edit = parsed_edit(tool).map(std::sync::Arc::new);
+    let mut title = format!(
+        "{arrow} {}{}{} · ",
+        if edit.is_some() {
+            "Изменён"
+        } else {
+            label(&tool.detail.name)
+        },
         if target.is_empty() { "" } else { " " },
         target,
-        status(tool),
-        elapsed(&tool.detail.operation)
     );
-    out.push(entry(
-        title,
-        Some(tool.key.clone()),
-        presentation_role(tool),
-    ));
+    if let Some(edit) = &edit {
+        title.push_str(&format!("(+{} -{}) · ", edit.diff.added, edit.diff.removed));
+    }
+    let start = title.len();
+    title.push_str(status(tool));
+    let end = title.len();
+    title.push_str(&elapsed(&tool.detail.operation));
+    let action = if edit.is_some() {
+        format!("diff:{}", tool.key)
+    } else {
+        tool.key.clone()
+    };
+    let mut header = entry(title, Some(action.clone()), presentation_role(tool));
+    header.edit = edit.clone();
+    header.status = Some(start..end);
+    out.push(header);
+    if tool.detail.name == "edit_file"
+        && edit.is_none()
+        && !tool.uncertain
+        && matches!(
+            tool.detail.phase,
+            ToolPhase::Finished {
+                execution: Execution::Succeeded,
+                effects: Effects::KnownResult
+            }
+        )
+    {
+        out.push(entry(
+            "  Diff недоступен; результат инструмента можно раскрыть через Ctrl+T".into(),
+            None,
+            "tool_diff_notice",
+        ));
+    }
+    if let Some(edit) = &edit {
+        for row in edit.diff.rows.iter().take(10) {
+            let mut entry = entry(row.display(), Some(action.clone()), row.role());
+            entry.edit = Some(edit.clone());
+            out.push(entry);
+        }
+        if edit.diff.rows.len() > 10 {
+            let mut notice = entry(
+                format!(
+                    "  Ещё {} строк · нажмите, чтобы открыть diff",
+                    edit.diff.rows.len() - 10
+                ),
+                Some(action),
+                "tool_diff_notice",
+            );
+            notice.edit = Some(edit.clone());
+            out.push(notice);
+        }
+    }
     if expanded {
         let mut detail = String::new();
         if !tool.detail.purpose.is_empty() {
@@ -150,7 +273,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
             ("Аргументы", &tool.arguments, tool.partial_arguments),
             ("Вывод", &tool.output, tool.partial_output),
         ] {
-            if !value.is_empty() {
+            if !value.is_empty() && !(edit.is_some() && label == "Вывод") {
                 detail.push_str(&format!(
                     "  {label}{}:\n",
                     if partial { " (фрагмент)" } else { "" }
@@ -169,6 +292,8 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
             role: "tool_detail".into(),
             text: detail.trim_end().into(),
             action: None,
+            edit: None,
+            status: None,
         });
     } else if failed(tool) && !tool.output.is_empty() {
         out.push(entry(
@@ -204,6 +329,8 @@ pub(super) fn project(
                 role: row.role.clone(),
                 text,
                 action: None,
+                edit: None,
+                status: None,
             }));
             continue;
         };
@@ -396,15 +523,21 @@ pub(super) fn project(
                 .take(3)
                 .collect::<Vec<_>>()
                 .join(", ");
-            result.push(entry(
-                format!(
-                    "{} Чтение и поиск · {} {}{state}{}{}",
-                    if open { "v" } else { ">" },
-                    group.len(),
-                    calls(group.len()),
-                    if targets.is_empty() { "" } else { " · " },
-                    targets
-                ),
+            let mut title = format!(
+                "{} Чтение и поиск · {} {}",
+                if open { "v" } else { ">" },
+                group.len(),
+                calls(group.len())
+            );
+            let start = title.len() + " · ".len();
+            title.push_str(&state);
+            let end = title.len();
+            if !targets.is_empty() {
+                title.push_str(" · ");
+                title.push_str(&targets);
+            }
+            let mut header = entry(
+                title,
                 Some(key),
                 if group
                     .iter()
@@ -423,15 +556,26 @@ pub(super) fn project(
                 } else {
                     "tool_success"
                 },
-            ));
+            );
+            header.status = Some(start..end);
+            result.push(header);
             for tool in group {
                 if open || failed(tool) {
+                    let begin = result.len();
                     show(
                         tool,
                         all || expanded.contains(&tool.key),
                         &elapsed,
                         &mut result,
                     );
+                    for row in &mut result[begin..] {
+                        if row.action.is_some() {
+                            row.role = format!(
+                                "tool_child_{}",
+                                row.role.strip_prefix("tool_").unwrap_or(&row.role)
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -513,6 +657,165 @@ mod tests {
             .map(|row| row.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    #[test]
+    fn status_range_ignores_separators_in_command_arguments() {
+        let mut result = row(
+            "op",
+            "run_command",
+            ToolPhase::Finished {
+                execution: Execution::Failed,
+                effects: Effects::KnownResult,
+            },
+            "failure",
+        );
+        let mut metadata = (**result.tool.as_ref().unwrap()).clone();
+        metadata.target = "printf 'a · b' · project".into();
+        result.tool = Some(Arc::new(metadata));
+        let shown = project(&[result], &view(), &BTreeSet::new(), false, false, |_| {
+            " · 12 мс".into()
+        });
+        let header = &shown[0];
+        assert_eq!(&header.text[header.status.clone().unwrap()], "ошибка");
+        assert!(header.text.contains("printf 'a · b'"));
+    }
+    #[test]
+    fn acknowledged_edit_has_numbered_inline_diff_and_exact_full_view() {
+        use crate::protocol::{json::Json, legacy_json_v1::sha256};
+        let before = "fn main() {\n    old();\n}\n";
+        let after = "fn main() {\n    new();\n}\n";
+        let value = Json::object(vec![
+            ("path", Json::string("code.rs").unwrap()),
+            ("before", Json::string(before).unwrap()),
+            ("after", Json::string(after).unwrap()),
+            (
+                "before_hash",
+                Json::string(&sha256(before.as_bytes())).unwrap(),
+            ),
+            (
+                "after_hash",
+                Json::string(&sha256(after.as_bytes())).unwrap(),
+            ),
+            ("applied", Json::parse("true").unwrap()),
+        ])
+        .unwrap();
+        let result = row(
+            "edit",
+            "edit_file",
+            ToolPhase::Finished {
+                execution: Execution::Succeeded,
+                effects: Effects::KnownResult,
+            },
+            &value.dump(),
+        );
+        let shown = project(
+            std::slice::from_ref(&result),
+            &view(),
+            &BTreeSet::new(),
+            false,
+            false,
+            |_| String::new(),
+        );
+        assert!(shown[0].text.contains("(+1 -1)"));
+        assert_eq!(shown[0].action.as_deref(), Some("diff:request:edit"));
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.role == "tool_diff_remove" && row.text.contains("old();"))
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.role == "tool_diff_add" && row.text.contains("new();"))
+        );
+        let full = edit_view(std::slice::from_ref(&result), "request:edit").unwrap();
+        assert_eq!(full.path, "code.rs");
+        assert_eq!((full.diff.added, full.diff.removed), (1, 1));
+        for phase in [
+            ToolPhase::Prepared,
+            ToolPhase::Finished {
+                execution: Execution::Succeeded,
+                effects: Effects::Unknown,
+            },
+        ] {
+            let unknown = row("edit", "edit_file", phase, &value.dump());
+            assert!(
+                project(&[unknown], &view(), &BTreeSet::new(), false, false, |_| {
+                    String::new()
+                })
+                .iter()
+                .all(|row| !row.role.starts_with("tool_diff_"))
+            );
+        }
+    }
+    #[test]
+    fn displayed_edit_survives_snapshot_only_outcome_and_page_replacement() {
+        use super::super::carbon::{self, Workspace};
+        use crate::protocol::{json::Json, legacy_json_v1::sha256};
+        let before = "old\n";
+        let after = "new\n";
+        let output = Json::object(vec![
+            ("path", Json::string("saved.rs").unwrap()),
+            ("before", Json::string(before).unwrap()),
+            ("after", Json::string(after).unwrap()),
+            (
+                "before_hash",
+                Json::string(&sha256(before.as_bytes())).unwrap(),
+            ),
+            (
+                "after_hash",
+                Json::string(&sha256(after.as_bytes())).unwrap(),
+            ),
+            ("applied", Json::parse("true").unwrap()),
+        ])
+        .unwrap()
+        .dump();
+        let prepared = row("edit", "edit_file", ToolPhase::Prepared, "{}");
+        let mut snapshot = view();
+        snapshot.storage_failed = true;
+        snapshot.tools = vec![Activity::Finished(Finished {
+            operation: "edit".into(),
+            call_id: "call-edit".into(),
+            execution: Execution::Succeeded,
+            effects: Effects::KnownResult,
+            output: Arc::new(output),
+        })];
+        let shown = project(
+            &[prepared],
+            &snapshot,
+            &BTreeSet::new(),
+            false,
+            true,
+            |_| String::new(),
+        );
+        let frame = carbon::layout_workspace(
+            &shown,
+            b"draft",
+            0,
+            "storage failed",
+            0,
+            "project",
+            (80, 24),
+            true,
+            &Workspace::default(),
+        )
+        .unwrap();
+        assert!(
+            frame
+                .tool_actions
+                .iter()
+                .any(|(_, key)| key == "diff:request:edit")
+        );
+        let captured = frame.edit_view("diff:request:edit").unwrap();
+        drop(snapshot);
+        drop(shown);
+        let _different_page = project(&[], &view(), &BTreeSet::new(), false, false, |_| {
+            String::new()
+        });
+        assert_eq!(captured.path, "saved.rs");
+        assert!(captured.diff.rows.iter().any(|row| row.text == "old"));
+        assert!(captured.diff.rows.iter().any(|row| row.text == "new"));
+        assert_eq!(frame.edit_view("diff:request:edit").unwrap(), captured);
     }
     #[test]
     fn group_targets_are_unique_and_counts_use_russian_plural_forms() {

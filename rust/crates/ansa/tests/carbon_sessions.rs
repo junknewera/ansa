@@ -103,6 +103,167 @@ async fn complete(runtime: &Runtime, id: &str, text: &str) {
     }
 }
 #[tokio::test(flavor = "current_thread")]
+async fn pre_edit_catalog_resumes_and_forks_without_upgrading_saved_tools_or_context() {
+    use ansa::{
+        config::agent_epoch,
+        frontend::offline,
+        provider::request::{Binding, Request},
+        runtime::{Limits, Options},
+        tools::{
+            files::local_tools,
+            registry::{Policy, Registry},
+        },
+    };
+    use std::{collections::BTreeMap, path::Path, sync::Arc};
+    fn parts(directory: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter_map(|path| {
+                let name = path.file_name()?.to_str()?;
+                (name.starts_with("part-") && name.ends_with(".log"))
+                    .then(|| (name.to_owned(), std::fs::read(&path).unwrap()))
+            })
+            .collect()
+    }
+    let fixture = Fixture::new();
+    let factory = fixture.factory();
+    let selected = factory
+        .settings
+        .catalog("offline")
+        .unwrap()
+        .create_kind("main", None)
+        .unwrap();
+    let epoch = agent_epoch(&factory.settings).unwrap();
+    let current = local_tools(
+        factory.settings.clone(),
+        epoch.clone(),
+        &selected.directory,
+        &factory.auth_path,
+        &std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    // Reconstruct the compiled pre-edit catalogue using the unchanged existing
+    // descriptors and the same durable/read-only policies as before edit_file.
+    let mut legacy = Registry::new();
+    for descriptor in &current.advertisement().descriptors {
+        if descriptor.name == "edit_file" {
+            continue;
+        }
+        legacy
+            .register_with_policy(
+                current.definition(&descriptor.name).unwrap().clone(),
+                Policy {
+                    requires_journal: descriptor.name == "run_command",
+                    read_only: descriptor.name != "run_command",
+                    ..Policy::default()
+                },
+            )
+            .unwrap();
+    }
+    let legacy = legacy.snapshot();
+    let configuration = Request::new(
+        Binding {
+            provider: "openai-siwc".into(),
+            account: "offline-fixture".into(),
+            requested_model: factory.settings.model.clone(),
+            returned_model: factory.settings.returned_model.clone(),
+        },
+        epoch,
+        legacy.advertisement().clone(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut original = Runtime::new(
+        selected.id.as_str().into(),
+        configuration,
+        legacy,
+        Arc::new(|request, stop, _| offline::generate(request, stop)),
+        Limits {
+            tool_rounds: factory.settings.tool_rounds,
+            ..Limits::default()
+        },
+        Options {
+            directory: Some(selected.directory.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    original.ready().await.unwrap();
+    complete(&original, "old_turn", "old catalogue message").await;
+    let expected = context(&original, "old_context").await.request().unwrap();
+    assert!(
+        !expected
+            .tools
+            .descriptors
+            .iter()
+            .any(|d| d.name == "edit_file")
+    );
+    assert!(
+        expected
+            .input
+            .iter()
+            .any(|item| item.has("encrypted_content"))
+    );
+    original.shutdown().await.unwrap();
+    let journal_before = parts(&selected.directory);
+    assert!(!journal_before.is_empty());
+
+    let mut resumed = factory.resume(&selected.id).unwrap();
+    resumed.runtime.ready().await.unwrap();
+    let seed = context(&resumed.runtime, "resumed_old").await;
+    let actual = seed.request().unwrap();
+    assert_eq!(actual.input, expected.input);
+    assert_eq!(actual.tools, expected.tools);
+    assert_eq!(actual.epoch, expected.epoch);
+    assert_eq!(actual.binding, expected.binding);
+    assert_eq!(
+        parts(&selected.directory),
+        journal_before,
+        "reopen rewrote the canonical journal"
+    );
+
+    let mut fork = factory.create(Kind::Fork, Some(seed)).unwrap();
+    fork.runtime.ready().await.unwrap();
+    let forked = context(&fork.runtime, "forked_old")
+        .await
+        .request()
+        .unwrap();
+    assert_eq!(forked.tools, expected.tools);
+    assert_eq!(forked.input, expected.input);
+    assert_eq!(forked.epoch, expected.epoch);
+    complete(
+        &fork.runtime,
+        "fork_turn",
+        "continue with the saved catalogue",
+    )
+    .await;
+    assert_eq!(
+        context(&fork.runtime, "fork_after_turn")
+            .await
+            .request()
+            .unwrap()
+            .tools,
+        expected.tools
+    );
+
+    let mut fresh = factory.create(Kind::Main, None).unwrap();
+    fresh.runtime.ready().await.unwrap();
+    assert!(
+        context(&fresh.runtime, "fresh_tools")
+            .await
+            .request()
+            .unwrap()
+            .tools
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.name == "edit_file")
+    );
+    fresh.runtime.shutdown().await.unwrap();
+    fork.runtime.shutdown().await.unwrap();
+    resumed.runtime.shutdown().await.unwrap();
+}
+#[tokio::test(flavor = "current_thread")]
 async fn fork_keeps_native_context_and_independent_history_across_restart() {
     let fixture = Fixture::new();
     let factory = fixture.factory();

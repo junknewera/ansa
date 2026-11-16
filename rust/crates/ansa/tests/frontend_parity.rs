@@ -166,6 +166,8 @@ fn editor_overflow_cannot_be_healed_by_backspaces() {
 fn entry(role: &str, text: &str) -> Entry {
     Entry {
         action: None,
+        edit: None,
+        status: None,
         role: role.into(),
         text: text.into(),
     }

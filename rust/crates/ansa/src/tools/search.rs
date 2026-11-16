@@ -46,10 +46,7 @@ impl Host {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.as_encoded_bytes();
-            if ansa_linux::fs::protected_path(&path)
-                || path.starts_with(&self.auth)
-                || path.starts_with(self.settings.directory.join("auth"))
-                || path.starts_with(self.settings.directory.join("sessions"))
+            if self.protected_path(&path)
                 || self.settings.exclude.iter().any(|v| v.as_bytes() == name)
             {
                 continue;

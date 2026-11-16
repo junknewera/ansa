@@ -101,6 +101,8 @@ fn scrolling_the_split_inspector_never_erases_or_rewrites_stable_chat_cells() {
             role: "assistant".into(),
             text: "CHAT_STAYS_VISIBLE 👩\u{200d}💻 e\u{301} 🇷🇺".into(),
             action: None,
+            edit: None,
+            status: None,
         }];
         let before = carbon::layout_workspace(
             &history,
@@ -269,6 +271,8 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
                     role: "assistant".into(),
                     text: text.clone(),
                     action: None,
+                    edit: None,
+                    status: None,
                 }];
                 let frame = carbon::layout_workspace(
                     &history,
@@ -315,6 +319,8 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
             role: "assistant".into(),
             text: "**❤**\u{fe0f}1️⃣".into(),
             action: None,
+            edit: None,
+            status: None,
         }],
         b"",
         0,

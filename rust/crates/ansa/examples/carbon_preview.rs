@@ -1,13 +1,21 @@
 //! Reproducible visual fixture using the production renderer, without a model.
-use ansa::frontend::carbon::{self, Entry, Workspace};
+use ansa::frontend::{
+    carbon::{self, Entry, Workspace},
+    diff,
+    theme::Theme,
+};
 
 fn main() {
     let row = |role: &str, text: &str, action: Option<&str>| Entry {
         role: role.into(),
         text: text.into(),
         action: action.map(str::to_owned),
+        edit: None,
+        status: text
+            .find("готово")
+            .map(|start| start..start + "готово".len()),
     };
-    let history = vec![
+    let mut history = vec![
         row("user", "Прочитай README", None),
         row(
             "tool_success",
@@ -45,7 +53,25 @@ fn main() {
             None,
         ),
     ];
-    let frame = carbon::layout_workspace(
+    let patch = diff::between(
+        "# ansa\n\nЛокальный агент.\n",
+        "# ansa\n\nЛокальный агент для работы с проектом.\nСессии сохраняются между запусками.\n",
+    )
+    .unwrap();
+    history.truncate(3);
+    history.push(row(
+        "tool_success",
+        "> Изменён README.md · (+2 -1) · готово",
+        Some("diff:demo"),
+    ));
+    history.extend(
+        patch
+            .rows
+            .iter()
+            .map(|line| row(line.role(), &line.display(), Some("diff:demo"))),
+    );
+    history.push(row("assistant","README обновлён. Описание проекта и сохранения сессий теперь рядом.\n\nПроверка: `git diff --check`.",None));
+    let mut frame = carbon::layout_workspace(
         &history,
         "Покажи файлы проекта".as_bytes(),
         "Покажи файлы проекта".len(),
@@ -62,5 +88,9 @@ fn main() {
         },
     )
     .unwrap();
+    frame.apply_theme(
+        &Theme::builtin(&std::env::args().nth(1).unwrap_or_else(|| "carbon".into()))
+            .expect("known theme"),
+    );
     println!("{}", serde_json::to_string(&frame.lines).unwrap());
 }

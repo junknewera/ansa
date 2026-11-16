@@ -5,6 +5,9 @@ pub struct Entry {
     pub role: String,
     pub text: String,
     pub action: Option<String>,
+    /// Byte range built by the tool projection, never inferred from command text.
+    pub status: Option<std::ops::Range<usize>>,
+    pub edit: Option<std::sync::Arc<super::diff::EditView>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -19,6 +22,9 @@ pub struct Frame {
     cursor_row: usize,
     status_rows: Vec<usize>,
     panes: Vec<Option<PaneRow>>,
+    themed: bool,
+    selection_style: Option<String>,
+    edit_views: std::collections::BTreeMap<String, std::sync::Arc<super::diff::EditView>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRow {
@@ -35,6 +41,67 @@ impl PaneRow {
     }
 }
 impl Frame {
+    pub fn edit_view(&self, key: &str) -> Option<std::sync::Arc<super::diff::EditView>> {
+        self.edit_views.get(key).cloned()
+    }
+    pub fn apply_theme(&mut self, theme: &super::theme::Theme) {
+        if self.themed {
+            return;
+        }
+        self.themed = true;
+        let mut replacements = theme.replacements();
+        let background = replacements
+            .iter()
+            .find(|(from, _)| from == CANVAS)
+            .map(|(_, to)| to.clone())
+            .unwrap_or_else(|| CANVAS.into());
+        let base = format!("{background}{}", theme.foreground_sgr());
+        replacements.push((RESET.into(), format!("{RESET}{base}")));
+        let columns = self.viewport.map_or_else(
+            || self.lines.iter().map(|line| cells(line)).max().unwrap_or(0),
+            |size| size.0.saturating_sub(1),
+        );
+        let translate = |text: &str| {
+            let mut output = String::new();
+            let mut at = 0;
+            while at < text.len() {
+                if let Some((from, to)) = replacements
+                    .iter()
+                    .filter(|(from, _)| !from.is_empty() && text[at..].starts_with(from.as_str()))
+                    .max_by_key(|(from, _)| from.len())
+                {
+                    output.push_str(to);
+                    at += from.len();
+                } else {
+                    let ch = text[at..].chars().next().expect("char boundary");
+                    output.push(ch);
+                    at += ch.len_utf8();
+                }
+            }
+            output
+        };
+        self.selection_style = Some(translate(SELECTED));
+        let paint = |text: &str, width: usize| {
+            format!(
+                "{base}{}{}{RESET}",
+                translate(text),
+                " ".repeat(width.saturating_sub(cells(text)))
+            )
+        };
+        for row in 0..self.lines.len() {
+            if let Some(pane) = self.pane(row).cloned() {
+                let pane = PaneRow {
+                    column: pane.column,
+                    left: paint(&pane.left, pane.column),
+                    right: paint(&pane.right, columns.saturating_sub(pane.column)),
+                };
+                self.lines[row] = pane.line();
+                self.panes[row] = Some(pane);
+            } else {
+                self.lines[row] = paint(&self.lines[row], columns);
+            }
+        }
+    }
     fn pane(&self, row: usize) -> Option<&PaneRow> {
         self.panes
             .get(row)?
@@ -424,20 +491,42 @@ fn layout_impl(
     let reset = if color { "\x1b[0m" } else { "" };
     let mut wrapped = vec![];
     let mut tool_actions = Vec::new();
+    let mut edits = std::collections::BTreeMap::new();
     let mut previous_tool = false;
     for entry in history {
         let tool = entry.role.starts_with("tool");
-        if !wrapped.is_empty() && !(tool && previous_tool) {
+        let separate_tool = tool
+            && previous_tool
+            && entry.action.is_some()
+            && !entry.role.starts_with("tool_child_")
+            && !entry.role.starts_with("tool_diff_");
+        if !wrapped.is_empty() && (!(tool && previous_tool) || separate_tool) {
             wrapped.push(String::new());
         }
         previous_tool = tool;
         if let Some(action) = &entry.action {
             tool_actions.push((wrapped.len(), action.clone()));
+            if let Some(edit) = &entry.edit {
+                edits.insert(action.clone(), edit.clone());
+            }
         }
         let safe: String = glyphs(entry.text.as_bytes())
             .iter()
             .map(|v| v.text.as_str())
             .collect();
+        if let Some(kind) = match entry.role.as_str() {
+            "tool_diff_add" => Some(super::diff::Kind::Add),
+            "tool_diff_remove" => Some(super::diff::Kind::Remove),
+            "tool_diff_hunk" => Some(super::diff::Kind::Hunk),
+            "tool_diff_context" => Some(super::diff::Kind::Context),
+            "tool_diff_notice" => Some(super::diff::Kind::Notice),
+            _ => None,
+        } {
+            for text in safe.lines() {
+                wrapped.push(diff_line(&clipped(text, cols), kind, cols, color));
+            }
+            continue;
+        }
         let assistant = entry.role == "assistant";
         let user = entry.role == "user";
         let mut fence = false;
@@ -673,16 +762,22 @@ fn layout_impl(
     }
     lines.push(format!("{mint}{clipped}{reset}"));
     let cursor_row = lines.len() - 2;
+    let tool_actions: Vec<_> = tool_actions
+        .into_iter()
+        .filter_map(|(row, key)| {
+            (row >= begin && row < end).then_some((row.saturating_sub(begin) + 1, key))
+        })
+        .collect();
+    let edit_views = tool_actions
+        .iter()
+        .filter_map(|(_, key)| edits.remove(key).map(|edit| (key.clone(), edit)))
+        .collect();
     Some(Frame {
         lines,
         cursor: 2 + before_width,
         scroll_limit: wrapped.len().saturating_sub(available),
-        tool_actions: tool_actions
-            .into_iter()
-            .filter_map(|(row, key)| {
-                (row >= begin && row < end).then_some((row.saturating_sub(begin) + 1, key))
-            })
-            .collect(),
+        tool_actions,
+        edit_views,
         chat_bounds: Some((1, available + 1, cols)),
         inspector_content_rows: 0,
         viewport: full.then_some(size),
@@ -693,6 +788,8 @@ fn layout_impl(
             vec![cursor_row + 1]
         },
         panes: Vec::new(),
+        themed: false,
+        selection_style: None,
     })
 }
 
@@ -724,6 +821,8 @@ pub struct Inspector {
     pub footer: String,
     pub kind: InspectorKind,
     pub markdown: Option<std::sync::Arc<Vec<super::markdown::Row>>>,
+    pub diff: Option<std::sync::Arc<Vec<super::diff::Row>>>,
+    pub diff_column: usize,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Choice {
@@ -756,25 +855,52 @@ const MUTED: &str = "\x1b[38;2;145;157;177m";
 const SKY: &str = "\x1b[38;2;125;183;245m";
 const LAVENDER: &str = "\x1b[38;2;188;166;242m";
 const AMBER: &str = "\x1b[38;2;232;189;117m";
+const CODE: &str = "\x1b[38;2;229;193;137m";
 const RED: &str = "\x1b[38;2;241;142;150m";
 const RULE: &str = "\x1b[38;2;62;74;93m";
 const USER_SURFACE: &str = "\x1b[48;2;28;40;57m";
 const INPUT_SURFACE: &str = "\x1b[48;2;34;41;54m";
+const CANVAS: &str = "\x1b[48;2;13;17;19m";
+const DIFF_ADD: &str = "\x1b[48;2;24;58;39m";
+const DIFF_REMOVE: &str = "\x1b[48;2;68;31;36m";
 const RESET: &str = "\x1b[0m";
 const SELECTED: &str = "\x1b[48;2;46;63;88m\x1b[38;2;232;240;255m";
 
 fn tool_ink(role: &str) -> &'static str {
-    match role {
-        "tool_success" => MINT,
-        "tool_error" => RED,
-        "tool_warning" | "tool_running" => AMBER,
+    match role
+        .strip_prefix("tool_child_")
+        .or_else(|| role.strip_prefix("tool_"))
+        .unwrap_or(role)
+    {
+        "success" => MINT,
+        "error" => RED,
+        "warning" | "running" => AMBER,
         _ => MUTED,
     }
+}
+fn diff_line(text: &str, kind: super::diff::Kind, width: usize, color: bool) -> String {
+    use super::diff::Kind;
+    let style = match kind {
+        Kind::Add => format!("{DIFF_ADD}{MINT}"),
+        Kind::Remove => format!("{DIFF_REMOVE}{RED}"),
+        Kind::Hunk => SKY.into(),
+        Kind::Notice => MUTED.into(),
+        Kind::Context => TEXT.into(),
+    };
+    styled(
+        &if matches!(kind, Kind::Add | Kind::Remove) {
+            padded(text, width)
+        } else {
+            text.into()
+        },
+        &style,
+        color,
+    )
 }
 struct TranscriptPaint {
     base: &'static str,
     header: &'static str,
-    fields: Vec<usize>,
+    status: Option<std::ops::Range<usize>>,
     group: bool,
     tool: bool,
 }
@@ -796,33 +922,26 @@ impl TranscriptPaint {
                 TEXT
             },
             header: if group { LAVENDER } else { SKY },
-            fields: if tool {
-                text.match_indices(" · ").map(|(at, _)| at).collect()
-            } else {
-                Vec::new()
-            },
+            status: entry.status.clone(),
             group,
             tool,
         }
     }
     fn ink(&self, at: usize, code: bool, heading: bool) -> &'static str {
         if self.tool {
-            if at < 2 || self.fields.is_empty() {
+            if at < 2 || self.status.as_ref().is_none_or(|range| range.contains(&at)) {
                 return self.base;
             }
-            let field = self.fields.partition_point(|offset| *offset <= at);
-            return match (self.group, field) {
-                (_, 0) => self.header,
-                (true, 1) => MUTED,
-                (true, 2) | (false, 1) => self.base,
-                (true, _) => SKY,
-                _ => MUTED,
+            return if self.status.as_ref().is_some_and(|range| at >= range.end) {
+                if self.group { SKY } else { MUTED }
+            } else {
+                self.header
             };
         }
         if heading {
             SKY
         } else if code {
-            AMBER
+            CODE
         } else {
             self.base
         }
@@ -881,7 +1000,7 @@ fn heading(left: &str, right: &str, columns: usize, color: bool) -> String {
         if let Some(rest) = left.strip_prefix("ANSA") {
             format!(
                 "{}{}",
-                styled("ANSA", "\x1b[1m\x1b[38;2;133;220;177m", color),
+                styled("ANSA", "\x1b[1m\x1b[38;2;188;166;242m", color),
                 styled(rest, MUTED, color)
             )
         } else {
@@ -1003,7 +1122,31 @@ fn inspector_rows(
     }
     let footer = usize::from(!panel.footer.is_empty());
     let available = height.saturating_sub(rows.len() + footer);
-    if let Some(markdown) = &panel.markdown {
+    if let Some(diff) = &panel.diff {
+        for row in diff.iter().skip(panel.offset).take(available) {
+            let text = if matches!(
+                row.kind,
+                super::diff::Kind::Hunk | super::diff::Kind::Notice
+            ) {
+                clipped(&row.display(), width)
+            } else {
+                let gutter = clipped(&row.gutter(), width);
+                let room = width.saturating_sub(cells(&gutter));
+                format!(
+                    "{gutter}{}",
+                    clipped(
+                        &slice_cells(
+                            &super::workspace::display_text(&row.code()),
+                            panel.diff_column,
+                            panel.diff_column.saturating_add(room),
+                        ),
+                        room,
+                    )
+                )
+            };
+            rows.push(diff_line(&text, row.kind, width, color));
+        }
+    } else if let Some(markdown) = &panel.markdown {
         for line in markdown.iter().skip(panel.offset).take(available) {
             let mut rendered = String::new();
             for span in &line.spans {
@@ -1014,7 +1157,7 @@ fn inspector_rows(
                 if span.style.heading > 0 {
                     style.push_str(SKY);
                 } else if span.style.code {
-                    style.push_str(AMBER);
+                    style.push_str(CODE);
                 }
                 if span.style.italic {
                     style.push_str("\x1b[3m");
@@ -1051,7 +1194,7 @@ fn inspector_rows(
                 && safe.starts_with('-')
                 && !safe.starts_with("---")
             {
-                "\x1b[38;2;235;153;142m"
+                RED
             } else if matches!(panel.kind, InspectorKind::Markdown) && safe.starts_with('#') {
                 MINT
             } else {
@@ -1209,6 +1352,8 @@ pub fn layout_workspace(
         lines: rows,
         status_rows: vec![height - 2, height - 1],
         panes,
+        themed: false,
+        selection_style: None,
         cursor: editor_cursor,
         cursor_row: cursor_row.min(height - 1),
         scroll_limit: chat.scroll_limit,
@@ -1220,6 +1365,11 @@ pub fn layout_workspace(
             )
         }),
         viewport: Some(size),
+        edit_views: if (side_by_side || ui.inspector.is_none()) && ui.popup.is_none() {
+            chat.edit_views
+        } else {
+            Default::default()
+        },
         tool_actions: if (side_by_side || ui.inspector.is_none()) && ui.popup.is_none() {
             chat.tool_actions
                 .into_iter()
@@ -1329,20 +1479,75 @@ fn selected_segment(text: &str, first: usize, last: usize) -> String {
     let (first, last) = selection_bounds(&line, first, last);
     slice_cells(&line, first, last)
 }
-fn highlighted_segment(text: &str, first: usize, last: usize, color: bool) -> String {
+fn highlighted_segment(
+    text: &str,
+    first: usize,
+    last: usize,
+    color: bool,
+    selection_style: &str,
+) -> String {
     let line = plain(text);
     let (first, last) = selection_bounds(&line, first, last);
-    let before = slice_cells(&line, 0, first);
-    let selected = slice_cells(&line, first, last);
-    let after = slice_cells(&line, last, usize::MAX);
-    if selected.is_empty() {
-        line
-    } else {
-        format!(
-            "{before}{}{after}",
-            styled(&selected, if color { SELECTED } else { "\x1b[7m" }, true)
-        )
+    if first == last || first >= cells(text) {
+        return text.into();
     }
+    let mut output = String::new();
+    let mut column = 0;
+    let mut painted = String::new();
+    for glyph in paint_glyphs(text) {
+        let selected = column >= first && column < last;
+        let style = if selected {
+            format!(
+                "{}{}",
+                glyph.style,
+                if color { selection_style } else { "\x1b[7m" }
+            )
+        } else {
+            glyph.style.to_string()
+        };
+        if painted != style {
+            output.push_str(RESET);
+            output.push_str(&style);
+        }
+        output.push_str(&if selected {
+            plain(&glyph.text)
+        } else {
+            glyph.text
+        });
+        painted = if selected {
+            style
+        } else {
+            glyph.ending_style.to_string()
+        };
+        column += glyph.width;
+    }
+    output.push_str(RESET);
+    output
+}
+fn clipped_painted(text: &str, columns: usize) -> String {
+    if cells(text) <= columns {
+        return text.into();
+    }
+    if !text.contains('\x1b') {
+        return clipped(text, columns);
+    }
+    let mut output = String::new();
+    let mut column = 0;
+    let mut style = String::new();
+    for glyph in paint_glyphs(text) {
+        if column + glyph.width > columns {
+            break;
+        }
+        if style != glyph.style.as_ref() {
+            output.push_str(RESET);
+            output.push_str(&glyph.style);
+        }
+        output.push_str(&glyph.text);
+        style = glyph.ending_style.to_string();
+        column += glyph.width;
+    }
+    output.push_str(RESET);
+    output
 }
 impl Frame {
     pub fn plain_lines(&self) -> Vec<String> {
@@ -1417,18 +1622,26 @@ impl Frame {
                         first.min(pane.column),
                         last.min(pane.column),
                         color,
+                        frame.selection_style.as_deref().unwrap_or(SELECTED),
                     ),
                     right: highlighted_segment(
                         &pane.right,
                         first.saturating_sub(pane.column),
                         last.saturating_sub(pane.column),
                         color,
+                        frame.selection_style.as_deref().unwrap_or(SELECTED),
                     ),
                 };
                 frame.lines[row] = pane.line();
                 frame.panes[row] = Some(pane);
             } else {
-                frame.lines[row] = highlighted_segment(&frame.lines[row], first, last, color);
+                frame.lines[row] = highlighted_segment(
+                    &frame.lines[row],
+                    first,
+                    last,
+                    color,
+                    frame.selection_style.as_deref().unwrap_or(SELECTED),
+                );
             }
         }
         frame
@@ -1468,12 +1681,12 @@ impl Selection {
         frame.panes = vec![None; size.1];
         for (row, line) in self.frozen.lines.iter().enumerate().take(size.1) {
             if let Some(pane) = self.frozen.pane(row) {
-                let left = clipped(&plain(&pane.left), columns.min(pane.column));
+                let left = clipped_painted(&pane.left, columns.min(pane.column));
                 if pane.column < columns {
                     let pane = PaneRow {
                         column: pane.column,
                         left,
-                        right: clipped(&plain(&pane.right), columns - pane.column),
+                        right: clipped_painted(&pane.right, columns - pane.column),
                     };
                     frame.lines.push(pane.line());
                     frame.panes[row] = Some(pane);
@@ -1481,7 +1694,7 @@ impl Selection {
                     frame.lines.push(left);
                 }
             } else {
-                frame.lines.push(clipped(&plain(line), columns));
+                frame.lines.push(clipped_painted(line, columns));
             }
         }
         frame.lines.resize(size.1, String::new());
@@ -1581,7 +1794,7 @@ fn source_line(text: &str, color: bool) -> String {
                     | "true"
                     | "false"
             ) {
-                result.push_str(&styled(token, "\x1b[38;2;231;196;112m", true));
+                result.push_str(&styled(token, CODE, true));
             } else {
                 result.push_str(token);
             }

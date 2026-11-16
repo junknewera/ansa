@@ -191,19 +191,24 @@ impl Factory {
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
         )?;
-        let tools = if kind.read_only()
-            || source_configuration
-                .as_ref()
-                .is_some_and(|r| r.tools == *tools.read_only().advertisement())
-        {
+        // Resume/fork retains the exact saved tool catalogue. Adding a compiled
+        // tool only affects new sessions; saved descriptors cannot install code.
+        let tools = if let Some(source) = &source_configuration {
+            tools
+                .compatible(&source.tools)
+                .ok_or("session_fork_tools")?
+        } else {
+            tools
+        };
+        let tools = if kind.read_only() {
             tools.read_only()
         } else {
             tools
         };
-        if !kind.read_only()
-            && source_configuration
+        if kind.read_only()
+            && restored
                 .as_ref()
-                .is_some_and(|r| r.tools != *tools.advertisement())
+                .is_some_and(|source| source.tools != *tools.advertisement())
         {
             return Err("session_fork_tools");
         }

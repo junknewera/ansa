@@ -192,6 +192,32 @@ impl Registry {
     }
 }
 impl Snapshot {
+    /// Retain the exact compiled subset and order of a saved advertisement.
+    /// Saved descriptions never supply executable definitions or policies.
+    /// Recomputing the revision also checks the saved durable-intent policy.
+    pub fn compatible(&self, saved: &Advertisement) -> Option<Arc<Self>> {
+        if !self.definitions_match_advertisement() {
+            return None;
+        }
+        let mut registry = Registry::new();
+        for descriptor in &saved.descriptors {
+            let index = self
+                .definitions
+                .iter()
+                .position(|definition| definition.descriptor.name == descriptor.name)?;
+            if self.definitions[index].descriptor != *descriptor {
+                return None;
+            }
+            registry
+                .register_with_policy(
+                    self.definitions[index].clone(),
+                    self.policies[index].clone(),
+                )
+                .ok()?;
+        }
+        let subset = registry.snapshot();
+        (subset.advertisement == *saved).then_some(subset)
+    }
     pub fn requires_journal(&self) -> bool {
         self.policies.iter().any(|p| p.requires_journal)
     }
@@ -227,5 +253,108 @@ impl Snapshot {
 
     pub fn definition(&self, name: &str) -> Option<&Definition> {
         self.definitions.iter().find(|d| d.descriptor.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn definition(name: &str) -> Definition {
+        let output = name.to_owned();
+        Definition {
+            descriptor: Descriptor { name: name.into(), description: format!("Compiled {name}"),
+                revision: "revision-1".into(), schema: Json::parse(r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#).unwrap() },
+            validator: Arc::new(|_| true),
+            executor: Arc::new(move |_| Outcome::succeeded(output.clone())),
+        }
+    }
+    fn registered(names: &[&str]) -> Arc<Snapshot> {
+        let mut registry = Registry::new();
+        for name in names {
+            registry
+                .register_with_policy(
+                    definition(name),
+                    Policy {
+                        requires_journal: *name != "read",
+                        read_only: *name == "read",
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+        }
+        registry.snapshot()
+    }
+    #[test]
+    fn compatible_subset_uses_compiled_executors_and_exact_saved_order_and_policies() {
+        let current = registered(&["edit", "run", "read"]);
+        let old = registered(&["read", "run"]);
+        let subset = current.compatible(old.advertisement()).unwrap();
+        assert_eq!(subset.advertisement(), old.advertisement());
+        assert!(subset.definition("edit").is_none());
+        assert!(subset.policy("run").unwrap().requires_journal);
+        assert!(subset.policy("read").unwrap().read_only);
+        assert_eq!(
+            (subset.definition("read").unwrap().executor)(&Json::parse("{}").unwrap()).output(),
+            b"read"
+        );
+        assert_eq!(
+            subset.read_only().advertisement(),
+            old.read_only().advertisement()
+        );
+        assert_eq!(current.advertisement().descriptors.len(), 3);
+    }
+    #[test]
+    fn compatible_subset_rejects_changed_unknown_or_duplicate_descriptors() {
+        let current = registered(&["read", "run", "edit"]);
+        for changed in 0..4 {
+            let mut definition = definition("read");
+            match changed {
+                0 => definition.descriptor.name = "missing".into(),
+                1 => definition.descriptor.description.push_str(" changed"),
+                2 => definition.descriptor.revision = "revision-2".into(),
+                _ => definition.descriptor.schema = Json::parse(r#"{"type":"object","properties":{"new":{"type":"string"}},"required":["new"],"additionalProperties":false}"#).unwrap(),
+            }
+            let mut registry = Registry::new();
+            registry
+                .register_with_policy(
+                    definition,
+                    Policy {
+                        read_only: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+            assert!(
+                current
+                    .compatible(registry.snapshot().advertisement())
+                    .is_none()
+            );
+        }
+        let mut duplicate = registered(&["read"]).advertisement().clone();
+        duplicate.descriptors.push(duplicate.descriptors[0].clone());
+        assert!(current.compatible(&duplicate).is_none());
+    }
+    #[test]
+    fn compatible_subset_checks_revision_and_durable_policy_without_upgrading_readonly() {
+        let current = registered(&["read", "run", "edit"]);
+        let readonly = current.read_only();
+        assert_eq!(
+            current
+                .compatible(readonly.advertisement())
+                .unwrap()
+                .advertisement(),
+            readonly.advertisement()
+        );
+        assert!(readonly.compatible(current.advertisement()).is_none());
+        let mut forged = readonly.advertisement().clone();
+        forged.revision = "forged".into();
+        assert!(current.compatible(&forged).is_none());
+        let mut wrong_policy = Registry::new();
+        wrong_policy.register(definition("run")).unwrap();
+        assert!(
+            current
+                .compatible(wrong_policy.snapshot().advertisement())
+                .is_none()
+        );
     }
 }
