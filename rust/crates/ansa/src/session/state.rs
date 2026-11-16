@@ -490,6 +490,7 @@ impl State {
                     "session_fork_transcript",
                 )?;
                 transcript.append(Entry {
+                    tool: None,
                     turn: entry.text_field("turn")?.into(),
                     request: entry.text_field("request")?.into(),
                     role: entry.text_field("role")?.into(),
@@ -601,6 +602,7 @@ impl State {
             current.receipt.state = "generating".into();
             for message in &messages {
                 Arc::make_mut(&mut self.transcript).append(Entry {
+                    tool: None,
                     turn: current.receipt.turn.clone(),
                     request: current.receipt.request.clone(),
                     role: "user".into(),
@@ -685,6 +687,7 @@ impl State {
                 "session_turn_limits",
             )?;
             Arc::make_mut(&mut self.transcript).append(Entry {
+                tool: None,
                 turn: receipt.turn.clone(),
                 request: receipt.request.clone(),
                 role: "user".into(),
@@ -906,6 +909,7 @@ impl State {
                     let transcript = Arc::make_mut(&mut self.transcript);
                     transcript.set_last("completed");
                     transcript.append(Entry {
+                        tool: None,
                         turn: current.receipt.turn.clone(),
                         request: current.receipt.request.clone(),
                         role: "assistant".into(),

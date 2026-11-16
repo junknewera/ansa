@@ -170,6 +170,7 @@ mod tests {
         for i in 0..80 {
             for role in ["user", "assistant"] {
                 transcript.append(Entry {
+                    tool: None,
                     turn: TurnId(format!("t{i}")),
                     request: RequestId(format!("r{i}")),
                     role: role.into(),

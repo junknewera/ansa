@@ -1,33 +1,92 @@
 //! Carbon layout in the main screen buffer. All untrusted bytes are sanitized.
-use ansa_linux::terminal::Width;
+use super::cells as display_cells;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub role: String,
     pub text: String,
+    pub action: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub lines: Vec<String>,
     pub cursor: usize,
     pub scroll_limit: usize,
+    pub tool_actions: Vec<(usize, String)>,
+    /// Chat row range and right column, all zero based and exclusive at end.
+    pub chat_bounds: Option<(usize, usize, usize)>,
+    pub inspector_content_rows: usize,
     viewport: Option<(usize, usize)>,
     cursor_row: usize,
+    status_rows: Vec<usize>,
+    panes: Vec<Option<PaneRow>>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneRow {
+    column: usize,
+    left: String,
+    right: String,
+}
+impl PaneRow {
+    fn line(&self) -> String {
+        format!("{}{}", self.left, self.right)
+    }
+    fn matches(&self, line: &str) -> bool {
+        line.strip_prefix(self.left.as_str()) == Some(self.right.as_str())
+    }
 }
 impl Frame {
+    fn pane(&self, row: usize) -> Option<&PaneRow> {
+        self.panes
+            .get(row)?
+            .as_ref()
+            .filter(|pane| self.lines.get(row).is_some_and(|line| pane.matches(line)))
+    }
+    fn paint_row(&self, row: usize, output: &mut String) {
+        if let Some(pane) = self.pane(row) {
+            output.push_str(&pane.left);
+            // A terminal can compose multiple emoji scalars into one glyph.
+            // The adjoining pane has a fixed column independent of that width.
+            output.push('\r');
+            if pane.column > 0 {
+                output.push_str(&format!("\x1b[{}C", pane.column));
+            }
+            if pane.left.contains('\x1b') {
+                output.push_str("\x1b[0m");
+            }
+            output.push_str(&pane.right);
+        } else {
+            output.push_str(&self.lines[row]);
+        }
+    }
+    /// Status belongs to the live runtime; the selected text remains frozen.
+    pub fn update_status_from(&mut self, live: &Self) {
+        if self.viewport == live.viewport && self.lines.len() == live.lines.len() {
+            for &row in &live.status_rows {
+                if let (Some(target), Some(source)) = (self.lines.get_mut(row), live.lines.get(row))
+                {
+                    target.clone_from(source);
+                }
+            }
+            self.status_rows.clone_from(&live.status_rows);
+        }
+    }
     pub fn paint(&self, previous: usize) -> String {
         if self.viewport.is_some() {
             let mut out = "\x1b[H\x1b[2J".to_owned();
-            for (i, line) in self.lines.iter().enumerate() {
+            for i in 0..self.lines.len() {
                 if i > 0 {
                     out.push_str("\r\n");
                 }
-                out.push_str(line);
+                self.paint_row(i, &mut out);
             }
             let up = self.lines.len().saturating_sub(self.cursor_row + 1);
             if up > 0 {
                 out.push_str(&format!("\x1b[{up}A"));
             }
-            out.push_str(&format!("\r\x1b[{}C", self.cursor));
+            out.push('\r');
+            if self.cursor > 0 {
+                out.push_str(&format!("\x1b[{}C", self.cursor));
+            }
             return out;
         }
         let rows = self.lines.len();
@@ -66,14 +125,78 @@ impl Frame {
         }
         let mut row = 0;
         for (index, line) in self.lines.iter().enumerate() {
-            if previous.lines[index] == *line {
+            let old_pane = previous.pane(index);
+            let new_pane = self.pane(index);
+            if previous.lines[index] == *line && old_pane == new_pane {
                 continue;
             }
+            let segment = match (old_pane, new_pane) {
+                (Some(before), Some(after))
+                    if before.column == after.column && before.left == after.left =>
+                {
+                    Some((before.right.as_str(), after.right.as_str(), after.column))
+                }
+                (None, None) => Some((previous.lines[index].as_str(), line.as_str(), 0)),
+                _ => None,
+            };
+            let Some((old_segment, new_segment, base_column)) = segment else {
+                if index > row {
+                    out.push_str(&format!("\x1b[{}B", index - row));
+                }
+                let colored = line.contains('\x1b') || previous.lines[index].contains('\x1b');
+                out.push('\r');
+                if colored {
+                    out.push_str("\x1b[0m");
+                }
+                out.push_str("\x1b[K");
+                self.paint_row(index, &mut out);
+                if colored {
+                    out.push_str("\x1b[0m");
+                }
+                row = index;
+                continue;
+            };
+            let before = paint_glyphs(old_segment);
+            let after = paint_glyphs(new_segment);
+            let equal = before
+                .iter()
+                .zip(&after)
+                .take_while(|(before, after)| before == after)
+                .count();
+            if equal == before.len() && equal == after.len() {
+                continue;
+            }
+            let column: usize = base_column
+                + after[..equal]
+                    .iter()
+                    .map(|glyph| glyph.width)
+                    .sum::<usize>();
             if index > row {
                 out.push_str(&format!("\x1b[{}B", index - row));
             }
-            out.push_str("\r\x1b[2K");
-            out.push_str(line);
+            out.push('\r');
+            if column > 0 {
+                out.push_str(&format!("\x1b[{column}C"));
+            }
+            let colored = new_segment.contains('\x1b') || old_segment.contains('\x1b');
+            if colored {
+                out.push_str("\x1b[0m");
+            }
+            // Clear only the changed suffix. In a split workspace the chat
+            // occupies the common prefix and must stay on screen untouched.
+            out.push_str("\x1b[K");
+            let mut style = "";
+            for glyph in &after[equal..] {
+                if style != glyph.style.as_ref() {
+                    out.push_str("\x1b[0m");
+                    out.push_str(&glyph.style);
+                }
+                out.push_str(&glyph.text);
+                style = &glyph.ending_style;
+            }
+            if colored {
+                out.push_str("\x1b[0m");
+            }
             row = index;
         }
         let target = self.cursor_row;
@@ -83,59 +206,101 @@ impl Frame {
         if row < target {
             out.push_str(&format!("\x1b[{}B", target - row));
         }
-        out.push_str(&format!("\r\x1b[{}C", self.cursor));
+        out.push('\r');
+        if self.cursor > 0 {
+            out.push_str(&format!("\x1b[{}C", self.cursor));
+        }
         out
     }
+}
+/// A printable base and its combining marks form one repaint boundary. Styles
+/// are retained so a color change is visible even when the text is unchanged.
+#[derive(PartialEq, Eq)]
+struct PaintGlyph {
+    text: String,
+    width: usize,
+    style: std::sync::Arc<str>,
+    ending_style: std::sync::Arc<str>,
+}
+fn paint_glyphs(line: &str) -> Vec<PaintGlyph> {
+    struct Scalar {
+        visible_at: usize,
+        raw_at: usize,
+        raw_end: usize,
+        style: std::sync::Arc<str>,
+    }
+    let mut visible = String::new();
+    let mut scalars = Vec::new();
+    let mut style: std::sync::Arc<str> = "".into();
+    let mut at = 0;
+    while at < line.len() {
+        let remaining = &line[at..];
+        if let Some(sgr) = remaining.strip_prefix("\x1b[")
+            && let Some(end) = sgr.find('m')
+            && sgr[..end]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
+        {
+            let sequence = &remaining[..end + 3];
+            style = if sequence == "\x1b[0m" || sequence == "\x1b[m" {
+                "".into()
+            } else {
+                format!("{style}{sequence}").into()
+            };
+            at += sequence.len();
+            continue;
+        }
+        let cp = remaining.chars().next().expect("char boundary");
+        scalars.push(Scalar {
+            visible_at: visible.len(),
+            raw_at: at,
+            raw_end: at + cp.len_utf8(),
+            style: style.clone(),
+        });
+        visible.push(cp);
+        at += cp.len_utf8();
+    }
+    let mut result = Vec::new();
+    let mut scalar = 0;
+    let mut end = 0;
+    for cluster in display_cells::graphemes(&visible) {
+        end += cluster.len();
+        let first = &scalars[scalar];
+        while scalar + 1 < scalars.len() && scalars[scalar + 1].visible_at < end {
+            scalar += 1;
+        }
+        let last = &scalars[scalar];
+        result.push(PaintGlyph {
+            text: line[first.raw_at..last.raw_end].into(),
+            width: display_cells::width(cluster),
+            style: first.style.clone(),
+            ending_style: last.style.clone(),
+        });
+        scalar += 1;
+    }
+    result
 }
 #[derive(Clone)]
 struct Glyph {
     text: String,
     width: usize,
     newline: bool,
+    source_end: usize,
 }
-fn fallback(cp: char) -> usize {
-    match cp as u32 {
-        0x0300..=0x036f
-        | 0x1ab0..=0x1aff
-        | 0x1dc0..=0x1dff
-        | 0x20d0..=0x20ff
-        | 0xfe00..=0xfe0f
-        | 0xfe20..=0xfe2f
-        | 0xe0100..=0xe01ef
-        | 0x200d => 0,
-        0x1100..=0x115f
-        | 0x2329
-        | 0x232a
-        | 0x2e80..=0x303e
-        | 0x3040..=0xa4cf
-        | 0xac00..=0xd7a3
-        | 0xf900..=0xfaff
-        | 0xfe10..=0xfe19
-        | 0xfe30..=0xfe6f
-        | 0xff00..=0xff60
-        | 0xffe0..=0xffe6
-        | 0x1f300..=0x1faff
-        | 0x20000..=0x3fffd => 2,
-        _ => 1,
-    }
-}
-fn glyphs(bytes: &[u8], width: &Width) -> Vec<Glyph> {
-    let mut result = vec![];
+fn glyphs(bytes: &[u8]) -> Vec<Glyph> {
+    let mut safe = String::new();
+    let mut offsets = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
         let ch = bytes[at];
         if ch < 32 || ch == 127 {
-            result.push(Glyph {
-                text: match ch {
-                    b'\n' => "\n",
-                    b'\t' => " ",
-                    _ => "?",
-                }
-                .into(),
-                width: usize::from(ch != b'\n'),
-                newline: ch == b'\n',
+            safe.push_str(match ch {
+                b'\n' => "\n",
+                b'\t' => " ",
+                _ => "?",
             });
             at += 1;
+            offsets.push((safe.len(), at));
             continue;
         }
         let n = match ch {
@@ -153,33 +318,42 @@ fn glyphs(bytes: &[u8], width: &Width) -> Vec<Glyph> {
             None
         };
         if let Some(cp) = cp {
-            result.push(if matches!(cp as u32, 0x80..=0x9f) {
-                Glyph {
-                    text: "?".into(),
-                    width: 1,
-                    newline: false,
-                }
+            safe.push(if matches!(cp as u32, 0x80..=0x9f) {
+                '?'
             } else {
-                Glyph {
-                    text: cp.to_string(),
-                    width: width.width(cp).unwrap_or_else(|| fallback(cp)),
-                    newline: false,
-                }
+                cp
             });
             at += n;
         } else {
-            result.push(Glyph {
-                text: "?".into(),
-                width: 1,
-                newline: false,
-            });
+            safe.push('?');
             at += 1;
         }
+        offsets.push((safe.len(), at));
+    }
+    let mut result = Vec::new();
+    let mut end = 0;
+    let mut offset = 0;
+    for cluster in display_cells::graphemes(&safe) {
+        end += cluster.len();
+        while offsets[offset].0 < end {
+            offset += 1;
+        }
+        let newline = cluster == "\n";
+        result.push(Glyph {
+            text: cluster.into(),
+            width: if newline {
+                0
+            } else {
+                display_cells::width(cluster)
+            },
+            newline,
+            source_end: offsets[offset].1,
+        });
     }
     result
 }
-fn compact_input_glyphs(bytes: &[u8], width: &Width) -> Vec<Glyph> {
-    let mut result = glyphs(bytes, width);
+fn compact_input_glyphs(bytes: &[u8]) -> Vec<Glyph> {
+    let mut result = glyphs(bytes);
     for glyph in &mut result {
         if glyph.newline {
             glyph.text = "↵".into();
@@ -245,15 +419,21 @@ fn layout_impl(
     }
     let max_rows = if full { rows } else { (rows - 1).clamp(4, 30) };
     let cols = cols - 1;
-    let width = Width::default();
     let mint = if color { "\x1b[38;2;133;220;177m" } else { "" };
     let reset = if color { "\x1b[0m" } else { "" };
     let mut wrapped = vec![];
+    let mut tool_actions = Vec::new();
+    let mut previous_tool = false;
     for entry in history {
-        if !wrapped.is_empty() {
+        let tool = entry.role.starts_with("tool");
+        if !wrapped.is_empty() && !(tool && previous_tool) {
             wrapped.push(String::new());
         }
-        let safe: String = glyphs(entry.text.as_bytes(), &width)
+        previous_tool = tool;
+        if let Some(action) = &entry.action {
+            tool_actions.push((wrapped.len(), action.clone()));
+        }
+        let safe: String = glyphs(entry.text.as_bytes())
             .iter()
             .map(|v| v.text.as_str())
             .collect();
@@ -283,6 +463,7 @@ fn layout_impl(
                             text: text.into(),
                             width: 1,
                             newline: false,
+                            source_end: 0,
                         },
                         bold: true,
                         code: true,
@@ -292,6 +473,8 @@ fn layout_impl(
             let mut bold = false;
             let mut code = user || entry.role == "tool" && first;
             let mut at = 0;
+            let mut visible = String::new();
+            let mut styles = Vec::new();
             while at < text.len() {
                 if assistant
                     && !fence
@@ -312,14 +495,17 @@ fn layout_impl(
                     continue;
                 }
                 let cp = text[at..].chars().next().expect("char boundary");
-                for glyph in glyphs(&text.as_bytes()[at..at + cp.len_utf8()], &width) {
-                    chars.push(Styled {
-                        glyph,
-                        bold: bold || heading || user,
-                        code,
-                    });
-                }
+                styles.push((visible.len(), bold || heading || user, code));
+                visible.push(cp);
                 at += cp.len_utf8();
+            }
+            let mut scalar = 0;
+            for glyph in glyphs(visible.as_bytes()) {
+                let (_, bold, code) = styles[scalar];
+                while scalar < styles.len() && styles[scalar].0 < glyph.source_end {
+                    scalar += 1;
+                }
+                chars.push(Styled { glyph, bold, code });
             }
             let mut pos = 0;
             loop {
@@ -370,11 +556,11 @@ fn layout_impl(
         }
     }
     let available = max_rows - if full { 5 } else { 3 };
-    let end = wrapped.len() - scroll.min(wrapped.len().saturating_sub(1));
+    let end = wrapped.len() - scroll.min(wrapped.len().saturating_sub(available));
     let begin = end.saturating_sub(available);
     let mut header = format!("{mint}{}ansa{reset}", if color { "\x1b[1m" } else { "" });
     let mut used = 4;
-    for glyph in glyphs(context.as_bytes(), &width) {
+    for glyph in glyphs(context.as_bytes()) {
         if glyph.newline || used + glyph.width + 2 > cols {
             break;
         }
@@ -398,7 +584,7 @@ fn layout_impl(
         for _ in 0..2 {
             let mut line = String::new();
             let mut used = 0;
-            for glyph in glyphs(status_lines.next().unwrap_or("").as_bytes(), &width) {
+            for glyph in glyphs(status_lines.next().unwrap_or("").as_bytes()) {
                 if glyph.newline || used + glyph.width > cols {
                     break;
                 }
@@ -409,8 +595,9 @@ fn layout_impl(
         }
     }
     let cursor = cursor.min(input.len());
-    let before = compact_input_glyphs(&input[..cursor], &width);
-    let after = compact_input_glyphs(&input[cursor..], &width);
+    let input_glyphs = compact_input_glyphs(input);
+    let split = input_glyphs.partition_point(|glyph| glyph.source_end <= cursor);
+    let (before, after) = input_glyphs.split_at(split);
     let mut before_width: usize = before.iter().map(|v| v.width).sum();
     let mut first_visible = 0;
     while first_visible < before.len() && before_width > cols - 3 {
@@ -442,7 +629,7 @@ fn layout_impl(
     let mut clipped = String::new();
     let mut used = 0;
     let text = format!("{status}  / команды  Tab фокус  ? помощь");
-    for glyph in glyphs(text.as_bytes(), &width) {
+    for glyph in glyphs(text.as_bytes()) {
         if glyph.newline || used + glyph.width > cols {
             break;
         }
@@ -455,8 +642,22 @@ fn layout_impl(
         lines,
         cursor: 2 + before_width,
         scroll_limit: wrapped.len().saturating_sub(available),
+        tool_actions: tool_actions
+            .into_iter()
+            .filter_map(|(row, key)| {
+                (row >= begin && row < end).then_some((row.saturating_sub(begin) + 1, key))
+            })
+            .collect(),
+        chat_bounds: Some((1, available + 1, cols)),
+        inspector_content_rows: 0,
         viewport: full.then_some(size),
         cursor_row,
+        status_rows: if full {
+            vec![max_rows - 4, max_rows - 3, max_rows - 1]
+        } else {
+            vec![cursor_row + 1]
+        },
+        panes: Vec::new(),
     })
 }
 
@@ -487,6 +688,7 @@ pub struct Inspector {
     pub offset: usize,
     pub footer: String,
     pub kind: InspectorKind,
+    pub markdown: Option<std::sync::Arc<Vec<super::markdown::Row>>>,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Choice {
@@ -546,15 +748,12 @@ fn plain(text: &str) -> String {
     out
 }
 fn cells(text: &str) -> usize {
-    glyphs(plain(text).as_bytes(), &Width::default())
-        .iter()
-        .map(|g| g.width)
-        .sum()
+    glyphs(plain(text).as_bytes()).iter().map(|g| g.width).sum()
 }
 fn clipped(text: &str, columns: usize) -> String {
     let mut result = String::new();
     let mut used = 0;
-    for glyph in glyphs(text.as_bytes(), &Width::default()) {
+    for glyph in glyphs(text.as_bytes()) {
         if glyph.newline || used + glyph.width > columns {
             break;
         }
@@ -586,15 +785,15 @@ fn editor_rows(
     maximum: usize,
     color: bool,
 ) -> (Vec<String>, usize, usize) {
-    let width = Width::default();
     let cursor = cursor.min(input.len());
     let mut logical = vec![String::new()];
     let mut row = 0;
     let mut used = 2;
     let mut cursor_at = (0, 2);
     let mut consumed = 0;
-    for glyph in glyphs(input, &width) {
-        if consumed == cursor {
+    for glyph in glyphs(input) {
+        let contains_cursor = consumed <= cursor && cursor < glyph.source_end;
+        if contains_cursor {
             cursor_at = (row, used);
         }
         if glyph.newline {
@@ -606,40 +805,16 @@ fn editor_rows(
                 logical.push(String::new());
                 row += 1;
                 used = 2;
-                if consumed == cursor {
+                if contains_cursor {
                     cursor_at = (row, used);
                 }
             }
             logical[row].push_str(&glyph.text);
             used += glyph.width;
         }
-        // Valid UTF-8 is copied as-is; invalid bytes each render as one '?'.
-        // Original byte counts must stay separate from sanitized text lengths.
-        let ch = input.get(consumed).copied().unwrap_or_default();
-        consumed += match ch {
-            0xc2..=0xdf
-                if input
-                    .get(consumed..consumed + 2)
-                    .is_some_and(|v| std::str::from_utf8(v).is_ok()) =>
-            {
-                2
-            }
-            0xe0..=0xef
-                if input
-                    .get(consumed..consumed + 3)
-                    .is_some_and(|v| std::str::from_utf8(v).is_ok()) =>
-            {
-                3
-            }
-            0xf0..=0xf4
-                if input
-                    .get(consumed..consumed + 4)
-                    .is_some_and(|v| std::str::from_utf8(v).is_ok()) =>
-            {
-                4
-            }
-            _ => 1,
-        };
+        // Cursor byte offsets refer to the original input, including controls
+        // represented as text and invalid bytes represented by one '?' each.
+        consumed = glyph.source_end;
     }
     if cursor == input.len() {
         cursor_at = (row, used);
@@ -696,38 +871,64 @@ fn inspector_rows(
     }
     let footer = usize::from(!panel.footer.is_empty());
     let available = height.saturating_sub(rows.len() + footer);
-    for (index, text) in panel
-        .lines
-        .iter()
-        .enumerate()
-        .skip(panel.offset)
-        .take(available)
-    {
-        let safe = clipped(text, width);
-        let selected = panel.selected == Some(index);
-        let style = if selected {
-            SELECTED
-        } else if matches!(panel.kind, InspectorKind::Diff)
-            && safe.starts_with('+')
-            && !safe.starts_with("+++")
+    if let Some(markdown) = &panel.markdown {
+        for line in markdown.iter().skip(panel.offset).take(available) {
+            let mut rendered = String::new();
+            for span in &line.spans {
+                let mut style = String::new();
+                if span.style.heading > 0 || span.style.bold {
+                    style.push_str("\x1b[1m");
+                }
+                if span.style.heading > 0 || span.style.code {
+                    style.push_str(MINT);
+                }
+                if span.style.italic {
+                    style.push_str("\x1b[3m");
+                }
+                if span.style.link {
+                    style.push_str("\x1b[4m");
+                }
+                if span.style.strike {
+                    style.push_str("\x1b[9m");
+                }
+                rendered.push_str(&styled(&span.text, &style, color));
+            }
+            rows.push(rendered);
+        }
+    } else {
+        for (index, text) in panel
+            .lines
+            .iter()
+            .enumerate()
+            .skip(panel.offset)
+            .take(available)
         {
-            MINT
-        } else if matches!(panel.kind, InspectorKind::Diff)
-            && safe.starts_with('-')
-            && !safe.starts_with("---")
-        {
-            "\x1b[38;2;235;153;142m"
-        } else if matches!(panel.kind, InspectorKind::Markdown) && safe.starts_with('#') {
-            MINT
-        } else {
-            ""
-        };
-        let rendered = if selected { padded(&safe, width) } else { safe };
-        rows.push(if panel.kind == InspectorKind::Source && !selected {
-            source_line(&rendered, color)
-        } else {
-            styled(&rendered, style, color)
-        });
+            let safe = clipped(text, width);
+            let selected = panel.selected == Some(index);
+            let style = if selected {
+                SELECTED
+            } else if matches!(panel.kind, InspectorKind::Diff)
+                && safe.starts_with('+')
+                && !safe.starts_with("+++")
+            {
+                MINT
+            } else if matches!(panel.kind, InspectorKind::Diff)
+                && safe.starts_with('-')
+                && !safe.starts_with("---")
+            {
+                "\x1b[38;2;235;153;142m"
+            } else if matches!(panel.kind, InspectorKind::Markdown) && safe.starts_with('#') {
+                MINT
+            } else {
+                ""
+            };
+            let rendered = if selected { padded(&safe, width) } else { safe };
+            rows.push(if panel.kind == InspectorKind::Source && !selected {
+                source_line(&rendered, color)
+            } else {
+                styled(&rendered, style, color)
+            });
+        }
     }
     rows.resize(height.saturating_sub(footer), String::new());
     if footer > 0 && height > 0 {
@@ -806,6 +1007,7 @@ pub fn layout_workspace(
         true,
     )?;
     let chat_rows = &chat.lines[1..body_height + 1];
+    let mut panes = vec![None; height];
     if let Some(panel) = &ui.inspector {
         let panel_rows = inspector_rows(
             panel,
@@ -816,12 +1018,14 @@ pub fn layout_workspace(
         );
         if side_by_side {
             for (left, right) in chat_rows.iter().zip(panel_rows) {
-                rows.push(format!(
-                    "{} {} {}",
-                    padded(left, chat_width),
-                    styled("│", RULE, color),
-                    right
-                ));
+                let pane = PaneRow {
+                    column: chat_width,
+                    left: padded(left, chat_width),
+                    right: format!(" {} {}", styled("│", RULE, color), right),
+                };
+                let line = pane.line();
+                panes[rows.len()] = Some(pane);
+                rows.push(line);
             }
         } else {
             rows.extend(panel_rows);
@@ -868,10 +1072,32 @@ pub fn layout_workspace(
     }
     Some(Frame {
         lines: rows,
+        status_rows: vec![height - 2, height - 1],
+        panes,
         cursor: editor_cursor,
         cursor_row: cursor_row.min(height - 1),
         scroll_limit: chat.scroll_limit,
+        inspector_content_rows: ui.inspector.as_ref().map_or(0, |panel| {
+            body_height.saturating_sub(
+                1 + usize::from(!panel.tabs.is_empty() && body_height > 2)
+                    + usize::from(body_height > 3)
+                    + usize::from(!panel.footer.is_empty()),
+            )
+        }),
         viewport: Some(size),
+        tool_actions: if (side_by_side || ui.inspector.is_none()) && ui.popup.is_none() {
+            chat.tool_actions
+                .into_iter()
+                .map(|(row, key)| (row + 2, key))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        chat_bounds: ((side_by_side || ui.inspector.is_none()) && ui.popup.is_none()).then_some((
+            3,
+            3 + body_height,
+            chat_width,
+        )),
     })
 }
 fn paint_popup(rows: &mut [String], popup: &Popup, columns: usize, color: bool) {
@@ -936,7 +1162,7 @@ fn slice_cells(text: &str, begin: usize, end: usize) -> String {
     let mut output = String::new();
     let mut column = 0;
     let mut include = false;
-    for glyph in glyphs(text.as_bytes(), &Width::default()) {
+    for glyph in glyphs(text.as_bytes()) {
         if glyph.newline {
             break;
         }
@@ -952,7 +1178,7 @@ fn slice_cells(text: &str, begin: usize, end: usize) -> String {
 }
 fn selection_bounds(text: &str, mut begin: usize, mut end: usize) -> (usize, usize) {
     let mut column = 0;
-    for glyph in glyphs(text.as_bytes(), &Width::default()) {
+    for glyph in glyphs(text.as_bytes()) {
         if column < begin && begin < column + glyph.width {
             begin = column;
         }
@@ -962,6 +1188,26 @@ fn selection_bounds(text: &str, mut begin: usize, mut end: usize) -> (usize, usi
         column += glyph.width;
     }
     (begin, end)
+}
+fn selected_segment(text: &str, first: usize, last: usize) -> String {
+    let line = plain(text);
+    let (first, last) = selection_bounds(&line, first, last);
+    slice_cells(&line, first, last)
+}
+fn highlighted_segment(text: &str, first: usize, last: usize, color: bool) -> String {
+    let line = plain(text);
+    let (first, last) = selection_bounds(&line, first, last);
+    let before = slice_cells(&line, 0, first);
+    let selected = slice_cells(&line, first, last);
+    let after = slice_cells(&line, last, usize::MAX);
+    if selected.is_empty() {
+        line
+    } else {
+        format!(
+            "{before}{}{after}",
+            styled(&selected, if color { SELECTED } else { "\x1b[7m" }, true)
+        )
+    }
 }
 impl Frame {
     pub fn plain_lines(&self) -> Vec<String> {
@@ -989,9 +1235,20 @@ impl Frame {
             } else {
                 usize::MAX
             };
-            let line = plain(&self.lines[row]);
-            let (first, last) = selection_bounds(&line, first, last);
-            let selected = slice_cells(&line, first, last);
+            let selected = if let Some(pane) = self.pane(row) {
+                let mut selected =
+                    selected_segment(&pane.left, first.min(pane.column), last.min(pane.column));
+                if last > pane.column {
+                    selected.push_str(&selected_segment(
+                        &pane.right,
+                        first.saturating_sub(pane.column),
+                        last.saturating_sub(pane.column),
+                    ));
+                }
+                selected
+            } else {
+                selected_segment(&self.lines[row], first, last)
+            };
             text.push_str(if last == usize::MAX {
                 selected.trim_end()
             } else {
@@ -1017,15 +1274,27 @@ impl Frame {
             } else {
                 usize::MAX
             };
-            let line = plain(&frame.lines[row]);
-            let (first, last) = selection_bounds(&line, first, last);
-            let before = slice_cells(&line, 0, first);
-            let selected = slice_cells(&line, first, last);
-            let after = slice_cells(&line, last, usize::MAX);
-            frame.lines[row] = format!(
-                "{before}{}{after}",
-                styled(&selected, if color { SELECTED } else { "\x1b[7m" }, true)
-            );
+            if let Some(pane) = frame.pane(row).cloned() {
+                let pane = PaneRow {
+                    column: pane.column,
+                    left: highlighted_segment(
+                        &pane.left,
+                        first.min(pane.column),
+                        last.min(pane.column),
+                        color,
+                    ),
+                    right: highlighted_segment(
+                        &pane.right,
+                        first.saturating_sub(pane.column),
+                        last.saturating_sub(pane.column),
+                        color,
+                    ),
+                };
+                frame.lines[row] = pane.line();
+                frame.panes[row] = Some(pane);
+            } else {
+                frame.lines[row] = highlighted_segment(&frame.lines[row], first, last, color);
+            }
         }
         frame
     }
@@ -1059,12 +1328,27 @@ impl Selection {
     /// the source bytes used by `finish`. Reflow resumes after the drag ends.
     pub fn frame_at(&self, size: (usize, usize), color: bool) -> Frame {
         let mut frame = self.frozen.clone();
-        frame.lines = frame
-            .plain_lines()
-            .iter()
-            .map(|line| clipped(line, size.0.saturating_sub(1)))
-            .take(size.1)
-            .collect();
+        let columns = size.0.saturating_sub(1);
+        frame.lines.clear();
+        frame.panes = vec![None; size.1];
+        for (row, line) in self.frozen.lines.iter().enumerate().take(size.1) {
+            if let Some(pane) = self.frozen.pane(row) {
+                let left = clipped(&plain(&pane.left), columns.min(pane.column));
+                if pane.column < columns {
+                    let pane = PaneRow {
+                        column: pane.column,
+                        left,
+                        right: clipped(&plain(&pane.right), columns - pane.column),
+                    };
+                    frame.lines.push(pane.line());
+                    frame.panes[row] = Some(pane);
+                } else {
+                    frame.lines.push(left);
+                }
+            } else {
+                frame.lines.push(clipped(&plain(line), columns));
+            }
+        }
         frame.lines.resize(size.1, String::new());
         frame.viewport = Some(size);
         frame.cursor_row = frame.cursor_row.min(size.1.saturating_sub(1));

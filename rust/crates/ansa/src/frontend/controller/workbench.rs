@@ -46,6 +46,9 @@ struct Slot {
     ready_refresh: bool,
     ready_snapshot: Option<CommandId>,
     startup_cancelled: bool,
+    jump_top: bool,
+    tool_expanded: std::collections::BTreeSet<String>,
+    tool_anchor_limit: Option<usize>,
 }
 impl Slot {
     fn new(
@@ -90,7 +93,54 @@ impl Slot {
             ready_refresh: true,
             ready_snapshot: None,
             startup_cancelled: false,
+            jump_top: false,
+            tool_expanded: Default::default(),
+            tool_anchor_limit: None,
         }
+    }
+    fn jump_history(&mut self, top: bool) {
+        self.state.reading = None;
+        self.jump_top = top;
+        if !top {
+            self.state.scroll = 0;
+        }
+        self.state.follow_tail = !top;
+        self.timeline_query = GetTranscript {
+            before: 0,
+            limit: 64,
+            forward: top,
+        };
+        self.refresh = Instant::now();
+    }
+    fn cancel_history_jump(&mut self) {
+        if std::mem::take(&mut self.jump_top)
+            && let Some(page) = &self.timeline
+        {
+            self.timeline_query = GetTranscript {
+                before: page.end,
+                limit: 64,
+                forward: false,
+            };
+        }
+    }
+    fn received_timeline(&mut self, page: &TranscriptPage) {
+        if self
+            .timeline
+            .as_ref()
+            .is_none_or(|old| (old.begin, old.end) != (page.begin, page.end))
+            || self.jump_top
+        {
+            self.state.reading = None;
+        }
+        if self.jump_top
+            && !self.state.follow_tail
+            && page.query == self.timeline_query
+            && page.query.forward
+        {
+            self.state.scroll = usize::MAX;
+        }
+        self.jump_top = false;
+        self.timeline = Some(page.clone());
     }
     fn active(&self) -> bool {
         !self.ready
@@ -331,56 +381,23 @@ impl Slot {
     fn projected(&self) -> Option<Vec<Entry>> {
         let page = self.timeline.as_ref()?;
         let view = self.state.snapshot.as_ref()?;
-        let current_progress = if view.worker_busy
-            && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
-        {
-            self.state
-                .progress
-                .entries(view, self.state.tools_expanded, Instant::now())
-        } else {
-            Vec::new()
-        };
-        let mut entries = Vec::new();
-        for entry in &page.entries {
-            if !current_progress.is_empty()
-                && !self.state.tools_expanded
-                && Some(&entry.request) == view.request.as_ref()
-                && matches!(entry.role.as_str(), "tool" | "tool_result")
-            {
-                continue;
-            }
-            let text = if self.state.tools_expanded
-                || !matches!(entry.role.as_str(), "tool" | "tool_result" | "reasoning")
-            {
-                entry.text.clone()
-            } else {
-                entry
-                    .text
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(180)
-                    .collect()
-            };
-            entries.push(Entry {
-                role: entry.role.clone(),
-                text,
-            });
-        }
+        let now = Instant::now();
+        let mut entries = super::super::tool_ui::project(
+            &page.entries,
+            view,
+            &self.tool_expanded,
+            self.state.tools_expanded,
+            page.end == page.total,
+            |operation| self.state.progress.tool_elapsed(operation, now),
+        );
         if page.end == page.total {
-            entries.extend(current_progress.into_iter().map(|mut entry| {
-                if self.state.tools_expanded {
-                    entry.text = entry.text.lines().next().unwrap_or_default().into();
-                }
-                entry
-            }));
             for message in view
                 .followups
                 .iter()
                 .filter(|message| message.state == "queued")
             {
                 entries.push(Entry {
+                    action: None,
                     role: "user".into(),
                     text: format!("{}\n(ожидает текущий шаг)", message.text),
                 });
@@ -391,6 +408,7 @@ impl Slot {
                 && self.state.preview_request == view.request
             {
                 entries.push(Entry {
+                    action: None,
                     role: "assistant".into(),
                     text: format!(
                         "{}\n({})",
@@ -439,6 +457,11 @@ enum Job {
         token: u64,
         result: Result<FileValue>,
     },
+    Preview {
+        token: u64,
+        width: usize,
+        rows: Option<PreviewRows>,
+    },
     EditorReady {
         owner: String,
         token: u64,
@@ -462,6 +485,12 @@ enum Menu {
     },
     Help,
 }
+type PreviewRows = std::sync::Arc<Vec<super::super::markdown::Row>>;
+struct PreviewJob {
+    token: u64,
+    width: usize,
+    stop: Cancel,
+}
 struct Files {
     token: u64,
     listing: Option<FileListing>,
@@ -471,18 +500,51 @@ struct Files {
     offset: usize,
     loading: bool,
     jump: Option<String>,
+    preview_cache: Option<(usize, PreviewRows)>,
+    preview_width: Option<usize>,
+    preview_end: bool,
 }
 impl Files {
+    fn preview_rows(&self) -> Option<&PreviewRows> {
+        self.preview_cache
+            .as_ref()
+            .filter(|(width, _)| self.preview_width == Some(*width))
+            .map(|(_, rows)| rows)
+    }
+    fn accept_preview(&mut self, token: u64, width: usize, rows: Option<PreviewRows>) -> bool {
+        if self.token != token || self.preview_width != Some(width) {
+            return false;
+        }
+        let Some(rows) = rows else {
+            return false;
+        };
+        if self.tab == 2
+            && let Some(anchor) = self
+                .preview_cache
+                .as_ref()
+                .and_then(|(_, old)| old.get(self.offset))
+                .map(|row| row.anchor)
+        {
+            self.offset = super::super::markdown::Row::locate(&rows, anchor);
+        }
+        if self.tab == 2 && self.preview_end {
+            self.offset = rows.len().saturating_sub(1);
+        }
+        self.preview_end = false;
+        self.preview_cache = Some((width, rows));
+        true
+    }
     fn last_line(&self) -> usize {
+        if self.tab == 2 {
+            // Navigation keeps using the last completed layout while a resize
+            // worker computes its replacement; only display requires the width.
+            return self
+                .preview_cache
+                .as_ref()
+                .map_or(0, |(_, rows)| rows.len().saturating_sub(1));
+        }
         self.document.as_ref().map_or(0, |document| match self.tab {
             1 => document.diff.text.lines().count().saturating_sub(1),
-            2 => document
-                .preview
-                .as_deref()
-                .unwrap_or_default()
-                .lines()
-                .count()
-                .saturating_sub(1),
             _ => document.source.lines().count().saturating_sub(1),
         })
     }
@@ -508,11 +570,13 @@ struct Workbench {
     panel: Option<Panel>,
     focus: Focus,
     selection: Option<Selection>,
+    tool_press: Option<(usize, usize, String)>,
     frames: std::collections::VecDeque<(u64, carbon::Frame)>,
     displayed: Option<carbon::Frame>,
     operational_frame: Option<u64>,
     last_frame: Option<carbon::Frame>,
     file_token: u64,
+    preview_job: Option<PreviewJob>,
     editor: Option<super::super::terminal::EditorJob>,
     pending_editor: Option<EditorCommand>,
     editor_preparing: bool,
@@ -583,11 +647,13 @@ impl Workbench {
             panel: None,
             focus: Focus::Chat,
             selection: None,
+            tool_press: None,
             frames: std::collections::VecDeque::new(),
             displayed: None,
             operational_frame: None,
             last_frame: None,
             file_token: 0,
+            preview_job: None,
             editor: None,
             pending_editor: None,
             editor_preparing: false,
@@ -736,7 +802,7 @@ impl Workbench {
                 prompt,
             },
         );
-        self.report(io, "Сохраняю точку разговора для новой сессии");
+        self.report(io, "Создаю сессию");
     }
     fn open_file(&mut self, path: PathBuf, io: &Io) {
         if !self.can_job(io) {
@@ -753,6 +819,9 @@ impl Workbench {
             offset: 0,
             loading: true,
             jump: None,
+            preview_cache: None,
+            preview_width: None,
+            preview_end: false,
         })));
         self.focus = Focus::Inspector;
         let host = self.files.clone();
@@ -1042,7 +1111,7 @@ impl Workbench {
                 (true, false)
             }
             "/basic" if self.slots[self.current].kind == Kind::Btw => {
-                self.report(io, "Побочный разговор использует только чтение");
+                self.report(io, "Режим /btw: только чтение");
                 (true, false)
             }
             _ => {
@@ -1127,7 +1196,7 @@ impl Workbench {
                 self.slots[index].state.exit = 1;
                 self.slots[index]
                     .state
-                    .report(io, "Точка разговора недоступна: runtime завершился");
+                    .report(io, "Не удалось создать сессию: агент завершил работу");
             }
             return;
         };
@@ -1173,14 +1242,7 @@ impl Workbench {
                             .as_ref()
                             .map_or(0, |snapshot| snapshot.timeline_size) =>
             {
-                if slot
-                    .timeline
-                    .as_ref()
-                    .is_none_or(|old| (old.begin, old.end) != (page.begin, page.end))
-                {
-                    slot.state.reading = None;
-                }
-                slot.timeline = Some(page.clone());
+                slot.received_timeline(page);
             }
             _ => {}
         }
@@ -1196,7 +1258,7 @@ impl Workbench {
             slot.state.exit = 1;
             slot.state.report(
                 io,
-                "Точка разговора потеряна при resync; повторите команду создания сессии",
+                "Не удалось восстановить контекст; повторите команду создания сессии",
             );
         }
         if reading.is_some() {
@@ -1308,9 +1370,27 @@ impl Workbench {
                     files.loading = false;
                     match result {
                         Ok(FileValue::Listing(listing)) => files.listing = Some(listing),
-                        Ok(FileValue::Document(document)) => files.document = Some(document),
+                        Ok(FileValue::Document(document)) => {
+                            files.document = Some(document);
+                            files.preview_cache = None;
+                        }
                         Err(code) => self.report(io, &format!("Не удалось открыть файл: {code}")),
                     }
+                }
+            }
+            Job::Preview { token, width, rows } => {
+                if self
+                    .preview_job
+                    .as_ref()
+                    .is_some_and(|job| job.token == token && job.width == width)
+                {
+                    self.preview_job = None;
+                }
+                if !self.input_closed
+                    && !self.terminating
+                    && let Some(Panel::Files(files)) = &mut self.panel
+                {
+                    files.accept_preview(token, width, rows);
                 }
             }
             Job::EditorReady { result, .. } => match result {
@@ -1320,6 +1400,7 @@ impl Workbench {
         }
     }
     fn escape(&mut self, io: &Io) {
+        self.slots[self.current].cancel_history_jump();
         self.cancel_modal();
         self.cancel_editor_request();
         if self.selection.take().is_some() {
@@ -1378,8 +1459,10 @@ impl Workbench {
     }
     fn page(&mut self, older: bool) {
         self.selection = None;
+        self.slots[self.current].cancel_history_jump();
         if self.focus == Focus::Inspector {
             if let Some(Panel::Files(files)) = &mut self.panel {
+                files.preview_end = false;
                 files.offset = if older {
                     files.offset.saturating_sub(8)
                 } else {
@@ -1398,7 +1481,11 @@ impl Workbench {
             if slot.timeline_query.before == 0
                 && let Some(page) = &slot.timeline
             {
-                slot.timeline_query.before = page.end;
+                slot.timeline_query = GetTranscript {
+                    before: page.end,
+                    limit: 64,
+                    forward: false,
+                };
             }
             if state.scroll >= state.scroll_limit
                 && let Some(page) = &slot.timeline
@@ -1413,7 +1500,7 @@ impl Workbench {
                 state.reading = None;
                 slot.refresh = Instant::now();
             } else {
-                state.scroll = (state.scroll + 8).min(state.scroll_limit);
+                state.scroll = state.scroll.saturating_add(8).min(state.scroll_limit);
             }
         } else if state.scroll == 0
             && let Some(page) = &slot.timeline
@@ -1424,6 +1511,7 @@ impl Workbench {
                 limit: 64,
                 forward: true,
             };
+            slot.jump_top = true;
             state.reading = None;
             slot.refresh = Instant::now();
         } else {
@@ -1446,6 +1534,11 @@ impl Workbench {
     }
     fn navigate(&mut self, older: bool) {
         self.selection = None;
+        if self.focus == Focus::Inspector
+            && let Some(Panel::Files(files)) = &mut self.panel
+        {
+            files.preview_end = false;
+        }
         let delta = |selected: &mut usize, length: usize| {
             if older {
                 *selected = selected.saturating_sub(1);
@@ -1522,7 +1615,15 @@ impl Workbench {
                 && let Some(line) = files.jump.take()
             {
                 if let Ok(line) = line.parse::<usize>() {
-                    files.offset = line.saturating_sub(1).min(files.last_line());
+                    files.preview_end = false;
+                    let source = line.saturating_sub(1);
+                    files.offset = if files.tab == 2 {
+                        files.preview_cache.as_ref().map_or(0, |(_, rows)| {
+                            super::super::markdown::Row::source_row(rows, source)
+                        })
+                    } else {
+                        source.min(files.last_line())
+                    };
                 }
                 return None;
             }
@@ -1565,16 +1666,46 @@ impl Workbench {
         }
     }
     fn mouse(&mut self, mouse: MouseEvent, io: &Io) {
+        if matches!(
+            mouse.kind,
+            MouseKind::Press | MouseKind::WheelUp | MouseKind::WheelDown
+        ) {
+            self.update_displayed(io);
+            if let Some(frame) = &self.displayed {
+                if let Some((begin, end, right)) = frame.chat_bounds {
+                    if mouse.row >= begin && mouse.row < end {
+                        self.focus = if mouse.column < right {
+                            Focus::Chat
+                        } else if self.panel.is_some() {
+                            Focus::Inspector
+                        } else {
+                            self.focus
+                        };
+                    }
+                } else if self.panel.is_some() {
+                    self.focus = Focus::Inspector;
+                }
+            }
+        }
         match mouse.kind {
             MouseKind::Press => {
+                self.slots[self.current].cancel_history_jump();
                 self.update_displayed(io);
                 self.selection = None;
+                self.tool_press = None;
                 // A partially painted frame has no single truthful text
                 // snapshot. Selection starts only on a completed paint.
                 if !self.frames.is_empty() || io.writer.failed() {
                     return;
                 }
                 if let Some(frame) = &self.displayed {
+                    if frame.chat_bounds.is_some_and(|(begin, end, right)| {
+                        mouse.row >= begin && mouse.row < end && mouse.column < right
+                    }) && let Some((_, key)) =
+                        frame.tool_actions.iter().find(|(row, _)| *row == mouse.row)
+                    {
+                        self.tool_press = Some((mouse.column, mouse.row, key.clone()));
+                    }
                     let slot = &mut self.slots[self.current];
                     let reading = slot.projected();
                     slot.state.follow_tail = false;
@@ -1584,7 +1715,11 @@ impl Workbench {
                         .as_ref()
                         .map_or(0, |s| s.transcript_size);
                     if let Some(page) = &slot.timeline {
-                        slot.timeline_query.before = page.end;
+                        slot.timeline_query = GetTranscript {
+                            before: page.end,
+                            limit: 64,
+                            forward: false,
+                        };
                     }
                     if let Some(reading) = reading {
                         slot.state.reading = Some(reading);
@@ -1593,11 +1728,31 @@ impl Workbench {
                 }
             }
             MouseKind::Drag => {
+                if self
+                    .tool_press
+                    .as_ref()
+                    .is_some_and(|(column, row, _)| (*column, *row) != (mouse.column, mouse.row))
+                {
+                    self.tool_press = None;
+                }
                 if let Some(selection) = &mut self.selection {
                     selection.drag(mouse.column, mouse.row);
                 }
             }
             MouseKind::Release => {
+                if let Some((column, row, key)) = self.tool_press.take()
+                    && (column, row) == (mouse.column, mouse.row)
+                {
+                    let slot = &mut self.slots[self.current];
+                    if !slot.tool_expanded.remove(&key) && slot.tool_expanded.len() < 4096 {
+                        slot.tool_expanded.insert(key);
+                    }
+                    slot.tool_anchor_limit =
+                        self.displayed.as_ref().map(|frame| frame.scroll_limit);
+                    slot.state.reading = None;
+                    self.selection = None;
+                    return;
+                }
                 if let Some(selection) = &mut self.selection
                     && let Some(text) = selection.finish(mouse.column, mouse.row)
                     && !io.writer.clipboard(&text)
@@ -1642,7 +1797,7 @@ impl Workbench {
             },
             Menu::Models { models, selected } => Popup {
                 title: "/model".into(),
-                subtitle: "Текущий разговор · со следующего turn".into(),
+                subtitle: "Для следующих сообщений".into(),
                 items: models
                     .iter()
                     .map(|m| Choice {
@@ -1659,9 +1814,7 @@ impl Workbench {
                 items: values
                     .iter()
                     .map(|e| Choice {
-                        label: e
-                            .clone()
-                            .unwrap_or_else(|| "По умолчанию провайдера".into()),
+                        label: e.clone().unwrap_or_else(|| "По умолчанию".into()),
                         detail: String::new(),
                     })
                     .collect(),
@@ -1744,10 +1897,15 @@ impl Workbench {
                         ),
                         2 => (
                             InspectorKind::Markdown,
-                            document
-                                .preview
-                                .as_deref()
-                                .unwrap_or("Preview доступен для Markdown"),
+                            if document.preview.is_some() {
+                                if files.preview_rows().is_some() {
+                                    ""
+                                } else {
+                                    "Готовлю просмотр..."
+                                }
+                            } else {
+                                "Preview доступен для Markdown"
+                            },
                         ),
                         _ => (InspectorKind::Source, document.source.as_str()),
                     };
@@ -1770,6 +1928,11 @@ impl Workbench {
                             |line| format!(":{line}"),
                         ),
                         kind,
+                        markdown: if files.tab == 2 {
+                            files.preview_rows().cloned()
+                        } else {
+                            None
+                        },
                         ..Inspector::default()
                     })
                 } else {
@@ -1845,12 +2008,75 @@ impl Workbench {
             io.writer.displayed(sequence)
         });
     }
+    fn prepare_preview(&mut self, io: &Io) {
+        let width = if self.input_closed || self.terminating || io.size.0 < 12 || io.size.1 < 8 {
+            None
+        } else {
+            let width = io.size.0 - 1;
+            Some(if width >= 100 {
+                (width * 2 / 5).max(34)
+            } else {
+                width
+            })
+        };
+        let mut desired = None;
+        let mut request = None;
+        if let Some(Panel::Files(files)) = &mut self.panel {
+            let document = files
+                .document
+                .as_ref()
+                .and_then(|document| document.preview.as_ref());
+            files.preview_width = width.filter(|_| document.is_some());
+            if let (Some(width), Some(document)) = (files.preview_width, document) {
+                desired = Some((files.token, width));
+                if files.preview_rows().is_none() {
+                    request = Some((files.token, width, document.clone()));
+                }
+            }
+        }
+        if let Some(job) = &self.preview_job {
+            if desired != Some((job.token, job.width)) {
+                job.stop.cancel();
+            }
+            // An obsolete layout is joined before the latest resize can start.
+            return;
+        }
+        if self.jobs.len() + self.pending_context.len() >= MAX_JOBS {
+            return;
+        }
+        if let Some((token, width, document)) = request {
+            let stop = Cancel::linked(&self.stop);
+            self.preview_job = Some(PreviewJob {
+                token,
+                width,
+                stop: stop.clone(),
+            });
+            self.jobs.spawn_blocking(move || Job::Preview {
+                token,
+                width,
+                rows: document
+                    .rows_cancelled(width, &stop)
+                    .map(std::sync::Arc::new),
+            });
+        }
+    }
     fn render(&mut self, io: &Io, context: &str) {
         self.update_displayed(io);
+        self.prepare_preview(io);
         let operational =
             self.operational_frame.is_some() || self.slots[self.current].input_ready();
         let frame = if let Some(selection) = &self.selection {
-            Some(selection.frame_at(io.size, io.color))
+            let mut frozen = selection.frame_at(io.size, io.color);
+            let ui = self.ui();
+            let slot = &mut self.slots[self.current];
+            let projected = slot.projected();
+            if let Some(live) = slot
+                .state
+                .render_workspace(io, context, &ui, projected.as_deref())
+            {
+                frozen.update_status_from(&live);
+            }
+            Some(frozen)
         } else if !operational {
             let status = if !self.slots[self.current].state.status.trim().is_empty() {
                 self.slots[self.current].state.status.trim()
@@ -1874,8 +2100,17 @@ impl Workbench {
                 .render_workspace(io, context, &ui, projected.as_deref())
         };
         if let Some(frame) = &frame {
-            let state = &mut self.slots[self.current].state;
-            state.scroll = state.scroll.min(frame.scroll_limit);
+            let slot = &mut self.slots[self.current];
+            if let Some(before) = slot.tool_anchor_limit.take() {
+                slot.state.scroll = slot
+                    .state
+                    .scroll
+                    .saturating_add(frame.scroll_limit)
+                    .saturating_sub(before)
+                    .min(frame.scroll_limit);
+                return self.render(io, context);
+            }
+            slot.state.scroll = slot.state.scroll.min(frame.scroll_limit);
         }
         if let Some(frame) = frame
             && self.last_frame.as_ref() != Some(&frame)
@@ -2098,6 +2333,7 @@ pub async fn run(
                             if byte.is_ascii() && !work.slots[work.current].state.editor.escape_pending() && !work.slots[work.current].state.editor.pasting() {
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());
                                 if matches!(byte, b'j' | b'k') && !jumping && (work.menu.is_some() || work.focus == Focus::Inspector || !work.slots[work.current].state.follow_tail) { work.navigate(byte == b'k'); continue; }
+                                let file_visible = work.displayed.as_ref().map_or(1, |frame| frame.inspector_content_rows).max(1);
                                 if work.focus == Focus::Inspector && let Some(Panel::Files(files)) = &mut work.panel {
                                     if let Some(line) = &mut files.jump {
                                         if byte.is_ascii_digit() { if line.len() < 9 { line.push(byte as char); } continue; }
@@ -2105,10 +2341,10 @@ pub async fn run(
                                         if !matches!(byte, 27 | b'\r' | b'\n' | 9) { continue; }
                                     } else {
                                         if byte == b':' && files.document.is_some() { files.jump = Some(String::new()); continue; }
-                                        if byte == b'g' { files.offset = 0; continue; }
-                                        if byte == b'G' { files.offset = files.last_line().saturating_sub(io.size.1.saturating_sub(12)); continue; }
+                                        if byte == b'g' { files.preview_end = false; files.offset = 0; continue; }
+                                        if byte == b'G' { files.preview_end = files.tab == 2 && files.preview_rows().is_none(); let visible = if files.preview_end { 1 } else { file_visible }; files.offset = files.last_line().saturating_sub(visible - 1); continue; }
                                     }
-                                    if let Some(tab) = match byte { b's' => Some(0), b'd' => Some(1), b'p' => Some(2), _ => None } { files.tab = tab; files.offset = 0; continue; }
+                                    if let Some(tab) = match byte { b's' => Some(0), b'd' => Some(1), b'p' => Some(2), _ => None } { files.preview_end = false; files.tab = tab; files.offset = 0; continue; }
                                     if byte == b'h' { let parent = files.document.as_ref().and_then(|d| d.path.parent()).or_else(|| files.listing.as_ref().and_then(|l| l.path.parent())).map(Path::to_path_buf); if let Some(parent) = parent { work.open_file(parent, io); } continue; }
                                     if byte == b'e' { work.prepare_editor(io); continue; }
                                     if byte >= 32 && byte != 127 { continue; }
@@ -2116,11 +2352,7 @@ pub async fn run(
                                 if work.focus == Focus::Chat && !work.slots[work.current].state.follow_tail && matches!(byte, b'g' | b'G') {
                                     work.selection = None;
                                     let slot = &mut work.slots[work.current];
-                                    slot.state.reading = None;
-                                    slot.state.scroll = if byte == b'g' { usize::MAX } else { 0 };
-                                    slot.state.follow_tail = byte == b'G';
-                                    slot.timeline_query = GetTranscript { before: 0, limit: 64, forward: byte == b'g' };
-                                    slot.refresh = Instant::now();
+                                    slot.jump_history(byte == b'g');
                                     continue;
                                 }
                                 if work.menu.is_some() && !matches!(byte, 27 | b'\r' | b'\n' | 9) { continue; }
@@ -2293,6 +2525,134 @@ fn exit_result(exit: i32, failure: Option<&'static str>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_replies_match_file_width_and_preserve_only_preview_anchors() {
+        let document = super::super::super::markdown::Document::parse(&"word ".repeat(40));
+        let old = std::sync::Arc::new(document.rows(16));
+        let rows = std::sync::Arc::new(document.rows(30));
+        let mut files = Files {
+            token: 7,
+            listing: None,
+            document: None,
+            selected: 0,
+            tab: 2,
+            offset: 4,
+            loading: false,
+            jump: None,
+            preview_cache: Some((16, old)),
+            preview_width: Some(30),
+            preview_end: false,
+        };
+        assert!(files.preview_rows().is_none());
+        assert!(!files.accept_preview(6, 30, Some(rows.clone())));
+        assert!(!files.accept_preview(7, 16, Some(rows.clone())));
+        assert!(!files.accept_preview(7, 30, None));
+        assert_eq!(files.offset, 4);
+        files.offset = files.offset.saturating_add(1).min(files.last_line());
+        assert_eq!(
+            files.offset, 5,
+            "navigation during resize must retain the old reading anchor"
+        );
+        let anchor = files.preview_cache.as_ref().unwrap().1[files.offset].anchor;
+        assert!(files.accept_preview(7, 30, Some(rows.clone())));
+        assert_eq!(
+            files.offset,
+            super::super::super::markdown::Row::locate(&rows, anchor)
+        );
+        assert!(std::sync::Arc::ptr_eq(files.preview_rows().unwrap(), &rows));
+        files.preview_width = Some(11);
+        files.preview_end = true;
+        let narrow = std::sync::Arc::new(document.rows(11));
+        assert!(files.accept_preview(7, 11, Some(narrow.clone())));
+        assert_eq!(
+            files.offset,
+            narrow.len() - 1,
+            "pending G must show the new layout's actual tail"
+        );
+        assert!(!files.preview_end);
+
+        files.tab = 0;
+        files.offset = 37;
+        files.preview_width = Some(40);
+        assert!(files.accept_preview(7, 40, Some(std::sync::Arc::new(document.rows(40)))));
+        assert_eq!(
+            files.offset, 37,
+            "Source uses source lines, not preview row anchors"
+        );
+        files.preview_width = None;
+        assert!(files.preview_rows().is_none());
+        assert!(!files.accept_preview(7, 40, Some(rows)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_top_waits_for_its_page_and_cancelled_jump_keeps_the_tail() {
+        let runtime = super::super::super::app::offline_runtime(None, false).unwrap();
+        runtime.ready().await.unwrap();
+        let mut slot = Slot::new(runtime, "offline".into(), Kind::Main, None, None, false);
+        slot.state.scroll = 2;
+        slot.jump_history(true);
+        assert_eq!(slot.state.scroll, 2);
+        // A paint of the old, shorter page is allowed to clamp its scroll.
+        slot.state.scroll = 0;
+        let page = TranscriptPage {
+            begin: 0,
+            end: 1,
+            total: 80,
+            entries: vec![],
+            query: slot.timeline_query.clone(),
+        };
+        slot.received_timeline(&page);
+        let frame = carbon::layout_full(
+            &[Entry {
+                role: "user".into(),
+                text: format!("EARLIEST\n{}", "later\n".repeat(50)),
+                action: None,
+            }],
+            b"draft",
+            5,
+            "",
+            slot.state.scroll,
+            "",
+            (60, 16),
+            false,
+        )
+        .unwrap();
+        assert!(
+            frame
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("EARLIEST"))
+        );
+        assert!(
+            frame
+                .plain_lines()
+                .iter()
+                .filter(|line| line.contains("later"))
+                .count()
+                > 3
+        );
+        slot.jump_history(true);
+        slot.jump_history(false);
+        let tail = TranscriptPage {
+            begin: 16,
+            end: 80,
+            total: 80,
+            entries: vec![],
+            query: slot.timeline_query.clone(),
+        };
+        slot.received_timeline(&tail);
+        assert_eq!(slot.state.scroll, 0);
+        assert!(slot.state.follow_tail && !slot.jump_top);
+        for _ in 0..2 {
+            slot.jump_history(true);
+            slot.cancel_history_jump();
+            assert!(!slot.timeline_query.forward);
+            assert_eq!(slot.timeline_query.before, tail.end);
+            assert!(!slot.jump_top);
+        }
+        slot.runtime.shutdown().await.unwrap();
+    }
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2537,6 +2897,7 @@ mod tests {
         let frame = |text: &str| {
             carbon::layout_full(
                 &[Entry {
+                    action: None,
                     role: "user".into(),
                     text: text.into(),
                 }],
@@ -2615,6 +2976,7 @@ mod tests {
             total: 1,
             query: slot.timeline_query.clone(),
             entries: vec![transcript::Entry {
+                tool: None,
                 turn: "turn".into(),
                 request: "task".into(),
                 role: "tool".into(),

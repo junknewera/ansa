@@ -677,6 +677,7 @@ impl State {
         let mut entries: Vec<_> = self.entries[begin..]
             .iter()
             .map(|e| Entry {
+                action: None,
                 role: e.role.clone(),
                 text: e.text.clone(),
             })
@@ -701,6 +702,7 @@ impl State {
         ) {
             let preview = self.preview.as_ref().expect("checked");
             entries.push(Entry {
+                action: None,
                 role: "assistant".into(),
                 text: format!(
                     "{}{}",

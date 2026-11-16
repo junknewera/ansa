@@ -165,6 +165,7 @@ fn editor_overflow_cannot_be_healed_by_backspaces() {
 }
 fn entry(role: &str, text: &str) -> Entry {
     Entry {
+        action: None,
         role: role.into(),
         text: text.into(),
     }
@@ -290,6 +291,7 @@ fn history_queries_and_preview_cannot_publish_stale_or_tool_round_text() {
         forward: false,
     };
     let entry = ansa::session::transcript::Entry {
+        tool: None,
         turn: "turn".into(),
         request: "request".into(),
         role: "user".into(),
