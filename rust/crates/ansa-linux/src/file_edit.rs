@@ -47,6 +47,10 @@ fn same_metadata(a: &Metadata, b: &Metadata) -> bool {
         && a.ctime_nsec() == b.ctime_nsec()
 }
 
+fn ordinary_mode(mode: u32) -> bool {
+    mode & 0o7000 == 0
+}
+
 fn read_current(directory: &File, name: &OsString) -> Result<Option<Existing>, &'static str> {
     let fd = match rustix::fs::openat(
         directory,
@@ -63,7 +67,7 @@ fn read_current(directory: &File, name: &OsString) -> Result<Option<Existing>, &
     if !metadata.is_file()
         || metadata.nlink() != 1
         || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.mode() & 0o7000 != 0
+        || !ordinary_mode(metadata.mode())
     {
         return Err("file_not_regular");
     }
@@ -392,7 +396,17 @@ mod tests {
         std::fs::remove_file(root.0.join("hardlink")).unwrap();
         symlink(&root.0, root.0.join("parent-link")).unwrap();
         assert!(Snapshot::open(&root.0.join("parent-link/file")).is_err());
-        std::fs::set_permissions(root.file(), Permissions::from_mode(0o4755)).unwrap();
+        // Nix forbids chmod with setuid/setgid bits. Exercise a real special
+        // mode without those privileges, and check every permission/special-bit
+        // combination through the production predicate.
+        for mode in 0..=0o7777 {
+            assert_eq!(ordinary_mode(0o100000 | mode), mode <= 0o777);
+        }
+        std::fs::set_permissions(root.file(), Permissions::from_mode(0o1755)).unwrap();
+        assert_eq!(
+            std::fs::metadata(root.file()).unwrap().mode() & 0o7777,
+            0o1755
+        );
         assert!(Snapshot::open(&root.file()).is_err());
         std::fs::set_permissions(root.file(), Permissions::from_mode(0o600)).unwrap();
         std::fs::write(root.file(), vec![b'x'; MAX_BYTES + 1]).unwrap();
