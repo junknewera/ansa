@@ -11,8 +11,230 @@ fn feed(editor: &mut Editor, bytes: &[u8]) -> Vec<Action> {
 fn entry(role: &str, text: &str) -> Entry {
     Entry {
         action: None,
+        edit: None,
+        status: None,
         role: role.into(),
         text: text.into(),
+    }
+}
+#[test]
+fn full_diff_horizontal_scroll_exposes_and_copies_unicode_tails() {
+    use ansa::frontend::{diff, theme::Theme};
+    let before = format!("{}TAIL_界😀\n", "x".repeat(80));
+    let after = format!("{}NEW_界🌍\n", "x".repeat(80));
+    let rows = std::sync::Arc::new(diff::between(&before, &after).unwrap().rows);
+    for size in [(42, 24), (64, 30)] {
+        let render = |column| {
+            let mut frame = carbon::layout_workspace(
+                &[],
+                b"draft",
+                3,
+                "ready",
+                0,
+                "project",
+                size,
+                true,
+                &Workspace {
+                    inspector: Some(Inspector {
+                        title: "Diff".into(),
+                        kind: InspectorKind::Diff,
+                        diff: Some(rows.clone()),
+                        diff_column: column,
+                        ..Inspector::default()
+                    }),
+                    ..Workspace::default()
+                },
+            )
+            .unwrap();
+            frame.apply_theme(&Theme::default());
+            frame
+        };
+        assert!(!render(0).plain_lines().join("\n").contains("TAIL_界😀"));
+        let frame = render(80);
+        let row = frame
+            .plain_lines()
+            .iter()
+            .position(|line| line.contains("TAIL_界😀"))
+            .unwrap();
+        assert!(frame.plain_lines().join("\n").contains("NEW_界🌍"));
+        let mut selection = Selection::new(frame, 12, row);
+        assert_eq!(selection.finish(20, row).as_deref(), Some("TAIL_界😀"));
+    }
+}
+
+#[test]
+fn full_diff_clips_wide_glyphs_at_the_right_panel_edge() {
+    use ansa::frontend::{diff, theme::Theme};
+    let numbered = diff::Row {
+        kind: diff::Kind::Context,
+        old: Some(15000),
+        new: Some(15000),
+        text: "x".repeat(40),
+    };
+    assert_eq!(numbered.horizontal_limit(34), 20);
+    let notice = diff::Row {
+        kind: diff::Kind::Notice,
+        old: None,
+        new: None,
+        text: "x".repeat(80),
+    };
+    assert_eq!(notice.horizontal_limit(34), 0);
+    for glyph in ["界", "😀", "👩‍💻"] {
+        let before = format!("{}{}tail\n", "x".repeat(21), glyph);
+        let rows = std::sync::Arc::new(diff::between(&before, "new\n").unwrap().rows);
+        for column in 0..26 {
+            let mut frame = carbon::layout_workspace(
+                &[],
+                b"",
+                0,
+                "",
+                0,
+                "project",
+                (35, 24),
+                true,
+                &Workspace {
+                    inspector: Some(Inspector {
+                        title: "Diff".into(),
+                        kind: InspectorKind::Diff,
+                        diff: Some(rows.clone()),
+                        diff_column: column,
+                        ..Inspector::default()
+                    }),
+                    ..Workspace::default()
+                },
+            )
+            .unwrap();
+            frame.apply_theme(&Theme::default());
+            for line in frame.plain_lines() {
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(line.as_str()) <= 34,
+                    "column={column}, glyph={glyph}, line={line:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn selection_and_resize_preserve_unselected_colors_and_backgrounds() {
+    let frame = carbon::layout_workspace(
+        &[
+            entry("user", "USER COLOR"),
+            entry("assistant", "# HEAD\nColor `inline` and Ж界😀 end"),
+        ],
+        b"draft",
+        3,
+        "ready",
+        0,
+        "project",
+        (60, 24),
+        true,
+        &Workspace::default(),
+    )
+    .unwrap();
+    let row = frame
+        .plain_lines()
+        .iter()
+        .position(|line| line.contains("Color inline"))
+        .unwrap();
+    let mut selection = Selection::new(frame.clone(), 0, row);
+    selection.drag(4, row);
+    let selected = selection.frame_at((60, 24), true);
+    for (index, line) in frame.lines.iter().enumerate() {
+        if index != row {
+            assert_eq!(&selected.lines[index], line, "unselected row lost styling");
+        }
+    }
+    assert!(
+        selected.lines[row].contains("\x1b[38;2;229;193;137m"),
+        "inline code after the selection lost its color"
+    );
+    let narrow = selection.frame_at((24, 24), true);
+    assert!(
+        narrow
+            .lines
+            .iter()
+            .any(|line| line.contains("\x1b[48;2;28;40;57m")),
+        "clipping dropped user background"
+    );
+    assert_eq!(selection.finish(4, row).as_deref(), Some("Color"));
+    assert!(!selection.text().unwrap().contains('\x1b'));
+}
+
+#[test]
+fn semantic_palette_keeps_statuses_distinct_and_plain_output_unstyled() {
+    let mut history = vec![
+        entry("user", "Прочитай README Ж界😀"),
+        entry("assistant", "# Обзор\nОтвет с `кодом`.\x1b[31m"),
+    ];
+    for (role, text) in [
+        ("tool_success", "> Чтение README.md · готово · 20 мс"),
+        ("tool_running", "> Запуск cargo test · выполняется"),
+        ("tool_error", "> Запуск false · ошибка"),
+        (
+            "tool_warning",
+            "> Запуск command · результат неизвестен (effect_unknown)",
+        ),
+        ("tool_detail", "  Вывод:\n    CONTENT Ж界😀"),
+    ] {
+        let mut row = entry(role, text);
+        if role != "tool_detail" {
+            row.action = Some(role.into());
+        }
+        history.push(row);
+    }
+    for size in [(100, 32), (42, 32)] {
+        let render = |color| {
+            carbon::layout_workspace(
+                &history,
+                b"draft",
+                5,
+                "basic  инструмент",
+                0,
+                "~/ansa",
+                size,
+                color,
+                &Workspace::default(),
+            )
+            .unwrap()
+        };
+        let colored = render(true);
+        let plain = render(false);
+        let raw = colored.lines.join("\n");
+        let colors: std::collections::BTreeSet<_> = raw
+            .split("\x1b[38;2;")
+            .skip(1)
+            .filter_map(|part| part.split_once('m').map(|(value, _)| value))
+            .collect();
+        assert!(
+            colors.len() >= 6,
+            "roles collapsed to one accent: {colors:?}"
+        );
+        let row = |needle: &str| {
+            colored
+                .lines
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap()
+        };
+        assert_ne!(
+            row("готово").split("Чтение").next(),
+            row("ошибка").split("Запуск").next()
+        );
+        assert!(raw.contains("▸") && raw.contains("│") && raw.contains("\x1b[48;2;"));
+        assert!(
+            !raw.contains("\x1b[31m"),
+            "untrusted controls became styles"
+        );
+        assert!(!plain.lines.join("\n").contains('\x1b'));
+        assert_eq!(colored.cursor, plain.cursor);
+        assert_eq!(colored.scroll_limit, plain.scroll_limit);
+        assert!(
+            colored
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("CONTENT Ж界😀"))
+        );
     }
 }
 
@@ -225,7 +447,7 @@ fn workspace_shows_real_data_and_adapts_inspector_to_narrow_screen() {
     assert!(
         wide.lines
             .iter()
-            .any(|line| line.contains("\x1b[38;2;231;196;112m"))
+            .any(|line| line.contains("\x1b[38;2;229;193;137m"))
     );
     let narrow = carbon::layout_workspace(
         &history,
@@ -301,7 +523,7 @@ fn selection_copies_the_frozen_visible_text_with_utf8_and_without_sgr() {
     let selected = selection.finish(5, row).unwrap();
     assert_eq!(selected, "Ae\u{301}😀B");
     assert!(!selected.contains('\x1b'));
-    assert!(selection.frame(true).lines[row].contains("\x1b[48;2;28;68;44m"));
+    assert!(selection.frame(true).lines[row].contains("\x1b[48;2;46;63;88m"));
 }
 #[test]
 fn multiline_input_retains_cursor_row_and_status_ticks_leave_chat_untouched() {

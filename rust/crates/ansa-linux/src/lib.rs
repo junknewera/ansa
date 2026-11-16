@@ -3,6 +3,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod auth_store;
+pub mod file_edit;
 pub mod fs;
 pub mod journal;
 pub mod local;

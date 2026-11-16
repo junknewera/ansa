@@ -1,5 +1,65 @@
 # Состояние ansa
 
+## Carbon: темы и diff отдельных правок
+
+**GO**, проверенный code checkpoint
+[`a4d308b`](https://github.com/junknewera/ansa/commit/a4d308b414633e219d9c22f2f02f0fbcff41df67),
+X13s/NixOS/aarch64. Carbon получил подложки сообщений и ввода, интервалы между
+вызовами инструментов и различимые статусы. Выделение, копирование и изменение
+ширины сохраняют цвета. Оформление сверено с `designs/final-design/`.
+
+`/theme` предлагает Carbon, Pink, Red, Blue, Amber и Auto DMS. Стрелки меняют
+предпросмотр, Enter сохраняет выбор между проектами, Esc возвращает прежнюю
+тему. Свои JSON-палитры загружаются из `~/.ansa/themes/`.
+Auto DMS обновляет цвета из готового `dms-colors.json` в `$XDG_CACHE_HOME/dms/`
+или `$XDG_CACHE_HOME/DankMaterialShell/`, по умолчанию в `~/.cache/`.
+Формат проверен для DMS 1.6.3: `mode`, `colors.dark/light` и `dank16`.
+Источники: [шаблон v1.6.3](https://github.com/duxlabs-dev/dux-shell/blob/v1.6.3/quickshell/matugen/templates/dank.json),
+[Matugen templates](https://duxlabs.dev/docs/1.6/dankmaterialshell/application-themes/#custom-matugen-templates).
+Генерация из обоев и настройки Matugen остаются в [TODO](TODO.md).
+
+Новый `edit_file` меняет одно точное вхождение текста либо создаёт файл.
+Перед записью проверяются путь, исходное содержимое и инструкции каталога;
+intent и полный результат проходят через canonical journal. Размер файла
+ограничен 64 KiB. Проверка перед публикацией обнаруживает наблюдаемые изменения;
+она не даёт атомарного compare-and-swap с внешними писателями. Неизвестный
+результат сохраняет паузу без автоматического повтора. Продолженная сессия
+и её fork сохраняют точный прежний каталог инструментов.
+
+Подтверждённая правка показывает имя файла, счётчики, номера строк и цветной
+inline diff. Нажатие открывает полный diff именно отображённой правки.
+`h/l` и `0/$` дают дочитать длинные строки; gutters остаются на месте.
+Esc отменяет незавершённый клик и возвращает в чат с сохранением черновика.
+
+Locked Cargo и Nix Release прошли по **259 native и 9 doctests**.
+fmt/clippy по всем targets/features, сборки adapters, offline build,
+default Nix build, flake check, self-check и offline demo прошли.
+Pinned ASan с instrumented std/leak detection прошёл **259/259**.
+Replay baseline прошёл, drop/reorder mutants обнаружены **2/2**.
+В обоих профилях прошли acceptance **12/12**, progress PTY **10/10**,
+workspace PTY **15/15**, цветная приёмка **3/3** и editor setup/backpressure
+**2/2**. Цветной сценарий редактирования использует adapter своего профиля
+с настоящими runtime, tools и workbench; VT oracle проверяет цвета ячеек,
+подложки и сброс стилей тремя контрольными примерами. Drain **4/4**,
+startup **259/259**, дополнительная проверка suspend/resume, субагента и режимов
+вывода **6/6**.
+
+Все 27 этапов выполнены на чистом checkpoint за 696,52 секунды,
+с `jobs/cores=2` и последовательными сборками. Независимые проверки проекции,
+совместимости и терминала завершены без открытых замечаний.
+Первый полный прогон остановился на setup: Nix sandbox запретил `chmod 4755`
+в новом тесте. После проверки sandbox тест использует реальный sticky-файл
+и перебор всех permission/special bits через production predicate.
+Защита сохранена, пропусков нет; полная матрица повторена на новом checkpoint.
+Сохранены failed capture и WIP-ошибки oracle. Новых live model calls не было;
+ожидание очереди не измерялось.
+
+Evidence, примеры Carbon/Pink/Red и package GC root:
+`~/Workspace/pet/ansa-baselines/carbon-themes-a4d308b/`.
+Очистка промежуточных сборок и временных копий освободила **8,4 ГиБ**.
+Проверенные бинарники, rollback, evidence и dependency/std caches сохранены.
+Следующие задачи - генератор палитры и [этап субагентов](TODO.md#следующий-этап-субагентов).
+
 ## Carbon UX: история, инструменты и Markdown Preview
 
 **GO**, проверенный code checkpoint

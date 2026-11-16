@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
-pub(crate) mod workbench;
+pub mod workbench;
 pub fn history_page_current(page: &TranscriptPage, query: &GetTranscript, total: usize) -> bool {
     page.query == *query && page.total >= total
 }
@@ -736,6 +736,8 @@ impl State {
             .iter()
             .map(|e| Entry {
                 action: None,
+                edit: None,
+                status: None,
                 role: e.role.clone(),
                 text: e.text.clone(),
             })
@@ -761,6 +763,8 @@ impl State {
             let preview = self.preview.as_ref().expect("checked");
             entries.push(Entry {
                 action: None,
+                edit: None,
+                status: None,
                 role: "assistant".into(),
                 text: format!(
                     "{}{}",

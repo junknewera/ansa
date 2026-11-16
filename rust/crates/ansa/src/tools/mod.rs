@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod command;
+mod edit;
 pub mod evidence;
 pub mod files;
 pub mod invocation;

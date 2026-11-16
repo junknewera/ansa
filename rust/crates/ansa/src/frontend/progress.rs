@@ -222,6 +222,8 @@ impl Progress {
         if begin > 0 {
             result.push(Entry {
                 action: None,
+                edit: None,
+                status: None,
                 role: "tool".into(),
                 text: format!("Ещё {begin} вызовов - Ctrl+T: подробности"),
             });
@@ -282,6 +284,8 @@ impl Progress {
             }
             result.push(Entry {
                 action: None,
+                edit: None,
+                status: None,
                 role: "tool".into(),
                 text,
             });

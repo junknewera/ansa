@@ -7,6 +7,7 @@ use crate::{
         carbon::{Choice, Focus, Inspector, InspectorKind, Popup, Selection, Workspace},
         input::{MouseEvent, MouseKind},
         sessions::{Created, Factory, Kind},
+        theme::{Catalog as ThemeCatalog, Preview as ThemePreview, Store as ThemeStore, Theme},
         workspace::{DiffStatus, EditorCommand, FileDocument, FileHost, FileListing},
     },
     protocol::json::Json,
@@ -396,6 +397,8 @@ impl Slot {
             {
                 entries.push(Entry {
                     action: None,
+                    edit: None,
+                    status: None,
                     role: "user".into(),
                     text: format!("{}\n(ожидает текущий шаг)", message.text),
                 });
@@ -407,6 +410,8 @@ impl Slot {
             {
                 entries.push(Entry {
                     action: None,
+                    edit: None,
+                    status: None,
                     role: "assistant".into(),
                     text: format!(
                         "{}\n({})",
@@ -434,6 +439,19 @@ enum FileValue {
     Document(FileDocument),
 }
 enum Job {
+    Themes {
+        request: ThemeLoad,
+        result: Result<ThemeCatalog>,
+    },
+    ThemeSaved {
+        revision: u64,
+        theme: Theme,
+        result: Result<()>,
+    },
+    ThemeReload {
+        revision: u64,
+        result: Result<Theme>,
+    },
     Created {
         source: String,
         prompt: Option<String>,
@@ -467,7 +485,16 @@ enum Job {
         result: Result<EditorCommand>,
     },
 }
+enum ThemeLoad {
+    Startup,
+    Picker {
+        owner: String,
+        token: u64,
+        requested: Option<String>,
+    },
+}
 enum Menu {
+    Themes(ThemePreview),
     Loading(String),
     Sessions {
         entries: Vec<CatalogEntry>,
@@ -549,11 +576,29 @@ impl Files {
 }
 enum Panel {
     Files(Box<Files>),
-    Agents { selected: usize },
+    Agents {
+        selected: usize,
+    },
+    EditDiff {
+        title: String,
+        rows: std::sync::Arc<Vec<super::super::diff::Row>>,
+        offset: usize,
+        column: usize,
+    },
 }
 struct Workbench {
     factory: Factory,
     files: FileHost,
+    theme_store: ThemeStore,
+    theme: Theme,
+    saved_theme: Theme,
+    theme_initialized: bool,
+    theme_revision: u64,
+    theme_save: Option<u64>,
+    pending_theme: Option<(u64, Theme)>,
+    theme_reload: bool,
+    theme_refresh: Instant,
+    theme_error: Option<&'static str>,
     slots: Vec<Slot>,
     current: usize,
     root_id: String,
@@ -568,7 +613,12 @@ struct Workbench {
     panel: Option<Panel>,
     focus: Focus,
     selection: Option<Selection>,
-    tool_press: Option<(usize, usize, String)>,
+    tool_press: Option<(
+        usize,
+        usize,
+        String,
+        Option<std::sync::Arc<super::super::diff::EditView>>,
+    )>,
     frames: std::collections::VecDeque<(u64, carbon::Frame)>,
     displayed: Option<carbon::Frame>,
     operational_frame: Option<u64>,
@@ -627,10 +677,21 @@ impl Workbench {
         parent: Option<String>,
     ) -> Result<Self> {
         let files = FileHost::new(&factory.settings, &factory.auth_path)?;
+        let theme_store = ThemeStore::new(&factory.settings.home, &factory.settings.directory);
         let (sender, events) = mpsc::channel(64);
         let mut value = Self {
             factory,
             files,
+            theme_store,
+            theme: Theme::default(),
+            saved_theme: Theme::default(),
+            theme_initialized: false,
+            theme_revision: 0,
+            theme_save: None,
+            pending_theme: None,
+            theme_reload: false,
+            theme_refresh: Instant::now(),
+            theme_error: None,
             slots: Vec::new(),
             current: 0,
             root_id: root_id.clone(),
@@ -663,6 +724,12 @@ impl Workbench {
             terminating: false,
         };
         value.add(Slot::new(runtime, root_id, kind, parent, None, false));
+        let store = value.theme_store.clone();
+        let stop = Cancel::linked(&value.stop);
+        value.jobs.spawn_blocking(move || Job::Themes {
+            request: ThemeLoad::Startup,
+            result: store.load(&stop),
+        });
         Ok(value)
     }
     fn add(&mut self, slot: Slot) {
@@ -720,6 +787,7 @@ impl Workbench {
         self.panel = None;
         self.focus = Focus::Chat;
         self.selection = None;
+        self.tool_press = None;
         self.last_frame = None;
         self.frames.clear();
         self.displayed = None;
@@ -952,10 +1020,120 @@ impl Workbench {
         before != self.pending_context.len()
     }
     fn cancel_modal(&mut self) {
+        if let Some(Menu::Themes(preview)) = &self.menu {
+            let original = preview.original();
+            self.set_theme(original);
+        }
         self.modal_token = self.modal_token.wrapping_add(1);
         if let Some(stop) = self.modal_stop.take() {
             stop.cancel();
         }
+    }
+    fn set_theme(&mut self, theme: Theme) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.selection = None;
+            self.tool_press = None;
+            self.last_frame = None;
+        }
+    }
+    fn open_themes(&mut self, requested: Option<String>, io: &Io) {
+        if !self.can_job(io) {
+            return;
+        }
+        self.cancel_modal();
+        self.selection = None;
+        self.tool_press = None;
+        let request = ThemeLoad::Picker {
+            owner: self.slots[self.current].id.clone(),
+            token: self.modal_token,
+            requested,
+        };
+        let store = self.theme_store.clone();
+        let stop = Cancel::linked(&self.stop);
+        self.modal_stop = Some(stop.clone());
+        self.menu = Some(Menu::Loading("/theme".into()));
+        self.jobs.spawn_blocking(move || Job::Themes {
+            request,
+            result: store.load(&stop),
+        });
+    }
+    fn commit_theme(&mut self, theme: Theme) {
+        self.theme_initialized = true;
+        self.theme_revision = self.theme_revision.wrapping_add(1);
+        self.pending_theme = Some((self.theme_revision, theme.clone()));
+        self.theme_error = None;
+        self.set_theme(theme);
+        self.start_theme_save();
+    }
+    fn start_theme_save(&mut self) {
+        if self.theme_save.is_some() || self.jobs.len() + self.pending_context.len() >= MAX_JOBS {
+            return;
+        }
+        let Some((revision, theme)) = self.pending_theme.take() else {
+            return;
+        };
+        self.theme_save = Some(revision);
+        let store = self.theme_store.clone();
+        // Enter accepted this preference. Finish its publication even if the
+        // user exits; only previews and palette reads are cancellable.
+        self.jobs.spawn_blocking(move || {
+            let result = store.save(theme.id());
+            Job::ThemeSaved {
+                revision,
+                theme,
+                result,
+            }
+        });
+    }
+    fn saved_theme(&mut self, revision: u64, theme: Theme, result: Result<()>, io: &Io) {
+        if self.theme_save != Some(revision) {
+            return;
+        }
+        self.theme_save = None;
+        match result {
+            Ok(()) => {
+                self.saved_theme = theme;
+                if self.theme_revision == revision && !self.terminating && !self.input_closed {
+                    self.report(io, &format!("Тема {} сохранена", self.saved_theme.name()));
+                }
+            }
+            Err(code) => {
+                if self.theme_revision == revision {
+                    if let Some(Menu::Themes(preview)) = &mut self.menu {
+                        preview.replace_original(self.saved_theme.clone());
+                    } else {
+                        self.set_theme(self.saved_theme.clone());
+                    }
+                }
+                if !self.terminating && !self.input_closed {
+                    self.report(io, &format!("Не удалось сохранить тему: {code}"));
+                }
+            }
+        }
+        self.start_theme_save();
+    }
+    fn prepare_theme(&mut self, now: Instant) {
+        self.start_theme_save();
+        if !self.theme.is_dynamic()
+            || self.menu.is_some()
+            || self.theme_reload
+            || self.input_closed
+            || self.terminating
+            || now < self.theme_refresh
+            || self.jobs.len() + self.pending_context.len() >= MAX_JOBS
+        {
+            return;
+        }
+        self.theme_reload = true;
+        self.theme_refresh = now + Duration::from_secs(1);
+        let revision = self.theme_revision;
+        let store = self.theme_store.clone();
+        let stop = Cancel::linked(&self.stop);
+        self.jobs.spawn_blocking(move || Job::ThemeReload {
+            revision,
+            result: store.dynamic(&stop),
+        });
     }
     fn open_sessions(&mut self, io: &Io) {
         if !self.can_job(io) {
@@ -1094,6 +1272,10 @@ impl Workbench {
                     (!argument.is_empty()).then(|| argument.to_string()),
                     io,
                 );
+                (true, false)
+            }
+            "/theme" => {
+                self.open_themes((!argument.is_empty()).then(|| argument.to_string()), io);
                 (true, false)
             }
             "/send" => {
@@ -1269,6 +1451,19 @@ impl Workbench {
     }
     fn job(&mut self, job: Job, io: &Io) {
         let fresh = match &job {
+            Job::Themes {
+                request: ThemeLoad::Startup,
+                ..
+            } => !self.input_closed && !self.terminating && !self.theme_initialized,
+            Job::Themes {
+                request: ThemeLoad::Picker { owner, token, .. },
+                ..
+            } => {
+                !self.input_closed
+                    && !self.terminating
+                    && *owner == self.slots[self.current].id
+                    && *token == self.modal_token
+            }
             Job::Sessions { owner, token, .. } | Job::Models { owner, token, .. } => {
                 !self.input_closed
                     && !self.terminating
@@ -1292,14 +1487,103 @@ impl Workbench {
         if matches!(&job, Job::EditorReady { request, .. } if *request == self.editor_request) {
             self.editor_preparing = false;
         }
+        if matches!(&job, Job::ThemeReload { .. }) {
+            self.theme_reload = false;
+        }
         if !fresh {
             return;
         }
-        if matches!(&job, Job::Models { .. } | Job::Sessions { .. }) {
+        if matches!(
+            &job,
+            Job::Models { .. }
+                | Job::Sessions { .. }
+                | Job::Themes {
+                    request: ThemeLoad::Picker { .. },
+                    ..
+                }
+        ) {
             self.menu = None;
             self.modal_stop = None;
         }
         match job {
+            Job::Themes { request, result } => match result {
+                Ok(catalog) => {
+                    if !self.theme_initialized {
+                        let initial = catalog.selected();
+                        self.saved_theme = initial.clone();
+                        self.set_theme(initial);
+                        self.theme_initialized = true;
+                    }
+                    if !catalog.warnings.is_empty() {
+                        self.report(
+                            io,
+                            &catalog
+                                .warnings
+                                .iter()
+                                .take(2)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        );
+                    }
+                    if let ThemeLoad::Picker { requested, .. } = request {
+                        if let Some(requested) = requested {
+                            let requested = match requested.to_ascii_lowercase().as_str() {
+                                "auto" | "auto-dms" => "dms".to_owned(),
+                                _ => requested,
+                            };
+                            if let Some(theme) = catalog.find(&requested) {
+                                self.commit_theme(theme.clone());
+                            } else {
+                                self.report(io, "Тема недоступна. /theme - выбрать доступную тему");
+                            }
+                        } else {
+                            let preview = ThemePreview::new(catalog.themes, self.theme.clone());
+                            self.set_theme(preview.current());
+                            self.menu = Some(Menu::Themes(preview));
+                        }
+                    }
+                }
+                Err(code) => {
+                    if matches!(request, ThemeLoad::Startup) {
+                        self.theme_initialized = true;
+                    }
+                    if code != "theme_cancelled" {
+                        self.report(io, &format!("Не удалось прочитать темы: {code}"));
+                    }
+                }
+            },
+            Job::ThemeSaved {
+                revision,
+                theme,
+                result,
+            } => self.saved_theme(revision, theme, result, io),
+            Job::ThemeReload { revision, result } => {
+                if revision == self.theme_revision
+                    && self.theme.is_dynamic()
+                    && self.menu.is_none()
+                    && !self.input_closed
+                    && !self.terminating
+                {
+                    match result {
+                        Ok(theme) => {
+                            if self.saved_theme.is_dynamic() {
+                                self.saved_theme = theme.clone();
+                            }
+                            self.set_theme(theme);
+                            self.theme_error = None;
+                        }
+                        Err(code) if self.theme_error != Some(code) => {
+                            self.theme_error = Some(code);
+                            self.report(
+                                io,
+                                &format!("Auto DMS: не удалось обновить палитру ({code})"),
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
             Job::Created {
                 source,
                 prompt,
@@ -1402,6 +1686,7 @@ impl Workbench {
         }
     }
     fn escape(&mut self, io: &Io) {
+        self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
         self.cancel_modal();
         self.cancel_editor_request();
@@ -1461,8 +1746,16 @@ impl Workbench {
     }
     fn page(&mut self, older: bool) {
         self.selection = None;
+        self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
         if self.focus == Focus::Inspector {
+            if let Some(Panel::EditDiff { rows, offset, .. }) = &mut self.panel {
+                *offset = if older {
+                    offset.saturating_sub(8)
+                } else {
+                    offset.saturating_add(8).min(rows.len().saturating_sub(1))
+                };
+            }
             if let Some(Panel::Files(files)) = &mut self.panel {
                 files.preview_end = false;
                 files.offset = if older {
@@ -1536,6 +1829,7 @@ impl Workbench {
     }
     fn navigate(&mut self, older: bool) {
         self.selection = None;
+        self.tool_press = None;
         if self.focus == Focus::Inspector
             && let Some(Panel::Files(files)) = &mut self.panel
         {
@@ -1549,12 +1843,18 @@ impl Workbench {
             }
         };
         match &mut self.menu {
+            Some(Menu::Themes(preview)) => {
+                preview.navigate(older);
+                let theme = preview.current();
+                self.set_theme(theme);
+            }
             Some(Menu::Loading(_)) => {}
             Some(Menu::Sessions { entries, selected }) => delta(selected, entries.len()),
             Some(Menu::Models { models, selected }) => delta(selected, models.len()),
             Some(Menu::Efforts { values, selected }) => delta(selected, values.len()),
             Some(Menu::Help) => {}
             None if self.focus == Focus::Inspector => match &mut self.panel {
+                Some(Panel::EditDiff { rows, offset, .. }) => delta(offset, rows.len()),
                 Some(Panel::Files(files)) if files.document.is_none() => delta(
                     &mut files.selected,
                     files.listing.as_ref().map_or(0, |l| l.entries.len()),
@@ -1589,6 +1889,7 @@ impl Workbench {
     fn enter(&mut self, io: &Io) -> Option<String> {
         if let Some(menu) = self.menu.take() {
             match menu {
+                Menu::Themes(preview) => self.commit_theme(preview.current()),
                 Menu::Loading(_) => {}
                 Menu::Sessions { entries, selected } => {
                     if let Some(entry) = entries.get(selected) {
@@ -1668,6 +1969,14 @@ impl Workbench {
         }
     }
     fn mouse(&mut self, mouse: MouseEvent, io: &Io) {
+        if matches!(&self.menu, Some(Menu::Themes(_)))
+            || matches!(&self.menu, Some(Menu::Loading(title)) if title == "/theme")
+        {
+            if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
+                self.navigate(mouse.kind == MouseKind::WheelUp);
+            }
+            return;
+        }
         if matches!(
             mouse.kind,
             MouseKind::Press | MouseKind::WheelUp | MouseKind::WheelDown
@@ -1706,7 +2015,8 @@ impl Workbench {
                     }) && let Some((_, key)) =
                         frame.tool_actions.iter().find(|(row, _)| *row == mouse.row)
                     {
-                        self.tool_press = Some((mouse.column, mouse.row, key.clone()));
+                        self.tool_press =
+                            Some((mouse.column, mouse.row, key.clone(), frame.edit_view(key)));
                     }
                     let slot = &mut self.slots[self.current];
                     let reading = slot.projected();
@@ -1733,7 +2043,7 @@ impl Workbench {
                 if self
                     .tool_press
                     .as_ref()
-                    .is_some_and(|(column, row, _)| (*column, *row) != (mouse.column, mouse.row))
+                    .is_some_and(|(column, row, _, _)| (*column, *row) != (mouse.column, mouse.row))
                 {
                     self.tool_press = None;
                 }
@@ -1742,9 +2052,31 @@ impl Workbench {
                 }
             }
             MouseKind::Release => {
-                if let Some((column, row, key)) = self.tool_press.take()
+                if let Some((column, row, key, edit)) = self.tool_press.take()
                     && (column, row) == (mouse.column, mouse.row)
                 {
+                    if key.starts_with("diff:") {
+                        self.selection = None;
+                        if let Some(edit) = edit {
+                            let filename = Path::new(&edit.path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(&edit.path);
+                            self.panel = Some(Panel::EditDiff {
+                                title: format!(
+                                    "{} · +{} -{} · Diff правки",
+                                    filename, edit.diff.added, edit.diff.removed
+                                ),
+                                rows: std::sync::Arc::new(edit.diff.rows.clone()),
+                                offset: 0,
+                                column: 0,
+                            });
+                            self.focus = Focus::Inspector;
+                        } else {
+                            self.report(io, "Данные этой правки вне текущей страницы истории");
+                        }
+                        return;
+                    }
                     let slot = &mut self.slots[self.current];
                     if !slot.tool_expanded.remove(&key) && slot.tool_expanded.len() < 4096 {
                         slot.tool_expanded.insert(key);
@@ -1778,6 +2110,26 @@ impl Workbench {
     fn popup(&self) -> Option<Popup> {
         let menu = self.menu.as_ref()?;
         Some(match menu {
+            Menu::Themes(preview) => Popup {
+                title: "/theme".into(),
+                subtitle: "Предпросмотр темы".into(),
+                items: preview
+                    .themes()
+                    .iter()
+                    .map(|theme| Choice {
+                        label: theme.name().into(),
+                        detail: if theme.id() == preview.original().id() {
+                            "текущая".into()
+                        } else if theme.is_dynamic() {
+                            "системная палитра".into()
+                        } else {
+                            theme.id().into()
+                        },
+                    })
+                    .collect(),
+                selected: preview.selected(),
+                footer: "Enter сохранить · Esc отменить".into(),
+            },
             Menu::Loading(title) => Popup {
                 title: title.clone(),
                 subtitle: "Загрузка…".into(),
@@ -1828,6 +2180,7 @@ impl Workbench {
                 subtitle: "Enter отправляет уточнение и во время работы".into(),
                 items: [
                     "/model · /effort · /thinking",
+                    "/theme · /theme pink · /theme dms",
                     "/basic · /plan · /status",
                     "/fork · /btw вопрос · /agent задача",
                     "/sessions · /agents · /send",
@@ -1850,6 +2203,20 @@ impl Workbench {
     }
     fn inspector(&self) -> Option<Inspector> {
         match self.panel.as_ref()? {
+            Panel::EditDiff {
+                title,
+                rows,
+                offset,
+                column,
+            } => Some(Inspector {
+                title: title.clone(),
+                offset: *offset,
+                kind: InspectorKind::Diff,
+                diff: Some(rows.clone()),
+                diff_column: *column,
+                footer: "j/k строки · h/l горизонтально · g/G начало/конец · Esc чат".into(),
+                ..Inspector::default()
+            }),
             Panel::Agents { selected } => Some(Inspector {
                 title: "AGENTS".into(),
                 lines: self
@@ -2067,15 +2434,18 @@ impl Workbench {
         self.prepare_preview(io);
         let operational =
             self.operational_frame.is_some() || self.slots[self.current].input_ready();
-        let frame = if let Some(selection) = &self.selection {
+        let mut frame = if let Some(selection) = &self.selection {
             let mut frozen = selection.frame_at(io.size, io.color);
             let ui = self.ui();
             let slot = &mut self.slots[self.current];
             let projected = slot.projected();
-            if let Some(live) = slot
-                .state
-                .render_workspace(io, context, &ui, projected.as_deref())
+            if let Some(mut live) =
+                slot.state
+                    .render_workspace(io, context, &ui, projected.as_deref())
             {
+                if io.color {
+                    live.apply_theme(&self.theme);
+                }
                 frozen.update_status_from(&live);
             }
             Some(frozen)
@@ -2101,6 +2471,12 @@ impl Workbench {
             slot.state
                 .render_workspace(io, context, &ui, projected.as_deref())
         };
+        if io.color
+            && self.selection.is_none()
+            && let Some(frame) = &mut frame
+        {
+            frame.apply_theme(&self.theme);
+        }
         if let Some(frame) = &frame {
             let slot = &mut self.slots[self.current];
             if let Some(before) = slot.tool_anchor_limit.take() {
@@ -2277,6 +2653,7 @@ pub async fn run(
                 }
             }
             let now = Instant::now();
+            work.prepare_theme(now);
             let mut admissions = Vec::new();
             for slot in &mut work.slots {
                 dirty |= slot.poll_replies(io)?;
@@ -2336,6 +2713,17 @@ pub async fn run(
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());
                                 if matches!(byte, b'j' | b'k') && !jumping && (work.menu.is_some() || work.focus == Focus::Inspector || !work.slots[work.current].state.follow_tail) { work.navigate(byte == b'k'); continue; }
                                 let file_visible = work.displayed.as_ref().map_or(1, |frame| frame.inspector_content_rows).max(1);
+                                let inspector_width = work.displayed.as_ref().and_then(|frame|frame.chat_bounds).map_or(io.size.0.saturating_sub(1),|(_,_,right)|io.size.0.saturating_sub(right+4));
+                                if work.focus == Focus::Inspector && let Some(Panel::EditDiff { rows, offset, column, .. }) = &mut work.panel {
+                                    if byte == b'g' { *offset = 0; continue; }
+                                    if byte == b'G' { *offset = rows.len().saturating_sub(file_visible); continue; }
+                                    if matches!(byte,b'h'|b'l'|b'0'|b'$') {
+                                        let maximum = rows.iter().map(|row|row.horizontal_limit(inspector_width)).max().unwrap_or(0);
+                                        *column = match byte { b'h'=>column.saturating_sub(4),b'l'=>column.saturating_add(4).min(maximum),b'$'=>maximum,_=>0 };
+                                        continue;
+                                    }
+                                    if byte >= 32 && byte != 127 { continue; }
+                                }
                                 if work.focus == Focus::Inspector && let Some(Panel::Files(files)) = &mut work.panel {
                                     if let Some(line) = &mut files.jump {
                                         if byte.is_ascii_digit() { if line.len() < 9 { line.push(byte as char); } continue; }
@@ -2353,6 +2741,7 @@ pub async fn run(
                                 }
                                 if work.focus == Focus::Chat && !work.slots[work.current].state.follow_tail && matches!(byte, b'g' | b'G') {
                                     work.selection = None;
+                                    work.tool_press = None;
                                     let slot = &mut work.slots[work.current];
                                     slot.jump_history(byte == b'g');
                                     continue;
@@ -2361,6 +2750,7 @@ pub async fn run(
                             }
                             if byte >= 32 && byte != 127 && !work.slots[work.current].state.editor.escape_pending() && !work.slots[work.current].state.editor.pasting() {
                                 work.selection = None;
+                                work.tool_press = None;
                             }
                             let slot = &mut work.slots[work.current];
                             let before = (slot.state.editor.bytes.len(), slot.state.editor.cursor);
@@ -2441,9 +2831,25 @@ pub async fn run(
         slot.handle.request_shutdown();
     }
     while let Some(result) = work.jobs.join_next().await {
-        if result.is_err() {
-            failure.get_or_insert("workspace_job");
+        match result {
+            Ok(Job::ThemeSaved {
+                revision,
+                theme,
+                result,
+            }) => {
+                if result.is_err() {
+                    failure.get_or_insert("theme_preferences_write");
+                }
+                work.saved_theme(revision, theme, result, io);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                failure.get_or_insert("workspace_job");
+            }
         }
+        // A newer accepted choice can have waited behind an earlier save or
+        // another bounded frontend job. Drain that final preference as well.
+        work.start_theme_save();
     }
     for slot in &mut work.slots {
         while let Some(result) = slot.replies.join_next().await {
@@ -2607,9 +3013,11 @@ mod tests {
         slot.received_timeline(&page);
         let frame = carbon::layout_full(
             &[Entry {
+                status: None,
                 role: "user".into(),
                 text: format!("EARLIEST\n{}", "later\n".repeat(50)),
                 action: None,
+                edit: None,
             }],
             b"draft",
             5,
@@ -2900,6 +3308,8 @@ mod tests {
             carbon::layout_full(
                 &[Entry {
                     action: None,
+                    edit: None,
+                    status: None,
                     role: "user".into(),
                     text: text.into(),
                 }],

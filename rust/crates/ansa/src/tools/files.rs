@@ -34,8 +34,16 @@ pub(crate) struct Host {
     pub epoch: Epoch,
     pub processes: ProcessRunner,
     pub auth: PathBuf,
+    pub session: PathBuf,
 }
 impl Host {
+    pub(crate) fn protected_path(&self, path: &Path) -> bool {
+        ansa_linux::fs::protected_path(path)
+            || path.starts_with(&self.auth)
+            || path.starts_with(&self.session)
+            || path.starts_with(self.settings.directory.join("auth"))
+            || path.starts_with(self.settings.directory.join("sessions"))
+    }
     pub fn path(&self, text: &str) -> Result<PathBuf> {
         self.path_os(Path::new(text))
     }
@@ -49,15 +57,11 @@ impl Host {
         } else {
             self.settings.cwd.join(path)
         };
-        if ansa_linux::fs::protected_path(&input) {
+        if self.protected_path(&input) {
             return Err("protected_file");
         }
         let resolved = input.canonicalize().map_err(|_| "file_access_failed")?;
-        if ansa_linux::fs::protected_path(&resolved)
-            || resolved.starts_with(&self.auth)
-            || resolved.starts_with(self.settings.directory.join("auth"))
-            || resolved.starts_with(self.settings.directory.join("sessions"))
-        {
+        if self.protected_path(&resolved) {
             return Err("protected_file");
         }
         Ok(resolved)
@@ -105,7 +109,7 @@ impl Host {
                 break;
             }
             let entry = entry.map_err(|_| "file_access_failed")?;
-            if ansa_linux::fs::protected_path(&entry.path()) {
+            if self.protected_path(&entry.path()) {
                 continue;
             }
             let value = Json::object(vec![
@@ -220,7 +224,7 @@ pub(crate) fn append(values: &mut Vec<Json>, value: Json, bytes: &mut usize) -> 
         true
     }
 }
-fn schema(properties: &[(&str, &str)]) -> Result<Json> {
+pub(super) fn schema(properties: &[(&str, &str)]) -> Result<Json> {
     let mut fields = vec![];
     let mut required = vec![];
     for (name, ty) in properties {
@@ -243,7 +247,7 @@ fn schema(properties: &[(&str, &str)]) -> Result<Json> {
         ("additionalProperties", b(false)),
     ])
 }
-fn path_argument(args: &Json, key: &str) -> Result<bool> {
+pub(super) fn path_argument(args: &Json, key: &str) -> Result<bool> {
     let text = args.text_field(key)?;
     Ok(!text.is_empty()
         && text.len() <= 4096
@@ -261,6 +265,7 @@ pub fn local_tools(
     let host = Arc::new(Host {
         processes: ProcessRunner::new(&session.join("operations"), worker)?,
         auth: ansa_linux::fs::weakly_canonical(auth).map_err(|_| "file_access_failed")?,
+        session: ansa_linux::fs::weakly_canonical(session).map_err(|_| "file_access_failed")?,
         settings,
         epoch,
     });
@@ -344,6 +349,7 @@ pub fn local_tools(
             },
         )?;
     }
+    super::edit::register(&mut registry, host.clone())?;
     let maximum = host.settings.process_timeout_ms;
     let run = host.clone();
     let recovery = host.clone();

@@ -15,7 +15,7 @@ const TERMINAL_ENABLE: &str = "\x1b[?2004h\x1b[?1002h\x1b[?1006h";
 const TERMINAL_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?2004l";
 enum Item {
     Text(String),
-    Frame(u64, Frame),
+    Frame(u64, Box<Frame>),
 }
 struct Pending {
     queue: VecDeque<Item>,
@@ -97,7 +97,7 @@ impl Writer {
                             }
                             Some(item)
                         } else if let Some((sequence, frame)) = p.frame.take() {
-                            Some(Item::Frame(sequence, frame))
+                            Some(Item::Frame(sequence, Box::new(frame)))
                         } else {
                             None
                         }
@@ -117,7 +117,7 @@ impl Writer {
                             let result = previous
                                 .as_ref()
                                 .map_or_else(|| v.paint(0), |old| v.paint_changes(old));
-                            previous = Some(v);
+                            previous = Some(*v);
                             (sequence, result)
                         }
                     };
