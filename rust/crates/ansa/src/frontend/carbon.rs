@@ -368,6 +368,7 @@ struct Styled {
     glyph: Glyph,
     bold: bool,
     code: bool,
+    ink: &'static str,
 }
 #[allow(clippy::too_many_arguments)]
 pub fn layout(
@@ -455,9 +456,10 @@ fn layout_impl(
                     heading = true;
                 }
             }
+            let paint = TranscriptPaint::new(entry, text);
             let mut chars = vec![];
             if user && first {
-                for text in [">", " "] {
+                for text in [if color { "›" } else { ">" }, " "] {
                     chars.push(Styled {
                         glyph: Glyph {
                             text: text.into(),
@@ -467,11 +469,12 @@ fn layout_impl(
                         },
                         bold: true,
                         code: true,
+                        ink: LAVENDER,
                     });
                 }
             }
             let mut bold = false;
-            let mut code = user || entry.role == "tool" && first;
+            let mut code = false;
             let mut at = 0;
             let mut visible = String::new();
             let mut styles = Vec::new();
@@ -501,11 +504,17 @@ fn layout_impl(
             }
             let mut scalar = 0;
             for glyph in glyphs(visible.as_bytes()) {
-                let (_, bold, code) = styles[scalar];
+                let (offset, bold, code) = styles[scalar];
                 while scalar < styles.len() && styles[scalar].0 < glyph.source_end {
                     scalar += 1;
                 }
-                chars.push(Styled { glyph, bold, code });
+                let ink = paint.ink(offset, code || fence, heading);
+                chars.push(Styled {
+                    glyph,
+                    bold,
+                    code,
+                    ink,
+                });
             }
             let mut pos = 0;
             loop {
@@ -525,22 +534,48 @@ fn layout_impl(
                 if end == pos && end < chars.len() {
                     end += 1;
                 }
-                let mut line = String::new();
-                let mut was = (false, false);
-                for ch in &chars[pos..end] {
-                    if color && (ch.bold, ch.code) != was {
+                let mut line = if color && user {
+                    USER_SURFACE.to_owned()
+                } else {
+                    String::new()
+                };
+                let mut was = (false, false, "");
+                for (index, ch) in chars[pos..end].iter().enumerate() {
+                    if color && (ch.bold, ch.code, ch.ink) != was {
                         line.push_str(reset);
+                        if user {
+                            line.push_str(USER_SURFACE);
+                        }
                         if ch.bold {
                             line.push_str("\x1b[1m");
                         }
-                        if ch.code {
-                            line.push_str(mint);
-                        }
-                        was = (ch.bold, ch.code);
+                        line.push_str(ch.ink);
+                        was = (ch.bold, ch.code, ch.ink);
                     }
-                    line.push_str(&ch.glyph.text);
+                    // Disclosure and detail guides retain the same cell width.
+                    let glyph = if color && tool && entry.action.is_some() && pos == 0 && index == 0
+                    {
+                        match ch.glyph.text.as_str() {
+                            ">" => "▸",
+                            "v" => "▾",
+                            _ => &ch.glyph.text,
+                        }
+                    } else if color
+                        && entry.role == "tool_detail"
+                        && pos == 0
+                        && index == 0
+                        && ch.glyph.text == " "
+                    {
+                        "│"
+                    } else {
+                        &ch.glyph.text
+                    };
+                    line.push_str(glyph);
                 }
                 if color {
+                    if user {
+                        line.push_str(&" ".repeat(cols.saturating_sub(cells(&line))));
+                    }
                     line.push_str(reset);
                 }
                 wrapped.push(line);
@@ -716,10 +751,83 @@ pub struct Workspace {
     pub popup: Option<Popup>,
 }
 const MINT: &str = "\x1b[38;2;133;220;177m";
-const MUTED: &str = "\x1b[38;2;151;158;155m";
-const RULE: &str = "\x1b[38;2;80;93;87m";
+const TEXT: &str = "\x1b[38;2;215;223;235m";
+const MUTED: &str = "\x1b[38;2;145;157;177m";
+const SKY: &str = "\x1b[38;2;125;183;245m";
+const LAVENDER: &str = "\x1b[38;2;188;166;242m";
+const AMBER: &str = "\x1b[38;2;232;189;117m";
+const RED: &str = "\x1b[38;2;241;142;150m";
+const RULE: &str = "\x1b[38;2;62;74;93m";
+const USER_SURFACE: &str = "\x1b[48;2;28;40;57m";
+const INPUT_SURFACE: &str = "\x1b[48;2;34;41;54m";
 const RESET: &str = "\x1b[0m";
-const SELECTED: &str = "\x1b[48;2;28;68;44m\x1b[38;2;219;255;230m";
+const SELECTED: &str = "\x1b[48;2;46;63;88m\x1b[38;2;232;240;255m";
+
+fn tool_ink(role: &str) -> &'static str {
+    match role {
+        "tool_success" => MINT,
+        "tool_error" => RED,
+        "tool_warning" | "tool_running" => AMBER,
+        _ => MUTED,
+    }
+}
+struct TranscriptPaint {
+    base: &'static str,
+    header: &'static str,
+    fields: Vec<usize>,
+    group: bool,
+    tool: bool,
+}
+impl TranscriptPaint {
+    fn new(entry: &Entry, text: &str) -> Self {
+        let tool = entry.role.starts_with("tool") && entry.role != "tool_detail";
+        let group = entry
+            .action
+            .as_deref()
+            .is_some_and(|key| key.starts_with("group:"));
+        Self {
+            base: if entry.role == "tool_detail" {
+                if text.starts_with("    ") { SKY } else { MUTED }
+            } else if tool {
+                tool_ink(&entry.role)
+            } else if entry.role == "reasoning" {
+                MUTED
+            } else {
+                TEXT
+            },
+            header: if group { LAVENDER } else { SKY },
+            fields: if tool {
+                text.match_indices(" · ").map(|(at, _)| at).collect()
+            } else {
+                Vec::new()
+            },
+            group,
+            tool,
+        }
+    }
+    fn ink(&self, at: usize, code: bool, heading: bool) -> &'static str {
+        if self.tool {
+            if at < 2 || self.fields.is_empty() {
+                return self.base;
+            }
+            let field = self.fields.partition_point(|offset| *offset <= at);
+            return match (self.group, field) {
+                (_, 0) => self.header,
+                (true, 1) => MUTED,
+                (true, 2) | (false, 1) => self.base,
+                (true, _) => SKY,
+                _ => MUTED,
+            };
+        }
+        if heading {
+            SKY
+        } else if code {
+            AMBER
+        } else {
+            self.base
+        }
+    }
+}
 
 fn styled(text: &str, style: &str, color: bool) -> String {
     if color {
@@ -770,7 +878,15 @@ fn heading(left: &str, right: &str, columns: usize, color: bool) -> String {
     let left = clipped(left, columns.saturating_sub(cells(&right) + 2));
     format!(
         "{}{}{}",
-        styled(&left, MINT, color),
+        if let Some(rest) = left.strip_prefix("ANSA") {
+            format!(
+                "{}{}",
+                styled("ANSA", "\x1b[1m\x1b[38;2;133;220;177m", color),
+                styled(rest, MUTED, color)
+            )
+        } else {
+            styled(&left, SKY, color)
+        },
         " ".repeat(columns.saturating_sub(cells(&left) + cells(&right))),
         styled(&right, MUTED, color)
     )
@@ -824,7 +940,19 @@ fn editor_rows(
     let mut lines = Vec::with_capacity(visible);
     for (index, text) in logical.iter().enumerate().skip(first).take(visible) {
         let prefix = if index == 0 { "› " } else { "  " };
-        lines.push(format!("{}{text}", styled(prefix, MINT, color)));
+        lines.push(if color {
+            format!(
+                "{}{}",
+                styled(prefix, &format!("{INPUT_SURFACE}{LAVENDER}\x1b[1m"), true),
+                styled(
+                    &padded(text, columns.saturating_sub(2)),
+                    &format!("{INPUT_SURFACE}{TEXT}"),
+                    true
+                )
+            )
+        } else {
+            format!("{prefix}{text}")
+        });
     }
     (
         lines,
@@ -859,7 +987,11 @@ fn inspector_rows(
             }
             tabs.push_str(&styled(
                 &safe,
-                if i == panel.selected_tab { MINT } else { MUTED },
+                if i == panel.selected_tab {
+                    "\x1b[1;4m\x1b[38;2;125;183;245m"
+                } else {
+                    MUTED
+                },
                 color,
             ));
             used += cells(&safe);
@@ -879,13 +1011,16 @@ fn inspector_rows(
                 if span.style.heading > 0 || span.style.bold {
                     style.push_str("\x1b[1m");
                 }
-                if span.style.heading > 0 || span.style.code {
-                    style.push_str(MINT);
+                if span.style.heading > 0 {
+                    style.push_str(SKY);
+                } else if span.style.code {
+                    style.push_str(AMBER);
                 }
                 if span.style.italic {
                     style.push_str("\x1b[3m");
                 }
                 if span.style.link {
+                    style.push_str(SKY);
                     style.push_str("\x1b[4m");
                 }
                 if span.style.strike {

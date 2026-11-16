@@ -17,6 +17,83 @@ fn entry(role: &str, text: &str) -> Entry {
 }
 
 #[test]
+fn semantic_palette_keeps_statuses_distinct_and_plain_output_unstyled() {
+    let mut history = vec![
+        entry("user", "Прочитай README Ж界😀"),
+        entry("assistant", "# Обзор\nОтвет с `кодом`.\x1b[31m"),
+    ];
+    for (role, text) in [
+        ("tool_success", "> Чтение README.md · готово · 20 мс"),
+        ("tool_running", "> Запуск cargo test · выполняется"),
+        ("tool_error", "> Запуск false · ошибка"),
+        (
+            "tool_warning",
+            "> Запуск command · результат неизвестен (effect_unknown)",
+        ),
+        ("tool_detail", "  Вывод:\n    CONTENT Ж界😀"),
+    ] {
+        let mut row = entry(role, text);
+        if role != "tool_detail" {
+            row.action = Some(role.into());
+        }
+        history.push(row);
+    }
+    for size in [(100, 32), (42, 32)] {
+        let render = |color| {
+            carbon::layout_workspace(
+                &history,
+                b"draft",
+                5,
+                "basic  инструмент",
+                0,
+                "~/ansa",
+                size,
+                color,
+                &Workspace::default(),
+            )
+            .unwrap()
+        };
+        let colored = render(true);
+        let plain = render(false);
+        let raw = colored.lines.join("\n");
+        let colors: std::collections::BTreeSet<_> = raw
+            .split("\x1b[38;2;")
+            .skip(1)
+            .filter_map(|part| part.split_once('m').map(|(value, _)| value))
+            .collect();
+        assert!(
+            colors.len() >= 6,
+            "roles collapsed to one accent: {colors:?}"
+        );
+        let row = |needle: &str| {
+            colored
+                .lines
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap()
+        };
+        assert_ne!(
+            row("готово").split("Чтение").next(),
+            row("ошибка").split("Запуск").next()
+        );
+        assert!(raw.contains("▸") && raw.contains("│") && raw.contains("\x1b[48;2;"));
+        assert!(
+            !raw.contains("\x1b[31m"),
+            "untrusted controls became styles"
+        );
+        assert!(!plain.lines.join("\n").contains('\x1b'));
+        assert_eq!(colored.cursor, plain.cursor);
+        assert_eq!(colored.scroll_limit, plain.scroll_limit);
+        assert!(
+            colored
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("CONTENT Ж界😀"))
+        );
+    }
+}
+
+#[test]
 fn selection_keeps_copy_bytes_while_runtime_diagnostics_update() {
     let before = carbon::layout_workspace(
         &[entry("assistant", "ORIGINAL_COPY")],
@@ -301,7 +378,7 @@ fn selection_copies_the_frozen_visible_text_with_utf8_and_without_sgr() {
     let selected = selection.finish(5, row).unwrap();
     assert_eq!(selected, "Ae\u{301}😀B");
     assert!(!selected.contains('\x1b'));
-    assert!(selection.frame(true).lines[row].contains("\x1b[48;2;28;68;44m"));
+    assert!(selection.frame(true).lines[row].contains("\x1b[48;2;46;63;88m"));
 }
 #[test]
 fn multiline_input_retains_cursor_row_and_status_ticks_leave_chat_untouched() {

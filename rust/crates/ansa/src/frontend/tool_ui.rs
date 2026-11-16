@@ -85,9 +85,38 @@ fn preview(text: &str, limit: usize) -> String {
     result
 }
 
-fn entry(text: String, action: Option<String>) -> Entry {
+fn presentation_role(tool: &Tool) -> &'static str {
+    if tool.uncertain
+        || matches!(
+            tool.detail.phase,
+            ToolPhase::Finished {
+                effects: Effects::Unknown,
+                ..
+            }
+        )
+    {
+        "tool_warning"
+    } else if failed(tool) {
+        "tool_error"
+    } else if matches!(tool.detail.phase, ToolPhase::Finished { .. }) {
+        "tool_success"
+    } else if tool.running {
+        "tool_running"
+    } else {
+        "tool_pending"
+    }
+}
+fn calls(count: usize) -> &'static str {
+    match (count % 100, count % 10) {
+        (11..=14, _) => "вызовов",
+        (_, 1) => "вызов",
+        (_, 2..=4) => "вызова",
+        _ => "вызовов",
+    }
+}
+fn entry(text: String, action: Option<String>, role: &str) -> Entry {
     Entry {
-        role: "tool".into(),
+        role: role.into(),
         text,
         action,
     }
@@ -103,7 +132,11 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         status(tool),
         elapsed(&tool.detail.operation)
     );
-    out.push(entry(title, Some(tool.key.clone())));
+    out.push(entry(
+        title,
+        Some(tool.key.clone()),
+        presentation_role(tool),
+    ));
     if expanded {
         let mut detail = String::new();
         if !tool.detail.purpose.is_empty() {
@@ -138,7 +171,11 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
             action: None,
         });
     } else if failed(tool) && !tool.output.is_empty() {
-        out.push(entry(format!("  {}", preview(&tool.output, 240)), None));
+        out.push(entry(
+            format!("  {}", preview(&tool.output, 240)),
+            None,
+            presentation_role(tool),
+        ));
     }
 }
 
@@ -340,28 +377,52 @@ pub(super) fn project(
                 .any(|tool| tool.running && matches!(tool.detail.phase, ToolPhase::Prepared));
             let problems = group.iter().filter(|tool| failed(tool)).count();
             let state = if problems > 0 {
-                format!(" · с ошибками: {problems}")
+                format!(" · проблем: {problems}")
             } else if active {
                 " · выполняется".into()
+            } else if group
+                .iter()
+                .any(|tool| matches!(tool.detail.phase, ToolPhase::Prepared))
+            {
+                " · подготовлено".into()
             } else {
-                String::new()
+                " · готово".into()
             };
+            let mut seen = BTreeSet::new();
             let targets = group
                 .iter()
-                .take(3)
                 .map(|tool| preview(&tool.detail.target, 45))
-                .filter(|t| !t.is_empty())
+                .filter(|t| !t.is_empty() && seen.insert(t.clone()))
+                .take(3)
                 .collect::<Vec<_>>()
                 .join(", ");
             result.push(entry(
                 format!(
-                    "{} Чтение и поиск · {} вызовов{state}{}{}",
+                    "{} Чтение и поиск · {} {}{state}{}{}",
                     if open { "v" } else { ">" },
                     group.len(),
+                    calls(group.len()),
                     if targets.is_empty() { "" } else { " · " },
                     targets
                 ),
                 Some(key),
+                if group
+                    .iter()
+                    .any(|tool| presentation_role(tool) == "tool_error")
+                {
+                    "tool_error"
+                } else if problems > 0 {
+                    "tool_warning"
+                } else if active {
+                    "tool_running"
+                } else if group
+                    .iter()
+                    .any(|tool| matches!(tool.detail.phase, ToolPhase::Prepared))
+                {
+                    "tool_pending"
+                } else {
+                    "tool_success"
+                },
             ));
             for tool in group {
                 if open || failed(tool) {
@@ -452,6 +513,38 @@ mod tests {
             .map(|row| row.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    #[test]
+    fn group_targets_are_unique_and_counts_use_russian_plural_forms() {
+        for (count, expected) in [
+            (1, "вызов"),
+            (2, "вызова"),
+            (3, "вызова"),
+            (5, "вызовов"),
+            (11, "вызовов"),
+            (21, "вызов"),
+            (24, "вызова"),
+        ] {
+            assert_eq!(calls(count), expected);
+        }
+        let rows = ["one", "two", "three"].map(|op| {
+            row(
+                op,
+                "read_file",
+                ToolPhase::Finished {
+                    execution: Execution::Succeeded,
+                    effects: Effects::KnownResult,
+                },
+                "file body",
+            )
+        });
+        let shown = project(&rows, &view(), &BTreeSet::new(), false, false, |_| {
+            String::new()
+        });
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].role, "tool_success");
+        assert!(shown[0].text.contains("3 вызова · готово"));
+        assert_eq!(shown[0].text.matches("docs/README.md").count(), 1);
     }
     #[test]
     fn one_operation_updates_and_expands_without_repeating_the_intent() {
@@ -552,7 +645,7 @@ mod tests {
         });
         let shown = text(&compact);
         assert!(
-            shown.contains("3 вызовов")
+            shown.contains("3 вызова")
                 && shown.contains("ACCESS_CANARY")
                 && shown.contains("UNKNOWN_CANARY")
         );

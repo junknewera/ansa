@@ -1,5 +1,55 @@
 # Состояние ansa
 
+## WIP: оформление Carbon, темы и встроенные diff
+
+Работа остановлена по просьбе пользователя перед перезагрузкой 2026-11-16.
+Продолжать после его команды. Ветка `fix/carbon-visual-hierarchy`; этот черновик
+не заменяет проверенный checkpoint `77df057` ниже. Текущий `result/bin/ansa`
+остаётся сборкой из PR #27. Новый PR и полная матрица не запускались.
+
+Согласовано с пользователем:
+
+- Отступы, ширину и плотность подобрать по PNG/SVG в `designs/final-design/`
+  для удобства чтения. Число колонок и пустых строк не является требованием.
+- Carbon остаётся темой по умолчанию. Нужны варианты акцента Pink, Red и другие;
+  палитра должна быть сдержанной, с различимыми статусами.
+- `/theme` с предпросмотром, сохранением выбора между запусками и собственными
+  палитрами. Настройки интерфейса хранить отдельно от model context/effective config.
+- Для явной правки файла показывать inline diff как в Codex: имя, счётчики,
+  номера строк, фон добавления/удаления и раскрытие полного diff этой правки.
+  Сейчас compiled edit tool отсутствует; его нужно реализовать с durable intent,
+  проверкой исходного содержимого, защитой путей и ограниченным точным результатом.
+  Изменения произвольных команд остаются в общем Git diff.
+- Добавить Auto DMS на основе готовой системной палитры; генерацию из обоев,
+  выбор Matugen algorithm/source/contrast сохранить в TODO для отдельного этапа.
+
+В черновике изменены только рендерер, представление tools, две регрессии,
+inventory и добавлен пример `carbon_preview`. Исправлены формы «3 вызова»
+и повторяющиеся пути в группах. Целевые lib/carbon_workspace/frame_diff/
+frontend_parity прошли; это не полная приёмка. Темы и edit tool ещё не реализованы.
+Агенты этих двух частей остановлены до записи файлов.
+
+Независимое ревью основы нашло незакрытые замечания:
+
+- `Selection::frame_at` и highlight удаляют исходные SGR: обычный клик снимает
+  цвета и подложки. Нужны clipping/highlight с сохранением стилей и регрессия.
+- `TranscriptPaint` делит поля по ` · ` внутри текста команды. Нужны точные
+  границы полей из проекции, чтобы статус всегда сохранял правильный цвет.
+- Проверить весь путь projection -> цветной workspace -> mouse/resize/repaint:
+  существующая workspace PTY работает с NO_COLOR, legacy tools-color не закрывает
+  новую production projection.
+
+Проверены x13s/aarch64, DMS 1.6.3 и Matugen 4.2.0. Готовый regular single-link
+JSON находится в `~/.cache/DankMaterialShell/dms-colors.json`; новый upstream
+использует `~/.cache/dms/dms-colors.json`, с учётом XDG_CACHE_HOME. Формат содержит
+`mode`, `colors.dark/light` с Material roles и `dank16.color0..15`.
+Параметры генератора в нём не сохраняются. Первичные источники:
+[формат v1.6.3](https://github.com/duxlabs-dev/dux-shell/blob/v1.6.3/quickshell/matugen/templates/dank.json),
+[пользовательские Matugen templates](https://duxlabs.dev/docs/1.6/dankmaterialshell/application-themes/#custom-matugen-templates).
+
+WIP-логи и пример кадра сохранены в
+`~/Workspace/pet/ansa-baselines/carbon-visual-wip-20261116/`.
+
 ## Carbon UX: история, инструменты и Markdown Preview
 
 **GO**, проверенный code checkpoint
