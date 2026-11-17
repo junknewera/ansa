@@ -147,6 +147,10 @@ Worker передаёт cumulative preview через один заменяем�
 
 Markdown-файлы разбирает CommonMark parser в file worker. Отдельный bounded worker переносит блоки под ширину inspector и проверяет Cancel. Одновременно выполняется один такой расчёт; устаревшая работа завершается до запуска новой. Результат принимается по file token и ширине. Якорь блока и символа сохраняет место при resize; диапазон исходных строк нужен для `:номер`.
 
+Ручной терминал занимает ту же рабочую панель, что файлы и полный вывод инструмента. Отдельный PTY worker владеет shell, файловыми дескрипторами и очисткой принадлежащей ему process session; bounded input и приоритетный interrupt отделены от runtime Cancel. Экран разбирается VT parser и рисуется через обычный renderer. Ручной ввод и вывод не становятся model context или journal events. Проверка foreground process group и zsh prompt hook разрешает Esc возврат к файлам только из приглашения shell. Скрытая панель не получает ввод. Очистка ограничена принадлежащим SID; отделившиеся через setsid процессы могут сохраниться.
+
+Меню моделей сразу читает локальный display cache и обновляет его в worker. Этот кэш не даёт разрешения на dispatch: auth epoch и каталог отдельно проверяет authorization path. Выбор модели и effort подтверждается одной typed command. Названия сохранённых сессий выводятся из readonly replay с проверкой canonical State и идентичности файла до, во время и после чтения. Производные сводки не создают журнал и не восстанавливают его; непроверяемая сводка отмечается недоступной.
+
 Запуск live CLI строит binding из локального `AuthStatus`, включая opaque auth session ID без bearer. `AgentAuthorization` откладывает access/refresh и каталог моделей до serialized dispatch worker. Он проверяет account/session до generation и tools, принимает смену session только при явном Resume и кеширует успешную проверку model catalog на auth epoch. `AuthManager::generate` и execution lease продолжают независимо проверять допуск. Сетевые запросы больше не предшествуют первому кадру.
 
 ## Следующая граница
