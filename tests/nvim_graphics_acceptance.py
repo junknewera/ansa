@@ -65,7 +65,7 @@ def run(nvim,chart,output):
                 script=case/'init.lua'
                 descriptor=dict(session_id='graphics_fixture',artifact_id='chart',revision=hashlib.sha256(chart.read_bytes()).hexdigest(),
                     mime='image/png',size_bytes=chart.stat().st_size,title='Monthly totals')
-                script.write_text("""vim.o.laststatus=0;vim.o.showtabline=0;vim.o.number=false;vim.o.relativenumber=false
+                script.write_text("""vim.o.laststatus=2;vim.o.showtabline=0;vim.o.number=false;vim.o.relativenumber=false
 vim.o.signcolumn='no';vim.o.cmdheight=1
 _G.fixture={descriptor=vim.json.decode(%s),path=%s}
 fixture.text=vim.api.nvim_get_current_buf()
@@ -118,14 +118,28 @@ end,300)
                     wait(lambda:lua("vim.b[fixture.image].snacks_image ~= nil or vim.bo[fixture.image].filetype == 'image'")=='true',terminal+' image placement')
                     time.sleep(1)
                     screenshot('visible',True)
+                    assert lua("vim.api.nvim_eval_statusline(vim.o.statusline,{maxwidth=90}).str").endswith('Enter открыть PNG')
+                    assert lua("local open=vim.ui.open;local path;vim.ui.open=function(value) path=value end;vim.fn.feedkeys(string.char(13),'mx');vim.ui.open=open;return path==fixture.path and #vim.api.nvim_list_tabpages()==1")=='true'
+                    observations.append(dict(terminal=terminal,case='single-pane-opens-original-png'))
                     lua("vim.api.nvim_set_current_buf(fixture.text);return true")
                     screenshot('buffer-away',False)
                     lua("vim.api.nvim_set_current_buf(fixture.image);return true")
                     screenshot('buffer-return',True)
                     lua("vim.cmd('vsplit');vim.cmd('vertical resize 38');return true")
                     screenshot('resized-pane',True)
+                    assert lua("vim.api.nvim_eval_statusline(vim.o.statusline,{maxwidth=38}).str").startswith('Monthly totals')
+                    assert 'ansa://' not in lua("vim.api.nvim_eval_statusline(vim.o.statusline,{maxwidth=38}).str")
+                    resized=observations[-1]['chart_pixels']
+                    assert lua("fixture.original_tab=vim.api.nvim_get_current_tabpage();vim.fn.feedkeys(string.char(13),'mx');return vim.api.nvim_win_get_width(0)>38")=='true'
+                    screenshot('zoomed',True)
+                    assert observations[-1]['chart_pixels']>resized*2,(terminal,observations[-1],resized)
+                    assert lua("vim.fn.feedkeys(string.char(13),'mx');return vim.api.nvim_get_current_tabpage()==fixture.original_tab and vim.api.nvim_win_get_width(0)==38")=='true'
+                    screenshot('zoom-return',True)
                     lua("vim.cmd('normal! 3'..string.char(5));return true")
                     screenshot('scrolled',True)
+                    assert lua("vim.fn.feedkeys(string.char(13),'mx');vim.cmd('tabonly');return require('ansa.images').zoom_action(fixture.image,0)")=='open'
+                    assert lua("local open=vim.ui.open;local path;vim.ui.open=function(value) path=value end;vim.fn.feedkeys(string.char(13),'mx');vim.ui.open=open;return path==fixture.path and #vim.api.nvim_list_tabpages()==1")=='true'
+                    observations.append(dict(terminal=terminal,case='zoom-source-tab-closed-opens-png'))
                     lua("vim.cmd('only');fixture.descriptor.revision=string.rep('b',64);require('ansa.images').open(fixture.descriptor,fixture.path,{buffer=fixture.image,focus=true});return true")
                     wait(lambda:lua("require('ansa.images').state")=='png',terminal+' revision negotiation')
                     screenshot('replaced-revision',True)

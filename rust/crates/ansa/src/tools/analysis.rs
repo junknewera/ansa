@@ -19,6 +19,21 @@ use crate::{
 use std::{io::Read, os::unix::fs::MetadataExt, sync::Arc};
 const SCRIPT: &str = include_str!("analysis/worker.py");
 const PYTHON: Option<&str> = option_env!("ANSA_ANALYSIS_PYTHON");
+fn analysis_revision(script_hash: &str) -> String {
+    let identity = format!("{script_hash}:{}", PYTHON.unwrap_or("unavailable"));
+    format!("ansa_analysis_{}", sha256(identity.as_bytes()))
+}
+
+fn rejected(code: &str) -> Outcome {
+    if code == "cancelled" {
+        return Outcome::not_started();
+    }
+    Outcome::from_bytes(
+        Execution::Failed,
+        Effects::KnownResult,
+        error(code).output().to_vec(),
+    )
+}
 
 enum Input {
     Instructions(Outcome),
@@ -281,6 +296,16 @@ fn parameters(invocation: &Invocation) -> Result<Json> {
         ),
     ])
 }
+
+fn job_parameters(invocation: &Invocation, saved: &Json) -> Result<Json> {
+    let parameters = parameters(invocation)?;
+    if saved.has("worker_input_sha256") {
+        parameters.with("source_sha256", saved.field("input_sha256")?.clone())
+    } else {
+        Ok(parameters)
+    }
+}
+
 fn verify_inputs(host: &Host, invocation: &Invocation) -> Result<()> {
     let store = Store::new(&host.session)?;
     let directory = ansa_linux::fs::private_directory(&store.job_path(invocation))
@@ -288,19 +313,37 @@ fn verify_inputs(host: &Host, invocation: &Invocation) -> Result<()> {
     let saved = evidence::read(&directory, "analysis.json")?.ok_or("analysis_evidence_missing")?;
     let script = super::artifacts::read(&directory, "worker.py", 64 * 1024)?
         .ok_or("analysis_evidence_missing")?;
-    let input = super::artifacts::read(&directory, "input.csv", DATASET_BYTES)?
-        .ok_or("analysis_evidence_missing")?;
+    super::artifacts::analysis_input(&directory, &saved)?;
     if *saved.field("invocation")? != invocation.save()?
         || saved.text_field("python")? != PYTHON.ok_or("analysis_environment_unavailable")?
         || saved.text_field("script_sha256")? != sha256(SCRIPT.as_bytes())
         || script != SCRIPT.as_bytes()
-        || saved.text_field("input_sha256")? != sha256(&input)
-        || evidence::read(&directory, "parameters.json")? != Some(parameters(invocation)?)
+        || evidence::read(&directory, "parameters.json")?
+            != Some(job_parameters(invocation, &saved)?)
     {
         return Err("analysis_evidence_identity");
     }
     Ok(())
 }
+
+pub(super) fn csv_prefix(mut bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    while let Some(rest) = bytes
+        .strip_prefix(b"\n")
+        .or_else(|| bytes.strip_prefix(b"\r\n"))
+    {
+        bytes = rest;
+    }
+    len - bytes.len()
+}
+fn failure_result(code: &str, status: &str, process: Json) -> Result<Json> {
+    Json::object(vec![
+        ("status", s(status)?),
+        ("error", s(code)?),
+        ("process", process),
+    ])
+}
+
 fn finish(host: &Host, invocation: &Invocation, outcome: Outcome) -> Result<Outcome> {
     if outcome.effects() != Effects::KnownResult {
         return Ok(outcome);
@@ -331,20 +374,18 @@ fn finish(host: &Host, invocation: &Invocation, outcome: Outcome) -> Result<Outc
         .field("timed_out")
         .and_then(Json::boolean)
         .unwrap_or(false);
-    let value = Json::object(vec![
-        ("status", s(if cancelled { "cancelled" } else { "failed" })?),
-        (
-            "error",
-            s(if cancelled {
-                "analysis_cancelled"
-            } else if timed_out {
-                "analysis_timed_out"
-            } else {
-                "analysis_failed"
-            })?,
-        ),
-        ("process", process),
-    ])?;
+    let code = if cancelled {
+        "analysis_cancelled"
+    } else if timed_out {
+        "analysis_timed_out"
+    } else {
+        "analysis_failed"
+    };
+    let value = failure_result(
+        code,
+        if cancelled { "cancelled" } else { "failed" },
+        process,
+    )?;
     store.record_failure(invocation, &value)?;
     Ok(Outcome::from_bytes(
         if cancelled {
@@ -362,10 +403,31 @@ fn recover(host: &Host, invocation: &Invocation) -> Result<Option<Outcome>> {
         return Ok(None);
     }
     verify_inputs(host, invocation)?;
-    host.processes
-        .recover(invocation)?
-        .map(|value| finish(host, invocation, value))
-        .transpose()
+    if host.processes.has_job(invocation)? {
+        return host
+            .processes
+            .recover(invocation)?
+            .map(|value| finish(host, invocation, value))
+            .transpose();
+    }
+    // ProcessRunner can report known cancellation before creating its job.
+    // Only its exact pre-start outcome is recoverable from an analysis receipt.
+    let Some(saved) = store.saved_receipt(invocation)? else {
+        return Ok(None);
+    };
+    let cancelled = failure_result(
+        "analysis_cancelled",
+        "cancelled",
+        Json::parse(r#"{"error":"cancelled"}"#)?,
+    )?;
+    if saved != cancelled {
+        return Err("analysis_pre_start_receipt");
+    }
+    Ok(Some(Outcome::from_bytes(
+        Execution::Cancelled,
+        Effects::KnownResult,
+        saved.dump().into_bytes(),
+    )))
 }
 fn run(host: &Host, invocation: &Invocation, stop: &Cancel) -> Result<Outcome> {
     let store = Store::new(&host.session)?;
@@ -375,43 +437,51 @@ fn run(host: &Host, invocation: &Invocation, stop: &Cancel) -> Result<Outcome> {
         return Ok(recover(host, invocation)?.unwrap_or_else(Outcome::failed_unknown));
     }
     let Some(python) = PYTHON else {
-        return Ok(error("analysis_environment_unavailable"));
+        return Ok(rejected("analysis_environment_unavailable"));
     };
     let bytes = match dataset(host, &invocation.arguments, stop) {
         Ok(Input::Instructions(value)) => return Ok(value),
         Ok(Input::Data(bytes)) => bytes,
-        Err(code) => return Ok(error(code)),
+        Err(code) => return Ok(rejected(code)),
     };
     if let Err(code) = inspect(&bytes, stop) {
-        return Ok(error(code));
+        return Ok(rejected(code));
     }
     if stop.cancelled() {
         return Ok(Outcome::not_started());
     }
     let _lease = match store.reserve() {
         Ok(lease) => lease,
-        Err(code) => return Ok(error(code)),
+        Err(code) => return Ok(rejected(code)),
     };
     let path = store.job_path(invocation);
     ansa_linux::fs::create_private(&path).map_err(|_| "analysis_job_create")?;
     let directory =
         ansa_linux::fs::private_directory(&path).map_err(|_| "analysis_job_permissions")?;
-    let parameters = parameters(invocation)?;
-    evidence::create(
-        &directory,
-        "analysis.json",
-        &Json::object(vec![
-            ("invocation", invocation.save()?),
-            ("input_sha256", s(&sha256(&bytes))?),
-            ("script_sha256", s(&sha256(SCRIPT.as_bytes()))?),
-            ("python", s(python)?),
-        ])?,
-    )?;
-    ansa_linux::local::create(&directory, "input.csv", &bytes)
+    // The inspection parser skips empty records before the header. Feed the
+    // same records to DictReader and keep enough evidence for the exact input.
+    let (prefix, input) = bytes.split_at(csv_prefix(&bytes));
+    let mut saved = Json::object(vec![
+        ("invocation", invocation.save()?),
+        ("input_sha256", s(&sha256(&bytes))?),
+        ("script_sha256", s(&sha256(SCRIPT.as_bytes()))?),
+        ("python", s(python)?),
+    ])?;
+    if !prefix.is_empty() {
+        saved = saved.with("worker_input_sha256", s(&sha256(input))?)?;
+        ansa_linux::local::create(&directory, "leading-empty.csv", prefix)
+            .map_err(|_| "analysis_input_publish")?;
+    }
+    evidence::create(&directory, "analysis.json", &saved)?;
+    ansa_linux::local::create(&directory, "input.csv", input)
         .map_err(|_| "analysis_input_publish")?;
     ansa_linux::local::create(&directory, "worker.py", SCRIPT.as_bytes())
         .map_err(|_| "analysis_script_publish")?;
-    evidence::create(&directory, "parameters.json", &parameters)?;
+    evidence::create(
+        &directory,
+        "parameters.json",
+        &job_parameters(invocation, &saved)?,
+    )?;
     verify_inputs(host, invocation)?;
     let process = host.processes.run(
         invocation,
@@ -446,17 +516,7 @@ pub(super) fn register(registry: &mut Registry, host: Arc<Host>) -> Result<()> {
         Policy{read_only:true,invoke:Some(Arc::new(move|i,stop|read(&inspect_host,&i.arguments,stop))),..Policy::default()})?;
     let execute_host = host.clone();
     let recover_host = host;
-    let revision = format!(
-        "ansa_analysis_{}",
-        sha256(
-            format!(
-                "{}:{}",
-                sha256(SCRIPT.as_bytes()),
-                PYTHON.unwrap_or("unavailable")
-            )
-            .as_bytes()
-        )
-    );
+    let revision = analysis_revision(&sha256(SCRIPT.as_bytes()));
     registry.register_with_policy(Definition{descriptor:Descriptor{name:"python_execute".into(),description:"Run the fixed monthly CSV sum analysis in a pinned supervised Python/Matplotlib job (60s). date_column is YYYY-MM-DD; value_column accepts signed decimals with at most 18 integral and 6 fractional digits. Missing date/value rows are counted and skipped. report_key links immutable revisions. Returns exact totals plus Markdown, CSV and PNG descriptors; arbitrary source and package installation are unavailable.".into(),revision,schema:schema(&[("path","string"),("date_column","string"),("value_column","string"),("report_key","string")])?},
         validator:Arc::new(|a|(||->Result<bool>{Ok(path_argument(a,"path")? && ["date_column","value_column"].iter().all(|k|a.text_field(k).is_ok_and(|s|!s.is_empty() && s.len()<=128 && !s.chars().any(char::is_control))) && crate::provider::contracts::valid_id(a.text_field("report_key")?) && a.text_field("report_key")?.len()<=64)})().unwrap_or(false)),
         executor:Arc::new(|_|Outcome::failed_unknown())},Policy{requires_journal:true,

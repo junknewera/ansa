@@ -31,7 +31,7 @@ let
       lua << EOF
       vim.opt.runtimepath:prepend("${integration}")
       vim.opt.termguicolors = vim.env.NO_COLOR == nil
-      require('ansa').setup({render=true,open_history=true})
+      require('ansa').setup({render=true,open_history=true,statusline=true})
       vim.schedule(function()
         local socket=vim.env.ANSA_WORKSPACE_SOCKET
         if socket and socket~="" then require('ansa').attach(socket,{editor=vim.env.ANSA_WORKSPACE_EDITOR=='1'}) end

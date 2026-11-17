@@ -632,7 +632,7 @@ fn workspace_shows_real_data_and_adapts_inspector_to_narrow_screen() {
         &history,
         b"draft",
         3,
-        "working",
+        "План · Чат · готов",
         0,
         "~/project",
         (60, 24),
@@ -644,6 +644,8 @@ fn workspace_shows_real_data_and_adapts_inspector_to_narrow_screen() {
     assert!(text.contains("src/retry.rs") && text.contains("CHAT_MARKER"));
     assert!(!text.contains('\x1b'));
     assert_eq!(narrow.lines.len(), 24);
+    let status = &narrow.lines[22];
+    assert!(status.contains("План · Чат · готов") && status.contains("? помощь"));
 }
 #[test]
 fn model_popup_sanitizes_untrusted_fields_and_keeps_next_turn_scope_visible() {

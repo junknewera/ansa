@@ -147,20 +147,72 @@ local function fallback(buf,d,path)
   vim.api.nvim_buf_set_lines(buf,0,-1,false,{'# '..d.title,'','PNG · '..d.size_bytes..' bytes','',path})
   vim.bo[buf].modified=false; vim.bo[buf].modifiable=false
 end
+
+local function open_external(view)
+  local _, err = vim.ui.open(view.path)
+  if err then vim.notify('Не удалось открыть PNG: '..err, vim.log.levels.WARN) end
+end
+
+function M.zoom_action(buf, win)
+  local view = M.owned[buf]
+  if not view then return end
+  if not view.placement then return 'open' end
+  local tab = vim.api.nvim_win_get_tabpage(win)
+  if view.zoom == tab then
+    return view.source and vim.api.nvim_tabpage_is_valid(view.source) and 'return' or 'open'
+  end
+  if (view.zoom and vim.api.nvim_tabpage_is_valid(view.zoom))
+    or vim.api.nvim_win_get_width(win) < vim.o.columns
+    or #vim.api.nvim_tabpage_list_wins(tab) > 1 then
+    return 'zoom'
+  end
+  return 'open'
+end
+
+local function image_keys(buf)
+  vim.keymap.set('n', '<CR>', function()
+    local view = M.owned[buf]
+    if not view then return end
+    local action = M.zoom_action(buf, vim.api.nvim_get_current_win())
+    if action == 'open' then
+      open_external(view)
+    elseif action == 'return' then
+      local source = view.source
+      vim.cmd('tabclose')
+      if vim.api.nvim_tabpage_is_valid(source) then vim.api.nvim_set_current_tabpage(source) end
+      view.zoom, view.source = nil, nil
+    elseif view.zoom and vim.api.nvim_tabpage_is_valid(view.zoom) then
+      vim.api.nvim_set_current_tabpage(view.zoom)
+    else
+      view.source = vim.api.nvim_get_current_tabpage()
+      vim.cmd('tab split')
+      view.zoom = vim.api.nvim_get_current_tabpage()
+    end
+  end, {buffer=buf, desc='Увеличить график или вернуться'})
+  vim.keymap.set('n', 'o', function()
+    local view = M.owned[buf]
+    if view then open_external(view) end
+  end, {buffer=buf, desc='Открыть PNG в системном просмотрщике'})
+end
+
 function M.open(d,path,options,callback)
   options=options or {}
   local generation=M.generation
   local buf=options.buffer
   if not buf or not vim.api.nvim_buf_is_valid(buf) or vim.bo[buf].modified then
     buf=vim.api.nvim_create_buf(false,true)
-    vim.api.nvim_buf_set_name(buf,'ansa://image/'..d.session_id..'/'..d.artifact_id..'/'..d.revision..'/'..tostring(uv.hrtime()))
     vim.bo[buf].buftype='acwrite'; vim.bo[buf].bufhidden='hide'; vim.bo[buf].swapfile=false
+    image_keys(buf)
   end
+  local name = 'ansa://image/'..d.session_id..'/'..d.artifact_id..'/'..d.revision..'/'..buf
+  if vim.api.nvim_buf_get_name(buf) ~= name then vim.api.nvim_buf_set_name(buf,name) end
   vim.b[buf].ansa_artifact=vim.deepcopy(d)
+  local zoom = M.owned[buf] and M.owned[buf].zoom
+  local source = M.owned[buf] and M.owned[buf].source
   release(buf)
   fallback(buf,d,path)
   if options.focus then vim.cmd('hide buffer '..buf) end
-  local owned={tick=vim.api.nvim_buf_get_changedtick(buf),revision=d.revision}
+  local owned={tick=vim.api.nvim_buf_get_changedtick(buf),revision=d.revision,path=path,zoom=zoom,source=source}
   M.owned[buf]=owned
   if callback then callback(buf) end
   if not M.configured then return buf end
@@ -185,6 +237,7 @@ function M.open(d,path,options,callback)
           vim.api.nvim_buf_set_lines(buf,0,-1,false,{''})
           vim.bo[buf].modified=false;vim.bo[buf].filetype='image';vim.bo[buf].modifiable=false
           owned.placement=image.placement.new(buf,path,{conceal=true,auto_resize=true})
+          vim.cmd('redrawstatus')
         end)
       end})
       owned.conversion:run()

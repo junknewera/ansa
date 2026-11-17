@@ -136,6 +136,15 @@ assert(vim.wait(2000,function() return versions~=nil end,10),'version picker')
 assert(#versions==3 and versions[1].revision==rc,'picker hid saved revisions or did not put latest first')
 local listed={};for _,d in ipairs(versions) do listed[d.revision]=true end
 assert(listed[ra] and listed[rb] and listed[rc],'older result unavailable without typing an ID')
+vim.cmd('AnsaArtifact '..id..' '..ra)
+assert(vim.wait(2000,function() return vim.api.nvim_buf_get_lines(0,0,1,false)[1]=='# Report a' end,10),'old version did not open')
+local pinned=vim.api.nvim_get_current_buf()
+assert(pinned~=fresh and vim.api.nvim_buf_get_name(pinned):find(ra,1,true),'old version reused the live report URI')
+vim.cmd('AnsaArtifacts')
+assert(vim.wait(2000,function() return not a.status().artifact_read_pending end,10))
+vim.wait(250,function() return false end,10)
+assert(vim.api.nvim_get_current_buf()==pinned and vim.api.nvim_buf_get_lines(pinned,0,1,false)[1]=='# Report a','catalog replaced the explicitly selected old version')
+vim.api.nvim_set_current_buf(fresh)
 vim.cmd('AnsaDetach'); a.attach(endpoint)
 assert(vim.wait(2000,function() return a.status().snapshot ~= nil end,10),'reconnect snapshot')
 assert(not a.status().artifacts[id..'/'..rc],'old incarnation cache survived before the delayed catalog')
@@ -150,6 +159,35 @@ vim.cmd('AnsaDetach'); attach('other',rc)
 vim.wait(100,function() return false end,10)
 assert(vim.api.nvim_get_current_buf()==fresh and vim.deep_equal(before,vim.api.nvim_buf_get_lines(fresh,0,-1,false)),'new session replaced old report')
 assert(vim.api.nvim_buf_get_lines(old,0,1,false)[1]=='MY_REPORT_DRAFT','scope switch lost draft')
+-- Two new revisions arrive before the first read finishes. The plugin's own
+-- write of B must not look like the user changed the buffer and cancel C.
+local seq = 0
+local live = require('ansa.artifacts').new({
+  attachment=function() return {session='queue',incarnation='inc',capabilities={'artifact_catalog'}} end,
+  notify=function() end,
+  send=function() seq=seq+1; return true,'q_'..seq end,
+})
+local function descriptor(revision)
+  return {artifact_id='queued',revision=revision,session_id='queue',mime='text/markdown',size_bytes=1,title='Report'}
+end
+local da,db,dc=descriptor(ra),descriptor(rb),descriptor(rc)
+local function catalog(total,d)
+  live:observe({session='queue',incarnation='inc',state={timeline_total=total}})
+  live:handle({type='artifact_catalog',id=live.pending,session='queue',incarnation='inc',begin=0,['end']=total,total=total,artifacts={d}})
+end
+local function show(d,content)
+  live:handle({type='artifact',id=live.read.id,descriptor=d,content=content})
+end
+live:attached()
+catalog(1,da)
+live:open(da.artifact_id,ra)
+show(da,'A')
+catalog(2,db)
+catalog(3,dc)
+show(db,'B')
+assert(live.read and live.read.descriptor.revision==rc,'write of B skipped queued C')
+show(dc,'C')
+assert(vim.api.nvim_get_current_line()=='C')
 vim.cmd('qa!')
 """%(json.dumps(str(plugin)),json.dumps(str(endpoint)),json.dumps(str(root/'dirty-ready'))))
         child=subprocess.run(["nvim","--headless","--clean","-l",str(script)],env=environment(root,root,True),capture_output=True,timeout=15)
@@ -159,10 +197,10 @@ vim.cmd('qa!')
         assert child.returncode==0,child.stderr.decode(errors="replace")
         assert not worker.is_alive() and not errors,errors
         assert all(row["kind"] in ["snapshot","history","artifact_catalog","artifact_read"] for row in events)
-        assert sum(row["kind"]=="artifact_read" for row in events)==7,events
+        assert sum(row["kind"]=="artifact_read" for row in events)==8,events
         assert any(row['kind']=='artifact_catalog' and row['before']==5 for row in events),'older page race was not exercised'
         assert sum(row['connection']==0 and row['kind']=='history' for row in events)==1,'tool outcome waited for chat history refresh'
-    result=dict(passed=10,cases=["delayed-read-does-not-steal-typing-focus","timeline-only-revision-update-before-Done","older-page-does-not-ack-latest-barrier","dirty-report-kept-and-new-revision-separated","cursor-scroll-preserved","saved-versions-picker-with-latest-label","reconnect-rereads-without-mutation","delayed-reconnect-catalog-before-read","corrupt-read-preserves-document","cross-session-report-not-overwritten"])
+    result=dict(passed=12,cases=["delayed-read-does-not-steal-typing-focus","timeline-only-revision-update-before-Done","older-page-does-not-ack-latest-barrier","dirty-report-kept-and-new-revision-separated","cursor-scroll-preserved","saved-versions-picker-with-latest-label","old-version-keeps-its-uri-and-content","reconnect-rereads-without-mutation","delayed-reconnect-catalog-before-read","corrupt-read-preserves-document","cross-session-report-not-overwritten","queued-revisions-follow-after-own-buffer-write"])
     (output/"report.json").write_text(json.dumps(result,indent=2)); print(json.dumps(result))
 
 

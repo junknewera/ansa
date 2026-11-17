@@ -73,6 +73,18 @@ pub struct ProcessRunner {
     worker: PathBuf,
 }
 impl ProcessRunner {
+    pub(super) fn has_job(&self, invocation: &Invocation) -> Result<bool> {
+        match self
+            .root
+            .join(sha256(invocation.operation.as_bytes()))
+            .symlink_metadata()
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err("process_job_metadata"),
+        }
+    }
+
     pub fn new(root: &Path, worker: &Path) -> Result<Self> {
         let root = std::path::absolute(root).map_err(|_| "local_directory_path")?;
         ansa_linux::fs::create_private(&root).map_err(|_| "local_directory_permissions")?;

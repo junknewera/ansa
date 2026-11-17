@@ -87,16 +87,11 @@ impl Store {
         if *request.field("invocation")? != invocation.save()? {
             return Err("analysis_evidence_identity");
         }
-        let input =
-            read(&directory, "input.csv", DATASET_BYTES)?.ok_or("analysis_input_missing")?;
-        if request.text_field("input_sha256")? != sha256(&input) {
+        let worker_hash = analysis_input(&directory, &request)?;
+        if proof.field("inputs")?.text_field("input.csv")? != worker_hash {
             return Err("analysis_input_changed");
         }
-        for (name, limit) in [
-            ("input.csv", DATASET_BYTES),
-            ("worker.py", 64 * 1024),
-            ("parameters.json", 4096),
-        ] {
+        for (name, limit) in [("worker.py", 64 * 1024), ("parameters.json", 4096)] {
             let bytes = read(&directory, name, limit)?.ok_or("analysis_evidence_missing")?;
             if proof.field("inputs")?.text_field(name)? != sha256(&bytes) {
                 return Err("analysis_input_changed");
@@ -154,7 +149,7 @@ impl Store {
         }
         let value = Json::object(vec![
             ("status", s("ready")?),
-            ("input_sha256", s(&sha256(&input))?),
+            ("input_sha256", request.field("input_sha256")?.clone()),
             ("summary", summary),
             ("artifacts", Json::array(descriptors)?),
         ])?;
@@ -191,6 +186,36 @@ impl Store {
             evidence::create(&directory, "receipt.json", &receipt)?;
         }
         Ok(())
+    }
+    pub(super) fn saved_receipt(&self, invocation: &Invocation) -> Result<Option<Json>> {
+        let directory = ansa_linux::fs::private_directory(&self.job_path(invocation))
+            .map_err(|_| "artifact_store_permissions")?;
+        let Some(receipt) = evidence::read(&directory, "receipt.json")? else {
+            return Ok(None);
+        };
+        let (names, more) =
+            ansa_linux::local::names(&directory, 7).map_err(|_| "artifact_store_permissions")?;
+        if more
+            || names.iter().any(|name| {
+                !matches!(
+                    name.to_str(),
+                    Some(
+                        "analysis.json"
+                            | "input.csv"
+                            | "leading-empty.csv"
+                            | "parameters.json"
+                            | "worker.py"
+                            | "receipt.json"
+                    )
+                )
+            })
+        {
+            return Err("analysis_pre_start_receipt");
+        }
+        if receipt.keys()?.len() != 2 || *receipt.field("invocation")? != invocation.save()? {
+            return Err("artifact_receipt_conflict");
+        }
+        Ok(Some(receipt.field("result")?.clone()))
     }
     /// Caller supplies a descriptor obtained from a canonical transcript page,
     /// never an arbitrary client path or an uncommitted execution receipt.
@@ -265,6 +290,29 @@ fn measure(path: &Path, depth: usize) -> Result<usize> {
 }
 pub fn read(dir: &File, name: &str, limit: usize) -> Result<Option<Vec<u8>>> {
     ansa_linux::local::read(dir, name, limit).map_err(|_| "artifact_file_permissions")
+}
+
+pub(super) fn analysis_input(directory: &File, saved: &Json) -> Result<String> {
+    let input = read(directory, "input.csv", DATASET_BYTES)?.ok_or("analysis_input_missing")?;
+    let hash = sha256(&input);
+    let original = if saved.has("worker_input_sha256") {
+        if saved.text_field("worker_input_sha256")? != hash {
+            return Err("analysis_input_changed");
+        }
+        let mut prefix = read(directory, "leading-empty.csv", DATASET_BYTES - input.len())?
+            .ok_or("analysis_input_missing")?;
+        if prefix.is_empty() || super::analysis::csv_prefix(&prefix) != prefix.len() {
+            return Err("analysis_input_changed");
+        }
+        prefix.extend(input);
+        sha256(&prefix)
+    } else {
+        hash.clone()
+    };
+    if saved.text_field("input_sha256")? != original {
+        return Err("analysis_input_changed");
+    }
+    Ok(hash)
 }
 fn hash(value: &str) -> bool {
     value.len() == 64

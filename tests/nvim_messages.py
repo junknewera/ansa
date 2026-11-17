@@ -129,6 +129,7 @@ assert(not a.status().pending_message and a.status().message_draft=='PRESERVED_M
 a.send(1,2,'FRESH_SNAPSHOT_ROUTING')
 assert(vim.wait(2000,function() local m=a.status().last_message; return m and m.id=='m_5' and not a.status().pending_message end,10),'fresh projection steering confirmation')
 assert(a.status().last_message.receipt.kind=='steer','ACK used stale idle projection')
+vim.cmd('AnsaDetach')
 vim.cmd('qa!')
 """ % (json.dumps(str(plugin)), json.dumps(str(endpoint))))
         child = subprocess.run(["nvim", "--headless", "--clean", "-l", str(script)],
@@ -143,8 +144,56 @@ vim.cmd('qa!')
         assert list(bodies) == ["m_1", "m_2", "m_3", "m_4", "m_5"], bodies
         assert sum(r["kind"] == "message_lookup" and r["message"] == "m_2" for r in events) == 5, events
         assert not any(r["kind"] == "cancel_message" for r in events), "local forget cancelled runtime task"
-    result = dict(passed=6, cases=["lost-ACK-reconnect-read-only-confirmation", "frozen-multiline-payload-retained", "absent-receipt-bounded-five-reads",
-                                  "conflicting-payload-never-confirmed", "mode-rejection-preserves-draft", "ACK-and-new-projection-route-to-current-request"])
+    # Exercise cancellation while Steer is pending and again after its receipt.
+    with tempfile.TemporaryDirectory(prefix="ansa-cancel-steer-", dir="/tmp") as directory:
+        root = Path(directory)
+        lua = root / "test.lua"
+        lua.write_text("""vim.opt.runtimepath:prepend(%s)
+local sent = {}
+local notes = {}
+local client = 'steering_editor'
+local turn = 'n_' .. vim.fn.sha256(client):sub(1,16) .. '_m_1'
+local attachment = {role='editor', session='same_session', incarnation='current'}
+local snapshot = {state={phase='idle', input_mode='basic'}}
+local message = require('ansa.messages').new({
+  client=function() return client end,
+  attachment=function() return attachment end,
+  snapshot=function() return snapshot end,
+  share=function(_,_,after) after({path='', first_line=1, text='selected'}, 'basic') end,
+  notify=function(note) notes[#notes+1] = note end,
+  send=function(request) sent[#sent+1] = request; return true, request.id or 'r_' .. #sent end,
+})
+local function confirm(kind)
+  local pending = message.pending
+  message:handle({type='message_status',id=pending.id,status='Accepted'})
+  message:handle({type='message_receipt',id=message.lookup.id,session='same_session',incarnation='current',
+    message=pending.id, ready=true, receipt={turn=turn, request='request', kind=kind, mode='basic',
+      admission_durable=true, text_sha256=vim.fn.sha256(pending.text)}})
+end
+local function cancel_original()
+  message:cancel()
+  local request=sent[#sent]
+  assert(request.kind=='cancel_message' and request.message=='m_1' and request.target=='request' and request.turn==turn)
+  message:handle({type='message_status',id=message.cancel_request,status='Accepted'})
+end
+message:submit(1,1,'task')
+confirm('submit')
+snapshot.state={phase='generating',busy=true,turn=turn,request='request',input_mode='basic'}
+message:submit(1,1,'clarification')
+assert(message.pending.id=='m_2')
+cancel_original()
+confirm('steer')
+assert(message.last.id=='m_2')
+cancel_original()
+snapshot.state.request='another_request'
+local count=#sent
+message:cancel()
+assert(#sent==count and notes[#notes]:find('другая задача',1,true))
+vim.cmd('qa!')
+""" % json.dumps(str(plugin)))
+        subprocess.run(["nvim", "--headless", "--clean", "-l", str(lua)], env=environment(root, root, True), check=True, timeout=5)
+    result = dict(passed=7, cases=["lost-ACK-reconnect-read-only-confirmation", "frozen-multiline-payload-retained", "absent-receipt-bounded-five-reads",
+                                  "conflicting-payload-never-confirmed", "mode-rejection-preserves-draft", "ACK-and-new-projection-route-to-current-request", "own-submit-cancellable-during-and-after-steer"])
     (output / "report.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result))
 
