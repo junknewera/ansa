@@ -508,7 +508,7 @@ impl State {
                 );
                 if posted && io.raw.is_some() {
                     self.pending_draft = Some((id, self.editor.bytes.clone(), self.editor.cursor));
-                    self.status = "Сообщение ожидает завершения текущего шага".into();
+                    self.status.clear();
                 }
                 return (posted, false);
             }
@@ -655,12 +655,9 @@ impl State {
                 self.input_history.retry(None);
                 self.copy.retry(None);
             }
-            EventPayload::FollowupQueued { .. } => {
-                self.report(io, "Сообщение сохранено; ожидает текущий шаг\n")
-            }
+            EventPayload::FollowupQueued { .. } => {}
             EventPayload::FollowupDelivered { commands } => {
                 self.delivery_event(event.request.as_ref(), commands);
-                self.report(io, "Уточнение передано агенту\n");
             }
             EventPayload::GenerationSelected { selection, .. } => {
                 self.report(
@@ -737,6 +734,7 @@ impl State {
             .map(|e| Entry {
                 action: None,
                 edit: None,
+                output: None,
                 status: None,
                 role: e.role.clone(),
                 text: e.text.clone(),
@@ -764,6 +762,7 @@ impl State {
             entries.push(Entry {
                 action: None,
                 edit: None,
+                output: None,
                 status: None,
                 role: "assistant".into(),
                 text: format!(
@@ -785,11 +784,39 @@ impl State {
             .is_some_and(|p| !p.text.is_empty() && p.state == "preview")
             && self.preview_request == view.request;
         let phase = Progress::phase(view, preview);
-        let mut status = format!("{}  {phase}", jsonl::mode(self.mode));
-        if let Some(elapsed) = self.progress.elapsed() {
+        let mut status = if let Some(ui) = ui {
+            format!(
+                "{} · {}{}",
+                if self.mode == AgentMode::Plan {
+                    "Планирование"
+                } else {
+                    "Работа"
+                },
+                if ui.focus == carbon::Focus::Inspector
+                    && ui
+                        .inspector
+                        .as_ref()
+                        .is_some_and(|p| p.kind == carbon::InspectorKind::Command)
+                {
+                    "Ввод в терминале"
+                } else {
+                    "Сообщение агенту"
+                },
+                if view.worker_busy {
+                    String::new()
+                } else {
+                    format!(" · {phase}")
+                }
+            )
+        } else {
+            format!("{}  {phase}", jsonl::mode(self.mode))
+        };
+        if ui.is_none()
+            && let Some(elapsed) = self.progress.elapsed()
+        {
             status.push_str(&format!("  {elapsed}"));
         }
-        if !view.tools.is_empty() {
+        if ui.is_none() && !view.tools.is_empty() {
             status.push_str(&format!(
                 "  tools {}/{}  Ctrl+T",
                 view.completed_tools,
@@ -801,7 +828,7 @@ impl State {
             .iter()
             .filter(|f| f.state == "queued")
             .count();
-        if queued > 0 {
+        if ui.is_none() && queued > 0 {
             status.push_str(&format!("  сообщений ожидает: {queued}"));
         }
         if let Some(projected) = projected {
@@ -1271,7 +1298,10 @@ pub async fn run(
                                     );
                                 }
                                 Action::CopyHistory => state.start_copy(io),
-                                Action::FocusNext | Action::FocusPrevious | Action::Mouse(_) => {}
+                                Action::Complete
+                                | Action::FocusNext
+                                | Action::FocusPrevious
+                                | Action::Mouse(_) => {}
                                 Action::Escape => {
                                     state.follow_tail = !state.follow_tail;
                                     state.expanded = true;

@@ -4,6 +4,7 @@ pub mod codec_v1;
 pub mod journal_v1;
 pub mod state;
 pub mod store;
+pub mod summary;
 pub mod timeline;
 pub mod transcript;
 pub type Result<T> = std::result::Result<T, &'static str>;

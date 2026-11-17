@@ -73,6 +73,9 @@ impl Factory {
     pub fn entries(&self) -> Result<Vec<CatalogEntry>> {
         self.settings.catalog(self.profile())?.entries()
     }
+    pub fn summaries(&self, stop: &Cancel) -> Result<Vec<crate::session::catalog::SessionSummary>> {
+        self.settings.catalog(self.profile())?.summaries(stop)
+    }
     pub fn create(&self, kind: Kind, seed: Option<ForkSeed>) -> Result<Created> {
         if matches!(kind, Kind::Fork | Kind::Btw | Kind::Agent) && seed.is_none() {
             return Err("session_context_required");
@@ -312,7 +315,23 @@ impl Factory {
     }
     pub fn models(&self, stop: &Cancel) -> Result<Json> {
         if let Some(auth) = &self.auth {
-            auth.models(stop)
+            let before = auth.status_with_cancel(stop)?;
+            if !before.logged_in || !before.plan_enabled || before.account != self.account {
+                return Err("auth_required");
+            }
+            let models = auth.models(stop)?;
+            let after = auth.status_with_cancel(stop)?;
+            if !after.logged_in
+                || !after.plan_enabled
+                || after.account != before.account
+                || after.session != before.session
+            {
+                return Err("auth_required");
+            }
+            stop.check()?;
+            // UI metadata is optional, derived and never consulted by dispatch.
+            let _ = self.save_display_models(&after, &models);
+            Ok(models)
         } else {
             Json::object(vec![(
                 "models",
@@ -324,6 +343,118 @@ impl Factory {
             )])
         }
     }
+    /// Worker-only disk lookup. It never performs discovery, token refresh,
+    /// provider calls, or runtime authorization from saved display metadata.
+    pub fn cached_models(&self, stop: &Cancel) -> Result<Option<Json>> {
+        stop.check()?;
+        let Some(auth) = &self.auth else {
+            return self.models(stop).map(Some);
+        };
+        let before = auth.status_with_cancel(stop)?;
+        if !before.logged_in || !before.plan_enabled || before.account != self.account {
+            return Ok(None);
+        }
+        let loaded = (|| {
+            let directory =
+                ansa_linux::fs::private_directory(&self.settings.directory.join("ui-cache"))
+                    .ok()?;
+            let bytes = ansa_linux::model_catalog::read(&directory).ok()??;
+            let value = Json::parse_with_limits(
+                std::str::from_utf8(&bytes).ok()?,
+                ansa_linux::model_catalog::LIMIT,
+                32,
+                16384,
+            )
+            .ok()?;
+            if value.usize_field("version").ok()? != 1
+                || value.text_field("binding").ok()? != self.model_cache_binding(&before).ok()?
+            {
+                return None;
+            }
+            let catalog = value.field("catalog").ok()?.clone();
+            display_models(&catalog).ok()
+        })();
+        stop.check()?;
+        let after = auth.status_with_cancel(stop)?;
+        stop.check()?;
+        if !after.logged_in
+            || !after.plan_enabled
+            || after.account != before.account
+            || after.session != before.session
+        {
+            return Ok(None);
+        }
+        Ok(loaded)
+    }
+    fn model_cache_binding(&self, status: &crate::auth::manager::Status) -> Result<String> {
+        Ok(crate::protocol::legacy_json_v1::sha256(
+            Json::array(vec![
+                Json::string("openai-siwc")?,
+                Json::string(self.profile())?,
+                Json::string(&self.auth_path.to_string_lossy())?,
+                Json::string(&status.account)?,
+                Json::string(&status.session)?,
+            ])?
+            .dump()
+            .as_bytes(),
+        ))
+    }
+    fn save_display_models(
+        &self,
+        status: &crate::auth::manager::Status,
+        models: &Json,
+    ) -> Result<()> {
+        let value = Json::object(vec![
+            ("version", Json::parse("1")?),
+            ("binding", Json::string(&self.model_cache_binding(status)?)?),
+            ("catalog", display_models(models)?),
+        ])?
+        .dump();
+        if value.len() > ansa_linux::model_catalog::LIMIT {
+            return Err("model_catalog_limit");
+        }
+        let path = self.settings.directory.join("ui-cache");
+        ansa_linux::fs::create_private(&path).map_err(|_| "model_catalog_cache")?;
+        let directory =
+            ansa_linux::fs::private_directory(&path).map_err(|_| "model_catalog_cache")?;
+        ansa_linux::model_catalog::replace(
+            &directory,
+            value.as_bytes(),
+            &crate::auth::pkce::random_token(16)?,
+        )
+        .map_err(|_| "model_catalog_cache")
+    }
+}
+fn display_models(models: &Json) -> Result<Json> {
+    let capabilities = crate::auth::dispatch::model_capabilities(models)?;
+    if capabilities.len() > 256 {
+        return Err("model_catalog_limit");
+    }
+    let mut models = Vec::new();
+    for value in capabilities {
+        if value.display_name.len() > 256
+            || value.display_name.chars().any(char::is_control)
+            || value.efforts.len() > 32
+        {
+            return Err("model_catalog_limit");
+        }
+        models.push(Json::object(vec![
+            ("slug", Json::string(&value.model)?),
+            ("display_name", Json::string(&value.display_name)?),
+            ("visibility", Json::string("list")?),
+            (
+                "supported_reasoning_levels",
+                Json::array(
+                    value
+                        .efforts
+                        .iter()
+                        .map(|v| Json::string(v))
+                        .collect::<Result<_>>()?,
+                )?,
+            ),
+        ])?);
+    }
+    Json::object(vec![("models", Json::array(models)?)])
 }
 fn base_state(value: &Json) -> Result<Json> {
     let mut value = value;

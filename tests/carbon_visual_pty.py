@@ -199,6 +199,14 @@ def escape(screen):
     for _ in range(8): screen.drain(.01)
 
 
+def local(screen, command):
+    assert command.startswith('/') and '\n' not in command and '\r' not in command
+    # Bare commands first insert their completion, then submit it; arguments
+    # supply the token delimiter. The workspace suite checks each Enter alone.
+    command = command.rstrip()
+    screen.send(command + ('\r' if any(char.isspace() for char in command) else '\r\r'))
+
+
 def mouse(screen, button, column, row, release=False):
     screen.send(f'\x1b[<{button};{column + 1};{row + 1}{"m" if release else "M"}')
 
@@ -261,6 +269,14 @@ def attribute_is(screen, text, index, value):
     return bool(locations) and screen.vt.attrs[locations[0][0]][locations[0][1]][index] == value
 
 
+def native_background(screen, *labels):
+    assert body_background(screen) is None, 'workspace painted over the native terminal background'
+    for label in labels:
+        locations = screen.vt.locations(label)
+        assert locations, ('missing native surface label', label)
+        assert all(screen.vt.attrs[row][column][1] is None for row, column in locations), ('non-native surface', label)
+
+
 def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     screen = start(binary, root, home, cwd, screens, 'lifecycle')
     screen.send('VISUAL_TASK\r')
@@ -271,12 +287,13 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     answer_fg = screen.vt.attribute('OMH_TOOL_OK:OMH_FIXED_VALUE_42')[0]
     status_fg = screen.vt.attribute('готово')[0]
     assert target_fg is not None and status_fg is not None and target_fg != answer_fg
-    user_bg = screen.vt.attribute('VISUAL_TASK')[1]
-    assert user_bg is not None and user_bg != body_background(screen)
+    user_bg = screen.vt.attribute('VISUAL_TASK', last=True)[1]
+    assert screen.vt.attribute('VISUAL_TASK', last=True)[2], 'user text lost its visual emphasis'
+    native_background(screen, 'VISUAL_TASK', 'get_test_value', 'OMH_TOOL_OK:OMH_FIXED_VALUE_42')
     screen.send('VISUAL_DRAFT Ж')
     until(screen, lambda text: 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'pinned colored draft')
     input_bg = screen.vt.attribute('VISUAL_DRAFT Ж')[1]
-    assert input_bg is not None and input_bg != body_background(screen)
+    native_background(screen, 'VISUAL_TASK', 'VISUAL_DRAFT Ж')
     snapshot(screen, 'compact')
     row, column = screen.vt.location('get_test_value')
     click(screen, column, row)
@@ -296,6 +313,8 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     mouse(screen, 0, column + len('get_test_value') - 1, row, True)
     assert copied(screen, at) == 'get_test_value'
     until(screen, lambda text: attribute_is(screen, 'готово', 0, status_fg), 'selection retained unselected status color')
+    selected_bg = screen.vt.attribute('get_test_value')[1]
+    assert selected_bg is not None, 'local text selection has no visible background'
     assert screen.vt.attribute('VISUAL_TASK')[1] == user_bg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     snapshot(screen, 'selected')
@@ -306,13 +325,16 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     until(screen, lambda text: 'get_test_value' in text and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'colored frozen resize')
     assert screen.vt.attribute('готово')[0] == status_fg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
+    assert screen.vt.attribute('get_test_value')[1] == selected_bg, 'resize lost local selection color'
     snapshot(screen, 'resized-selection')
     escape(screen)
     until(screen, lambda text: attribute_is(screen, 'get_test_value', 0, target_fg), 'Esc restored tool target color')
+    native_background(screen, 'get_test_value', 'VISUAL_TASK', 'VISUAL_DRAFT Ж')
     assert journals(root) == before, 'color interactions changed canonical journal'
     finish(screen)
     return {'effective_target_fg': target_fg, 'effective_status_fg': status_fg,
-            'effective_user_bg': user_bg, 'effective_input_bg': input_bg}
+            'effective_user_bg': user_bg, 'effective_input_bg': input_bg,
+            'effective_selection_bg': selected_bg, 'effective_body_bg': body_background(screen)}
 
 
 def preferences(home):
@@ -342,7 +364,7 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     screen = start(binary, root, home, cwd, screens, 'theme-first')
     baseline = screen.vt.attribute('ANSA')[0]
     before = journals(root)
-    screen.send('/theme\r')
+    local(screen, '/theme')
     until(screen, lambda text: 'Предпросмотр темы' in text, 'theme picker')
     screen.send(b'\x1b[B')
     until(screen, lambda text: 'ANSA' in text and not attribute_is(screen, 'ANSA', 0, baseline), 'Pink live preview')
@@ -350,7 +372,7 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     escape(screen)
     until(screen, lambda text: 'Предпросмотр темы' not in text and attribute_is(screen, 'ANSA', 0, baseline), 'Esc rolled back theme')
     assert preferences(home) is None, 'preview wrote preferences before Enter'
-    screen.send('/theme\r')
+    local(screen, '/theme')
     until(screen, lambda text: 'Предпросмотр темы' in text, 'theme picker for commit')
     screen.send(b'\x1b[B')
     until(screen, lambda text: 'ANSA' in text and not attribute_is(screen, 'ANSA', 0, baseline), 'Pink second preview')
@@ -361,9 +383,10 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     choices = []
     last = pink
     for name in ['red', 'blue', 'amber']:
-        screen.send(f'/theme {name}\r')
+        local(screen, f'/theme {name}')
         until(screen, lambda text: 'ANSA' in text and 'Загрузка' not in text and not attribute_is(screen, 'ANSA', 0, last), f'rapid {name} accepted')
         last = screen.vt.attribute('ANSA')[0]
+        native_background(screen, 'ANSA', '›')
         choices.append(name)
     until(screen, lambda text: preferences(home) == 'amber', 'latest accepted theme persisted')
     assert journals(root) == before, 'theme selection dispatched model/runtime changes'
@@ -371,28 +394,35 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     restarted = start(binary, root, home, cwd, screens, 'theme-restart')
     until(restarted, lambda text: attribute_is(restarted, 'ANSA', 0, last), 'theme restored after restart')
     custom = home / '.ansa/themes/rose.json'
-    atomic_json(custom, {'name': 'Fixture Rose', 'colors': {'accent': '#CB6D99', 'input': '#271A2A'}})
-    restarted.send('/theme custom:rose\r')
+    atomic_json(custom, {'name': 'Fixture Rose', 'colors': {'accent': '#CB6D99', 'background': '#111219', 'input': '#271A2A'}})
+    local(restarted, '/theme custom:rose')
     until(restarted, lambda text: preferences(home) == 'custom:rose' and attribute_is(restarted, 'ANSA', 0, (203, 109, 153)), 'custom palette applied')
     restarted.send('THEME_DRAFT')
-    until(restarted, lambda text: 'THEME_DRAFT' in restarted.vt.line(-4), 'custom input surface')
-    assert restarted.vt.attribute('THEME_DRAFT')[1] == (39, 26, 42)
+    until(restarted, lambda text: 'THEME_DRAFT' in restarted.vt.line(-4), 'custom accent with native composer')
+    native_background(restarted, 'ANSA', 'THEME_DRAFT')
     restarted.send(b'\x15')
     palette = root / 'cache/dms/dms-colors.json'
     atomic_json(palette, material('#AACC99'))
-    restarted.send('/theme dms\r')
+    local(restarted, '/theme dms')
     until(restarted, lambda text: preferences(home) == 'dms' and attribute_is(restarted, 'ANSA', 0, (170, 204, 153)), 'Auto DMS applied')
     atomic_json(palette, material('#F088BA', '#201723', '#2A1C2D'))
-    until(restarted, lambda text: attribute_is(restarted, 'ANSA', 0, (240, 136, 186)) and attribute_is(restarted, '›', 1, (42, 28, 45)), 'Auto DMS followed atomic cache update', timeout=5)
+    until(restarted, lambda text: attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'Auto DMS followed atomic cache update', timeout=5)
+    native_background(restarted, 'ANSA', '›')
     snapshot(restarted, 'dms-updated')
     prefs_before = (home / '.ansa/ui.json').read_bytes()
-    restarted.send('/theme\r')
+    local(restarted, '/theme')
     until(restarted, lambda text: 'Предпросмотр темы' in text, 'DMS theme picker')
     restarted.send(b'\x1b[A')
     until(restarted, lambda text: 'ANSA' in text and not attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'DMS picker preview')
     escape(restarted)
     until(restarted, lambda text: 'Предпросмотр темы' not in text and attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'DMS preview rollback')
     assert (home / '.ansa/ui.json').read_bytes() == prefs_before
+    restarted.send('/')
+    until(restarted, lambda text: attribute_is(restarted, '/model', 1, (73, 56, 71)), 'DMS colors the local completion selection')
+    native_background(restarted, 'ANSA', '›')
+    snapshot(restarted, 'dms-local-selection-native-body')
+    escape(restarted)
+    restarted.send(b'\x15')
     assert all(row['kind'] != 'accepted' for row in records(root)), 'UI-only themes submitted a turn'
     finish(restarted)
     return {'rapid_choices': choices, 'restored_accent': last, 'dms_updated_accent': [240, 136, 186]}
@@ -414,9 +444,11 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     added = screen.vt.attribute('new();')[1]
     context = screen.vt.attribute('fn main()')[1]
     assert removed is not None and added is not None and removed != added
-    assert removed != context and added != context, 'diff lines lost colored backgrounds'
+    assert context is None and removed != context and added != context, 'diff colors must stay local against native context rows'
+    native_background(screen, 'EDIT_VISUAL_TASK')
     screen.send('EDIT_DRAFT Ж')
     until(screen, lambda text: 'EDIT_DRAFT Ж' in screen.vt.line(-4), 'edit draft')
+    native_background(screen, 'EDIT_DRAFT Ж')
     before = journals(root)
     snapshot(screen, 'inline-diff')
     row, column = screen.vt.location('Изменён')
@@ -429,6 +461,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     click(screen, column, row)
     until(screen, lambda text: 'Diff правки' in text and 'j/k строки' in text, 'complete per-edit Diff inspector')
     assert screen.vt.attribute('old();')[1] == removed and screen.vt.attribute('new();')[1] == added
+    assert screen.vt.attribute('fn main()')[1] is None
     assert 'EDIT_DRAFT Ж' in screen.vt.line(-4)
     snapshot(screen, 'full-diff')
     escape(screen)
@@ -451,10 +484,14 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
 
 
 def main():
+    inventory = [('color-tool-selection-resize', colored_lifecycle),
+                 ('theme-preview-persistence-dms', theme_preferences),
+                 ('acknowledged-inline-edit-diff', inline_edit)]
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--fixture-binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--case', action='append', choices=[name for name, _ in inventory], dest='selected_cases')
     args = parser.parse_args()
     binary, adapter = args.binary.resolve(strict=True), args.fixture_binary.resolve(strict=True)
     binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -462,9 +499,9 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     oracle_controls()
     cases = []
-    for name, case in [('color-tool-selection-resize', colored_lifecycle),
-                       ('theme-preview-persistence-dms', theme_preferences),
-                       ('acknowledged-inline-edit-diff', inline_edit)]:
+    for name, case in inventory:
+        if args.selected_cases and name not in args.selected_cases:
+            continue
         began = time.monotonic()
         screens = []
         uses_fixture = case is inline_edit

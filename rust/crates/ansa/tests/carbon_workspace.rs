@@ -12,6 +12,7 @@ fn entry(role: &str, text: &str) -> Entry {
     Entry {
         action: None,
         edit: None,
+        output: None,
         status: None,
         role: role.into(),
         text: text.into(),
@@ -154,8 +155,12 @@ fn selection_and_resize_preserve_unselected_colors_and_backgrounds() {
         narrow
             .lines
             .iter()
-            .any(|line| line.contains("\x1b[48;2;28;40;57m")),
-        "clipping dropped user background"
+            .any(|line| line.contains("\x1b[38;2;188;166;242m")),
+        "clipping dropped user accent"
+    );
+    assert!(
+        !frame.lines.join("\n").contains("\x1b[48;2;"),
+        "chat must retain terminal background"
     );
     assert_eq!(selection.finish(4, row).as_deref(), Some("Color"));
     assert!(!selection.text().unwrap().contains('\x1b'));
@@ -221,7 +226,8 @@ fn semantic_palette_keeps_statuses_distinct_and_plain_output_unstyled() {
             row("готово").split("Чтение").next(),
             row("ошибка").split("Запуск").next()
         );
-        assert!(raw.contains("▸") && raw.contains("│") && raw.contains("\x1b[48;2;"));
+        assert!(raw.contains("▸") && raw.contains("│"));
+        assert!(!raw.contains("\x1b[48;2;"));
         assert!(
             !raw.contains("\x1b[31m"),
             "untrusted controls became styles"
@@ -236,6 +242,179 @@ fn semantic_palette_keeps_statuses_distinct_and_plain_output_unstyled() {
                 .any(|line| line.contains("CONTENT Ж界😀"))
         );
     }
+}
+
+#[test]
+fn every_theme_keeps_the_terminal_background_and_local_selection() {
+    use ansa::frontend::theme::Theme;
+    for id in ["carbon", "pink", "red", "blue", "amber"] {
+        let mut frame = carbon::layout_workspace(
+            &[entry("user", "USER"), entry("assistant", "THEMED text")],
+            b"draft",
+            2,
+            "",
+            0,
+            "project",
+            (72, 24),
+            true,
+            &Workspace::default(),
+        )
+        .unwrap();
+        frame.apply_theme(&Theme::builtin(id).unwrap());
+        let raw = frame.lines.join("\n");
+        assert!(!raw.contains("\x1b[48;"), "{id} painted a background");
+        assert!(raw.contains("\x1b[49m"));
+        let row = frame
+            .plain_lines()
+            .iter()
+            .position(|line| line.starts_with("THEMED"))
+            .unwrap();
+        let mut selection = Selection::new(frame, 0, row);
+        selection.drag(3, row);
+        assert!(selection.frame(true).lines[row].contains("\x1b[48;"));
+        assert_eq!(selection.text().as_deref(), Some("THEM"));
+    }
+}
+
+#[test]
+fn terminal_grid_is_clipped_sanitized_and_keeps_child_sgr_after_theme() {
+    use ansa::frontend::theme::Theme;
+    let grid = std::sync::Arc::new(vec![
+        "\x1b[38;2;125;183;245mCHILD\x1b[48;2;1;2;3m 界😀\x1b[0m\x1b[2J\x1b]52;unsafe".into(),
+    ]);
+    for color in [false, true] {
+        let ui = Workspace {
+            focus: Focus::Inspector,
+            inspector: Some(Inspector {
+                title: "Терминал".into(),
+                kind: InspectorKind::Command,
+                rendered: Some(grid.clone()),
+                cursor: Some((2, 0)),
+                ..Inspector::default()
+            }),
+            ..Workspace::default()
+        };
+        let mut frame = carbon::layout_workspace(
+            &[entry("assistant", "CHAT")],
+            b"draft",
+            2,
+            "",
+            0,
+            "project",
+            (120, 24),
+            color,
+            &ui,
+        )
+        .unwrap();
+        let (column, row, width, height) = frame.inspector_bounds().unwrap();
+        assert!(width > 0 && height > 0);
+        assert_eq!(frame.cursor, column + 2);
+        if color {
+            frame.apply_theme(&Theme::builtin("pink").unwrap());
+        }
+        let output = &frame.lines[row];
+        assert!(frame.plain_lines().join("\n").contains("CHAT"));
+        assert!(
+            frame
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("Ctrl+C"))
+        );
+        assert!(
+            !frame
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("Tab фокус"))
+        );
+        assert!(!output.contains("\x1b[2J") && !output.contains("\x1b]52"));
+        if color {
+            assert!(
+                output.contains("\x1b[38;2;125;183;245m") && output.contains("\x1b[48;2;1;2;3m")
+            );
+        } else {
+            assert!(!frame.lines.join("\n").contains('\x1b'));
+        }
+        assert!(unicode_width::UnicodeWidthStr::width(frame.plain_lines()[row].as_str()) <= 119);
+    }
+}
+
+#[test]
+fn slash_suggestions_stay_above_composer_and_leave_right_panel_unchanged() {
+    let history = (0..30)
+        .map(|i| entry("assistant", &format!("CHAT {i}")))
+        .collect::<Vec<_>>();
+    let mut ui = workspace();
+    let before =
+        carbon::layout_workspace(&history, b"/mo", 3, "", 0, "project", (120, 24), false, &ui)
+            .unwrap();
+    ui.suggestions = Some(Popup {
+        items: vec![
+            Choice {
+                label: "/model".into(),
+                detail: "Выбрать модель".into(),
+            },
+            Choice {
+                label: "/mode".into(),
+                detail: "Режим работы".into(),
+            },
+        ],
+        footer: "Enter/→ вставить".into(),
+        ..Popup::default()
+    });
+    let after =
+        carbon::layout_workspace(&history, b"/mo", 3, "", 0, "project", (120, 24), false, &ui)
+            .unwrap();
+    let lines = after.plain_lines();
+    let menu = lines
+        .iter()
+        .position(|line| line.contains("/model"))
+        .unwrap();
+    let composer = lines
+        .iter()
+        .position(|line| line.starts_with("› /mo"))
+        .unwrap();
+    assert!(menu < composer);
+    assert!(!lines[menu].contains("ANSA"));
+    for (before, after) in before.plain_lines().iter().zip(&lines) {
+        if let Some((_, right)) = before.split_once(" │ ") {
+            assert_eq!(after.split_once(" │ ").unwrap().1, right);
+        }
+    }
+}
+
+#[test]
+fn queued_user_and_activity_keep_width_and_scroll_stable_across_ticks() {
+    let history = [
+        entry("queued_user", "Уточнение без суффикса"),
+        entry("activity", "Читаю файлы · 02:14"),
+    ];
+    let mut ui = Workspace {
+        animate: true,
+        ..Workspace::default()
+    };
+    let first =
+        carbon::layout_workspace(&history, b"draft", 2, "", 0, "project", (72, 24), true, &ui)
+            .unwrap();
+    ui.animation_frame = 4;
+    let next =
+        carbon::layout_workspace(&history, b"draft", 2, "", 0, "project", (72, 24), true, &ui)
+            .unwrap();
+    assert_eq!(first.scroll_limit, next.scroll_limit);
+    assert_eq!(first.cursor, next.cursor);
+    assert_eq!(
+        first
+            .plain_lines()
+            .iter()
+            .map(|line| unicode_width::UnicodeWidthStr::width(line.as_str()))
+            .collect::<Vec<_>>(),
+        next.plain_lines()
+            .iter()
+            .map(|line| unicode_width::UnicodeWidthStr::width(line.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let text = next.plain_lines().join("\n");
+    assert!(text.contains("◷ Уточнение без суффикса") && text.contains("Читаю файлы · 02:14"));
+    assert!(!next.plain_lines()[0].contains("02:14"));
 }
 
 #[test]
@@ -462,7 +641,7 @@ fn workspace_shows_real_data_and_adapts_inspector_to_narrow_screen() {
     )
     .unwrap();
     let text = narrow.lines.join("\n");
-    assert!(text.contains("src/retry.rs") && !text.contains("CHAT_MARKER"));
+    assert!(text.contains("src/retry.rs") && text.contains("CHAT_MARKER"));
     assert!(!text.contains('\x1b'));
     assert_eq!(narrow.lines.len(), 24);
 }
@@ -597,4 +776,23 @@ fn tiny_workspace_keeps_multiline_draft_in_physical_cells() {
         );
     }
     assert_eq!(input, saved);
+}
+
+#[test]
+fn help_uses_room_for_complete_command_descriptions() {
+    let ui = Workspace {
+        popup: Some(ansa::frontend::commands::help(0)),
+        ..Workspace::default()
+    };
+    let frame =
+        carbon::layout_workspace(&[], b"", 0, "", 0, "project", (100, 32), false, &ui).unwrap();
+    let text = frame.plain_lines().join("\n");
+    assert!(text.contains("Выбрать модель и уровень рассуждения"));
+    assert!(text.contains("Файлы, diff и терминал проекта"));
+    assert!(
+        frame
+            .plain_lines()
+            .iter()
+            .all(|line| ansa::frontend::cells::width(line) <= 100)
+    );
 }

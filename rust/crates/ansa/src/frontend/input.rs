@@ -36,6 +36,7 @@ pub enum Action {
     HistoryNewer,
     ToggleTools,
     CopyHistory,
+    Complete,
     Eof,
 }
 #[derive(Default, Debug)]
@@ -47,8 +48,34 @@ pub struct Editor {
     paste_end: Vec<u8>,
     paste_cr: bool,
     pub overflow: bool,
+    complete_right: bool,
+    alt_utf8: usize,
 }
 impl Editor {
+    pub fn set_completion(&mut self, active: bool) {
+        self.complete_right = active;
+    }
+    pub fn replace(&mut self, begin: usize, end: usize, value: &[u8]) -> bool {
+        if self.overflow
+            || begin > end
+            || end > self.bytes.len()
+            || self.bytes.len() - (end - begin) + value.len() > LIMIT
+        {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(&self.bytes) else {
+            return false;
+        };
+        if !text.is_char_boundary(begin)
+            || !text.is_char_boundary(end)
+            || std::str::from_utf8(value).is_err()
+        {
+            return false;
+        }
+        self.bytes.splice(begin..end, value.iter().copied());
+        self.cursor = begin + value.len();
+        true
+    }
     pub fn clear(&mut self) {
         self.bytes.clear();
         self.cursor = 0;
@@ -57,6 +84,8 @@ impl Editor {
         self.paste = false;
         self.paste_end.clear();
         self.paste_cr = false;
+        self.complete_right = false;
+        self.alt_utf8 = 0;
     }
     pub fn text(&self) -> super::Result<&str> {
         std::str::from_utf8(&self.bytes).map_err(|_| "json_string_invalid")
@@ -185,6 +214,10 @@ impl Editor {
                 None
             }
             b"\x1b[C" | b"\x1bOC" => {
+                if self.complete_right {
+                    self.escape.clear();
+                    return Some(Action::Complete);
+                }
                 self.cursor = self.next(self.cursor);
                 None
             }
@@ -228,16 +261,35 @@ impl Editor {
     }
     pub fn feed(&mut self, ch: u8, terminal: bool) -> Option<Action> {
         if terminal {
+            if self.alt_utf8 > 0 {
+                if (0x80..=0xbf).contains(&ch) {
+                    self.alt_utf8 -= 1;
+                    return None;
+                }
+                self.alt_utf8 = 0;
+            }
             if self.paste {
                 self.pasted(ch);
                 return None;
             }
-            // A following ordinary byte still belongs to the editor, while
-            // the pending standalone Escape is reported to the controller.
+            // Alt is an ESC-prefixed key, never a standalone Escape followed
+            // by typing. In particular it must not navigate the conversation.
             if self.escape == b"\x1b" && !matches!(ch, b'[' | b'O' | b'\r' | b'\n' | 27) {
                 self.escape.clear();
-                let _ = self.feed(ch, true);
-                return Some(Action::Escape);
+                match ch {
+                    b'b' => self.cursor = self.word_left(),
+                    b'f' => self.cursor = self.word_right(),
+                    8 | 127 if !self.overflow => {
+                        let begin = self.word_left();
+                        self.bytes.drain(begin..self.cursor);
+                        self.cursor = begin;
+                    }
+                    0xc2..=0xdf => self.alt_utf8 = 1,
+                    0xe0..=0xef => self.alt_utf8 = 2,
+                    0xf0..=0xf4 => self.alt_utf8 = 3,
+                    _ => {}
+                }
+                return None;
             }
             if !self.escape.is_empty() || ch == 27 {
                 if ch == 27 && !self.escape.is_empty() {

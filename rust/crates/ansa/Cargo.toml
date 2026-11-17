@@ -64,6 +64,7 @@ tower-service.workspace = true
 pulldown-cmark.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+vt100.workspace = true
 
 [dev-dependencies]
 tokio-rustls.workspace = true

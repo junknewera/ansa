@@ -19,7 +19,7 @@
           cargoLock.lockFile = ./rust/Cargo.lock;
           strictDeps = true;
           nativeBuildInputs = [ pkgs.python3 ];
-          nativeCheckInputs = [ pkgs.gitMinimal ];
+          nativeCheckInputs = [ pkgs.gitMinimal pkgs.zsh ];
           cargoBuildFlags = [ "--workspace" ];
           cargoTestFlags = [ "--workspace" ];
           doCheck = true;
@@ -46,11 +46,11 @@
       devShells = each (system:
         let pkgs = import nixpkgs { inherit system; }; in {
           default = pkgs.mkShell {
-            packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy pkgs.python3 pkgs.gitMinimal ];
+            packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy pkgs.python3 pkgs.gitMinimal pkgs.zsh ];
           };
         } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
           quality = pkgs.mkShell {
-            packages = [ (pkgs.callPackage ./nix/quality-toolchain.nix {}) pkgs.python3 pkgs.gitMinimal ];
+            packages = [ (pkgs.callPackage ./nix/quality-toolchain.nix {}) pkgs.python3 pkgs.gitMinimal pkgs.zsh ];
           };
         });
     };

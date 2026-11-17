@@ -11,6 +11,7 @@ fn main() {
         text: text.into(),
         action: action.map(str::to_owned),
         edit: None,
+        output: None,
         status: text
             .find("готово")
             .map(|start| start..start + "готово".len()),

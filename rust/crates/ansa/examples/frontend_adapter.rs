@@ -153,6 +153,7 @@ fn run(row: &Json) -> Result<Json> {
                         Ok(carbon::Entry {
                             action: None,
                             edit: None,
+                            output: None,
                             status: None,
                             role: v.text_field("role")?.into(),
                             text: v.text_field("text")?.into(),

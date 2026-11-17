@@ -115,9 +115,6 @@ impl Theme {
             (Color(232, 240, 255), p.foreground),
         ];
         let bg = [
-            (Color(13, 17, 19), p.background),
-            (Color(28, 40, 57), p.background.blend(p.accent, 9)),
-            (Color(34, 41, 54), p.input),
             (Color(46, 63, 88), p.selection),
             (Color(24, 58, 39), p.background.blend(p.success, 18)),
             (Color(68, 31, 36), p.background.blend(p.error, 18)),
@@ -128,7 +125,7 @@ impl Theme {
             .collect()
     }
     pub fn background_sgr(&self) -> String {
-        self.palette.background.bg()
+        "\x1b[49m".into()
     }
     pub fn foreground_sgr(&self) -> String {
         self.palette.foreground.fg()
@@ -776,6 +773,7 @@ mod tests {
                 text: "SELECT this text".into(),
                 action: None,
                 edit: None,
+                output: None,
                 status: None,
             }],
             b"draft",
