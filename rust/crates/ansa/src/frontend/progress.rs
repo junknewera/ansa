@@ -24,6 +24,23 @@ pub(super) struct Progress {
     seconds: u64,
 }
 impl Progress {
+    pub fn tool_elapsed(&self, operation: &str, now: Instant) -> String {
+        self.tools
+            .get(operation)
+            .and_then(|clock| {
+                clock.started.map(|started| {
+                    format!(
+                        " · {} мс",
+                        clock
+                            .stopped
+                            .unwrap_or(now)
+                            .saturating_duration_since(started)
+                            .as_millis()
+                    )
+                })
+            })
+            .unwrap_or_default()
+    }
     pub fn submitted(&mut self, command: CommandId, now: Instant) {
         *self = Self {
             pending: Some(command),
@@ -204,6 +221,10 @@ impl Progress {
         };
         if begin > 0 {
             result.push(Entry {
+                action: None,
+                edit: None,
+                output: None,
+                status: None,
                 role: "tool".into(),
                 text: format!("Ещё {begin} вызовов - Ctrl+T: подробности"),
             });
@@ -263,6 +284,10 @@ impl Progress {
                 }
             }
             result.push(Entry {
+                action: None,
+                edit: None,
+                output: None,
+                status: None,
                 role: "tool".into(),
                 text,
             });

@@ -97,6 +97,32 @@ def frozen_body(terminal):
     return tuple(tuple(row) for row in terminal.cells[begin:end])
 
 
+def body_text(terminal):
+    return '\n'.join(''.join(row).rstrip() for row in frozen_body(terminal))
+
+
+def footer_phase(terminal, phase):
+    """The legacy fixture's task phase precedes timing and tool counters."""
+    return re.match(r'^(?:basic|plan)  '+re.escape(phase)+r'(?=$|[\s;])', terminal.line(-1)) is not None
+
+
+def workspace_ready(screen):
+    """Production Workbench, deliberately distinct from the legacy fixtures."""
+    until(screen, lambda: screen.vt.line(0).startswith('ANSA')
+          and 'Работа' in screen.vt.line(-2)
+          # The default 80-column footer clips готов to гот before the hints.
+          and re.search(r' · (?:готов|гот)(?=\s|$)', screen.vt.line(-2)) is not None,
+          'production workspace ready')
+
+
+def workspace_reading(screen):
+    return 'История' in screen.vt.line(1)
+
+
+def frame_text(terminal):
+    return '\n'.join(terminal.line(row) for row in range(terminal.rows))
+
+
 def journal_events(root):
     parts={Path(name).name:bytes.fromhex(raw) for name,raw in journals(root).items()
            if Path(name).parent==Path('journal')}
@@ -148,10 +174,10 @@ def recall(binary, output):
         argv = ["--offline", "--cwd", str(cwd), "--session", session]
         screen = Pty(str(binary), root, home, cwd, "", True, argv=argv)
         try:
-            screen.wait("basic")
+            workspace_ready(screen)
             screen.send("DRAFT Ж界😀")
             editor(screen, "DRAFT Ж界😀")
-            assert screen.vt.line(0).startswith('ANSA') and 'basic' in screen.vt.line(-2)
+            assert screen.vt.line(0).startswith('ANSA') and 'Работа' in screen.vt.line(-2)
             frame='\n'.join(screen.vt.line(i) for i in range(screen.vt.rows))
             assert all(hint not in frame for hint in ['Ctrl+F','PgUp','PgDn','↑/↓'])
             assert b'\x1b]52;' not in screen.raw
@@ -182,18 +208,23 @@ def recall(binary, output):
             while time.monotonic()<deadline:screen.drain(.01)
             screen.vt.update(screen.raw)
             assert 'seed-39' in '\n'.join(screen.vt.line(i) for i in range(3,19)),'polling lost tail'
-            if 'HISTORY' not in screen.vt.line(1):
-                screen.send(b'\x1b')
-                until(screen,lambda:'HISTORY' in screen.vt.line(1),'Esc entered reading')
+            if not workspace_reading(screen):
+                screen.send(b'\x1b[5~')
+                until(screen,lambda:workspace_reading(screen),'page navigation entered reading')
             screen.send(b'\x06')
             editor(screen,'DRAFT Ж界😀')
-            assert 'HISTORY' in screen.vt.line(1),'removed Ctrl+F binding changed reading mode'
+            assert workspace_reading(screen),'removed Ctrl+F binding changed reading mode'
             screen.send(b'\x1b')
-            until(screen,lambda:'HISTORY' not in screen.vt.line(1),'Esc returned to live')
+            until(screen,lambda:not workspace_reading(screen),'Esc returned to latest')
+            screen.send(b'\x1b')
+            for _ in range(8): screen.drain(.01)
+            screen.vt.update(screen.raw)
+            assert not workspace_reading(screen),'Esc at latest toggled into reading'
+            assert journals(root)==before,'copy/page/escape navigation changed the journal'
             screen.resize(100,32)
             screen.vt=Terminal(100,32)
             editor(screen,'DRAFT Ж界😀')
-            assert screen.vt.line(0).startswith('ANSA') and 'basic' in screen.vt.line(-2)
+            assert screen.vt.line(0).startswith('ANSA') and 'Работа' in screen.vt.line(-2)
             screen.resize(80,24)
             screen.vt=Terminal()
             editor(screen,'DRAFT Ж界😀')
@@ -214,13 +245,14 @@ def recall(binary, output):
             editor(screen, "seed-39 Ж界😀", at)
             at = len(screen.raw)
             screen.send(b"x" * (17 * 1024) + b"\r")
-            screen.wait("submit_size", at)
+            until(screen,lambda:'submit_size' in frame_text(screen.vt),'submit size diagnostic')
             editor(screen, "", at)
             at = len(screen.raw)
             screen.send(b"\x1b[B")
             for _ in range(8):
                 screen.drain(.01)
-            assert b"DRAFT" not in screen.raw[at:]
+            editor(screen, "", at)
+            assert "DRAFT" not in frame_text(screen.vt)
             screen.send(b"\x04")
             row = save(screen, output, "recall-pages-overflow", (1,))
         finally:
@@ -228,7 +260,7 @@ def recall(binary, output):
             screen.close()
         screen = Pty(str(binary), root, home, cwd, "", True, argv=argv)
         try:
-            screen.wait("basic")
+            workspace_ready(screen)
             screen.send(b"\x1b[A")
             editor(screen, "seed-39 Ж界😀")
             screen.send(b"\x1b[B\x04")
@@ -248,7 +280,7 @@ def busy(adapter, output):
         try:
             screen.wait("basic")
             screen.send("first\r")
-            screen.wait("предварительный ответ")
+            until(screen,lambda:'предварительный ответ' in body_text(screen.vt),'visible preview')
             message="SECOND Ж界😀"
             draft="AFTER_QUEUE Ж界😀"
             screen.send(message)
@@ -260,7 +292,9 @@ def busy(adapter, output):
             screen.send(b"\x1b[B")
             editor(screen, message, at)
             screen.send(b'\r')
-            screen.wait('Сообщение сохранено',at)
+            until(screen,lambda:screen.vt.line(-1).startswith('basic  ')
+                  and 'сообщений ожидает: 1' in screen.vt.line(-1),
+                  'legacy followup counter acknowledgement')
             until(screen,lambda:any(event['kind']=='queued' and event['text']==message for event in journal_events(root)),
                   'followup durable before interrupt')
             queued=[event for event in journal_events(root) if event['kind']=='queued']
@@ -268,7 +302,7 @@ def busy(adapter, output):
             editor(screen,'')
             assert (root/'generated').read_bytes()==b'x','queued message interrupted provider before Ctrl+C'
             screen.send(draft);editor(screen,draft)
-            screen.send(b'\x1b[5~');screen.wait('чтение')
+            screen.send(b'\x1b[5~');until(screen,lambda:'чтение' in screen.vt.line(-1),'reading mode')
             screen.vt.update(screen.raw);body=frozen_body(screen.vt)
             screen.child.send_signal(signal.SIGINT)
             until(screen,lambda:(root/'generated').read_bytes()==b'xx','interrupted provider read queued message')
@@ -290,7 +324,7 @@ def busy(adapter, output):
             assert draft not in copied_text and 'assistant manager' not in copied_text,'draft/preview entered confirmed transcript'
             editor(screen,draft)
             at=len(screen.raw);screen.child.send_signal(signal.SIGINT)
-            screen.wait('отменено',at)
+            until(screen,lambda:footer_phase(screen.vt,'отменено'),'second Cancel acknowledged')
             screen.send(b'\x7f'*len(draft)+b'\x04')
             row=save(screen,output,'busy-steer-draft-preview')
             events=journal_events(root)
@@ -317,19 +351,20 @@ def tools(adapter, output, failed=False, plain=True):
             screen.wait("basic")
             at = len(screen.raw)
             screen.send("question\r")
-            screen.wait("get_test_value: выполняется", at)
-            screen.wait("get_test_value: ошибка" if failed else "get_test_value: готово", at)
-            screen.wait("TOOL_FAILURE" if failed else "TOOL_RESULT", at)
-            screen.wait("done", at, timeout=6)
-            screen.wait("tools 1/1", at)
-            elapsed = re.findall(rb"basic  [^\r\n]*? ([0-9]+) " + "с  tools".encode(), screen.raw[at:])
+            until(screen,lambda:'get_test_value: выполняется' in body_text(screen.vt),'tool executing')
+            state='get_test_value: ошибка' if failed else 'get_test_value: готово'
+            until(screen,lambda:state in body_text(screen.vt),'tool terminal status')
+            until(screen,lambda:('TOOL_FAILURE' if failed else 'TOOL_RESULT') in body_text(screen.vt),'tool output')
+            until(screen,lambda:'done' in body_text(screen.vt) and footer_phase(screen.vt,'готов'),'durable completion',timeout=6)
+            until(screen,lambda:'tools 1/1' in screen.vt.line(-1),'tool count')
+            elapsed = re.findall(r"basic  [^\r\n]*? ([0-9]+) с  tools", screen.vt.line(-1))
             assert elapsed and int(elapsed[-1]) >= 2, elapsed
             if not failed:
                 at = len(screen.raw)
                 screen.send(b"\x14")
                 for _ in range(12):
                     screen.drain(.01)
-                assert screen.raw[at:].count(b"details") > 100
+                until(screen,lambda:body_text(screen.vt).count('details')>100,'expanded tool output')
                 assert b"\x1b]0;INJECTED" not in screen.raw and b"\x07" not in screen.raw
                 screen.send(b"\x14")
             if plain:
@@ -345,18 +380,19 @@ def reading_failure(adapter, output):
         root=Path(name);home,cwd=roots(root)
         screen=Pty(str(adapter),root,home,cwd,'fail-timeout',True)
         try:
-            screen.wait('basic');screen.send('question\r');screen.wait('> question')
+            screen.wait('basic');screen.send('question\r');until(screen,lambda:'> question' in body_text(screen.vt),'visible user message')
             screen.send('DRAFT Ж界😀');editor(screen,'DRAFT Ж界😀')
-            screen.send(b'\x1b[5~');screen.wait('чтение')
+            screen.send(b'\x1b[5~');until(screen,lambda:'чтение' in screen.vt.line(-1),'reading mode')
             screen.vt.update(screen.raw)
             body=frozen_body(screen.vt)
-            screen.wait('http_timeout');screen.wait('пауза')
+            until(screen,lambda:'http_timeout' in frame_text(screen.vt),'timeout diagnostic')
+            until(screen,lambda:footer_phase(screen.vt,'пауза'),'paused phase')
             editor(screen,'DRAFT Ж界😀');screen.vt.update(screen.raw)
             assert 'http_timeout' in screen.vt.line(-4),screen.vt.line(-4)
             assert body==frozen_body(screen.vt),'failure moved the frozen conversation'
             at=len(screen.raw);screen.send(b'\x19')
             assert copied(screen,at)=='Вы:\nquestion\n\n'
-            screen.wait('Диалог отправлен',at);editor(screen,'DRAFT Ж界😀')
+            until(screen,lambda:'Диалог отправлен' in frame_text(screen.vt),'copy notification');editor(screen,'DRAFT Ж界😀')
             screen.vt.update(screen.raw)
             assert 'http_timeout' in screen.vt.line(-4)
             assert screen.vt.line(-3).startswith('Диалог отправлен')
@@ -371,21 +407,22 @@ def cancel_tool(adapter, output):
         screen=Pty(str(adapter),root,home,cwd,'progress',True)
         try:
             screen.wait('basic');screen.send('question\r')
-            screen.wait('get_test_value: выполняется')
-            screen.child.send_signal(signal.SIGINT);screen.wait('отменено')
-            screen.wait('get_test_value: готово')
-            until=time.monotonic()+4
-            if not hasattr(screen,'vt'):screen.vt=Terminal()
+            until(screen,lambda:'get_test_value: выполняется' in body_text(screen.vt),'tool executing')
+            screen.child.send_signal(signal.SIGINT)
+            until(screen,lambda:footer_phase(screen.vt,'отменено'),'Cancel acknowledged')
+            until(screen,lambda:'get_test_value: готово' in body_text(screen.vt),'late known tool result')
+            deadline=time.monotonic()+4
             while True:
                 screen.vt.update(screen.raw);footer=screen.vt.line(-1)
                 if 'отменено' in footer and 'завершение' not in footer:break
-                assert time.monotonic()<until,'cancelled cleanup stayed busy'
+                assert time.monotonic()<deadline,'cancelled cleanup stayed busy'
                 screen.drain(.01)
-            until=time.monotonic()+1.1
-            while time.monotonic()<until:screen.drain(.01)
+            deadline=time.monotonic()+1.1
+            while time.monotonic()<deadline:screen.drain(.01)
             screen.vt.update(screen.raw)
             assert screen.vt.line(-1)==footer,'cancelled timer did not stop'
-            at=len(screen.raw);screen.send('next\r');screen.wait('done',at)
+            at=len(screen.raw);screen.send('next\r')
+            until(screen,lambda:'done' in body_text(screen.vt) and footer_phase(screen.vt,'готов'),'next completed task')
             assert b'ansa: busy' not in screen.raw[at:],'stale busy rejected next task'
             screen.send(b'\x04')
             return save(screen,output,'cancel-tool-settled-next-task')
@@ -399,7 +436,9 @@ def paused_signal(adapter, output, number):
         screen=Pty(str(adapter),root,home,cwd,'fail-timeout',True)
         case='paused-sigterm' if number==signal.SIGTERM else 'paused-sighup'
         try:
-            screen.wait('basic');screen.send('question\r');screen.wait('http_timeout');screen.wait('пауза')
+            screen.wait('basic');screen.send('question\r')
+            until(screen,lambda:'http_timeout' in frame_text(screen.vt),'timeout diagnostic')
+            until(screen,lambda:footer_phase(screen.vt,'пауза'),'paused phase')
             screen.child.send_signal(number)
             return save(screen,output,case,(128+number,))
         finally:
@@ -419,14 +458,30 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--fixture-binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    names = ['recall', 'busy-steer-draft-preview', 'tools-plain', 'tools-color', 'tool-error',
+             'reading-failure-copy', 'cancel-tool-settled-next-task', 'paused-sigterm', 'paused-sighup']
+    parser.add_argument('--case', action='append', choices=names, dest='selected_cases',
+                        help='recall includes both page/overflow and restart checks')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     binary, adapter = args.binary.resolve(strict=True), args.fixture_binary.resolve(strict=True)
-    rows = recall(binary, args.output)
-    rows += [busy(adapter, args.output), tools(adapter, args.output),
-             tools(adapter, args.output, plain=False), tools(adapter, args.output, failed=True),
-             reading_failure(adapter,args.output),cancel_tool(adapter,args.output),
-             paused_signal(adapter,args.output,signal.SIGTERM),paused_signal(adapter,args.output,signal.SIGHUP)]
+    checks = [lambda: recall(binary, args.output), lambda: busy(adapter, args.output),
+              lambda: tools(adapter, args.output), lambda: tools(adapter, args.output, plain=False),
+              lambda: tools(adapter, args.output, failed=True), lambda: reading_failure(adapter,args.output),
+              lambda: cancel_tool(adapter,args.output), lambda: paused_signal(adapter,args.output,signal.SIGTERM),
+              lambda: paused_signal(adapter,args.output,signal.SIGHUP)]
+    rows = []
+    for name, check in zip(names, checks):
+        if args.selected_cases and name not in args.selected_cases:
+            continue
+        try:
+            result = check()
+        except BaseException as error:
+            (args.output / 'report.json').write_text(json.dumps({'passed': len(rows), 'cases': rows,
+                'failed_case': name, 'error': repr(error)}, indent=2) + '\n')
+            raise
+        rows.extend(result if isinstance(result, list) else [result])
+        (args.output / 'report.json').write_text(json.dumps({'passed': len(rows), 'cases': rows}, indent=2) + '\n')
     report = {"passed": len(rows), "cases": rows}
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

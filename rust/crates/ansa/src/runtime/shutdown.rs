@@ -38,6 +38,40 @@ pub struct Handle {
     ready: watch::Receiver<Option<Result<()>>>,
 }
 impl Handle {
+    #[cfg(test)]
+    pub(crate) fn test_channels() -> (Self, Mailboxes) {
+        let (submits, submit_rx) = mpsc::channel(1);
+        let (cancel, cancel_rx) = mpsc::channel(1);
+        let (snapshot, snapshot_rx) = mpsc::channel(1);
+        let (resume, resume_rx) = mpsc::channel(1);
+        let (transcript, transcript_rx) = mpsc::channel(1);
+        let (_, ready) = watch::channel(Some(Ok(())));
+        (
+            Self {
+                session: "test-session".into(),
+                incarnation: "test-incarnation".into(),
+                submits,
+                cancel,
+                snapshot,
+                resume,
+                transcript,
+                closing: Arc::new(Closing {
+                    mode: AtomicU8::new(0),
+                    wake: Notify::new(),
+                }),
+                outbox: Outbox::new(2),
+                gate: Gate::new(),
+                ready,
+            },
+            Mailboxes {
+                submits: submit_rx,
+                cancel: cancel_rx,
+                snapshot: snapshot_rx,
+                resume: resume_rx,
+                transcript: transcript_rx,
+            },
+        )
+    }
     pub fn incarnation(&self) -> &RuntimeIncarnation {
         &self.incarnation
     }

@@ -151,6 +151,10 @@ fn run(row: &Json) -> Result<Json> {
                     .iter()
                     .map(|v| {
                         Ok(carbon::Entry {
+                            action: None,
+                            edit: None,
+                            output: None,
+                            status: None,
                             role: v.text_field("role")?.into(),
                             text: v.text_field("text")?.into(),
                         })
@@ -348,6 +352,7 @@ fn events() -> Result<Json> {
                 forward: false,
             },
             entries: vec![ansa::session::transcript::Entry {
+                tool: None,
                 turn: "turn".into(),
                 request: "request".into(),
                 role: "user".into(),
@@ -421,8 +426,125 @@ fn final_response(
         ("items", Json::array(vec![item])?),
     ]))
 }
+fn workspace_edit(root: &Path) -> Result<i32> {
+    use ansa::{
+        config::{agents::agent_epoch, load_agent_settings},
+        frontend::sessions::{Factory, Kind},
+        protocol::legacy_json_v1::sha256,
+        tools::files::local_tools,
+    };
+    let home = root.join("home");
+    let cwd = home.join("workspace");
+    let settings = load_agent_settings(&cwd, &home)?;
+    let epoch = agent_epoch(&settings)?;
+    let instruction_token = sha256(epoch.exact_state.field("instructions")?.dump().as_bytes());
+    let selected = settings.catalog("offline")?.create_kind("main", None)?;
+    let worker = std::env::current_exe().map_err(|_| "fixture_worker")?;
+    let auth = root.join("auth");
+    let tools = local_tools(
+        settings.clone(),
+        epoch.clone(),
+        &selected.directory,
+        &auth,
+        &worker,
+    )?;
+    std::fs::write(cwd.join("edit-target.rs"), b"fn main() {\n    old();\n}\n")
+        .map_err(|_| "fixture_edit_source")?;
+    let mut binding = app::binding();
+    binding.requested_model = settings.model.clone();
+    binding.returned_model = settings.returned_model.clone();
+    let configuration = Request::new(binding, epoch, tools.advertisement().clone(), vec![])?;
+    let root_path = root.to_owned();
+    let first_generation = std::sync::atomic::AtomicBool::new(true);
+    let generate = Arc::new(
+        move |request: &Request, stop: &Cancel, _: ansa::runtime::PreviewSink| {
+            if first_generation.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while root_path.join("hold-generation").exists() {
+                    if stop.cancelled() {
+                        return Err("offline_cancelled");
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("fixture_hold_timeout");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            if stop.cancelled() {
+                return Err("offline_cancelled");
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root_path.join("generated"))
+                .and_then(|mut file| file.write_all(b"x"))
+                .map_err(|_| "fixture_marker")?;
+            if let Some(last) = request.input.last()
+                && last.text_field("type") == Ok("function_call_output")
+            {
+                let output = Json::parse(last.text_field("output")?)?;
+                if !output.field("applied")?.boolean()? {
+                    return Err("fixture_edit_not_applied");
+                }
+                return final_response(request, "EDIT_DONE");
+            }
+            let arguments = obj(vec![
+                ("path", s("edit-target.rs")),
+                ("old_text", s("old();")),
+                ("new_text", s("new();")),
+                ("instruction_token", s(&instruction_token)),
+            ]);
+            let call = obj(vec![
+                ("type", s("function_call")),
+                ("id", s("visual_edit_item")),
+                ("call_id", s("visual_edit_call")),
+                ("namespace", s("omh")),
+                ("name", s("edit_file")),
+                ("arguments", s(&arguments.dump())),
+                ("status", s("completed")),
+            ]);
+            native::load(&obj(vec![
+                ("request", request.save()?),
+                ("id", s("visual_edit_response")),
+                ("model", s(&request.binding.returned_model)),
+                ("items", Json::array(vec![call])?),
+            ]))
+        },
+    );
+    // Block terminal signals before the owner and worker threads inherit them.
+    let mut io = Io::open(true)?;
+    let runtime = Runtime::new(
+        selected.id.as_str().into(),
+        configuration,
+        tools,
+        generate,
+        Limits::default(),
+        Options {
+            directory: Some(selected.directory.clone()),
+            ..Options::default()
+        },
+    )?;
+    let factory = Factory::new(settings, auth, true, "offline-fixture".into(), None);
+    let reactor = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| "fixture_runtime")?;
+    reactor.block_on(controller::workbench::run(
+        runtime,
+        &mut io,
+        "workspace edit fixture",
+        factory,
+        selected.id,
+        Kind::Main,
+        None,
+    ))
+}
 fn fixture(root: &Path, mode: &str) -> Result<i32> {
     ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
+    if mode == "workspace-edit" {
+        return workspace_edit(root);
+    }
     let mut io = Io::open(mode != "backpressure" && mode != "large-jsonl")?;
     let hold_terminal_for_cancel = mode == "terminal" && io.raw.is_some();
     let failure = match mode {

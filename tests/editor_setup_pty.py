@@ -8,7 +8,7 @@ import tempfile
 import termios
 import time
 
-from carbon_workspace_pty import start, until, visible
+from carbon_workspace_pty import start, until, visible, local
 from cli_progress_pty import roots
 
 
@@ -26,8 +26,8 @@ def exercise(binary, output, name, terminate):
         (cwd / "notes.md").write_text("# fixture document\n")
         try:
             screen = start(binary, root, home, cwd, {"EDITOR": str(editor)})
-            screen.send("/files notes.md\r")
-            until(screen, lambda text: "READ ONLY" in text and "fixture document" in text,
+            local(screen, "/files notes.md")
+            until(screen, lambda text: "только чтение" in text and "fixture document" in text,
                   "stable file inspector")
             for _ in range(12):
                 screen.drain(.01)
@@ -56,8 +56,8 @@ def exercise(binary, output, name, terminate):
                 until(screen, lambda text: "stalled" in text,
                       "bounded handoff drain error after flow-control recovery")
                 screen.send(b"\x1b")
-                for _ in range(8):
-                    screen.drain(.01)
+                until(screen, lambda text: "q терминал" not in text,
+                      "file inspector closed after failed handoff")
                 screen.send("AFTER_EDITOR_SETUP")
                 until(screen, lambda text: "AFTER_EDITOR_SETUP" in text,
                       "input reporting restored after failed handoff")

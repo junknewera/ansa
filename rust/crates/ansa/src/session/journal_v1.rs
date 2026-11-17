@@ -39,6 +39,132 @@ fn name(index: usize) -> String {
 fn header(index: usize, previous: &str) -> String {
     format!("OMHJ1 {index:020} {previous}\n")
 }
+fn frame_length(frame: &[u8]) -> Result<usize> {
+    need(
+        frame.len() == 83 && frame[8] == b' ' && frame[17] == b' ' && frame[82] == b'\n',
+        "journal_frame",
+    )?;
+    let parse = |bytes: &[u8]| -> Result<u32> {
+        need(bytes.iter().all(u8::is_ascii_hexdigit), "journal_frame")?;
+        u32::from_str_radix(std::str::from_utf8(bytes).map_err(|_| "journal_frame")?, 16)
+            .map_err(|_| "journal_frame")
+    };
+    let length = parse(&frame[..8])?;
+    need(
+        length ^ parse(&frame[9..17])? == u32::MAX && length > 0 && length as usize <= MAX_RECORD,
+        "journal_frame_length",
+    )?;
+    Ok(length as usize)
+}
+
+/// Bounded canonical framing/chain inspection. Unlike `open`, this never
+/// creates a lock or a recovery part, and it never acquires the writer lease.
+/// A raced append or unfinished final frame is conservatively unavailable.
+pub fn inspect_read_only(
+    path: &Path,
+    budget: &mut usize,
+    check: impl Fn() -> Result<()>,
+    mut replay: impl FnMut(&Json) -> Result<()>,
+) -> Result<()> {
+    use ansa_linux::journal::{ReadIdentity, ReadOnly};
+    check()?;
+    let files = ReadOnly::open(path).map_err(|_| "journal_directory_open")?;
+    let names = files.names().map_err(|_| "journal_parts_limit")?;
+    need(!names.is_empty(), "session_missing_init")?;
+    let mut previous_part = ZERO.to_owned();
+    let mut previous_record = ZERO.to_owned();
+    let mut sequence = 0u64;
+    let mut observed = Vec::new();
+    for (index, filename) in names.iter().enumerate() {
+        check()?;
+        let filename = filename.to_str().ok_or("journal_part_sequence")?;
+        need(filename == name(index), "journal_part_sequence")?;
+        let mut file = files.part(filename).map_err(|_| "journal_part_open")?;
+        // Capture before the first read, including nanosecond mtime/ctime.
+        // A same-length rewrite must not validate bytes from an older version.
+        let identity = ReadIdentity::capture(&file).map_err(|_| "journal_part_type")?;
+        let size = usize::try_from(identity.size()).map_err(|_| "journal_summary_limit")?;
+        need(size <= *budget, "journal_summary_limit")?;
+        *budget -= size;
+        let mut bytes = Vec::with_capacity(size.min(65536));
+        let mut chunk = [0; 65536];
+        while bytes.len() < size {
+            check()?;
+            let remaining = (size - bytes.len()).min(chunk.len());
+            let read = file
+                .read(&mut chunk[..remaining])
+                .map_err(|_| "journal_read")?;
+            need(read != 0, "journal_write_conflict")?;
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let expected = header(index, &previous_part);
+        let actual = &bytes[..bytes.len().min(expected.len())];
+        need(
+            expected.as_bytes().starts_with(actual),
+            "journal_part_header",
+        )?;
+        let mut offset = expected.len();
+        let mut torn = bytes.len() < expected.len();
+        while !torn && offset < bytes.len() {
+            check()?;
+            if bytes.len() - offset < 83 {
+                torn = true;
+                break;
+            }
+            let frame = &bytes[offset..offset + 83];
+            let length = frame_length(frame)?;
+            offset += 83;
+            if bytes.len() - offset < length {
+                torn = true;
+                break;
+            }
+            let body = &bytes[offset..offset + length];
+            let hash = sha256(body);
+            need(hash.as_bytes() == &frame[18..82], "journal_checksum")?;
+            let envelope = Json::parse_with_limits(
+                std::str::from_utf8(body).map_err(|_| "json_invalid")?,
+                MAX_RECORD,
+                64,
+                131072,
+            )?;
+            sequence = sequence.checked_add(1).ok_or("journal_sequence")?;
+            need(
+                envelope.usize_field("schema_version")? == 1
+                    && envelope.field("sequence")?.index()? as u64 == sequence
+                    && envelope.text_field("previous")? == previous_record,
+                "journal_sequence",
+            )?;
+            replay(envelope.field("event")?)?;
+            previous_record = hash;
+            offset += length;
+        }
+        need(!torn || index + 1 < names.len(), "journal_incomplete")?;
+        previous_part = sha256(&bytes);
+        need(
+            files
+                .unchanged(filename, &file, &identity)
+                .map_err(|_| "journal_write_conflict")?,
+            "journal_write_conflict",
+        )?;
+        observed.push((filename.to_owned(), identity));
+    }
+    check()?;
+    need(
+        files.names().map_err(|_| "journal_parts_limit")? == names,
+        "journal_write_conflict",
+    )?;
+    for (filename, identity) in observed {
+        check()?;
+        let file = files.part(&filename).map_err(|_| "journal_part_open")?;
+        need(
+            files
+                .unchanged(&filename, &file, &identity)
+                .map_err(|_| "journal_write_conflict")?,
+            "journal_write_conflict",
+        )?;
+    }
+    Ok(())
+}
 fn read(file: &mut File, count: usize) -> Result<Vec<u8>> {
     let mut value = Vec::with_capacity(count.min(65536));
     file.take(count as u64)
@@ -124,28 +250,9 @@ impl Journal {
                             journal.new_part = true;
                             break;
                         }
-                        need(
-                            frame[8] == b' ' && frame[17] == b' ' && frame[82] == b'\n',
-                            "journal_frame",
-                        )?;
-                        let parse = |bytes: &[u8]| -> Result<u32> {
-                            need(bytes.iter().all(u8::is_ascii_hexdigit), "journal_frame")?;
-                            u32::from_str_radix(
-                                std::str::from_utf8(bytes).map_err(|_| "journal_frame")?,
-                                16,
-                            )
-                            .map_err(|_| "journal_frame")
-                        };
-                        let length = parse(&frame[..8])?;
-                        let complement = parse(&frame[9..17])?;
-                        need(
-                            length ^ complement == u32::MAX
-                                && length > 0
-                                && length as usize <= MAX_RECORD,
-                            "journal_frame_length",
-                        )?;
-                        let body = read(&mut file, length as usize)?;
-                        if body.len() < length as usize {
+                        let length = frame_length(&frame)?;
+                        let body = read(&mut file, length)?;
+                        if body.len() < length {
                             journal.new_part = true;
                             break;
                         }

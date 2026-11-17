@@ -4,34 +4,56 @@ use ansa::{
         protocol_v1::*,
         sessions::{Factory, Kind},
     },
-    runtime::Runtime,
+    runtime::{PostStatus, Runtime},
 };
 use std::{
-    path::PathBuf,
+    fs::{self, DirBuilder},
+    io::ErrorKind,
+    os::unix::fs::DirBuilderExt,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ansa-carbon-sessions-{}-{}",
-            std::process::id(),
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self::with_clock(
+            &std::env::temp_dir(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
-        ));
-        for name in ["", "home", "work"] {
-            ansa_linux::fs::create_private(&path.join(name)).unwrap();
+                .as_nanos(),
+            &NEXT,
+        )
+    }
+    fn with_clock(parent: &Path, clock: u128, next: &AtomicU64) -> Self {
+        let fixture = loop {
+            let suffix = next.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                "ansa-carbon-sessions-{}-{clock}-{suffix}",
+                std::process::id()
+            ));
+            match DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => break Self(path),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("fixture directory: {error}"),
+            }
+        };
+        for name in ["home", "work"] {
+            ansa_linux::fs::create_private(&fixture.0.join(name)).unwrap();
         }
-        Self(path)
+        fixture
     }
     fn factory(&self) -> Factory {
-        let settings = load_agent_settings(&self.0.join("work"), &self.0.join("home")).unwrap();
+        Self::factory_at(&self.0)
+    }
+    fn factory_at(root: &Path) -> Factory {
+        let settings = load_agent_settings(&root.join("work"), &root.join("home")).unwrap();
         Factory::new(
             settings,
-            self.0.join("auth"),
+            root.join("auth"),
             true,
             "offline-fixture".into(),
             None,
@@ -42,6 +64,131 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn fixture_clock_collisions_and_cleanup_preserve_another_live_journal() {
+    use std::os::unix::fs::PermissionsExt;
+    struct LegacyFixture(PathBuf);
+    impl LegacyFixture {
+        fn with_fixed_clock(parent: &Path, clock: u128) -> Self {
+            let path = parent.join(format!(
+                "ansa-carbon-sessions-{}-{clock}",
+                std::process::id()
+            ));
+            // Reproduce the old reuse of an existing root only inside the
+            // regression's exclusively owned evidence directory.
+            for name in ["", "home", "work"] {
+                ansa_linux::fs::create_private(&path.join(name)).unwrap();
+            }
+            Self(path)
+        }
+    }
+    impl Drop for LegacyFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    async fn plan(runtime: &Runtime, id: &str) -> ansa::frontend::protocol_v1::Snapshot {
+        assert_eq!(
+            runtime
+                .post(command(
+                    runtime,
+                    id,
+                    CommandPayload::Submit(Submit {
+                        text: "inspect only".into(),
+                        mode: AgentMode::Plan,
+                    })
+                ))
+                .await
+                .unwrap(),
+            PostStatus::Accepted,
+        );
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), runtime.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            match event.payload {
+                EventPayload::FrontendSnapshot(view)
+                    if view.storage_failed
+                        || view.state == "paused"
+                        || view.submit.as_ref().is_some_and(|submit| submit.0 == id)
+                            && view.state == "completed"
+                            && !view.worker_busy =>
+                {
+                    return *view;
+                }
+                EventPayload::ResyncRequired { .. } => panic!("fixture regression event overflow"),
+                _ => {}
+            }
+        }
+    }
+    const CLOCK: u128 = 42;
+    let evidence = Fixture::new();
+    {
+        let first = LegacyFixture::with_fixed_clock(&evidence.0, CLOCK);
+        let second = LegacyFixture::with_fixed_clock(&evidence.0, CLOCK);
+        assert_eq!(first.0, second.0);
+        let mut main = Fixture::factory_at(&second.0)
+            .create(Kind::Main, None)
+            .unwrap();
+        main.runtime.ready().await.unwrap();
+        let part = main
+            .selected
+            .directory
+            .join("part-00000000000000000000.log");
+        assert!(part.is_file());
+        drop(first);
+        assert!(!part.exists());
+        let view = plan(&main.runtime, "old_fixture_plan").await;
+        assert_eq!(view.state, "paused");
+        assert!(view.storage_failed);
+        assert_eq!(view.diagnostic, "journal_write_conflict");
+        main.runtime.shutdown().await.unwrap();
+        drop(second);
+    }
+    assert!(evidence.0.is_dir());
+    let stale = evidence.0.join(format!(
+        "ansa-carbon-sessions-{}-{CLOCK}-0",
+        std::process::id()
+    ));
+    DirBuilder::new().mode(0o700).create(&stale).unwrap();
+    fs::write(stale.join("marker"), b"stale owned evidence").unwrap();
+    let next = AtomicU64::new(0);
+    let first = Fixture::with_clock(&evidence.0, CLOCK, &next);
+    let second = Fixture::with_clock(&evidence.0, CLOCK, &next);
+    assert_ne!(first.0, second.0);
+    assert_ne!(first.0, stale);
+    assert_ne!(second.0, stale);
+    assert_eq!(
+        fs::metadata(&first.0).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&second.0).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let mut main = second.factory().create(Kind::Main, None).unwrap();
+    main.runtime.ready().await.unwrap();
+    let part = main
+        .selected
+        .directory
+        .join("part-00000000000000000000.log");
+    let before = fs::read(&part).unwrap();
+    assert!(!before.is_empty());
+    drop(first);
+    assert!(second.0.is_dir());
+    assert_eq!(fs::read(&part).unwrap(), before);
+    let view = plan(&main.runtime, "owned_fixture_plan").await;
+    assert_eq!(view.state, "completed", "{}", view.diagnostic);
+    assert!(!view.storage_failed, "{}", view.diagnostic);
+    assert!(part.is_file());
+    assert!(fs::read(&part).unwrap().len() > before.len());
+    assert_eq!(
+        fs::read(stale.join("marker")).unwrap(),
+        b"stale owned evidence"
+    );
+    main.runtime.shutdown().await.unwrap();
 }
 fn command(runtime: &Runtime, id: &str, payload: CommandPayload) -> RuntimeCommand {
     let h = runtime.handle();
@@ -101,6 +248,167 @@ async fn complete(runtime: &Runtime, id: &str, text: &str) {
             }
         }
     }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn pre_edit_catalog_resumes_and_forks_without_upgrading_saved_tools_or_context() {
+    use ansa::{
+        config::agent_epoch,
+        frontend::offline,
+        provider::request::{Binding, Request},
+        runtime::{Limits, Options},
+        tools::{
+            files::local_tools,
+            registry::{Policy, Registry},
+        },
+    };
+    use std::{collections::BTreeMap, path::Path, sync::Arc};
+    fn parts(directory: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter_map(|path| {
+                let name = path.file_name()?.to_str()?;
+                (name.starts_with("part-") && name.ends_with(".log"))
+                    .then(|| (name.to_owned(), std::fs::read(&path).unwrap()))
+            })
+            .collect()
+    }
+    let fixture = Fixture::new();
+    let factory = fixture.factory();
+    let selected = factory
+        .settings
+        .catalog("offline")
+        .unwrap()
+        .create_kind("main", None)
+        .unwrap();
+    let epoch = agent_epoch(&factory.settings).unwrap();
+    let current = local_tools(
+        factory.settings.clone(),
+        epoch.clone(),
+        &selected.directory,
+        &factory.auth_path,
+        &std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    // Reconstruct the compiled pre-edit catalogue using the unchanged existing
+    // descriptors and the same durable/read-only policies as before edit_file.
+    let mut legacy = Registry::new();
+    for descriptor in &current.advertisement().descriptors {
+        if descriptor.name == "edit_file" {
+            continue;
+        }
+        legacy
+            .register_with_policy(
+                current.definition(&descriptor.name).unwrap().clone(),
+                Policy {
+                    requires_journal: descriptor.name == "run_command",
+                    read_only: descriptor.name != "run_command",
+                    ..Policy::default()
+                },
+            )
+            .unwrap();
+    }
+    let legacy = legacy.snapshot();
+    let configuration = Request::new(
+        Binding {
+            provider: "openai-siwc".into(),
+            account: "offline-fixture".into(),
+            requested_model: factory.settings.model.clone(),
+            returned_model: factory.settings.returned_model.clone(),
+        },
+        epoch,
+        legacy.advertisement().clone(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut original = Runtime::new(
+        selected.id.as_str().into(),
+        configuration,
+        legacy,
+        Arc::new(|request, stop, _| offline::generate(request, stop)),
+        Limits {
+            tool_rounds: factory.settings.tool_rounds,
+            ..Limits::default()
+        },
+        Options {
+            directory: Some(selected.directory.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    original.ready().await.unwrap();
+    complete(&original, "old_turn", "old catalogue message").await;
+    let expected = context(&original, "old_context").await.request().unwrap();
+    assert!(
+        !expected
+            .tools
+            .descriptors
+            .iter()
+            .any(|d| d.name == "edit_file")
+    );
+    assert!(
+        expected
+            .input
+            .iter()
+            .any(|item| item.has("encrypted_content"))
+    );
+    original.shutdown().await.unwrap();
+    let journal_before = parts(&selected.directory);
+    assert!(!journal_before.is_empty());
+
+    let mut resumed = factory.resume(&selected.id).unwrap();
+    resumed.runtime.ready().await.unwrap();
+    let seed = context(&resumed.runtime, "resumed_old").await;
+    let actual = seed.request().unwrap();
+    assert_eq!(actual.input, expected.input);
+    assert_eq!(actual.tools, expected.tools);
+    assert_eq!(actual.epoch, expected.epoch);
+    assert_eq!(actual.binding, expected.binding);
+    assert_eq!(
+        parts(&selected.directory),
+        journal_before,
+        "reopen rewrote the canonical journal"
+    );
+
+    let mut fork = factory.create(Kind::Fork, Some(seed)).unwrap();
+    fork.runtime.ready().await.unwrap();
+    let forked = context(&fork.runtime, "forked_old")
+        .await
+        .request()
+        .unwrap();
+    assert_eq!(forked.tools, expected.tools);
+    assert_eq!(forked.input, expected.input);
+    assert_eq!(forked.epoch, expected.epoch);
+    complete(
+        &fork.runtime,
+        "fork_turn",
+        "continue with the saved catalogue",
+    )
+    .await;
+    assert_eq!(
+        context(&fork.runtime, "fork_after_turn")
+            .await
+            .request()
+            .unwrap()
+            .tools,
+        expected.tools
+    );
+
+    let mut fresh = factory.create(Kind::Main, None).unwrap();
+    fresh.runtime.ready().await.unwrap();
+    assert!(
+        context(&fresh.runtime, "fresh_tools")
+            .await
+            .request()
+            .unwrap()
+            .tools
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.name == "edit_file")
+    );
+    fresh.runtime.shutdown().await.unwrap();
+    fork.runtime.shutdown().await.unwrap();
+    resumed.runtime.shutdown().await.unwrap();
 }
 #[tokio::test(flavor = "current_thread")]
 async fn fork_keeps_native_context_and_independent_history_across_restart() {

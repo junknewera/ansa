@@ -20,10 +20,9 @@ Production - Cargo workspace `rust/`, crates `ansa` и `ansa-linux`. Пути в
 | `config/`, `tools/` | Settings, AGENTS и compiled local tools |
 | `bin/ansa.rs`, `frontend/` | Production CLI/JSONL, Carbon, input и deterministic offline provider |
 
-Cargo/Nix нужны для сборки; Python/C++ helpers не участвуют в работе executable.
-Runtime использует Tokio, Hyper/rustls/ring и owning JSON поверх serde. Собственный
-unsafe запрещён в `ansa`; узкие обоснованные Linux boundaries находятся в `ansa-linux`.
-Текущий production graph не включает CMake/libcurl/yyjson/OpenSSL.
+Cargo/Nix собирают executable. Runtime использует Tokio, Hyper/rustls/ring
+и owning JSON поверх serde. Собственный unsafe запрещён в `ansa`;
+узкие обоснованные Linux boundaries находятся в `ansa-linux`.
 
 ## Admission и ownership
 
@@ -62,7 +61,7 @@ Legacy serializer отдельно сохраняет C++ v1 dump bytes, уча�
 | Tool result для replay | 128 KiB |
 | HTTP headers / fields | 64 KiB суммарно / 256 на block |
 
-Лимиты проверяются при incremental framing и JSON validation. JSON/SSE input bytes ограничивают объём parser allocations; depth, nodes и duplicate keys проверяются при построении owning значений. Одновременные owning copies увеличивают peak memory относительно body limit; это не обещание RSS ≤16 MiB. Overflow не приводит к усечённому executable JSON.
+Лимиты проверяются при incremental framing и JSON validation. JSON/SSE input bytes ограничивают объём parser allocations; depth, nodes и duplicate keys проверяются при построении owning значений. Лимит body относится к входным данным; копии owning значений увеличивают пиковую память процесса. При переполнении decoder отклоняет ответ целиком.
 
 ## Replay и provenance
 
@@ -70,7 +69,7 @@ Legacy serializer отдельно сохраняет C++ v1 dump bytes, уча�
 
 Opaque reasoning остаётся JSON value с точным encrypted string; ничего не дешифруется и не преобразуется в transcript text. Native metadata, включая неизвестные поля поддерживаемых items, сохраняется. Сравнение numeric tokens консервативное: различное написание чисел считается различием representation.
 
-Операции идентифицирует runtime-side `OperationIds`, а не provider или executor. Executor возвращает `ToolOutcome` без call/operation IDs. Ошибка после dispatch даёт failed/unknown; следующий call не запускается. Cancel до dispatch даёт cancelled/not_started. Cancelled с unknown не превращается в отсутствие эффекта. Replay unknown effects блокируется до будущего reconciliation workflow.
+Runtime присваивает операциям `OperationIds`. Executor возвращает `ToolOutcome` без call/operation IDs. Ошибка после dispatch даёт failed/unknown; следующий call не запускается. Cancel до dispatch даёт cancelled/not_started. При cancelled/unknown результат эффекта остаётся неизвестным. Replay unknown effects блокируется до будущего reconciliation workflow.
 
 Consume-once batch защищает конкретный подготовленный batch. Journal сохраняет принятые Submit и их identities. Runtime сверяет payload при повторе CommandId, возвращает состояние исходного turn и восстанавливает уже завершённый prefix batch с прежними operation IDs.
 
@@ -100,7 +99,7 @@ ProcessRunner сохраняет private request specification, затем fork/
 
 Supervisor сбрасывает inherited signal dispositions/mask, является subreaper, держит primary waitable до group cleanup, прекращает усыновлённых потомков включая setsid, собирает bounded stdout/stderr и точный status. Control pipe EOF означает Cancel либо гибель runtime. Timeout и Cancel прекращают дальнейший dispatch, известный итог сохраняется. Если сам supervisor уничтожен, effect остаётся unknown, повтор запуска запрещён; без cgroup гарантировать прекращение всех отделившихся потомков нельзя. PDEATHSIG прекращает primary при гибели supervisor, с проверкой исходного parent PID после установки.
 
-Backend отклоняет direct sudo, очищает capabilities, требует non-root identity и устанавливает `no_new_privs` до exec. Это ограничение повышения через exec, а не OS sandbox или блокировка уже разрешённых privileged brokers. [Контракт Linux no_new_privs](https://docs.kernel.org/userspace-api/no_new_privs.html).
+Backend отклоняет direct sudo, очищает capabilities, требует non-root identity и устанавливает `no_new_privs` до exec. Флаг запрещает повышение привилегий при exec. Процесс сохраняет доступ к файлам и привилегированным сервисам, уже разрешённым пользователю. [Контракт Linux no_new_privs](https://docs.kernel.org/userspace-api/no_new_privs.html).
 
 File tools проверяют весь batch до execution, читают только regular single-link files с nofollow walk каждого компонента. Dotenv, известные credential stores и собственные auth/session roots исключены. Search ограничивает visited entries, files, prefix bytes, matches и encoded output. Config/AGENTS также не следуют symlink/hardlink. Вложенные инструкции требуют актуального token перед доступом; shell остаётся full access и не является sandbox. Effective settings и начальные инструкции входят в exact context epoch: их смена требует новой сессии. Catalog info.json используется только для выбора сессии, canonical journal проверяет binding/config самостоятельно.
 
@@ -132,7 +131,7 @@ Worker проверяет auth до provider callback и до durable tool inten
 
 `Submit.mode` закрепляет basic/plan за turn; старые записи без mode означают basic. Plan создаёт отдельную exact epoch с политикой и revision read-only snapshot. Base epoch и общая native history сохраняются, compact использует base context и затем восстанавливает режим текущего turn. Compiled tool явно объявляет `read_only`; provider получает filtered descriptors, подготовка всего batch проверяет тот же filtered snapshot. Инструкции модели не заменяют backend-проверку.
 
-Transcript является производной проекцией проверенных canonical records: accepted добавляет user, done добавляет итоговый assistant. Cancel/pause меняют статус незавершённого запроса. Summary, opaque reasoning и tool payloads не становятся репликами. Неизменяемые блоки по 64 записи позволяют обновлять конец проекции без копирования всех текстов. `GetTranscript` выдаёт bounded страницы до 64 записей и 256 KiB текста; frontend хранит окно страниц. Сам canonical journal по-прежнему восстанавливается полным replay.
+Transcript строится из проверенных canonical records: accepted добавляет user, done добавляет итоговый assistant. Cancel/pause меняют статус незавершённого запроса. Summary, opaque reasoning и tool payloads хранятся отдельно от реплик. Неизменяемые блоки по 64 записи позволяют обновлять конец проекции без копирования всех текстов. `GetTranscript` выдаёт bounded страницы до 64 записей и 256 KiB текста; frontend хранит окно страниц. Сам canonical journal по-прежнему восстанавливается полным replay.
 
 Runtime публикует transcript только из последнего успешно синхронизированного состояния. При fsync failure candidate может сохранить известные outcomes для snapshot, но его несохранённый assistant не становится завершённой репликой. Первая страница истории загружается до первого интерактивного prompt.
 
@@ -140,7 +139,17 @@ Worker передаёт cumulative preview через один заменяем�
 
 Терминальный frontend редактирует ввод в noncanonical режиме и перерисовывает ограниченную область основного буфера отдельным writer. Заблокированный stdout не задерживает input/control. RAII восстанавливает termios; job control временно возвращает исходные настройки. Рендерер обрабатывает ширину UTF-8 символов и обезвреживает terminal controls в пользовательском и model тексте. Pipe, one-shot и JSONL используют общий typed runtime без интерактивного рендера.
 
-Структурированный `TerminalEntry` отделяет роль от содержимого. Markdown и fences разбираются для assistant, а пользовательский текст сохраняется буквально. Диалог занимает всю высоту терминала, ввод и текущие уведомления закреплены внизу; delta writer сохраняет неподвижные строки при чтении истории. Word wrapping и стили учитывают ширину glyphs. Подтверждённый финальный preview остаётся до получения transcript page без дублирования; committed tool-response не считается завершённым turn.
+Структурированный `carbon::Entry` отделяет роль от содержимого. Markdown и fences разбираются для assistant, пользовательский текст сохраняется буквально. Диалог занимает всю высоту терминала, ввод и текущие уведомления закреплены внизу. Подтверждённый финальный preview остаётся до получения transcript page без дублирования; committed tool-response не считается завершённым turn.
+
+Переносы, padding, курсор и копирование используют общие extended grapheme clusters и их ширину в ячейках терминала. `Frame` хранит границу панелей и ставит inspector на абсолютную колонку. Обновление справа сохраняет левую панель, включая составные emoji. Выделение хранит исходный кадр для копирования; координаты строк статуса позволяют обновлять диагностику во время выделения и в узком layout.
+
+`Timeline` выводит `ToolDetail` из подтверждённых intent/outcome: operation/call identity, цель, назначение, фазу и границы payload. Проекция объединяет жизненный цикл вызова и группирует чтение/поиск. Неизвестные эффекты и ошибки видны в свёрнутом виде. Страница ограничена 64 entries и 256 KiB с учётом metadata; аргументы и вывод разбиваются по UTF-8 границам, части помечены явно. Snapshot дополняет операции страницы; временный вывод из него ограничен 2048 символами. Metadata сохраняется в fork seed; прежние текстовые строки читаются через совместимый fallback. Обычный v1 journal codec сохранён.
+
+Markdown-файлы разбирает CommonMark parser в file worker. Отдельный bounded worker переносит блоки под ширину inspector и проверяет Cancel. Одновременно выполняется один такой расчёт; устаревшая работа завершается до запуска новой. Результат принимается по file token и ширине. Якорь блока и символа сохраняет место при resize; диапазон исходных строк нужен для `:номер`.
+
+Ручной терминал занимает ту же рабочую панель, что файлы и полный вывод инструмента. Отдельный PTY worker владеет shell, файловыми дескрипторами и очисткой принадлежащей ему process session; bounded input и приоритетный interrupt отделены от runtime Cancel. Экран разбирается VT parser и рисуется через обычный renderer. Ручной ввод и вывод не становятся model context или journal events. Проверка foreground process group и zsh prompt hook разрешает Esc возврат к файлам только из приглашения shell. Скрытая панель не получает ввод. Очистка ограничена принадлежащим SID; отделившиеся через setsid процессы могут сохраниться.
+
+Меню моделей сразу читает локальный display cache и обновляет его в worker. Этот кэш не даёт разрешения на dispatch: auth epoch и каталог отдельно проверяет authorization path. Выбор модели и effort подтверждается одной typed command. Названия сохранённых сессий выводятся из readonly replay с проверкой canonical State и идентичности файла до, во время и после чтения. Производные сводки не создают журнал и не восстанавливают его; непроверяемая сводка отмечается недоступной.
 
 Запуск live CLI строит binding из локального `AuthStatus`, включая opaque auth session ID без bearer. `AgentAuthorization` откладывает access/refresh и каталог моделей до serialized dispatch worker. Он проверяет account/session до generation и tools, принимает смену session только при явном Resume и кеширует успешную проверку model catalog на auth epoch. `AuthManager::generate` и execution lease продолжают независимо проверять допуск. Сетевые запросы больше не предшествуют первому кадру.
 
@@ -150,4 +159,4 @@ Worker передаёт cumulative preview через один заменяем�
 
 Расширение auth включает несколько профилей и системный secret store. Orchestrate, token-aware context budget, MCP, hooks, Ask, интерактивный sudo и отдельный TUI остаются в TODO.
 
-Исходные audit/P0 reports из `/home/gusevsaint/harness-research/` использованы read-only. Python probes не запускаются и не становятся dependency. Репозиторий содержит только синтетические fixture data.
+Исходные audit/P0 reports из `/home/gusevsaint/harness-research/` использованы как справочные материалы. Репозиторий содержит синтетические fixture data.

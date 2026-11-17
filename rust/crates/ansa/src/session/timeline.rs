@@ -2,13 +2,86 @@
 //! It never supplies provider context and never exposes encrypted reasoning.
 use super::{
     Result, codec_v1,
-    transcript::{Entry, Page, Transcript},
+    transcript::{Entry, Page, ToolDetail, ToolPhase, Transcript},
 };
 use crate::{
     protocol::json::Json,
     provider::contracts::{AgentMode, GetTranscript, RequestId, TurnId},
 };
 use std::collections::BTreeMap;
+
+impl ToolDetail {
+    fn save(&self) -> Result<Json> {
+        let (execution, effects) = match self.phase {
+            ToolPhase::Prepared => (4, 0),
+            ToolPhase::Finished { execution, effects } => (execution as usize, effects as usize),
+        };
+        Json::object(vec![
+            ("operation", Json::string(&self.operation)?),
+            ("name", Json::string(&self.name)?),
+            ("call", Json::string(&self.call)?),
+            ("purpose", Json::string(&self.purpose)?),
+            ("target", Json::string(&self.target)?),
+            ("execution", super::num(execution)?),
+            ("effects", super::num(effects)?),
+            ("content_start", super::num(self.content_start)?),
+            (
+                "continued",
+                Json::parse(if self.continued { "true" } else { "false" })?,
+            ),
+            (
+                "last_chunk",
+                Json::parse(if self.last_chunk { "true" } else { "false" })?,
+            ),
+        ])
+    }
+    fn load(value: &Json, text: &str) -> Result<Self> {
+        use crate::provider::replay::{Effects, Execution};
+        let operation = value.text_field("operation")?;
+        let name = value.text_field("name")?;
+        let call = value.text_field("call")?;
+        let purpose = value.text_field("purpose")?;
+        let target = value.text_field("target")?;
+        let content_start = value.usize_field("content_start")?;
+        if !text.is_char_boundary(content_start) {
+            return Err("fork_timeline_tool");
+        }
+        let effects = match value.usize_field("effects")? {
+            0 => Effects::NotStarted,
+            1 => Effects::KnownResult,
+            2 => Effects::Unknown,
+            _ => return Err("fork_timeline_tool"),
+        };
+        let phase = match value.usize_field("execution")? {
+            4 if effects == Effects::NotStarted => ToolPhase::Prepared,
+            n => ToolPhase::Finished {
+                execution: match n {
+                    0 => Execution::Succeeded,
+                    1 => Execution::Failed,
+                    2 => Execution::Cancelled,
+                    3 => Execution::Denied,
+                    _ => return Err("fork_timeline_tool"),
+                },
+                effects,
+            },
+        };
+        let result = Self {
+            operation: operation.into(),
+            name: name.into(),
+            call: call.into(),
+            purpose: purpose.into(),
+            target: target.into(),
+            phase,
+            content_start,
+            continued: value.field("continued")?.boolean()?,
+            last_chunk: value.field("last_chunk")?.boolean()?,
+        };
+        if !result.display_valid() || result.display_bytes() + text.len() > 256 * 1024 {
+            return Err("fork_timeline_tool_limit");
+        }
+        Ok(result)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Timeline {
@@ -17,7 +90,7 @@ pub struct Timeline {
     request: RequestId,
     mode: AgentMode,
     final_text: String,
-    names: BTreeMap<String, String>,
+    names: BTreeMap<String, ToolDetail>,
     purposes: BTreeMap<String, std::sync::Arc<str>>,
     pending: BTreeMap<String, String>,
 }
@@ -61,7 +134,7 @@ impl Timeline {
                 if bytes > 8 * 1024 * 1024 || entries.len() >= 65536 {
                     return Err("fork_timeline_limit");
                 }
-                entries.push(Json::object(vec![
+                let mut fields = vec![
                     ("turn", Json::string(&entry.turn.0)?),
                     ("request", Json::string(&entry.request.0)?),
                     ("role", Json::string(&entry.role)?),
@@ -75,7 +148,15 @@ impl Timeline {
                             "basic"
                         })?,
                     ),
-                ])?);
+                ];
+                if let Some(tool) = &entry.tool {
+                    fields.push(("tool", tool.save()?));
+                    bytes += tool.display_bytes();
+                    if bytes > 8 * 1024 * 1024 {
+                        return Err("fork_timeline_limit");
+                    }
+                }
+                entries.push(Json::object(fields)?);
             }
             if page.end <= offset {
                 return Err("fork_timeline_page");
@@ -116,6 +197,21 @@ impl Timeline {
                 "plan" => AgentMode::Plan,
                 _ => return Err("session_mode"),
             };
+            let tool = if entry.has("tool") {
+                let tool = ToolDetail::load(entry.field("tool")?, text)?;
+                if !matches!(role, "tool" | "tool_result")
+                    || (role == "tool") != matches!(tool.phase, ToolPhase::Prepared)
+                {
+                    return Err("fork_timeline_tool");
+                }
+                bytes += tool.display_bytes();
+                if bytes > 8 * 1024 * 1024 {
+                    return Err("fork_timeline_limit");
+                }
+                Some(std::sync::Arc::new(tool))
+            } else {
+                None
+            };
             result.entries.append(Entry {
                 turn: turn.into(),
                 request: request.into(),
@@ -123,17 +219,27 @@ impl Timeline {
                 text: text.into(),
                 state: state.into(),
                 mode,
+                tool,
             });
         }
         Ok(result)
     }
     fn append(&mut self, role: &str, text: String, state: &str) {
+        self.append_tool(role, text, state, None);
+    }
+    fn append_tool(&mut self, role: &str, text: String, state: &str, tool: Option<ToolDetail>) {
+        // An oversized custom descriptor keeps its lossless plain projection.
+        // Typed display metadata must fit alongside at least one UTF-8 scalar.
+        let tool = tool.filter(ToolDetail::display_valid);
+        let chunk_limit =
+            (128 * 1024).min(256 * 1024 - tool.as_ref().map_or(0, ToolDetail::display_bytes));
         // Arguments and summaries may exceed a page entry, and tool output
         // may fill its whole native limit before the display prefix is added.
         // Split the projection losslessly; provider-native history is untouched.
         let mut remaining = text.as_str();
+        let mut offset = 0;
         loop {
-            let mut end = remaining.len().min(128 * 1024);
+            let mut end = remaining.len().min(chunk_limit);
             while !remaining.is_char_boundary(end) {
                 end -= 1;
             }
@@ -144,8 +250,16 @@ impl Timeline {
                 text: remaining[..end].into(),
                 state: state.into(),
                 mode: self.mode,
+                tool: tool.as_ref().map(|tool| {
+                    let mut detail = tool.clone();
+                    detail.content_start = detail.content_start.saturating_sub(offset).min(end);
+                    detail.continued = offset > 0;
+                    detail.last_chunk = offset + end == text.len();
+                    std::sync::Arc::new(detail)
+                }),
             });
             remaining = &remaining[end..];
+            offset += end;
             if remaining.is_empty() {
                 break;
             }
@@ -216,45 +330,103 @@ impl Timeline {
             }
             "intent" => {
                 let invocation = codec_v1::Invocation::load(event.field("invocation")?)?;
-                self.names
-                    .insert(invocation.operation.clone(), invocation.name.clone());
-                self.append(
+                let purpose = self
+                    .purposes
+                    .get(&invocation.name)
+                    .cloned()
+                    .unwrap_or_default();
+                let prefix = format!(
+                    "{} (prepared)\n{}\n{}\n",
+                    invocation.name, purpose, invocation.operation
+                );
+                let mut target = ["command", "path", "query"]
+                    .iter()
+                    .filter_map(|field| invocation.arguments.text_field(field).ok())
+                    .map(|value| value.chars().take(160).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if target.is_empty()
+                    && let Ok(argv) = invocation.arguments.field("argv").and_then(Json::elements)
+                {
+                    target = argv
+                        .iter()
+                        .take(16)
+                        .filter_map(|arg| arg.text().ok())
+                        .map(|arg| {
+                            let arg: String = arg.chars().take(160).collect();
+                            if arg.chars().any(char::is_whitespace) {
+                                Json::string(&arg).map_or(arg.clone(), |value| value.dump())
+                            } else {
+                                arg
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if let Ok(cwd) = invocation.arguments.text_field("cwd") {
+                        target.push_str(" · ");
+                        target.extend(cwd.chars().take(80));
+                    }
+                }
+                let target: String = target.chars().take(480).collect();
+                let detail = ToolDetail {
+                    operation: invocation.operation.clone(),
+                    name: invocation.name,
+                    call: invocation.call,
+                    purpose,
+                    target,
+                    phase: ToolPhase::Prepared,
+                    content_start: prefix.len(),
+                    continued: false,
+                    last_chunk: true,
+                };
+                self.names.insert(invocation.operation, detail.clone());
+                self.append_tool(
                     "tool",
-                    format!(
-                        "{} (prepared)\n{}\n{}\n{}",
-                        invocation.name,
-                        self.purposes
-                            .get(&invocation.name)
-                            .map_or("", |text| text.as_ref()),
-                        invocation.operation,
-                        invocation.arguments.dump()
-                    ),
+                    format!("{prefix}{}", invocation.arguments.dump()),
                     "intent",
+                    Some(detail),
                 );
             }
             "outcome" => {
                 let result = codec_v1::SavedResult::load(event.field("result")?)?;
-                let name = self
+                let mut detail = self
                     .names
                     .get(result.result.operation_id())
-                    .map(String::as_str)
-                    .unwrap_or("tool");
-                self.append(
+                    .cloned()
+                    .unwrap_or_else(|| ToolDetail {
+                        operation: result.result.operation_id().into(),
+                        name: "tool".into(),
+                        call: result.result.call_id().into(),
+                        purpose: "".into(),
+                        target: String::new(),
+                        phase: ToolPhase::Prepared,
+                        content_start: 0,
+                        continued: false,
+                        last_chunk: true,
+                    });
+                let prefix = format!(
+                    "{} {:?} {:?}\n",
+                    detail.name,
+                    result.result.execution(),
+                    result.result.effects()
+                );
+                detail.phase = ToolPhase::Finished {
+                    execution: result.result.execution(),
+                    effects: result.result.effects(),
+                };
+                detail.content_start = prefix.len();
+                self.append_tool(
                     "tool_result",
-                    format!(
-                        "{name} {:?} {:?}\n{}",
-                        result.result.execution(),
-                        result.result.effects(),
-                        result.result.output()
-                    ),
+                    format!("{prefix}{}", result.result.output()),
                     "finished",
+                    Some(detail),
                 );
             }
             "done" => {
                 let text = std::mem::take(&mut self.final_text);
                 self.append("assistant", text, "completed");
             }
-            "cancel" => self.append("notice", "Current step interrupted".into(), "cancelled"),
+            "cancel" => self.append("notice", "Текущий шаг остановлен".into(), "cancelled"),
             _ => {}
         }
         Ok(())
@@ -268,6 +440,123 @@ mod tests {
         frontend::app,
         provider::request::{Epoch, Request},
     };
+    #[test]
+    fn command_target_uses_the_production_argv_and_cwd_contract() {
+        let mut timeline = Timeline::default();
+        timeline.observe(&Json::parse(r#"{"kind":"intent","invocation":{"operation":"run:op:1","call":"call","name":"run_command","revision":"1","arguments":{"argv":["sh","-c","printf hello"],"cwd":"src"}}}"#).unwrap()).unwrap();
+        let page = timeline.page(GetTranscript {
+            before: 0,
+            limit: 1,
+            forward: true,
+        });
+        let target = &page.entries[0].tool.as_ref().unwrap().target;
+        assert!(
+            target.contains("sh -c \"printf hello\"") && target.contains("src"),
+            "{target}"
+        );
+    }
+    #[test]
+    fn tool_metadata_roundtrips_chunked_unicode_and_accepts_legacy_fork_rows() {
+        let mut timeline = Timeline::default();
+        let payload = "界".repeat(100_000);
+        let detail = ToolDetail {
+            operation: "run:op:1".into(),
+            name: "read_file".into(),
+            call: "call".into(),
+            purpose: "Read file purpose".into(),
+            target: "src/界.rs".into(),
+            phase: ToolPhase::Prepared,
+            content_start: 4,
+            continued: false,
+            last_chunk: true,
+        };
+        timeline.append_tool("tool", format!("raw\n{payload}"), "intent", Some(detail));
+        let restored = Timeline::load(&timeline.save().unwrap()).unwrap();
+        let mut offset = 0;
+        let mut seen = String::new();
+        while offset < restored.len() {
+            let page = restored.page(GetTranscript {
+                before: offset,
+                limit: 64,
+                forward: true,
+            });
+            assert!(
+                page.entries
+                    .iter()
+                    .map(|entry| entry.text.len() + entry.tool.as_ref().unwrap().display_bytes())
+                    .sum::<usize>()
+                    <= 256 * 1024
+            );
+            for (index, entry) in page.entries.iter().enumerate() {
+                let tool = entry.tool.as_ref().unwrap();
+                assert_eq!(tool.continued, offset + index > 0);
+                assert_eq!(tool.operation, "run:op:1");
+                seen.push_str(&entry.text[tool.content_start..]);
+            }
+            offset = page.end;
+        }
+        assert_eq!(seen, payload);
+        let old = Json::parse(r#"[{"turn":"idle","request":"idle","role":"tool","text":"legacy args","state":"intent","mode":"basic"}]"#).unwrap();
+        let old = Timeline::load(&old).unwrap();
+        assert!(
+            old.page(GetTranscript {
+                before: 0,
+                limit: 1,
+                forward: true
+            })
+            .entries[0]
+                .tool
+                .is_none()
+        );
+        let detail = timeline
+            .page(GetTranscript {
+                before: 0,
+                limit: 1,
+                forward: true,
+            })
+            .entries[0]
+            .tool
+            .clone()
+            .unwrap();
+        let bad = Json::parse(
+            &detail
+                .save()
+                .unwrap()
+                .dump()
+                .replace("\"content_start\":4", "\"content_start\":999999"),
+        )
+        .unwrap();
+        assert!(ToolDetail::load(&bad, "raw\n{}").is_err());
+        for long_purpose in [false, true] {
+            let mut metadata = (*detail).clone();
+            if long_purpose {
+                metadata.purpose = "p".repeat(160 * 1024).into();
+            } else {
+                metadata.call = "c".repeat(5000);
+            }
+            let mut plain = Timeline::default();
+            plain.append_tool(
+                "tool",
+                "tool (prepared)\nraw args".into(),
+                "intent",
+                Some(metadata),
+            );
+            let restored = Timeline::load(&plain.save().unwrap()).unwrap();
+            let page = restored.page(GetTranscript {
+                before: 0,
+                limit: 64,
+                forward: true,
+            });
+            assert!(page.entries.iter().all(|entry| entry.tool.is_none()));
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .map(|entry| entry.text.as_str())
+                    .collect::<String>(),
+                "tool (prepared)\nraw args"
+            );
+        }
+    }
     #[test]
     fn prepared_tool_purpose_comes_from_admitted_descriptor() {
         let tools = app::pure_tools().unwrap();

@@ -5,27 +5,40 @@ use crate::{
     auth::Cancel,
     frontend::{
         carbon::{Choice, Focus, Inspector, InspectorKind, Popup, Selection, Workspace},
+        commands::{self, Completion},
         input::{MouseEvent, MouseKind},
         sessions::{Created, Factory, Kind},
+        theme::{Catalog as ThemeCatalog, Preview as ThemePreview, Store as ThemeStore, Theme},
         workspace::{DiffStatus, EditorCommand, FileDocument, FileHost, FileListing},
     },
     protocol::json::Json,
-    session::catalog::CatalogEntry,
+    session::catalog::SessionSummary,
 };
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
 use tokio::sync::mpsc;
+mod ux;
 
 const MAX_SESSIONS: usize = 16;
 const MAX_BACKGROUND: usize = 4;
 const MAX_JOBS: usize = 4;
 
+fn display_title(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(72)
+        .collect()
+}
+
 struct Slot {
     id: String,
     kind: Kind,
     parent: Option<String>,
+    title: Option<String>,
     runtime: Runtime,
     handle: Handle,
     state: State,
@@ -46,6 +59,9 @@ struct Slot {
     ready_refresh: bool,
     ready_snapshot: Option<CommandId>,
     startup_cancelled: bool,
+    jump_top: bool,
+    tool_expanded: std::collections::BTreeSet<String>,
+    tool_anchor_limit: Option<usize>,
 }
 impl Slot {
     fn new(
@@ -62,10 +78,12 @@ impl Slot {
             state.mode = AgentMode::Plan;
             state.mode_ready = true;
         }
+        let title = prompt.as_deref().map(display_title);
         Self {
             id,
             kind,
             parent,
+            title,
             runtime,
             handle,
             state,
@@ -90,7 +108,55 @@ impl Slot {
             ready_refresh: true,
             ready_snapshot: None,
             startup_cancelled: false,
+            jump_top: false,
+            tool_expanded: Default::default(),
+            tool_anchor_limit: None,
         }
+    }
+    #[cfg(test)]
+    fn jump_history(&mut self, top: bool) {
+        self.state.reading = None;
+        self.jump_top = top;
+        if !top {
+            self.state.scroll = 0;
+        }
+        self.state.follow_tail = !top;
+        self.timeline_query = GetTranscript {
+            before: 0,
+            limit: 64,
+            forward: top,
+        };
+        self.refresh = Instant::now();
+    }
+    fn cancel_history_jump(&mut self) {
+        if std::mem::take(&mut self.jump_top)
+            && let Some(page) = &self.timeline
+        {
+            self.timeline_query = GetTranscript {
+                before: page.end,
+                limit: 64,
+                forward: false,
+            };
+        }
+    }
+    fn received_timeline(&mut self, page: &TranscriptPage) {
+        if self
+            .timeline
+            .as_ref()
+            .is_none_or(|old| (old.begin, old.end) != (page.begin, page.end))
+            || self.jump_top
+        {
+            self.state.reading = None;
+        }
+        if self.jump_top
+            && !self.state.follow_tail
+            && page.query == self.timeline_query
+            && page.query.forward
+        {
+            self.state.scroll = usize::MAX;
+        }
+        self.jump_top = false;
+        self.timeline = Some(page.clone());
     }
     fn active(&self) -> bool {
         !self.ready
@@ -145,9 +211,7 @@ impl Slot {
         while let Some(reply) = self.replies.try_join_next() {
             dirty = true;
             let (id, submit, internal, result) = reply.map_err(|_| "cli_post_task")?;
-            if self.state.snapshot_read.as_ref() == Some(&id) {
-                self.state.snapshot_read = None;
-            }
+            self.state.read_replied(&id);
             let retry = internal && matches!(&result, Ok(PostStatus::QueueFull));
             if retry {
                 if self.ready_snapshot.as_ref() == Some(&id) {
@@ -234,6 +298,8 @@ impl Slot {
             );
             self.settled = now + Duration::from_millis(40);
         }
+        self.state.recall_page(&self.handle, &mut self.replies);
+        self.state.copy_page(&self.handle, &mut self.replies, io);
         let transcript_stale = !self.state.history_ready
             || self
                 .state
@@ -293,8 +359,6 @@ impl Slot {
                 self.settled = now + Duration::from_millis(40);
             }
         }
-        self.state.recall_page(&self.handle, &mut self.replies);
-        self.state.copy_page(&self.handle, &mut self.replies, io);
         if self.input_ready()
             && self.state.available()
             && let Some(prompt) = self.pending_prompt.take()
@@ -331,58 +395,28 @@ impl Slot {
     fn projected(&self) -> Option<Vec<Entry>> {
         let page = self.timeline.as_ref()?;
         let view = self.state.snapshot.as_ref()?;
-        let current_progress = if view.worker_busy
-            && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
-        {
-            self.state
-                .progress
-                .entries(view, self.state.tools_expanded, Instant::now())
-        } else {
-            Vec::new()
-        };
-        let mut entries = Vec::new();
-        for entry in &page.entries {
-            if !current_progress.is_empty()
-                && !self.state.tools_expanded
-                && Some(&entry.request) == view.request.as_ref()
-                && matches!(entry.role.as_str(), "tool" | "tool_result")
-            {
-                continue;
-            }
-            let text = if self.state.tools_expanded
-                || !matches!(entry.role.as_str(), "tool" | "tool_result" | "reasoning")
-            {
-                entry.text.clone()
-            } else {
-                entry
-                    .text
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(180)
-                    .collect()
-            };
-            entries.push(Entry {
-                role: entry.role.clone(),
-                text,
-            });
-        }
+        let now = Instant::now();
+        let mut entries = super::super::tool_ui::project(
+            &page.entries,
+            view,
+            &self.tool_expanded,
+            self.state.tools_expanded,
+            page.end == page.total,
+            |operation| self.state.progress.tool_elapsed(operation, now),
+        );
         if page.end == page.total {
-            entries.extend(current_progress.into_iter().map(|mut entry| {
-                if self.state.tools_expanded {
-                    entry.text = entry.text.lines().next().unwrap_or_default().into();
-                }
-                entry
-            }));
             for message in view
                 .followups
                 .iter()
                 .filter(|message| message.state == "queued")
             {
                 entries.push(Entry {
-                    role: "user".into(),
-                    text: format!("{}\n(ожидает текущий шаг)", message.text),
+                    action: None,
+                    edit: None,
+                    output: None,
+                    status: None,
+                    role: "queued_user".into(),
+                    text: message.text.clone(),
                 });
             }
             if let Some(preview) = &self.state.preview
@@ -391,6 +425,10 @@ impl Slot {
                 && self.state.preview_request == view.request
             {
                 entries.push(Entry {
+                    action: None,
+                    edit: None,
+                    output: None,
+                    status: None,
                     role: "assistant".into(),
                     text: format!(
                         "{}\n({})",
@@ -403,6 +441,23 @@ impl Slot {
                     ),
                 });
             }
+        }
+        if page.end == page.total
+            && view.worker_busy
+            && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
+        {
+            entries.push(Entry {
+                action: None,
+                edit: None,
+                output: None,
+                status: None,
+                role: "activity".into(),
+                text: format!(
+                    "{} · {}",
+                    Progress::phase(view, self.state.preview.is_some()),
+                    self.state.progress.elapsed().unwrap_or_default()
+                ),
+            });
         }
         Some(entries)
     }
@@ -418,6 +473,19 @@ enum FileValue {
     Document(FileDocument),
 }
 enum Job {
+    Themes {
+        request: ThemeLoad,
+        result: Result<ThemeCatalog>,
+    },
+    ThemeSaved {
+        revision: u64,
+        theme: Theme,
+        result: Result<()>,
+    },
+    ThemeReload {
+        revision: u64,
+        result: Result<Theme>,
+    },
     Created {
         source: String,
         prompt: Option<String>,
@@ -427,7 +495,10 @@ enum Job {
     Sessions {
         owner: String,
         token: u64,
-        result: Result<Vec<CatalogEntry>>,
+        result: Result<Vec<SessionSummary>>,
+    },
+    CachedModels {
+        result: Result<Option<Json>>,
     },
     Models {
         owner: String,
@@ -435,9 +506,17 @@ enum Job {
         effort: bool,
         result: Result<Json>,
     },
+    CachedSummaries {
+        result: Result<Vec<SessionSummary>>,
+    },
     File {
         token: u64,
         result: Result<FileValue>,
+    },
+    Preview {
+        token: u64,
+        width: usize,
+        rows: Option<PreviewRows>,
     },
     EditorReady {
         owner: String,
@@ -446,10 +525,19 @@ enum Job {
         result: Result<EditorCommand>,
     },
 }
+enum ThemeLoad {
+    Startup,
+    Picker {
+        owner: String,
+        token: u64,
+        requested: Option<String>,
+    },
+}
 enum Menu {
+    Themes(ThemePreview),
     Loading(String),
     Sessions {
-        entries: Vec<CatalogEntry>,
+        entries: Vec<SessionSummary>,
         selected: usize,
     },
     Models {
@@ -457,10 +545,20 @@ enum Menu {
         selected: usize,
     },
     Efforts {
+        model: String,
+        previous: Option<(ModelChoices, usize)>,
         values: Vec<Option<String>>,
         selected: usize,
     },
-    Help,
+    Help {
+        selected: usize,
+    },
+}
+type PreviewRows = std::sync::Arc<Vec<super::super::markdown::Row>>;
+struct PreviewJob {
+    token: u64,
+    width: usize,
+    stop: Cancel,
 }
 struct Files {
     token: u64,
@@ -471,29 +569,93 @@ struct Files {
     offset: usize,
     loading: bool,
     jump: Option<String>,
+    preview_cache: Option<(usize, PreviewRows)>,
+    preview_width: Option<usize>,
+    preview_end: bool,
 }
 impl Files {
+    fn preview_rows(&self) -> Option<&PreviewRows> {
+        self.preview_cache
+            .as_ref()
+            .filter(|(width, _)| self.preview_width == Some(*width))
+            .map(|(_, rows)| rows)
+    }
+    fn accept_preview(&mut self, token: u64, width: usize, rows: Option<PreviewRows>) -> bool {
+        if self.token != token || self.preview_width != Some(width) {
+            return false;
+        }
+        let Some(rows) = rows else {
+            return false;
+        };
+        if self.tab == 2
+            && let Some(anchor) = self
+                .preview_cache
+                .as_ref()
+                .and_then(|(_, old)| old.get(self.offset))
+                .map(|row| row.anchor)
+        {
+            self.offset = super::super::markdown::Row::locate(&rows, anchor);
+        }
+        if self.tab == 2 && self.preview_end {
+            self.offset = rows.len().saturating_sub(1);
+        }
+        self.preview_end = false;
+        self.preview_cache = Some((width, rows));
+        true
+    }
     fn last_line(&self) -> usize {
+        if self.tab == 2 {
+            // Navigation keeps using the last completed layout while a resize
+            // worker computes its replacement; only display requires the width.
+            return self
+                .preview_cache
+                .as_ref()
+                .map_or(0, |(_, rows)| rows.len().saturating_sub(1));
+        }
         self.document.as_ref().map_or(0, |document| match self.tab {
             1 => document.diff.text.lines().count().saturating_sub(1),
-            2 => document
-                .preview
-                .as_deref()
-                .unwrap_or_default()
-                .lines()
-                .count()
-                .saturating_sub(1),
             _ => document.source.lines().count().saturating_sub(1),
         })
     }
 }
 enum Panel {
     Files(Box<Files>),
-    Agents { selected: usize },
+    Agents {
+        selected: usize,
+    },
+    Terminal,
+    Output {
+        view: std::sync::Arc<carbon::OutputView>,
+        offset: usize,
+    },
+    EditDiff {
+        title: String,
+        rows: std::sync::Arc<Vec<super::super::diff::Row>>,
+        offset: usize,
+        column: usize,
+    },
 }
+type ModelChoices = Vec<(String, String, Vec<String>)>;
+type ToolPress = (
+    usize,
+    usize,
+    String,
+    Option<std::sync::Arc<super::super::diff::EditView>>,
+    Option<std::sync::Arc<carbon::OutputView>>,
+);
 struct Workbench {
     factory: Factory,
     files: FileHost,
+    theme_store: ThemeStore,
+    theme: Theme,
+    saved_theme: Theme,
+    theme_initialized: bool,
+    theme_revision: u64,
+    theme_save: Option<u64>,
+    pending_theme: Option<(u64, Theme)>,
+    theme_reload: bool,
+    theme_refresh: Instant,
+    theme_error: Option<&'static str>,
     slots: Vec<Slot>,
     current: usize,
     root_id: String,
@@ -505,14 +667,32 @@ struct Workbench {
     pending_context: BTreeMap<String, CreateIntent>,
     pending_results: BTreeMap<String, (String, Option<RequestId>)>,
     menu: Option<Menu>,
+    completion: Option<Completion>,
+    navigation_editor: super::super::input::Editor,
+    completion_closed: Option<(Vec<u8>, usize)>,
+    models_cache: Option<Json>,
+    models_refreshed: Option<Instant>,
+    models_refreshing: bool,
+    requested_model: Option<String>,
+    summaries: Vec<SessionSummary>,
     panel: Option<Panel>,
+    output_back: Option<Box<Panel>>,
+    terminal_back: Option<Box<Files>>,
+    terminal: Option<super::super::terminal_pane::TerminalPane>,
+    terminal_decoder: super::super::terminal_input::TerminalInput,
+    terminal_escape_at: Option<Instant>,
+    terminal_pending_input: Vec<u8>,
+    terminal_grid: Option<(u64, std::sync::Arc<Vec<String>>)>,
+    terminal_size: Option<(u16, u16)>,
     focus: Focus,
     selection: Option<Selection>,
+    tool_press: Option<ToolPress>,
     frames: std::collections::VecDeque<(u64, carbon::Frame)>,
     displayed: Option<carbon::Frame>,
     operational_frame: Option<u64>,
     last_frame: Option<carbon::Frame>,
     file_token: u64,
+    preview_job: Option<PreviewJob>,
     editor: Option<super::super::terminal::EditorJob>,
     pending_editor: Option<EditorCommand>,
     editor_preparing: bool,
@@ -565,10 +745,21 @@ impl Workbench {
         parent: Option<String>,
     ) -> Result<Self> {
         let files = FileHost::new(&factory.settings, &factory.auth_path)?;
+        let theme_store = ThemeStore::new(&factory.settings.home, &factory.settings.directory);
         let (sender, events) = mpsc::channel(64);
         let mut value = Self {
             factory,
             files,
+            theme_store,
+            theme: Theme::default(),
+            saved_theme: Theme::default(),
+            theme_initialized: false,
+            theme_revision: 0,
+            theme_save: None,
+            pending_theme: None,
+            theme_reload: false,
+            theme_refresh: Instant::now(),
+            theme_error: None,
             slots: Vec::new(),
             current: 0,
             root_id: root_id.clone(),
@@ -580,14 +771,32 @@ impl Workbench {
             pending_context: BTreeMap::new(),
             pending_results: BTreeMap::new(),
             menu: None,
+            completion: None,
+            navigation_editor: Default::default(),
+            completion_closed: None,
+            models_cache: None,
+            models_refreshed: None,
+            models_refreshing: false,
+            requested_model: None,
+            summaries: Vec::new(),
             panel: None,
+            output_back: None,
+            terminal_back: None,
+            terminal: None,
+            terminal_decoder: Default::default(),
+            terminal_escape_at: None,
+            terminal_pending_input: Vec::new(),
+            terminal_grid: None,
+            terminal_size: None,
             focus: Focus::Chat,
             selection: None,
+            tool_press: None,
             frames: std::collections::VecDeque::new(),
             displayed: None,
             operational_frame: None,
             last_frame: None,
             file_token: 0,
+            preview_job: None,
             editor: None,
             pending_editor: None,
             editor_preparing: false,
@@ -599,6 +808,22 @@ impl Workbench {
             terminating: false,
         };
         value.add(Slot::new(runtime, root_id, kind, parent, None, false));
+        let store = value.theme_store.clone();
+        let stop = Cancel::linked(&value.stop);
+        value.jobs.spawn_blocking(move || Job::Themes {
+            request: ThemeLoad::Startup,
+            result: store.load(&stop),
+        });
+        let factory = value.factory.clone();
+        let stop = Cancel::linked(&value.stop);
+        value.jobs.spawn_blocking(move || Job::CachedModels {
+            result: factory.cached_models(&stop),
+        });
+        let factory = value.factory.clone();
+        let stop = Cancel::linked(&value.stop);
+        value.jobs.spawn_blocking(move || Job::CachedSummaries {
+            result: factory.summaries(&stop),
+        });
         Ok(value)
     }
     fn add(&mut self, slot: Slot) {
@@ -653,9 +878,15 @@ impl Workbench {
         self.slots[index].refresh = Instant::now();
         self.slots[index].resync = true;
         self.menu = None;
+        self.completion = None;
+        self.completion_closed = None;
+        self.requested_model = None;
+        self.terminal_decoder.take_pending();
+        self.terminal_escape_at = None;
         self.panel = None;
         self.focus = Focus::Chat;
         self.selection = None;
+        self.tool_press = None;
         self.last_frame = None;
         self.frames.clear();
         self.displayed = None;
@@ -725,9 +956,13 @@ impl Workbench {
         let command = slot.state.command(&slot.handle, CommandPayload::GetContext);
         let id = command.command.clone();
         let key = id.0.clone();
-        let handle = slot.handle.clone();
-        slot.replies
-            .spawn(async move { (id, false, false, handle.post(command).await) });
+        if !slot
+            .state
+            .post_command(&slot.handle, command, &mut slot.replies, false)
+        {
+            slot.state.report(io, "Дождитесь текущих запросов");
+            return;
+        }
         self.pending_context.insert(
             key,
             CreateIntent {
@@ -736,7 +971,7 @@ impl Workbench {
                 prompt,
             },
         );
-        self.report(io, "Сохраняю точку разговора для новой сессии");
+        self.report(io, "Создаю сессию");
     }
     fn open_file(&mut self, path: PathBuf, io: &Io) {
         if !self.can_job(io) {
@@ -753,6 +988,9 @@ impl Workbench {
             offset: 0,
             loading: true,
             jump: None,
+            preview_cache: None,
+            preview_width: None,
+            preview_end: false,
         })));
         self.focus = Focus::Inspector;
         let host = self.files.clone();
@@ -881,10 +1119,120 @@ impl Workbench {
         before != self.pending_context.len()
     }
     fn cancel_modal(&mut self) {
+        if let Some(Menu::Themes(preview)) = &self.menu {
+            let original = preview.original();
+            self.set_theme(original);
+        }
         self.modal_token = self.modal_token.wrapping_add(1);
         if let Some(stop) = self.modal_stop.take() {
             stop.cancel();
         }
+    }
+    fn set_theme(&mut self, theme: Theme) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.selection = None;
+            self.tool_press = None;
+            self.last_frame = None;
+        }
+    }
+    fn open_themes(&mut self, requested: Option<String>, io: &Io) {
+        if !self.can_job(io) {
+            return;
+        }
+        self.cancel_modal();
+        self.selection = None;
+        self.tool_press = None;
+        let request = ThemeLoad::Picker {
+            owner: self.slots[self.current].id.clone(),
+            token: self.modal_token,
+            requested,
+        };
+        let store = self.theme_store.clone();
+        let stop = Cancel::linked(&self.stop);
+        self.modal_stop = Some(stop.clone());
+        self.menu = Some(Menu::Loading("/theme".into()));
+        self.jobs.spawn_blocking(move || Job::Themes {
+            request,
+            result: store.load(&stop),
+        });
+    }
+    fn commit_theme(&mut self, theme: Theme) {
+        self.theme_initialized = true;
+        self.theme_revision = self.theme_revision.wrapping_add(1);
+        self.pending_theme = Some((self.theme_revision, theme.clone()));
+        self.theme_error = None;
+        self.set_theme(theme);
+        self.start_theme_save();
+    }
+    fn start_theme_save(&mut self) {
+        if self.theme_save.is_some() || self.jobs.len() + self.pending_context.len() >= MAX_JOBS {
+            return;
+        }
+        let Some((revision, theme)) = self.pending_theme.take() else {
+            return;
+        };
+        self.theme_save = Some(revision);
+        let store = self.theme_store.clone();
+        // Enter accepted this preference. Finish its publication even if the
+        // user exits; only previews and palette reads are cancellable.
+        self.jobs.spawn_blocking(move || {
+            let result = store.save(theme.id());
+            Job::ThemeSaved {
+                revision,
+                theme,
+                result,
+            }
+        });
+    }
+    fn saved_theme(&mut self, revision: u64, theme: Theme, result: Result<()>, io: &Io) {
+        if self.theme_save != Some(revision) {
+            return;
+        }
+        self.theme_save = None;
+        match result {
+            Ok(()) => {
+                self.saved_theme = theme;
+                if self.theme_revision == revision && !self.terminating && !self.input_closed {
+                    self.report(io, &format!("Тема {} сохранена", self.saved_theme.name()));
+                }
+            }
+            Err(code) => {
+                if self.theme_revision == revision {
+                    if let Some(Menu::Themes(preview)) = &mut self.menu {
+                        preview.replace_original(self.saved_theme.clone());
+                    } else {
+                        self.set_theme(self.saved_theme.clone());
+                    }
+                }
+                if !self.terminating && !self.input_closed {
+                    self.report(io, &format!("Не удалось сохранить тему: {code}"));
+                }
+            }
+        }
+        self.start_theme_save();
+    }
+    fn prepare_theme(&mut self, now: Instant) {
+        self.start_theme_save();
+        if !self.theme.is_dynamic()
+            || self.menu.is_some()
+            || self.theme_reload
+            || self.input_closed
+            || self.terminating
+            || now < self.theme_refresh
+            || self.jobs.len() + self.pending_context.len() >= MAX_JOBS
+        {
+            return;
+        }
+        self.theme_reload = true;
+        self.theme_refresh = now + Duration::from_secs(1);
+        let revision = self.theme_revision;
+        let store = self.theme_store.clone();
+        let stop = Cancel::linked(&self.stop);
+        self.jobs.spawn_blocking(move || Job::ThemeReload {
+            revision,
+            result: store.dynamic(&stop),
+        });
     }
     fn open_sessions(&mut self, io: &Io) {
         if !self.can_job(io) {
@@ -898,7 +1246,7 @@ impl Workbench {
         self.jobs.spawn_blocking(move || Job::Sessions {
             owner,
             token,
-            result: factory.entries(),
+            result: factory.summaries(&Cancel::default()),
         });
     }
     fn open_models(&mut self, effort: bool, io: &Io) {
@@ -906,18 +1254,34 @@ impl Workbench {
             self.report(io, "У командной панели нет модели");
             return;
         }
-        if !self.can_job(io) {
-            return;
-        }
         let factory = self.factory.clone();
         self.cancel_modal();
         let token = self.modal_token;
         let owner = self.slots[self.current].id.clone();
-        let stop = Cancel::default();
+        let stop = Cancel::linked(&self.stop);
         self.modal_stop = Some(stop.clone());
-        self.menu = Some(Menu::Loading(
-            if effort { "/effort" } else { "/model" }.into(),
-        ));
+        if let Some(catalog) = self
+            .models_cache
+            .clone()
+            .and_then(|raw| model_choices(raw).ok())
+        {
+            self.show_models(catalog, effort);
+            if self
+                .models_refreshed
+                .is_some_and(|time| time.elapsed() < Duration::from_secs(300))
+                || self.models_refreshing
+            {
+                return;
+            }
+        } else {
+            self.menu = Some(Menu::Loading(
+                if effort { "/effort" } else { "/model" }.into(),
+            ));
+        }
+        if !self.can_job(io) {
+            return;
+        }
+        self.models_refreshing = true;
         self.jobs.spawn_blocking(move || Job::Models {
             owner,
             token,
@@ -996,6 +1360,13 @@ impl Workbench {
             "/agents" => {
                 self.panel = Some(Panel::Agents { selected: 0 });
                 self.focus = Focus::Inspector;
+                if self.can_job(io) {
+                    let factory = self.factory.clone();
+                    let stop = Cancel::linked(&self.stop);
+                    self.jobs.spawn_blocking(move || Job::CachedSummaries {
+                        result: factory.summaries(&stop),
+                    });
+                }
                 (true, false)
             }
             "/sessions" => {
@@ -1018,18 +1389,19 @@ impl Workbench {
                 (true, false)
             }
             "/run" => {
-                self.create(
-                    Kind::Console,
-                    (!argument.is_empty()).then(|| argument.to_string()),
-                    io,
-                );
+                self.report(io, "Терминал проекта: /files, затем q");
+                (false, false)
+            }
+            "/theme" => {
+                self.open_themes((!argument.is_empty()).then(|| argument.to_string()), io);
                 (true, false)
             }
             "/send" => {
                 self.send_result(io);
                 (true, false)
             }
-            "/model" if argument.is_empty() => {
+            "/model" => {
+                self.requested_model = (!argument.is_empty()).then(|| argument.to_string());
                 self.open_models(false, io);
                 (true, false)
             }
@@ -1038,16 +1410,35 @@ impl Workbench {
                 (true, false)
             }
             "/help" | "/" | "?" => {
-                self.menu = Some(Menu::Help);
+                self.menu = Some(Menu::Help { selected: 0 });
                 (true, false)
             }
             "/basic" if self.slots[self.current].kind == Kind::Btw => {
-                self.report(io, "Побочный разговор использует только чтение");
+                self.report(io, "Режим /btw: только чтение");
                 (true, false)
             }
             _ => {
                 let slot = &mut self.slots[self.current];
-                slot.state.text(text, &slot.handle, io, &mut slot.replies)
+                if slot.kind == Kind::Console && !text.starts_with('/') {
+                    slot.state.report(
+                        io,
+                        "Архив консоли. Esc - родительский разговор; /files - файлы и терминал",
+                    );
+                    return (false, false);
+                }
+                if !text.starts_with('/') && !text.trim().is_empty() && slot.title.is_none() {
+                    slot.title = Some(display_title(text));
+                }
+                let routed = if argument.is_empty()
+                    && matches!(
+                        command,
+                        "/basic" | "/plan" | "/status" | "/copy" | "/resume" | "/cancel" | "/exit"
+                    ) {
+                    command
+                } else {
+                    text
+                };
+                slot.state.text(routed, &slot.handle, io, &mut slot.replies)
             }
         }
     }
@@ -1127,7 +1518,7 @@ impl Workbench {
                 self.slots[index].state.exit = 1;
                 self.slots[index]
                     .state
-                    .report(io, "Точка разговора недоступна: runtime завершился");
+                    .report(io, "Не удалось создать сессию: агент завершил работу");
             }
             return;
         };
@@ -1173,14 +1564,7 @@ impl Workbench {
                             .as_ref()
                             .map_or(0, |snapshot| snapshot.timeline_size) =>
             {
-                if slot
-                    .timeline
-                    .as_ref()
-                    .is_none_or(|old| (old.begin, old.end) != (page.begin, page.end))
-                {
-                    slot.state.reading = None;
-                }
-                slot.timeline = Some(page.clone());
+                slot.received_timeline(page);
             }
             _ => {}
         }
@@ -1196,7 +1580,7 @@ impl Workbench {
             slot.state.exit = 1;
             slot.state.report(
                 io,
-                "Точка разговора потеряна при resync; повторите команду создания сессии",
+                "Не удалось восстановить контекст; повторите команду создания сессии",
             );
         }
         if reading.is_some() {
@@ -1204,7 +1588,29 @@ impl Workbench {
         }
     }
     fn job(&mut self, job: Job, io: &Io) {
+        if let Job::Models { result, .. } = &job {
+            self.models_refreshing = false;
+            if let Ok(raw) = result
+                && model_choices(raw.clone()).is_ok()
+            {
+                self.models_cache = Some(raw.clone());
+                self.models_refreshed = Some(Instant::now());
+            }
+        }
         let fresh = match &job {
+            Job::Themes {
+                request: ThemeLoad::Startup,
+                ..
+            } => !self.input_closed && !self.terminating && !self.theme_initialized,
+            Job::Themes {
+                request: ThemeLoad::Picker { owner, token, .. },
+                ..
+            } => {
+                !self.input_closed
+                    && !self.terminating
+                    && *owner == self.slots[self.current].id
+                    && *token == self.modal_token
+            }
             Job::Sessions { owner, token, .. } | Job::Models { owner, token, .. } => {
                 !self.input_closed
                     && !self.terminating
@@ -1228,14 +1634,102 @@ impl Workbench {
         if matches!(&job, Job::EditorReady { request, .. } if *request == self.editor_request) {
             self.editor_preparing = false;
         }
+        if matches!(&job, Job::ThemeReload { .. }) {
+            self.theme_reload = false;
+        }
         if !fresh {
             return;
         }
-        if matches!(&job, Job::Models { .. } | Job::Sessions { .. }) {
+        if matches!(
+            &job,
+            Job::Sessions { .. }
+                | Job::Themes {
+                    request: ThemeLoad::Picker { .. },
+                    ..
+                }
+        ) {
             self.menu = None;
             self.modal_stop = None;
         }
         match job {
+            Job::Themes { request, result } => match result {
+                Ok(catalog) => {
+                    if !self.theme_initialized {
+                        let initial = catalog.selected();
+                        self.saved_theme = initial.clone();
+                        self.set_theme(initial);
+                        self.theme_initialized = true;
+                    }
+                    if !catalog.warnings.is_empty() {
+                        self.report(
+                            io,
+                            &catalog
+                                .warnings
+                                .iter()
+                                .take(2)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        );
+                    }
+                    if let ThemeLoad::Picker { requested, .. } = request {
+                        if let Some(requested) = requested {
+                            let requested = match requested.to_ascii_lowercase().as_str() {
+                                "auto" | "auto-dms" => "dms".to_owned(),
+                                _ => requested,
+                            };
+                            if let Some(theme) = catalog.find(&requested) {
+                                self.commit_theme(theme.clone());
+                            } else {
+                                self.report(io, "Тема недоступна. /theme - выбрать доступную тему");
+                            }
+                        } else {
+                            let preview = ThemePreview::new(catalog.themes, self.theme.clone());
+                            self.set_theme(preview.current());
+                            self.menu = Some(Menu::Themes(preview));
+                        }
+                    }
+                }
+                Err(code) => {
+                    if matches!(request, ThemeLoad::Startup) {
+                        self.theme_initialized = true;
+                    }
+                    if code != "theme_cancelled" {
+                        self.report(io, &format!("Не удалось прочитать темы: {code}"));
+                    }
+                }
+            },
+            Job::ThemeSaved {
+                revision,
+                theme,
+                result,
+            } => self.saved_theme(revision, theme, result, io),
+            Job::ThemeReload { revision, result } => {
+                if revision == self.theme_revision
+                    && self.theme.is_dynamic()
+                    && self.menu.is_none()
+                    && !self.input_closed
+                    && !self.terminating
+                {
+                    match result {
+                        Ok(theme) => {
+                            if self.saved_theme.is_dynamic() {
+                                self.saved_theme = theme.clone();
+                            }
+                            self.set_theme(theme);
+                            self.theme_error = None;
+                        }
+                        Err(code) if self.theme_error != Some(code) => {
+                            self.theme_error = Some(code);
+                            self.report(
+                                io,
+                                &format!("Auto DMS: не удалось обновить палитру ({code})"),
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
             Job::Created {
                 source,
                 prompt,
@@ -1267,40 +1761,60 @@ impl Workbench {
             },
             Job::Sessions { result, .. } => match result {
                 Ok(entries) => {
+                    self.summaries = entries.clone();
                     self.menu = Some(Menu::Sessions {
-                        entries,
+                        entries: entries
+                            .into_iter()
+                            .filter(|s| matches!(s.entry.kind.as_str(), "main" | "fork"))
+                            .collect(),
                         selected: 0,
                     })
                 }
                 Err(code) => self.report(io, &format!("Не удалось прочитать сессии: {code}")),
             },
-            Job::Models { effort, result, .. } => match result.and_then(model_choices) {
-                Ok(models) => {
-                    let current = self.slots[self.current]
-                        .state
-                        .snapshot
-                        .as_ref()
-                        .map(|s| &s.generation);
-                    if effort {
-                        let supported = current
-                            .and_then(|current| models.iter().find(|m| m.0 == current.model))
-                            .map(|m| m.2.clone())
-                            .unwrap_or_default();
-                        let mut values = vec![None];
-                        values.extend(supported.into_iter().map(Some));
-                        let selected = current
-                            .and_then(|current| values.iter().position(|e| *e == current.effort))
-                            .unwrap_or(0);
-                        self.menu = Some(Menu::Efforts { values, selected });
-                    } else {
-                        let selected = current
-                            .and_then(|current| models.iter().position(|m| m.0 == current.model))
-                            .unwrap_or(0);
-                        self.menu = Some(Menu::Models { models, selected });
+            Job::CachedSummaries { result } => {
+                if let Ok(summaries) = result {
+                    for slot in &mut self.slots {
+                        if slot.title.is_none() {
+                            slot.title = summaries
+                                .iter()
+                                .find(|s| s.entry.id == slot.id)
+                                .and_then(|s| s.title.clone());
+                        }
+                    }
+                    self.summaries = summaries;
+                }
+            }
+            Job::CachedModels { result } => {
+                if self.models_cache.is_none()
+                    && let Ok(Some(raw)) = result
+                    && let Ok(models) = model_choices(raw.clone())
+                {
+                    self.models_cache = Some(raw);
+                    if let Some(Menu::Loading(title)) = &self.menu {
+                        let effort = title == "/effort";
+                        if effort || title == "/model" {
+                            self.show_models(models, effort);
+                        }
                     }
                 }
-                Err(code) => self.report(io, &format!("Каталог моделей недоступен: {code}")),
-            },
+            }
+            Job::Models { effort, result, .. } => {
+                self.modal_stop = None;
+                match result.and_then(model_choices) {
+                    Ok(models) => {
+                        if matches!(self.menu, Some(Menu::Loading(_))) {
+                            self.show_models(models, effort);
+                        }
+                    }
+                    Err(code) => {
+                        if matches!(self.menu, Some(Menu::Loading(_))) {
+                            self.menu = None;
+                        }
+                        self.report(io, &format!("Не удалось обновить каталог моделей: {code}"));
+                    }
+                }
+            }
             Job::File { token, result } => {
                 if let Some(Panel::Files(files)) = &mut self.panel
                     && files.token == token
@@ -1308,9 +1822,27 @@ impl Workbench {
                     files.loading = false;
                     match result {
                         Ok(FileValue::Listing(listing)) => files.listing = Some(listing),
-                        Ok(FileValue::Document(document)) => files.document = Some(document),
+                        Ok(FileValue::Document(document)) => {
+                            files.document = Some(document);
+                            files.preview_cache = None;
+                        }
                         Err(code) => self.report(io, &format!("Не удалось открыть файл: {code}")),
                     }
+                }
+            }
+            Job::Preview { token, width, rows } => {
+                if self
+                    .preview_job
+                    .as_ref()
+                    .is_some_and(|job| job.token == token && job.width == width)
+                {
+                    self.preview_job = None;
+                }
+                if !self.input_closed
+                    && !self.terminating
+                    && let Some(Panel::Files(files)) = &mut self.panel
+                {
+                    files.accept_preview(token, width, rows);
                 }
             }
             Job::EditorReady { result, .. } => match result {
@@ -1320,24 +1852,41 @@ impl Workbench {
         }
     }
     fn escape(&mut self, io: &Io) {
+        self.tool_press = None;
+        self.slots[self.current].cancel_history_jump();
         self.cancel_modal();
+        self.requested_model = None;
         self.cancel_editor_request();
-        if self.selection.take().is_some() {
-            let slot = &mut self.slots[self.current];
-            if slot.kind == Kind::Main {
-                slot.state.follow_tail = true;
-                slot.state.reading = None;
-                slot.state.scroll = 0;
-                slot.timeline_query = GetTranscript {
-                    before: 0,
-                    limit: 64,
-                    forward: false,
-                };
-                slot.refresh = Instant::now();
+        if self.completion.take().is_some() {
+            let editor = &self.slots[self.current].state.editor;
+            self.completion_closed = Some((editor.bytes.clone(), editor.cursor));
+            return;
+        }
+        if let Some(menu) = self.menu.take() {
+            if let Menu::Efforts {
+                previous: Some((models, selected)),
+                ..
+            } = menu
+            {
+                self.menu = Some(Menu::Models { models, selected });
             }
             return;
         }
-        if self.menu.take().is_some() {
+        if self.selection.take().is_some() {
+            self.show_latest();
+            return;
+        }
+        if matches!(self.panel, Some(Panel::Terminal)) {
+            self.hide_terminal(io);
+            return;
+        }
+        if matches!(self.panel, Some(Panel::Output { .. })) {
+            self.panel = self.output_back.take().map(|panel| *panel);
+            self.focus = if self.panel.is_some() {
+                Focus::Inspector
+            } else {
+                Focus::Chat
+            };
             return;
         }
         if let Some(Panel::Files(files)) = &mut self.panel
@@ -1350,41 +1899,62 @@ impl Workbench {
             self.focus = Focus::Chat;
             return;
         }
+        if !self.slots[self.current].state.follow_tail {
+            self.show_latest();
+            return;
+        }
         if let Some(parent) = self.slots[self.current].parent.clone() {
             if let Some(index) = self.slots.iter().position(|slot| slot.id == parent) {
                 self.switch(index);
             } else {
                 self.resume(parent, io);
             }
-            return;
         }
-        let state = &mut self.slots[self.current].state;
-        state.follow_tail = !state.follow_tail;
-        state.reading = None;
-        if state.follow_tail {
-            state.scroll = 0;
-            self.slots[self.current].timeline_query = GetTranscript {
-                before: 0,
-                limit: 64,
-                forward: false,
-            };
-        } else {
-            state.reading_total = state.snapshot.as_ref().map_or(0, |s| s.transcript_size);
-            if let Some(page) = &self.slots[self.current].timeline {
-                self.slots[self.current].timeline_query.before = page.end;
-            }
-        }
-        self.slots[self.current].refresh = Instant::now();
     }
     fn page(&mut self, older: bool) {
+        let output_limit = match &self.panel {
+            Some(Panel::Output { view, .. }) => {
+                self.output_lines(&view.text).len().saturating_sub(1)
+            }
+            _ => 0,
+        };
         self.selection = None;
+        self.tool_press = None;
+        self.slots[self.current].cancel_history_jump();
         if self.focus == Focus::Inspector {
-            if let Some(Panel::Files(files)) = &mut self.panel {
-                files.offset = if older {
-                    files.offset.saturating_sub(8)
+            if let Some(Panel::EditDiff { rows, offset, .. }) = &mut self.panel {
+                *offset = if older {
+                    offset.saturating_sub(8)
                 } else {
-                    files.offset.saturating_add(8).min(files.last_line())
+                    offset.saturating_add(8).min(rows.len().saturating_sub(1))
                 };
+            }
+            if let Some(Panel::Output { offset, .. }) = &mut self.panel {
+                *offset = if older {
+                    offset.saturating_sub(8)
+                } else {
+                    offset.saturating_add(8).min(output_limit)
+                };
+            }
+            if let Some(Panel::Files(files)) = &mut self.panel {
+                files.preview_end = false;
+                if files.document.is_none() {
+                    let last = files
+                        .listing
+                        .as_ref()
+                        .map_or(0, |listing| listing.entries.len().saturating_sub(1));
+                    files.selected = if older {
+                        files.selected.saturating_sub(8)
+                    } else {
+                        files.selected.saturating_add(8).min(last)
+                    };
+                } else {
+                    files.offset = if older {
+                        files.offset.saturating_sub(8)
+                    } else {
+                        files.offset.saturating_add(8).min(files.last_line())
+                    };
+                }
             }
             return;
         }
@@ -1398,7 +1968,11 @@ impl Workbench {
             if slot.timeline_query.before == 0
                 && let Some(page) = &slot.timeline
             {
-                slot.timeline_query.before = page.end;
+                slot.timeline_query = GetTranscript {
+                    before: page.end,
+                    limit: 64,
+                    forward: false,
+                };
             }
             if state.scroll >= state.scroll_limit
                 && let Some(page) = &slot.timeline
@@ -1413,7 +1987,7 @@ impl Workbench {
                 state.reading = None;
                 slot.refresh = Instant::now();
             } else {
-                state.scroll = (state.scroll + 8).min(state.scroll_limit);
+                state.scroll = state.scroll.saturating_add(8).min(state.scroll_limit);
             }
         } else if state.scroll == 0
             && let Some(page) = &slot.timeline
@@ -1424,6 +1998,7 @@ impl Workbench {
                 limit: 64,
                 forward: true,
             };
+            slot.jump_top = true;
             state.reading = None;
             slot.refresh = Instant::now();
         } else {
@@ -1446,6 +2021,23 @@ impl Workbench {
     }
     fn navigate(&mut self, older: bool) {
         self.selection = None;
+        self.tool_press = None;
+        if self.menu.is_none()
+            && let Some(completion) = &mut self.completion
+        {
+            completion.navigate(older);
+            return;
+        }
+        let agent_count = self.agent_rows().len();
+        let output_count = match &self.panel {
+            Some(Panel::Output { view, .. }) => self.output_lines(&view.text).len(),
+            _ => 0,
+        };
+        if self.focus == Focus::Inspector
+            && let Some(Panel::Files(files)) = &mut self.panel
+        {
+            files.preview_end = false;
+        }
         let delta = |selected: &mut usize, length: usize| {
             if older {
                 *selected = selected.saturating_sub(1);
@@ -1454,12 +2046,20 @@ impl Workbench {
             }
         };
         match &mut self.menu {
+            Some(Menu::Themes(preview)) => {
+                preview.navigate(older);
+                let theme = preview.current();
+                self.set_theme(theme);
+            }
             Some(Menu::Loading(_)) => {}
             Some(Menu::Sessions { entries, selected }) => delta(selected, entries.len()),
             Some(Menu::Models { models, selected }) => delta(selected, models.len()),
-            Some(Menu::Efforts { values, selected }) => delta(selected, values.len()),
-            Some(Menu::Help) => {}
+            Some(Menu::Efforts {
+                values, selected, ..
+            }) => delta(selected, values.len()),
+            Some(Menu::Help { selected }) => delta(selected, commands::COMMANDS.len()),
             None if self.focus == Focus::Inspector => match &mut self.panel {
+                Some(Panel::EditDiff { rows, offset, .. }) => delta(offset, rows.len()),
                 Some(Panel::Files(files)) if files.document.is_none() => delta(
                     &mut files.selected,
                     files.listing.as_ref().map_or(0, |l| l.entries.len()),
@@ -1471,13 +2071,11 @@ impl Workbench {
                         files.offset.saturating_add(1).min(files.last_line())
                     };
                 }
-                Some(Panel::Agents { selected }) => delta(
-                    selected,
-                    self.slots.iter().filter(|s| s.kind == Kind::Agent).count(),
-                ),
+                Some(Panel::Agents { selected }) => delta(selected, agent_count),
+                Some(Panel::Output { offset, .. }) => delta(offset, output_count),
+                Some(Panel::Terminal) => {}
                 None => {}
             },
-            None if !self.slots[self.current].state.follow_tail => self.page(older),
             None => {
                 let slot = &mut self.slots[self.current];
                 let total = slot
@@ -1492,28 +2090,41 @@ impl Workbench {
         }
     }
     fn enter(&mut self, io: &Io) -> Option<String> {
+        if self.completion.is_some() && self.menu.is_none() && self.focus == Focus::Chat {
+            self.complete_command();
+            return None;
+        }
         if let Some(menu) = self.menu.take() {
             match menu {
-                Menu::Loading(_) => {}
+                Menu::Themes(preview) => self.commit_theme(preview.current()),
+                Menu::Loading(title) => self.menu = Some(Menu::Loading(title)),
                 Menu::Sessions { entries, selected } => {
                     if let Some(entry) = entries.get(selected) {
-                        self.resume(entry.id.clone(), io);
+                        self.resume(entry.entry.id.clone(), io);
                     }
                 }
                 Menu::Models { models, selected } => {
-                    if let Some(model) = models.get(selected) {
-                        self.text(&format!("/model {}", model.0), io);
-                    }
+                    self.choose_model_effort(models, selected);
                 }
-                Menu::Efforts { values, selected } => {
+                Menu::Efforts {
+                    model,
+                    values,
+                    selected,
+                    ..
+                } => {
                     if let Some(effort) = values.get(selected) {
-                        self.text(
-                            &format!("/effort {}", effort.as_deref().unwrap_or("default")),
-                            io,
-                        );
+                        self.apply_generation(model, effort.clone(), io);
                     }
                 }
-                Menu::Help => {}
+                Menu::Help { selected } => {
+                    if let Some(command) = commands::COMMANDS.get(selected) {
+                        let slot = &mut self.slots[self.current];
+                        let end = slot.state.editor.bytes.len();
+                        slot.state.editor.replace(0, end, command.name.as_bytes());
+                        self.completion_closed =
+                            Some((slot.state.editor.bytes.clone(), slot.state.editor.cursor));
+                    }
+                }
             }
             return None;
         }
@@ -1522,7 +2133,15 @@ impl Workbench {
                 && let Some(line) = files.jump.take()
             {
                 if let Ok(line) = line.parse::<usize>() {
-                    files.offset = line.saturating_sub(1).min(files.last_line());
+                    files.preview_end = false;
+                    let source = line.saturating_sub(1);
+                    files.offset = if files.tab == 2 {
+                        files.preview_cache.as_ref().map_or(0, |(_, rows)| {
+                            super::super::markdown::Row::source_row(rows, source)
+                        })
+                    } else {
+                        source.min(files.last_line())
+                    };
                 }
                 return None;
             }
@@ -1537,15 +2156,9 @@ impl Workbench {
                     }
                 }
                 Some(Panel::Agents { selected }) => {
-                    if let Some(index) = self
-                        .slots
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| s.kind == Kind::Agent)
-                        .nth(*selected)
-                        .map(|(i, _)| i)
-                    {
-                        self.switch(index);
+                    if let Some((id, _, _)) = self.agent_rows().get(*selected) {
+                        let id = id.clone();
+                        self.resume(id, io);
                     }
                 }
                 _ => {}
@@ -1565,39 +2178,214 @@ impl Workbench {
         }
     }
     fn mouse(&mut self, mouse: MouseEvent, io: &Io) {
+        if matches!(&self.menu, Some(Menu::Themes(_)))
+            || matches!(&self.menu, Some(Menu::Loading(title)) if title == "/theme")
+        {
+            if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
+                self.navigate(mouse.kind == MouseKind::WheelUp);
+            }
+            return;
+        }
+        let mut hovered = self.focus;
+        if matches!(
+            mouse.kind,
+            MouseKind::Press | MouseKind::WheelUp | MouseKind::WheelDown
+        ) {
+            self.update_displayed(io);
+            if let Some(frame) = &self.displayed
+                && let Some((begin, end, right)) = frame.chat_bounds
+            {
+                if mouse.row >= begin && mouse.row < end {
+                    hovered = if mouse.column < right {
+                        Focus::Chat
+                    } else if self.panel.is_some() {
+                        Focus::Inspector
+                    } else {
+                        self.focus
+                    };
+                }
+                let mut body_end = end;
+                if let Some((column, row, width, height)) = frame.inspector_bounds() {
+                    let panel = self.inspector();
+                    let footer =
+                        usize::from(panel.as_ref().is_some_and(|panel| !panel.footer.is_empty()));
+                    body_end = body_end.max(row + height + footer);
+                    if mouse.column >= column.saturating_sub(3)
+                        && mouse.column < column + width
+                        && mouse.row >= row.saturating_sub(3)
+                        && mouse.row < row + height + footer
+                    {
+                        hovered = Focus::Inspector;
+                    }
+                }
+                if mouse.row >= body_end {
+                    hovered = Focus::Chat;
+                }
+            }
+            if mouse.kind == MouseKind::Press {
+                self.focus = hovered;
+            }
+        }
+        if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
+            let focus = self.focus;
+            self.focus = hovered;
+            self.page(mouse.kind == MouseKind::WheelUp);
+            self.focus = focus;
+            return;
+        }
         match mouse.kind {
             MouseKind::Press => {
+                self.slots[self.current].cancel_history_jump();
                 self.update_displayed(io);
                 self.selection = None;
+                self.tool_press = None;
                 // A partially painted frame has no single truthful text
                 // snapshot. Selection starts only on a completed paint.
                 if !self.frames.is_empty() || io.writer.failed() {
                     return;
                 }
-                if let Some(frame) = &self.displayed {
-                    let slot = &mut self.slots[self.current];
-                    let reading = slot.projected();
-                    slot.state.follow_tail = false;
-                    slot.state.reading_total = slot
-                        .state
-                        .snapshot
-                        .as_ref()
-                        .map_or(0, |s| s.transcript_size);
-                    if let Some(page) = &slot.timeline {
-                        slot.timeline_query.before = page.end;
+                let tab = self
+                    .displayed
+                    .as_ref()
+                    .and_then(|frame| frame.inspector_bounds())
+                    .zip(self.inspector())
+                    .and_then(|((column, row, _, _), panel)| {
+                        if panel.tabs.is_empty() || mouse.row != row.saturating_sub(2) {
+                            return None;
+                        }
+                        let mut at = column;
+                        for (index, label) in panel.tabs.iter().enumerate() {
+                            let width = super::super::cells::width(label);
+                            if mouse.column >= at && mouse.column < at + width {
+                                return Some(index);
+                            }
+                            at += width + 2;
+                        }
+                        None
+                    });
+                if let Some(tab) = tab {
+                    if tab == 1 && matches!(self.panel, Some(Panel::Files(_))) {
+                        self.open_terminal(io);
+                        return;
                     }
-                    if let Some(reading) = reading {
-                        slot.state.reading = Some(reading);
+                    if tab == 0 && matches!(self.panel, Some(Panel::Terminal)) {
+                        self.hide_terminal(io);
+                        return;
+                    }
+                    if let Some(Panel::Files(files)) = &mut self.panel {
+                        if (2..5).contains(&tab) && files.document.is_some() {
+                            files.tab = tab - 2;
+                            files.offset = 0;
+                            files.preview_end = false;
+                        }
+                        return;
+                    }
+                }
+                if let Some(frame) = &self.displayed {
+                    let in_chat = frame.chat_bounds.is_some_and(|(begin, end, right)| {
+                        mouse.row >= begin && mouse.row < end && mouse.column < right
+                    });
+                    if in_chat
+                        && let Some((_, key)) =
+                            frame.tool_actions.iter().find(|(row, _)| *row == mouse.row)
+                    {
+                        self.tool_press = Some((
+                            mouse.column,
+                            mouse.row,
+                            key.clone(),
+                            frame.edit_view(key),
+                            frame.output_view(key),
+                        ));
+                    }
+                    if !in_chat && self.focus == Focus::Chat {
+                        return;
+                    }
+                    let slot = &mut self.slots[self.current];
+                    if in_chat {
+                        let reading = slot.projected();
+                        slot.state.follow_tail = false;
+                        slot.state.reading_total = slot
+                            .state
+                            .snapshot
+                            .as_ref()
+                            .map_or(0, |s| s.transcript_size);
+                        if let Some(page) = &slot.timeline {
+                            slot.timeline_query = GetTranscript {
+                                before: page.end,
+                                limit: 64,
+                                forward: false,
+                            };
+                        }
+                        if let Some(reading) = reading {
+                            slot.state.reading = Some(reading);
+                        }
                     }
                     self.selection = Some(Selection::new(frame.clone(), mouse.column, mouse.row));
                 }
             }
             MouseKind::Drag => {
+                if self
+                    .tool_press
+                    .as_ref()
+                    .is_some_and(|(column, row, _, _, _)| {
+                        (*column, *row) != (mouse.column, mouse.row)
+                    })
+                {
+                    self.tool_press = None;
+                }
                 if let Some(selection) = &mut self.selection {
                     selection.drag(mouse.column, mouse.row);
                 }
             }
             MouseKind::Release => {
+                if let Some((column, row, key, edit, output)) = self.tool_press.take()
+                    && (column, row) == (mouse.column, mouse.row)
+                {
+                    if key.starts_with("output:") {
+                        self.selection = None;
+                        if let Some(view) = output {
+                            if !matches!(self.panel, Some(Panel::Output { .. })) {
+                                self.output_back = self.panel.take().map(Box::new);
+                            }
+                            self.panel = Some(Panel::Output { view, offset: 0 });
+                            self.focus = Focus::Inspector;
+                        } else {
+                            self.report(io, "Вывод этой операции вне текущего отображения");
+                        }
+                        return;
+                    }
+                    if key.starts_with("diff:") {
+                        self.selection = None;
+                        if let Some(edit) = edit {
+                            let filename = Path::new(&edit.path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(&edit.path);
+                            self.panel = Some(Panel::EditDiff {
+                                title: format!(
+                                    "{} · +{} -{} · Diff правки",
+                                    filename, edit.diff.added, edit.diff.removed
+                                ),
+                                rows: std::sync::Arc::new(edit.diff.rows.clone()),
+                                offset: 0,
+                                column: 0,
+                            });
+                            self.focus = Focus::Inspector;
+                        } else {
+                            self.report(io, "Данные этой правки вне текущей страницы истории");
+                        }
+                        return;
+                    }
+                    let slot = &mut self.slots[self.current];
+                    if !slot.tool_expanded.remove(&key) && slot.tool_expanded.len() < 4096 {
+                        slot.tool_expanded.insert(key);
+                    }
+                    slot.tool_anchor_limit =
+                        self.displayed.as_ref().map(|frame| frame.scroll_limit);
+                    slot.state.reading = None;
+                    self.selection = None;
+                    return;
+                }
                 if let Some(selection) = &mut self.selection
                     && let Some(text) = selection.finish(mouse.column, mouse.row)
                     && !io.writer.clipboard(&text)
@@ -1621,6 +2409,26 @@ impl Workbench {
     fn popup(&self) -> Option<Popup> {
         let menu = self.menu.as_ref()?;
         Some(match menu {
+            Menu::Themes(preview) => Popup {
+                title: "/theme".into(),
+                subtitle: "Предпросмотр темы".into(),
+                items: preview
+                    .themes()
+                    .iter()
+                    .map(|theme| Choice {
+                        label: theme.name().into(),
+                        detail: if theme.id() == preview.original().id() {
+                            "текущая".into()
+                        } else if theme.is_dynamic() {
+                            "системная палитра".into()
+                        } else {
+                            theme.id().into()
+                        },
+                    })
+                    .collect(),
+                selected: preview.selected(),
+                footer: "Enter сохранить · Esc отменить".into(),
+            },
             Menu::Loading(title) => Popup {
                 title: title.clone(),
                 subtitle: "Загрузка…".into(),
@@ -1633,8 +2441,19 @@ impl Workbench {
                 items: entries
                     .iter()
                     .map(|e| Choice {
-                        label: e.id.clone(),
-                        detail: e.kind.clone(),
+                        label: e.title.clone().unwrap_or_else(|| "Новый разговор".into()),
+                        detail: format!(
+                            "{} · {}{}",
+                            if e.entry.kind == "fork" {
+                                "Ветка"
+                            } else {
+                                "Разговор"
+                            },
+                            e.status.label(),
+                            e.preview
+                                .as_ref()
+                                .map_or(String::new(), |preview| format!(" · {preview}"))
+                        ),
                     })
                     .collect(),
                 selected: *selected,
@@ -1642,7 +2461,7 @@ impl Workbench {
             },
             Menu::Models { models, selected } => Popup {
                 title: "/model".into(),
-                subtitle: "Текущий разговор · со следующего turn".into(),
+                subtitle: "Для следующих сообщений".into(),
                 items: models
                     .iter()
                     .map(|m| Choice {
@@ -1651,68 +2470,103 @@ impl Workbench {
                     })
                     .collect(),
                 selected: *selected,
-                footer: "Enter применить · Esc отменить".into(),
+                footer: "Enter выбрать effort · Esc отменить".into(),
             },
-            Menu::Efforts { values, selected } => Popup {
+            Menu::Efforts {
+                model,
+                values,
+                selected,
+                previous,
+            } => Popup {
                 title: "/effort".into(),
-                subtitle: "Подтверждённые уровни модели".into(),
+                subtitle: format!("{model} · для следующих сообщений"),
                 items: values
                     .iter()
                     .map(|e| Choice {
-                        label: e
-                            .clone()
-                            .unwrap_or_else(|| "По умолчанию провайдера".into()),
+                        label: e.clone().unwrap_or_else(|| "По умолчанию".into()),
                         detail: String::new(),
                     })
                     .collect(),
                 selected: *selected,
-                footer: "Enter применить · Esc отменить".into(),
+                footer: if previous.is_some() {
+                    "Enter применить пару · Esc к моделям"
+                } else {
+                    "Enter применить · Esc отменить"
+                }
+                .into(),
             },
-            Menu::Help => Popup {
-                title: "Команды ANSA".into(),
-                subtitle: "Enter отправляет уточнение и во время работы".into(),
-                items: [
-                    "/model · /effort · /thinking",
-                    "/basic · /plan · /status",
-                    "/fork · /btw вопрос · /agent задача",
-                    "/sessions · /agents · /send",
-                    "/files путь · /run команда",
-                    "/copy · /resume · /exit",
-                    "Ctrl+J перенос · Ctrl+T подробности",
-                    "Ctrl+C прервать текущий шаг",
-                    "Esc чтение/возврат · Tab фокус",
-                ]
-                .iter()
-                .map(|label| Choice {
-                    label: (*label).into(),
-                    detail: String::new(),
-                })
-                .collect(),
-                selected: 0,
-                footer: "Esc закрыть".into(),
-            },
+            Menu::Help { selected } => commands::help(*selected),
         })
     }
     fn inspector(&self) -> Option<Inspector> {
         match self.panel.as_ref()? {
+            Panel::Terminal => {
+                let snapshot = self.terminal.as_ref()?.snapshot();
+                Some(Inspector {
+                    title: format!("Терминал · {}", snapshot.cwd.display()),
+                    tabs: vec!["Файлы".into(), "Терминал".into()],
+                    selected_tab: 1,
+                    kind: InspectorKind::Command,
+                    rendered: Some(
+                        self.terminal_grid
+                            .as_ref()
+                            .filter(|(revision, _)| *revision == snapshot.revision)
+                            .map_or_else(
+                                || std::sync::Arc::new(snapshot.rows.clone()),
+                                |(_, rows)| rows.clone(),
+                            ),
+                    ),
+                    cursor: snapshot
+                        .cursor
+                        .map(|(row, column)| (usize::from(column), usize::from(row))),
+                    footer: snapshot.error.clone().unwrap_or_else(|| {
+                        if snapshot.exited {
+                            "Терминал завершён · нажмите «Файлы»".into()
+                        } else if snapshot.shell_ready {
+                            "Esc к файлам · команды выполняются локально".into()
+                        } else {
+                            "Ctrl+C прервать · ввод передаётся программе".into()
+                        }
+                    }),
+                    ..Inspector::default()
+                })
+            }
+            Panel::Output { view, offset } => Some(Inspector {
+                title: view.title.clone(),
+                lines: self.output_lines(&view.text),
+                offset: *offset,
+                footer: "j/k строки · PgUp/PgDn страницы · g/G начало/конец · Esc назад".into(),
+                ..Inspector::default()
+            }),
+            Panel::EditDiff {
+                title,
+                rows,
+                offset,
+                column,
+            } => Some(Inspector {
+                title: title.clone(),
+                offset: *offset,
+                kind: InspectorKind::Diff,
+                diff: Some(rows.clone()),
+                diff_column: *column,
+                footer: "j/k строки · h/l горизонтально · g/G начало/конец · Esc чат".into(),
+                ..Inspector::default()
+            }),
             Panel::Agents { selected } => Some(Inspector {
-                title: "AGENTS".into(),
+                title: "Агенты разговора".into(),
                 lines: self
-                    .slots
-                    .iter()
-                    .filter(|s| s.kind == Kind::Agent)
-                    .map(|s| {
-                        format!(
-                            "{}  {}",
-                            s.id,
-                            s.state
-                                .snapshot
-                                .as_ref()
-                                .map_or("loading", |v| v.state.as_str())
-                        )
+                    .agent_rows()
+                    .into_iter()
+                    .map(|(_, title, generation)| {
+                        if generation.is_empty() {
+                            title
+                        } else {
+                            format!("{title} · {generation}")
+                        }
                     })
                     .collect(),
                 selected: Some(*selected),
+                offset: selected.saturating_sub(8),
                 footer: "Enter разговор · Esc назад".into(),
                 kind: InspectorKind::Agents,
                 ..Inspector::default()
@@ -1720,8 +2574,10 @@ impl Workbench {
             Panel::Files(files) => {
                 if files.loading {
                     return Some(Inspector {
-                        title: "FILES".into(),
+                        title: "Файлы".into(),
+                        tabs: vec!["Файлы".into(), "Терминал".into()],
                         lines: vec!["Открываю…".into()],
+                        footer: "q терминал · Esc чат".into(),
                         ..Inspector::default()
                     });
                 }
@@ -1744,39 +2600,56 @@ impl Workbench {
                         ),
                         2 => (
                             InspectorKind::Markdown,
-                            document
-                                .preview
-                                .as_deref()
-                                .unwrap_or("Preview доступен для Markdown"),
+                            if document.preview.is_some() {
+                                if files.preview_rows().is_some() {
+                                    ""
+                                } else {
+                                    "Готовлю просмотр..."
+                                }
+                            } else {
+                                "Preview доступен для Markdown"
+                            },
                         ),
                         _ => (InspectorKind::Source, document.source.as_str()),
                     };
                     Some(Inspector {
                         title: format!(
-                            "{} · READ ONLY{}",
+                            "{} · только чтение{}",
                             document.path.display(),
                             if document.truncated {
-                                " · truncated"
+                                " · фрагмент"
                             } else {
                                 ""
                             }
                         ),
-                        tabs: vec!["Source".into(), "Diff".into(), "Preview".into()],
-                        selected_tab: files.tab,
+                        tabs: vec![
+                            "Файлы".into(),
+                            "Терминал".into(),
+                            "Source".into(),
+                            "Diff".into(),
+                            "Preview".into(),
+                        ],
+                        selected_tab: files.tab + 2,
                         lines: text.lines().map(String::from).collect(),
                         offset: files.offset,
                         footer: files.jump.as_ref().map_or_else(
-                            || "s/d/p вкладки · :строка · e редактор · Esc чат".into(),
+                            || "s/d/p вкладки · :строка · e редактор · q терминал · Esc чат".into(),
                             |line| format!(":{line}"),
                         ),
                         kind,
+                        markdown: if files.tab == 2 {
+                            files.preview_rows().cloned()
+                        } else {
+                            None
+                        },
                         ..Inspector::default()
                     })
                 } else {
                     let listing = files.listing.as_ref();
                     Some(Inspector {
                         title: listing
-                            .map_or_else(|| "FILES".into(), |l| l.path.display().to_string()),
+                            .map_or_else(|| "Файлы".into(), |l| l.path.display().to_string()),
+                        tabs: vec!["Файлы".into(), "Терминал".into()],
                         lines: listing.map_or_else(Vec::new, |l| {
                             l.entries
                                 .iter()
@@ -1787,7 +2660,7 @@ impl Workbench {
                         }),
                         selected: Some(files.selected),
                         offset: files.selected.saturating_sub(8),
-                        footer: "Enter открыть · h родитель · Esc чат".into(),
+                        footer: "Enter открыть · h родитель · q терминал · Esc чат".into(),
                         ..Inspector::default()
                     })
                 }
@@ -1797,18 +2670,22 @@ impl Workbench {
     fn ui(&self) -> Workspace {
         let slot = &self.slots[self.current];
         let mut breadcrumb = Vec::new();
-        let mut current = Some(slot.id.as_str());
+        let mut current = Some(slot.id.clone());
+        let mut seen = std::collections::BTreeSet::new();
         for _ in 0..MAX_SESSIONS {
             let Some(id) = current else {
                 break;
             };
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            breadcrumb.push(self.title(&id));
             if let Some(ancestor) = self.slots.iter().find(|s| s.id == id) {
-                breadcrumb.push(format!(
-                    "{} {}",
-                    ancestor.kind.name(),
-                    &ancestor.id[..ancestor.id.len().min(12)]
-                ));
-                current = ancestor.parent.as_deref();
+                current = ancestor.parent.clone();
+            } else if let Some(ancestor) =
+                self.summaries.iter().find(|summary| summary.entry.id == id)
+            {
+                current = ancestor.entry.parent.clone();
             } else {
                 break;
             }
@@ -1818,19 +2695,19 @@ impl Workbench {
         let generation = snapshot.map(|s| &s.generation);
         Workspace {
             breadcrumb: if breadcrumb.is_empty() {
-                self.root_id.clone()
+                self.title(&self.root_id)
             } else {
                 breadcrumb.join(" / ")
             },
             model: if slot.kind == Kind::Console {
-                "local console".into()
+                "Локальная консоль".into()
             } else {
                 generation.map_or_else(String::new, |g| g.model.clone())
             },
             effort: generation
                 .and_then(|g| g.effort.clone())
                 .unwrap_or_default(),
-            activity: slot.state.progress.elapsed().unwrap_or_default(),
+            activity: String::new(),
             reading: !slot.state.follow_tail,
             new_events: snapshot.map_or(0, |s| {
                 s.transcript_size.saturating_sub(slot.state.reading_total)
@@ -1838,19 +2715,124 @@ impl Workbench {
             focus: self.focus,
             inspector: self.inspector(),
             popup: self.popup(),
+            suggestions: self
+                .completion
+                .as_ref()
+                .filter(|_| self.menu.is_none() && self.focus == Focus::Chat)
+                .map(Completion::popup),
+            animate: self.animation_enabled(),
+            animation_frame: Self::animation_frame(),
         }
+    }
+    fn animation_enabled(&self) -> bool {
+        let slot = &self.slots[self.current];
+        self.selection.is_none()
+            && slot.state.follow_tail
+            && self.menu.is_none()
+            && self.completion.is_none()
+            && slot.state.snapshot.as_ref().is_some_and(|view| {
+                view.worker_busy
+                    && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
+            })
+            && std::env::var_os("ANSA_NO_ANIMATION").is_none()
+    }
+    fn animation_frame() -> u8 {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        ((START.get_or_init(Instant::now).elapsed().as_millis() / 120) % 32) as u8
     }
     fn update_displayed(&mut self, io: &Io) {
         sync_displayed(&mut self.frames, &mut self.displayed, |sequence| {
             io.writer.displayed(sequence)
         });
     }
+    fn prepare_preview(&mut self, io: &Io) {
+        let width = if self.input_closed || self.terminating || io.size.0 < 12 || io.size.1 < 8 {
+            None
+        } else {
+            let width = io.size.0 - 1;
+            Some(if width >= 100 {
+                (width * 2 / 5).max(34)
+            } else {
+                width
+            })
+        };
+        let mut desired = None;
+        let mut request = None;
+        if let Some(Panel::Files(files)) = &mut self.panel {
+            let document = files
+                .document
+                .as_ref()
+                .and_then(|document| document.preview.as_ref());
+            files.preview_width = width.filter(|_| document.is_some());
+            if let (Some(width), Some(document)) = (files.preview_width, document) {
+                desired = Some((files.token, width));
+                if files.preview_rows().is_none() {
+                    request = Some((files.token, width, document.clone()));
+                }
+            }
+        }
+        if let Some(job) = &self.preview_job {
+            if desired != Some((job.token, job.width)) {
+                job.stop.cancel();
+            }
+            // An obsolete layout is joined before the latest resize can start.
+            return;
+        }
+        if self.jobs.len() + self.pending_context.len() >= MAX_JOBS {
+            return;
+        }
+        if let Some((token, width, document)) = request {
+            let stop = Cancel::linked(&self.stop);
+            self.preview_job = Some(PreviewJob {
+                token,
+                width,
+                stop: stop.clone(),
+            });
+            self.jobs.spawn_blocking(move || Job::Preview {
+                token,
+                width,
+                rows: document
+                    .rows_cancelled(width, &stop)
+                    .map(std::sync::Arc::new),
+            });
+        }
+    }
     fn render(&mut self, io: &Io, context: &str) {
         self.update_displayed(io);
+        self.prepare_preview(io);
+        if matches!(self.panel, Some(Panel::Terminal))
+            && let Some(terminal) = &self.terminal
+        {
+            let snapshot = terminal.snapshot();
+            if self
+                .terminal_grid
+                .as_ref()
+                .is_none_or(|(revision, _)| *revision != snapshot.revision)
+            {
+                self.terminal_grid = Some((
+                    snapshot.revision,
+                    std::sync::Arc::new(snapshot.rows.clone()),
+                ));
+            }
+        }
         let operational =
             self.operational_frame.is_some() || self.slots[self.current].input_ready();
-        let frame = if let Some(selection) = &self.selection {
-            Some(selection.frame_at(io.size, io.color))
+        let mut frame = if let Some(selection) = &self.selection {
+            let mut frozen = selection.frame_at(io.size, io.color);
+            let mut ui = self.ui();
+            ui.animate = false;
+            let slot = &mut self.slots[self.current];
+            let projected = slot.projected();
+            if let Some(mut live) =
+                slot.state
+                    .render_workspace(io, context, &ui, projected.as_deref())
+            {
+                if io.color {
+                    live.apply_theme(&self.theme);
+                }
+                frozen.update_status_from(&live);
+            }
+            Some(frozen)
         } else if !operational {
             let status = if !self.slots[self.current].state.status.trim().is_empty() {
                 self.slots[self.current].state.status.trim()
@@ -1867,15 +2849,84 @@ impl Workbench {
             }
             frame
         } else {
-            let ui = self.ui();
+            let mut ui = self.ui();
+            ui.animate &= io.color;
             let slot = &mut self.slots[self.current];
             let projected = slot.projected();
             slot.state
                 .render_workspace(io, context, &ui, projected.as_deref())
         };
+        if self.selection.is_none()
+            && let (Some(Panel::Output { view, .. }), Some((_, _, width, _))) = (
+                &self.panel,
+                frame.as_ref().and_then(|frame| frame.inspector_bounds()),
+            )
+            && self
+                .displayed
+                .as_ref()
+                .and_then(|frame| frame.inspector_bounds())
+                .is_none_or(|(_, _, old_width, _)| old_width != width)
+        {
+            let mut lines = Vec::new();
+            for line in view.text.lines() {
+                let mut part = String::new();
+                let mut used = 0;
+                for glyph in super::super::cells::graphemes(line) {
+                    let cells = super::super::cells::width(glyph);
+                    if used + cells > width.max(1) && !part.is_empty() {
+                        lines.push(std::mem::take(&mut part));
+                        used = 0;
+                    }
+                    part.push_str(glyph);
+                    used += cells;
+                }
+                lines.push(part);
+            }
+            let mut ui = self.ui();
+            ui.animate &= io.color;
+            if let Some(panel) = &mut ui.inspector {
+                panel.lines = lines;
+            }
+            let slot = &mut self.slots[self.current];
+            let projected = slot.projected();
+            frame = slot
+                .state
+                .render_workspace(io, context, &ui, projected.as_deref());
+        }
+        if self.selection.is_none()
+            && matches!(self.panel, Some(Panel::Terminal))
+            && let Some(bounds) = frame.as_ref().and_then(|frame| frame.inspector_bounds())
+            && self.terminal_size
+                != Some((bounds.3.clamp(1, 128) as u16, bounds.2.clamp(1, 256) as u16))
+            && let Some(terminal) = &self.terminal
+        {
+            let size = (bounds.3.clamp(1, 128) as u16, bounds.2.clamp(1, 256) as u16);
+            if let Err(error) = terminal.resize(size.0, size.1) {
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    self.report(io, &format!("Размер терминала не обновлён: {error}"));
+                }
+            } else {
+                self.terminal_size = Some(size);
+            }
+        }
+        if io.color
+            && self.selection.is_none()
+            && let Some(frame) = &mut frame
+        {
+            frame.apply_theme(&self.theme);
+        }
         if let Some(frame) = &frame {
-            let state = &mut self.slots[self.current].state;
-            state.scroll = state.scroll.min(frame.scroll_limit);
+            let slot = &mut self.slots[self.current];
+            if let Some(before) = slot.tool_anchor_limit.take() {
+                slot.state.scroll = slot
+                    .state
+                    .scroll
+                    .saturating_add(frame.scroll_limit)
+                    .saturating_sub(before)
+                    .min(frame.scroll_limit);
+                return self.render(io, context);
+            }
+            slot.state.scroll = slot.state.scroll.min(frame.scroll_limit);
         }
         if let Some(frame) = frame
             && self.last_frame.as_ref() != Some(&frame)
@@ -1947,6 +2998,7 @@ pub async fn run(
     let mut exit = 0;
     let mut escape_at = None;
     let mut dirty = true;
+    let mut animated_frame = None;
     let mut deferred_input = std::collections::VecDeque::new();
     let mut failure: Option<&'static str> = None;
     let mut terminating_since = None;
@@ -1955,7 +3007,7 @@ pub async fn run(
         while !finished || work.editor.is_some() {
             work.update_displayed(io);
             let mut input_guard = None; let mut signal_guard = None;
-            let input_enabled = !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing
+            let input_enabled = work.terminal_pending_input.is_empty() && !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing
                 && work.slots[work.current].state.pending_draft.is_none()
                 && work.slots[work.current].ready && !work.slots[work.current].ready_refresh
                 && work.slots[work.current].state.history_ready && work.displayed.is_some()
@@ -1986,17 +3038,26 @@ pub async fn run(
                         if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); } }
                     }
                     SIGINT => {
-                        if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); finished = true; work.terminating = true; terminating_since.get_or_insert(Instant::now()); } }
+                        if work.terminal_focused() { work.terminal_bytes(&[3], io); }
+                        else if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); finished = true; work.terminating = true; terminating_since.get_or_insert(Instant::now()); } }
                         else if work.pending_editor.is_some() || work.editor_preparing { work.cancel_editor_request(); }
                         else { work.cancel_current(io); }
                     }
                     SIGTSTP => {
-                        if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); finished = true; work.terminating = true; terminating_since.get_or_insert(Instant::now()); } }
+                        if work.terminal_focused() { work.terminal_bytes(&[26], io); }
+                        else if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); finished = true; work.terminating = true; terminating_since.get_or_insert(Instant::now()); } }
                         else { io.suspend().await?; }
                         work.last_frame = None;
                     }
                     SIGCONT => { io.resume_terminal()?; work.last_frame = None; }
-                    SIGWINCH => { io.resize(); work.last_frame = None; }
+                    SIGWINCH => { io.resize(); work.last_frame = None;
+                        if (io.size.0 < 12 || io.size.1 < 8) && work.focus == Focus::Inspector {
+                            let pending = work.terminal_decoder.take_pending();
+                            if !pending.is_empty() { work.terminal_bytes(&pending, io); }
+                            work.terminal_escape_at = None;
+                            work.focus = Focus::Chat;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2040,6 +3101,28 @@ pub async fn run(
                 }
             }
             let now = Instant::now();
+            work.flush_terminal_input(io);
+            if let Some(terminal) = &work.terminal {
+                let snapshot = terminal.snapshot();
+                if work.terminal_grid.as_ref().is_none_or(|(revision, _)| *revision != snapshot.revision) {
+                    work.terminal_grid = Some((snapshot.revision, std::sync::Arc::new(snapshot.rows.clone())));
+                    dirty |= matches!(work.panel, Some(Panel::Terminal));
+                }
+                if matches!(work.panel, Some(Panel::Terminal)) && let Some((_, _, width, height)) = work.displayed.as_ref().and_then(|frame| frame.inspector_bounds()) {
+                    dirty |= work.terminal_size != Some((height.clamp(1, 128) as u16, width.clamp(1, 256) as u16));
+                }
+            }
+            if work.terminal_decoder.pending_escape() {
+                let at = work.terminal_escape_at.get_or_insert(now);
+                if now.duration_since(*at) >= Duration::from_millis(35) {
+                    if let Some(event) = work.terminal_decoder.flush_escape() { work.terminal_event(event, io, &mut deferred_input); dirty = true; }
+                    work.terminal_escape_at = None;
+                }
+            } else { work.terminal_escape_at = None; }
+            work.prepare_theme(now);
+            let next_animation = (io.color && work.animation_enabled()).then(Workbench::animation_frame);
+            dirty |= next_animation != animated_frame;
+            animated_frame = next_animation;
             let mut admissions = Vec::new();
             for slot in &mut work.slots {
                 dirty |= slot.poll_replies(io)?;
@@ -2069,20 +3152,20 @@ pub async fn run(
                 let slot = &work.slots[index];
                 let Some(parent) = slot.parent.clone() else { continue; };
                 let view = slot.state.snapshot.as_ref().expect("checked completion");
-                let request = view.request.clone(); let child = slot.id.clone(); let text = format!("Результат субагента {}:\n{}", slot.id, view.text);
+                let request = view.request.clone(); let child = slot.id.clone(); let text = format!("Результат субагента «{}»:\n{}", work.title(&slot.id), view.text);
                 if let Some(parent) = work.slots.iter_mut().find(|slot| slot.id == parent)
                     && parent.state.snapshot.as_ref().is_some_and(|s| !s.storage_failed && s.state != "paused")
                     && parent.state.text(&text, &parent.handle, io, &mut parent.replies).0
                 { work.pending_results.insert(command_id(&parent.state), (child, request)); }
             }
-            if work.slots[work.current].state.editor.escape_pending() {
+            if work.input_editor().escape_pending() {
                 let at = escape_at.get_or_insert(now);
                 if now.duration_since(*at) >= Duration::from_millis(35) {
-                    if let Some(Action::Escape) = work.slots[work.current].state.editor.flush_escape() { work.escape(io); dirty = true; }
+                    if let Some(Action::Escape) = work.input_editor_mut().flush_escape() { work.escape(io); dirty = true; }
                     escape_at = None;
                 }
             } else { escape_at = None; }
-            let can_read = !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing && work.slots[work.current].state.pending_draft.is_none()
+            let can_read = work.terminal_pending_input.is_empty() && !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing && work.slots[work.current].state.pending_draft.is_none()
                 && work.slots[work.current].ready && !work.slots[work.current].ready_refresh
                 && work.slots[work.current].state.history_ready && work.displayed.is_some()
                 && work.operational_frame.is_some_and(|sequence| io.writer.displayed(sequence));
@@ -2093,11 +3176,36 @@ pub async fn run(
                     Ok(0) => finished |= work.eof(io, true),
                     Ok(count) => {
                         dirty = true;
+                        if work.terminal_focused() {
+                            work.terminal_chunk(&bytes[..count], io, &mut deferred_input);
+                            continue;
+                        }
                         for (position, &byte) in bytes[..count].iter().enumerate() {
                             // Modal/read-only navigation never edits a draft.
-                            if byte.is_ascii() && !work.slots[work.current].state.editor.escape_pending() && !work.slots[work.current].state.editor.pasting() {
+                            if byte.is_ascii() && !work.input_editor().escape_pending() && !work.input_editor().pasting() {
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());
-                                if matches!(byte, b'j' | b'k') && !jumping && (work.menu.is_some() || work.focus == Focus::Inspector || !work.slots[work.current].state.follow_tail) { work.navigate(byte == b'k'); continue; }
+                                if matches!(byte, b'j' | b'k') && !jumping && (work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Files(_) | Panel::EditDiff { .. } | Panel::Output { .. }))) { work.navigate(byte == b'k'); continue; }
+                                let file_visible = work.displayed.as_ref().map_or(1, |frame| frame.inspector_content_rows).max(1);
+                                let inspector_width = work.displayed.as_ref().and_then(|frame|frame.chat_bounds).map_or(io.size.0.saturating_sub(1),|(_,_,right)|io.size.0.saturating_sub(right+4));
+                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Output { .. })) {
+                                    let maximum = match &work.panel { Some(Panel::Output { view, .. }) => work.output_lines(&view.text).len().saturating_sub(file_visible), _ => 0 };
+                                    if let Some(Panel::Output { offset, .. }) = &mut work.panel {
+                                        if byte == b'g' { *offset = 0; continue; }
+                                        if byte == b'G' { *offset = maximum; continue; }
+                                    }
+                                    if byte >= 32 && byte != 127 { continue; }
+                                }
+                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Agents { .. })) && byte >= 32 && byte != 127 { continue; }
+                                if work.focus == Focus::Inspector && let Some(Panel::EditDiff { rows, offset, column, .. }) = &mut work.panel {
+                                    if byte == b'g' { *offset = 0; continue; }
+                                    if byte == b'G' { *offset = rows.len().saturating_sub(file_visible); continue; }
+                                    if matches!(byte,b'h'|b'l'|b'0'|b'$') {
+                                        let maximum = rows.iter().map(|row|row.horizontal_limit(inspector_width)).max().unwrap_or(0);
+                                        *column = match byte { b'h'=>column.saturating_sub(4),b'l'=>column.saturating_add(4).min(maximum),b'$'=>maximum,_=>0 };
+                                        continue;
+                                    }
+                                    if byte >= 32 && byte != 127 { continue; }
+                                }
                                 if work.focus == Focus::Inspector && let Some(Panel::Files(files)) = &mut work.panel {
                                     if let Some(line) = &mut files.jump {
                                         if byte.is_ascii_digit() { if line.len() < 9 { line.push(byte as char); } continue; }
@@ -2105,44 +3213,57 @@ pub async fn run(
                                         if !matches!(byte, 27 | b'\r' | b'\n' | 9) { continue; }
                                     } else {
                                         if byte == b':' && files.document.is_some() { files.jump = Some(String::new()); continue; }
-                                        if byte == b'g' { files.offset = 0; continue; }
-                                        if byte == b'G' { files.offset = files.last_line().saturating_sub(io.size.1.saturating_sub(12)); continue; }
+                                        if byte == b'g' { files.preview_end = false; files.offset = 0; if files.document.is_none() { files.selected = 0; } continue; }
+                                        if byte == b'G' { if files.document.is_none() { files.selected = files.listing.as_ref().map_or(0, |listing| listing.entries.len().saturating_sub(1)); } else { files.preview_end = files.tab == 2 && files.preview_rows().is_none(); let visible = if files.preview_end { 1 } else { file_visible }; files.offset = files.last_line().saturating_sub(visible - 1); } continue; }
                                     }
-                                    if let Some(tab) = match byte { b's' => Some(0), b'd' => Some(1), b'p' => Some(2), _ => None } { files.tab = tab; files.offset = 0; continue; }
+                                    if let Some(tab) = match byte { b's' => Some(0), b'd' => Some(1), b'p' => Some(2), _ => None } { files.preview_end = false; files.tab = tab; files.offset = 0; continue; }
                                     if byte == b'h' { let parent = files.document.as_ref().and_then(|d| d.path.parent()).or_else(|| files.listing.as_ref().and_then(|l| l.path.parent())).map(Path::to_path_buf); if let Some(parent) = parent { work.open_file(parent, io); } continue; }
                                     if byte == b'e' { work.prepare_editor(io); continue; }
+                                    if byte == b'q' { work.open_terminal(io); deferred_input.extend(&bytes[position + 1..count]); break; }
                                     if byte >= 32 && byte != 127 { continue; }
                                 }
-                                if work.focus == Focus::Chat && !work.slots[work.current].state.follow_tail && matches!(byte, b'g' | b'G') {
-                                    work.selection = None;
-                                    let slot = &mut work.slots[work.current];
-                                    slot.state.reading = None;
-                                    slot.state.scroll = if byte == b'g' { usize::MAX } else { 0 };
-                                    slot.state.follow_tail = byte == b'G';
-                                    slot.timeline_query = GetTranscript { before: 0, limit: 64, forward: byte == b'g' };
-                                    slot.refresh = Instant::now();
-                                    continue;
+                                if work.focus == Focus::Chat && work.menu.is_none() && byte == b'?' && work.slots[work.current].state.editor.bytes.is_empty() {
+                                    work.menu = Some(Menu::Help { selected: 0 }); work.completion = None; continue;
                                 }
                                 if work.menu.is_some() && !matches!(byte, 27 | b'\r' | b'\n' | 9) { continue; }
                             }
-                            if byte >= 32 && byte != 127 && !work.slots[work.current].state.editor.escape_pending() && !work.slots[work.current].state.editor.pasting() {
+                            if byte >= 32 && byte != 127 && !work.input_editor().escape_pending() && !work.input_editor().pasting() {
                                 work.selection = None;
+                                work.tool_press = None;
                             }
-                            let slot = &mut work.slots[work.current];
-                            let before = (slot.state.editor.bytes.len(), slot.state.editor.cursor);
-                            let action = slot.state.editor.feed(byte, true);
-                            if before != (slot.state.editor.bytes.len(), slot.state.editor.cursor) { slot.state.input_history.edited(&slot.state.editor); }
+                            let navigating = work.navigating();
+                            let complete = (work.completion.is_some() && work.menu.is_none()) || matches!(work.menu, Some(Menu::Help { .. }));
+                            let action = if navigating {
+                                work.navigation_editor.set_completion(complete);
+                                let action = work.navigation_editor.feed(byte, true);
+                                // This editor owns only escape/paste framing. Read-only
+                                // views must never modify the conversation's draft.
+                                work.navigation_editor.bytes.clear();
+                                work.navigation_editor.cursor = 0;
+                                work.navigation_editor.overflow = false;
+                                action.filter(|action| !matches!(action, Action::Overflow))
+                            } else {
+                                let slot = &mut work.slots[work.current];
+                                let before = (slot.state.editor.bytes.len(), slot.state.editor.cursor);
+                                slot.state.editor.set_completion(complete);
+                                let action = slot.state.editor.feed(byte, true);
+                                if before != (slot.state.editor.bytes.len(), slot.state.editor.cursor) {
+                                    slot.state.input_history.edited(&slot.state.editor); slot.state.status.clear();
+                                }
+                                action
+                            };
                             if let Some(action) = action {
                                 match action {
                                     Action::Submit | Action::QueueSubmit => {
                                         let origin = work.current;
                                         if let Some(text) = work.enter(io) {
                                             let (accepted, done) = work.text(&text, io); finished |= done;
-                                            if accepted { let slot = &mut work.slots[origin]; slot.state.editor.clear(); slot.state.input_history.reset(); slot.state.follow_tail = true; slot.state.reading = None; slot.timeline_query = GetTranscript { before: 0, limit: 64, forward: false }; slot.refresh = Instant::now(); }
+                                            if accepted { let slot = &mut work.slots[origin]; slot.state.editor.clear(); slot.state.input_history.reset(); if slot.state.follow_tail { slot.state.reading = None; slot.timeline_query = GetTranscript { before: 0, limit: 64, forward: false }; } slot.refresh = Instant::now(); }
                                         }
                                     }
+                                    Action::Complete => { if matches!(work.menu, Some(Menu::Help { .. })) { work.enter(io); } else { work.complete_command(); } }
                                     Action::Escape => work.escape(io),
-                                    Action::FocusNext | Action::FocusPrevious => if work.panel.is_some() { work.focus = if work.focus == Focus::Chat { Focus::Inspector } else { Focus::Chat }; },
+                                    Action::FocusNext | Action::FocusPrevious => if work.panel.is_some() { work.focus = if work.focus == Focus::Chat && work.displayed.as_ref().and_then(|frame| frame.inspector_bounds()).is_some_and(|(_, _, width, height)| width > 0 && height > 0) { Focus::Inspector } else { Focus::Chat }; },
                                     Action::Mouse(mouse) => work.mouse(mouse, io),
                                     Action::HistoryOlder | Action::HistoryNewer => work.navigate(action == Action::HistoryOlder),
                                     Action::PageUp => work.page(true), Action::PageDown => work.page(false),
@@ -2153,6 +3274,8 @@ pub async fn run(
                                     Action::ToggleHistory | Action::ToggleMode => {}
                                 }
                             }
+                            work.refresh_completion();
+                            if work.terminal_focused() { deferred_input.extend(&bytes[position + 1..count]); break; }
                             if finished || work.input_closed { break; }
                             if work.slots[work.current].state.pending_draft.is_some() { deferred_input.extend(&bytes[position + 1..count]); break; }
                         }
@@ -2206,10 +3329,34 @@ pub async fn run(
     for slot in &work.slots {
         slot.handle.request_shutdown();
     }
-    while let Some(result) = work.jobs.join_next().await {
-        if result.is_err() {
-            failure.get_or_insert("workspace_job");
+    if let Some(mut terminal) = work.terminal.take() {
+        match tokio::task::spawn_blocking(move || terminal.shutdown()).await {
+            Ok(outcome) if outcome.shell_reaped && outcome.session_empty => {}
+            _ => {
+                failure.get_or_insert("terminal_cleanup_unknown");
+            }
         }
+    }
+    while let Some(result) = work.jobs.join_next().await {
+        match result {
+            Ok(Job::ThemeSaved {
+                revision,
+                theme,
+                result,
+            }) => {
+                if result.is_err() {
+                    failure.get_or_insert("theme_preferences_write");
+                }
+                work.saved_theme(revision, theme, result, io);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                failure.get_or_insert("workspace_job");
+            }
+        }
+        // A newer accepted choice can have waited behind an earlier save or
+        // another bounded frontend job. Drain that final preference as well.
+        work.start_theme_save();
     }
     for slot in &mut work.slots {
         while let Some(result) = slot.replies.join_next().await {
@@ -2293,6 +3440,137 @@ fn exit_result(exit: i32, failure: Option<&'static str>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_replies_match_file_width_and_preserve_only_preview_anchors() {
+        let document = super::super::super::markdown::Document::parse(&"word ".repeat(40));
+        let old = std::sync::Arc::new(document.rows(16));
+        let rows = std::sync::Arc::new(document.rows(30));
+        let mut files = Files {
+            token: 7,
+            listing: None,
+            document: None,
+            selected: 0,
+            tab: 2,
+            offset: 4,
+            loading: false,
+            jump: None,
+            preview_cache: Some((16, old)),
+            preview_width: Some(30),
+            preview_end: false,
+        };
+        assert!(files.preview_rows().is_none());
+        assert!(!files.accept_preview(6, 30, Some(rows.clone())));
+        assert!(!files.accept_preview(7, 16, Some(rows.clone())));
+        assert!(!files.accept_preview(7, 30, None));
+        assert_eq!(files.offset, 4);
+        files.offset = files.offset.saturating_add(1).min(files.last_line());
+        assert_eq!(
+            files.offset, 5,
+            "navigation during resize must retain the old reading anchor"
+        );
+        let anchor = files.preview_cache.as_ref().unwrap().1[files.offset].anchor;
+        assert!(files.accept_preview(7, 30, Some(rows.clone())));
+        assert_eq!(
+            files.offset,
+            super::super::super::markdown::Row::locate(&rows, anchor)
+        );
+        assert!(std::sync::Arc::ptr_eq(files.preview_rows().unwrap(), &rows));
+        files.preview_width = Some(11);
+        files.preview_end = true;
+        let narrow = std::sync::Arc::new(document.rows(11));
+        assert!(files.accept_preview(7, 11, Some(narrow.clone())));
+        assert_eq!(
+            files.offset,
+            narrow.len() - 1,
+            "pending G must show the new layout's actual tail"
+        );
+        assert!(!files.preview_end);
+
+        files.tab = 0;
+        files.offset = 37;
+        files.preview_width = Some(40);
+        assert!(files.accept_preview(7, 40, Some(std::sync::Arc::new(document.rows(40)))));
+        assert_eq!(
+            files.offset, 37,
+            "Source uses source lines, not preview row anchors"
+        );
+        files.preview_width = None;
+        assert!(files.preview_rows().is_none());
+        assert!(!files.accept_preview(7, 40, Some(rows)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_top_waits_for_its_page_and_cancelled_jump_keeps_the_tail() {
+        let runtime = super::super::super::app::offline_runtime(None, false).unwrap();
+        runtime.ready().await.unwrap();
+        let mut slot = Slot::new(runtime, "offline".into(), Kind::Main, None, None, false);
+        slot.state.scroll = 2;
+        slot.jump_history(true);
+        assert_eq!(slot.state.scroll, 2);
+        // A paint of the old, shorter page is allowed to clamp its scroll.
+        slot.state.scroll = 0;
+        let page = TranscriptPage {
+            begin: 0,
+            end: 1,
+            total: 80,
+            entries: vec![],
+            query: slot.timeline_query.clone(),
+        };
+        slot.received_timeline(&page);
+        let frame = carbon::layout_full(
+            &[Entry {
+                status: None,
+                role: "user".into(),
+                text: format!("EARLIEST\n{}", "later\n".repeat(50)),
+                action: None,
+                edit: None,
+                output: None,
+            }],
+            b"draft",
+            5,
+            "",
+            slot.state.scroll,
+            "",
+            (60, 16),
+            false,
+        )
+        .unwrap();
+        assert!(
+            frame
+                .plain_lines()
+                .iter()
+                .any(|line| line.contains("EARLIEST"))
+        );
+        assert!(
+            frame
+                .plain_lines()
+                .iter()
+                .filter(|line| line.contains("later"))
+                .count()
+                > 3
+        );
+        slot.jump_history(true);
+        slot.jump_history(false);
+        let tail = TranscriptPage {
+            begin: 16,
+            end: 80,
+            total: 80,
+            entries: vec![],
+            query: slot.timeline_query.clone(),
+        };
+        slot.received_timeline(&tail);
+        assert_eq!(slot.state.scroll, 0);
+        assert!(slot.state.follow_tail && !slot.jump_top);
+        for _ in 0..2 {
+            slot.jump_history(true);
+            slot.cancel_history_jump();
+            assert!(!slot.timeline_query.forward);
+            assert_eq!(slot.timeline_query.before, tail.end);
+            assert!(!slot.jump_top);
+        }
+        slot.runtime.shutdown().await.unwrap();
+    }
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2537,6 +3815,10 @@ mod tests {
         let frame = |text: &str| {
             carbon::layout_full(
                 &[Entry {
+                    action: None,
+                    edit: None,
+                    output: None,
+                    status: None,
                     role: "user".into(),
                     text: text.into(),
                 }],
@@ -2615,6 +3897,7 @@ mod tests {
             total: 1,
             query: slot.timeline_query.clone(),
             entries: vec![transcript::Entry {
+                tool: None,
                 turn: "turn".into(),
                 request: "task".into(),
                 role: "tool".into(),
