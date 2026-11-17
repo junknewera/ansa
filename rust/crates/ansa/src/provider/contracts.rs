@@ -59,6 +59,26 @@ pub struct GetTranscript {
     pub limit: usize,
     pub forward: bool,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Submit,
+    Steer,
+}
+/// Status only: no submitted text, native items, tool payloads or auth binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageReceiptInfo {
+    pub kind: MessageKind,
+    pub turn: TurnId,
+    pub request: Option<RequestId>,
+    pub state: String,
+    pub mode: Option<AgentMode>,
+    /// Binds a reconnect lookup to the exact user message without exporting it.
+    pub text_sha256: String,
+    /// The message admission is confirmed by the canonical journal.
+    pub admission_durable: bool,
+    /// The reported state also matches an acknowledged journal state.
+    pub state_durable: bool,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandPayload {
     Submit(Submit),
@@ -70,6 +90,7 @@ pub enum CommandPayload {
     GetSnapshot(u64),
     Resume(RequestId),
     GetTranscript(GetTranscript),
+    GetMessageReceipt(CommandId),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCommand {
@@ -82,6 +103,14 @@ pub struct RuntimeCommand {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventPayload {
+    MessageReceipt {
+        query: CommandId,
+        command: CommandId,
+        receipt: Option<Box<MessageReceiptInfo>>,
+        ready: bool,
+        storage_failed: bool,
+        recovery_required: bool,
+    },
     FollowupQueued {
         command: CommandId,
     },
@@ -164,6 +193,7 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         CommandPayload::Cancel(id) | CommandPayload::Resume(id) if !valid_id(&id.0) => {
             Err("request_id")
         }
+        CommandPayload::GetMessageReceipt(id) if !valid_id(&id.0) => Err("command_id"),
         CommandPayload::Submit(submit) => {
             if submit.text.is_empty() || submit.text.len() > 16 * 1024 {
                 return Err("submit_size");

@@ -199,6 +199,47 @@ pub fn encode(event: &RuntimeEvent) -> Json {
         ),
     ];
     let (kind, extra) = match &event.payload {
+        EventPayload::MessageReceipt {
+            query,
+            command,
+            receipt,
+            ready,
+            storage_failed,
+            recovery_required,
+        } => (
+            "message_receipt",
+            vec![
+                ("query_id", s(&query.0)),
+                ("command_id", s(&command.0)),
+                ("ready", b(*ready)),
+                ("storage_failed", b(*storage_failed)),
+                ("recovery_required", b(*recovery_required)),
+                (
+                    "receipt",
+                    receipt.as_ref().map_or_else(null, |receipt| {
+                        object(vec![
+                            (
+                                "kind",
+                                s(match receipt.kind {
+                                    MessageKind::Submit => "submit",
+                                    MessageKind::Steer => "steer",
+                                }),
+                            ),
+                            ("turn", s(&receipt.turn.0)),
+                            (
+                                "request_id",
+                                id(receipt.request.as_ref().map(|r| r.0.as_str())),
+                            ),
+                            ("state", s(&receipt.state)),
+                            ("mode", receipt.mode.map_or_else(null, |m| s(mode(m)))),
+                            ("admission_durable", b(receipt.admission_durable)),
+                            ("text_sha256", s(&receipt.text_sha256)),
+                            ("state_durable", b(receipt.state_durable)),
+                        ])
+                    }),
+                ),
+            ],
+        ),
         EventPayload::FollowupQueued { command } => {
             ("followup_queued", vec![("command_id", s(&command.0))])
         }

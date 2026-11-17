@@ -1438,7 +1438,11 @@ impl Workbench {
                 } else {
                     text
                 };
-                slot.state.text(routed, &slot.handle, io, &mut slot.replies)
+                let result = slot.state.text(routed, &slot.handle, io, &mut slot.replies);
+                if slot.id == self.root_id {
+                    self.factory.set_editor_mode(slot.state.mode);
+                }
+                result
             }
         }
     }
@@ -2973,7 +2977,7 @@ fn model_choices(value: Json) -> Result<Vec<(String, String, Vec<String>)>> {
 }
 
 pub async fn run(
-    mut runtime: Runtime,
+    runtime: Runtime,
     io: &mut Io,
     context: &str,
     factory: Factory,
@@ -2981,9 +2985,37 @@ pub async fn run(
     kind: Kind,
     parent: Option<String>,
 ) -> Result<i32> {
+    run_attached(runtime, io, context, factory, root_id, kind, parent, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_attached(
+    mut runtime: Runtime,
+    io: &mut Io,
+    context: &str,
+    factory: Factory,
+    root_id: String,
+    kind: Kind,
+    parent: Option<String>,
+    bridge_options: Option<super::super::bridge::BridgeOptions>,
+) -> Result<i32> {
     if io.raw.is_none() {
+        if bridge_options.is_some() {
+            return Err("workspace_requires_tty");
+        }
         return super::run(&mut runtime, io, None, false, context).await;
     }
+    let mut bridge = bridge_options
+        .as_ref()
+        .map(|options| {
+            super::super::bridge::Bridge::start_with_artifacts(
+                &options.directory,
+                runtime.handle(),
+                options.editor.clone(),
+                options.artifact_store.clone(),
+            )
+        })
+        .transpose()?;
     let mut work = Workbench::new(runtime, factory, root_id, kind, parent)?;
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3005,6 +3037,10 @@ pub async fn run(
     let mut editor_cancel_since: Option<Instant> = None;
     let result: Result<()> = async {
         while !finished || work.editor.is_some() {
+            if let Some(bridge) = &mut bridge
+                && let Some(root) = work.slots.iter().find(|slot| slot.id == work.root_id) {
+                bridge.set_input_mode(root.state.mode);
+            }
             work.update_displayed(io);
             let mut input_guard = None; let mut signal_guard = None;
             let input_enabled = work.terminal_pending_input.is_empty() && !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing
@@ -3017,7 +3053,10 @@ pub async fn run(
                 event = work.events.recv() => { if let Some((id, event)) = event {
                     match event {
                         SessionEvent::Ready(result) => work.readiness(&id, result, io),
-                        SessionEvent::Runtime(event) => work.event(&id, Some(event), io),
+                        SessionEvent::Runtime(event) => {
+                            if let Some(bridge) = &mut bridge { bridge.publish(&event); }
+                            work.event(&id, Some(event), io)
+                        },
                         SessionEvent::Closed => work.event(&id, None, io),
                     }
                     dirty = true;
@@ -3426,6 +3465,9 @@ pub async fn run(
     }
     if let Some(code) = failure {
         io.status(&format!("ansa: {}\n", diagnostics::error(code)));
+    }
+    if let Some(bridge) = bridge.take() {
+        bridge.shutdown().await;
     }
     exit_result(exit, failure)
 }

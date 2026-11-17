@@ -1,8 +1,9 @@
 //! Shared owning CLI/TUI events. This is not a second source of session truth.
 pub use crate::provider::contracts::{
     AgentMode, CommandId, CommandPayload, EventPayload, Followup, GenerationSelection,
-    GetTranscript, OperationId, RequestId, RuntimeCommand, RuntimeEvent, RuntimeIncarnation,
-    SessionId, Steer, Submit, TurnId, validate_command, validate_event,
+    GetTranscript, MessageKind, MessageReceiptInfo, OperationId, RequestId, RuntimeCommand,
+    RuntimeEvent, RuntimeIncarnation, SessionId, Steer, Submit, TurnId, validate_command,
+    validate_event,
 };
 use crate::provider::replay::{Effects, Execution};
 use std::sync::Arc;

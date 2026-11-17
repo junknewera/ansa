@@ -228,6 +228,7 @@ mod tests {
                 .unwrap(),
                 auth: settings.directory.join("auth"),
                 session: self.0.join("session"),
+                editor: None,
                 settings,
             }
         }

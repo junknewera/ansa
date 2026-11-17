@@ -111,6 +111,12 @@ fn label(name: &str) -> &str {
         "search_files" => "Поиск",
         "run_command" => "Запуск",
         "edit_file" => "Правка",
+        "workspace_describe" => "Рабочая среда",
+        "editor_get_context" => "Выделение",
+        "editor_open_file" => "Просмотр в редакторе",
+        "editor_propose_diff" => "Предложение правки",
+        "dataset_inspect" => "Проверка CSV",
+        "python_execute" => "Анализ",
         _ => name,
     }
 }

@@ -293,6 +293,72 @@ impl Owner {
             preview: self.preview.clone(),
         })));
     }
+    fn message_receipt(&self, command: &CommandId) -> Option<MessageReceiptInfo> {
+        if let Some(receipt) = self.receipts.get(&command.0) {
+            let state = if self.request().as_ref() == Some(&receipt.request) {
+                self.phase.clone()
+            } else {
+                receipt.state.clone()
+            };
+            let admission_durable = self.options.directory.is_some()
+                && !self.storage_failed
+                && self.state.submits.contains_key(&command.0);
+            return Some(MessageReceiptInfo {
+                kind: MessageKind::Submit,
+                turn: receipt.turn.clone(),
+                request: (!receipt.request.0.is_empty()).then(|| receipt.request.clone()),
+                state_durable: admission_durable
+                    && self
+                        .state
+                        .submits
+                        .get(&command.0)
+                        .is_some_and(|r| r.state == state),
+                state,
+                mode: Some(receipt.mode),
+                text_sha256: crate::protocol::legacy_json_v1::sha256(receipt.text.as_bytes()),
+                admission_durable,
+            });
+        }
+        if let Some(message) = self.state.followups.iter().find(|m| m.command == *command) {
+            let source = self
+                .state
+                .submits
+                .values()
+                .find(|r| r.request == message.target);
+            return Some(MessageReceiptInfo {
+                kind: MessageKind::Steer,
+                turn: source
+                    .map(|r| r.turn.clone())
+                    .unwrap_or_else(|| self.turn()),
+                request: Some(message.target.clone()),
+                state: message.state.clone(),
+                mode: source.map(|r| r.mode),
+                text_sha256: crate::protocol::legacy_json_v1::sha256(message.text.as_bytes()),
+                admission_durable: self.options.directory.is_some() && !self.storage_failed,
+                state_durable: self.options.directory.is_some() && !self.storage_failed,
+            });
+        }
+        if let Some(pending) = self.control_commands.get(&command.0)
+            && let CommandPayload::Steer(message) = &pending.payload
+        {
+            return Some(MessageReceiptInfo {
+                kind: MessageKind::Steer,
+                turn: pending.turn.clone(),
+                request: Some(message.target.clone()),
+                state: "queued".into(),
+                mode: self
+                    .state
+                    .submits
+                    .values()
+                    .find(|r| r.request == message.target)
+                    .map(|r| r.mode),
+                admission_durable: false,
+                text_sha256: crate::protocol::legacy_json_v1::sha256(message.text.as_bytes()),
+                state_durable: false,
+            });
+        }
+        None
+    }
     fn finish_preview(&mut self, state: &str, final_text: bool) {
         if let Some(preview) = &mut self.preview
             && preview.state == "preview"
@@ -634,6 +700,16 @@ impl Owner {
             );
         }
         match &command.payload {
+            CommandPayload::GetMessageReceipt(target) => {
+                self.emit(EventPayload::MessageReceipt {
+                    query: command.command.clone(),
+                    command: target.clone(),
+                    receipt: self.message_receipt(target).map(Box::new),
+                    ready: self.initialized && !self.starting && self.phase != "loading",
+                    storage_failed: self.storage_failed,
+                    recovery_required: self.recovery.is_some(),
+                });
+            }
             CommandPayload::Steer(message) => {
                 if let Some(previous) = self
                     .state

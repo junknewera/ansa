@@ -18,7 +18,7 @@ use crate::{
     provider::request::{Binding, Epoch, Request},
     runtime::{Generate, Lease, Limits, Options as RuntimeOptions, Runtime},
     tools::{
-        files::local_tools,
+        files::local_tools_with_editor,
         registry::{Definition, Outcome, Policy, Registry},
     },
 };
@@ -355,12 +355,23 @@ fn text(args: &[String]) -> Result<i32> {
     } else {
         catalog.create()?
     };
-    let tools = local_tools(
+    let editor = parsed.workspace_editor.then(|| {
+        crate::tools::editor_context::EditorHub::new(
+            settings.cwd.clone(),
+            vec![
+                parsed.auth.clone(),
+                settings.directory.clone(),
+                selected.directory.clone(),
+            ],
+        )
+    });
+    let tools = local_tools_with_editor(
         settings.clone(),
         epoch.clone(),
         &selected.directory,
         &parsed.auth,
         &std::env::current_exe().map_err(|_| "process_executable")?,
+        editor.clone(),
     )?;
     let configuration = Request::new(bound, epoch, tools.advertisement().clone(), vec![])?;
     options.directory = Some(selected.directory.clone());
@@ -374,13 +385,16 @@ fn text(args: &[String]) -> Result<i32> {
             }
         });
     }
-    let factory = super::sessions::Factory::new(
+    let mut factory = super::sessions::Factory::new(
         settings.clone(),
         parsed.auth.clone(),
         parsed.offline,
         configuration.binding.account.clone(),
         workspace_auth,
     );
+    if let Some(editor) = &editor {
+        factory = factory.with_editor(selected.directory.clone(), editor.clone());
+    }
     // Signals must be blocked before starting owner and output threads.
     let mut io = Io::open(parsed.prompt.is_none())?;
     let (mut runtime, root_kind, parent) = if parsed.resume || !parsed.session.is_empty() {
@@ -411,7 +425,7 @@ fn text(args: &[String]) -> Result<i32> {
     ));
     let context = format!("{}  {}", settings.cwd.display(), settings.model);
     if io.raw.is_some() {
-        return reactor()?.block_on(controller::workbench::run(
+        return reactor()?.block_on(controller::workbench::run_attached(
             runtime,
             &mut io,
             &context,
@@ -419,7 +433,22 @@ fn text(args: &[String]) -> Result<i32> {
             selected.id,
             root_kind,
             parent,
+            parsed
+                .workspace
+                .map(|directory| -> Result<_> {
+                    Ok(super::bridge::BridgeOptions {
+                        directory,
+                        editor,
+                        artifact_store: Some(crate::tools::artifacts::Store::new(
+                            &selected.directory,
+                        )?),
+                    })
+                })
+                .transpose()?,
         ));
+    }
+    if parsed.workspace.is_some() {
+        return Err("workspace_requires_tty");
     }
     reactor()?.block_on(controller::run(
         &mut runtime,

@@ -1,5 +1,167 @@
 # Состояние ansa
 
+## Carbon + Neovim: workspace, отчёты и графики
+
+**GO**, проверенный code checkpoint
+[`aa51b23`](https://github.com/junknewera/ansa/commit/aa51b23af9dac1cefbdc0c2fd058eeb3392bfd74),
+X13s/NixOS/aarch64. Реализованы этапы 0–3 PR #26: private production bridge,
+контекст и отправка задач из соседнего Neovim, просмотр предложенных правок,
+CSV-анализ, сохранённые Markdown/CSV/PNG и Kitty launcher с проверкой ID панели.
+[Запуск](../integrations/ansa.nvim/README.md), [контракт](WORKSPACE_PROTOCOL.md).
+
+Финальная матрица прошла **43/43 фазы** на чистом коммите. Cargo и Nix Release:
+по **338 native + 9 doctests**. fmt/clippy всех targets/features, adapters,
+offline build, Nix package/check, self-check и offline demo прошли.
+Pinned ASan с instrumented std/leak detection: **338/338**. Replay baseline
+прошёл; drop/reorder mutants обнаружены **2/2**.
+
+В каждом профиле прошли acceptance **12/12**, progress PTY **10/10**,
+workspace PTY **20/20**, visual PTY **3/3**, editor setup **2/2**,
+production bridge **8/8** и editor messages **7/7**. Drain **4/4**,
+startup **259/259**, дополнительные режимы и suspend/resume **6/6**.
+Neovim: workspace **4/4**, editor invalidation **5/5**, sender **6/6**,
+artifacts **10/10**, prepared documents **9/9**, capability/paste **6/6**,
+image lifecycle **10/10**, launcher **6/6**, analysis worker **3/3**.
+Pinned Markdown renderer и queued-converter cleanup прошли; реальная графика
+Kitty 0.49.2/Ghostty 1.3.1 в отдельном Weston/software GL - **19/19**.
+
+Независимые source review закрыты. Отдельная Astra после сборки сама запустила
+установленные Carbon и native `ansa-nvim` в private HOME/XDG: проверила историю,
+несохранённое выделение, share/send, durable receipt, сохранность файла/черновика,
+reconnect без новых записей и повторный запуск прежней панели. Её собственный
+сценарий прошёл **5 групп**, сохранены **9 скриншотов**; она также независимо
+повторила графику **19/19** и просмотрела все **18 снимков** этой suite.
+Новых product findings нет. Prepared report/diff в её визуальной проверке
+использовали synthetic DTO; PNG создан настоящим deterministic worker.
+Canonical publication/recovery проверены отдельно native runtime/bridge тестами.
+Provider calls не выполнялись.
+
+Evidence: `~/Workspace/pet/ansa-baselines/workspace-bridge-20261117/`:
+`final-aa51b23/{summary.json,binary-preflight.json,graphics/}`,
+`final-harness-01/` и `final-astra-aa51b23-01/{verdict.txt,attempt02/,png-lifecycle/}`.
+Матрица выполнялась с 17:46:07 до 18:02:35 UTC, **987.9 с** wall time;
+предварительные итерации и независимая приёмка считаются отдельно. Failed
+captures сохранены. Установленный пакет закреплён GC root `final-aa51b23/package`.
+
+Анализ первой версии считает помесячные суммы CSV с точными decimal итогами.
+Хранилище сессии ограничено 64 MiB; сохранённые версии не удаляются автоматически.
+SSH/tmux и несколько Neovim UI используют текстовый fallback. В узких панелях
+подписи PNG мелкие; длинные URI и строка статуса требуют дальнейшей UX правки.
+Прямые editor mutations, headless frontend, MCP и persistent kernels остаются
+этапом 4. Предыдущий проверенный Carbon checkpoint `5df02d8` сохранён ниже.
+
+## Промежуточные проверки PR #26
+
+Ниже сохранены результаты отдельных срезов до финального checkpoint выше.
+
+2026-11-17, ветка `feat/terminal-workspace`, реализация PR #26 продолжается.
+Первый slice добавляет opt-in `--workspace-dir PATH`: private Unix socket
+над исходным production runtime Carbon и readonly Neovim viewer. Подключение
+не меняет цель при переходе Carbon в fork. История запрашивается отдельными
+correlated страницами; заменяемые snapshots имеют собственный cursor и gap.
+DTO исключает native context, opaque reasoning и внутренние tool outputs.
+`--workspace-editor` разрешает явную передачу выделения через `:AnsaAttach!`
+и `:AnsaShare`. Контекст ограничен 16 KiB и связан с editor incarnation,
+buffer, changedtick и sequence. Редактирование, переименование, закрытие буфера
+и потеря соединения отзывают его. `editor_get_context` проверяет актуальную
+версию, разрешённый путь и инструкции каталога в tool worker. Сервис доступен
+исходной сессии; fork и субагенты получают недоступный editor context.
+
+Адресно прошли 3 native bridge-теста, fmt/clippy всех targets/features,
+7 сценариев с production offline Carbon, двумя клиентами и настоящим Neovim,
+а также 4 Neovim fault-сценария: QueueFull с bounded retry, более свежая
+страница при старом snapshot, задержанный reconnect с сохранением cursor/scroll
+и смена сессии с сохранением dirty document. Независимый адресный review Astra
+закрыт без открытых замечаний. Предыдущие failed capture сохранены, включая
+ошибку учёта dirty state у Neovim `nofile` buffer; используется `acwrite`.
+
+Evidence: `~/Workspace/pet/ansa-baselines/workspace-bridge-20261117/`.
+Это WIP checkpoint: отправка задачи из редактора, analysis worker, durable artifacts,
+PNG renderer и полная финальная матрица ещё впереди. Последний проверенный
+GO runtime остаётся `5df02d8`, описанный ниже. Контракт расширения -
+[WORKSPACE_PROTOCOL](WORKSPACE_PROTOCOL.md).
+
+Context subset дополнительно прошёл locked Cargo **319 native + 9 doctests**,
+8 сценариев с настоящими Carbon/Neovim/Unix clients и 5 Neovim fault-сценариев
+для delayed ACK, rename без смены tick, wipe, переполнения очереди и ошибки
+write при отзыве контекста. Отдельные native-тесты проверяют отмену чтения
+частичного frame и завершение history между фрагментами следующей команды.
+Независимый source review context subset закрыт без открытых замечаний.
+Следующий шаг - typed selection submit с проверяемым исходом по ID.
+
+Editor sender добавлен в WIP: `:AnsaSend` передаёт выделение как typed Submit
+или Steer текущего request. `:AnsaPending` проверяет исход по прежнему ID и
+hash текста. Отдельно возвращается сохранность сообщения и текущего состояния;
+нет автоматического повтора вычисления при отсутствии подтверждения.
+`:AnsaCancel` адресует свою подтверждённую задачу через priority Cancel.
+Проверка настоящего bridge с удержанным journal fsync подтвердила отмену при
+занятой отправке и заполненной обычной очереди.
+
+Sender subset прошёл **324 native + 9 doctests**, дополнительную native
+регрессию priority Cancel, production Carbon/Neovim **7/7** и Neovim fault
+**6/6**. Последние проверяют потерю ACK и reconnect, неизменный payload,
+bounded status reads, конфликт ID, сохранение черновика при смене режима
+и ACK вместе со свежим snapshot. Независимый source review закрыт; найденная
+гонка маршрутизации по старому snapshot исправлена. fmt/clippy всех
+targets/features прошли. Полная финальная матрица PR #26 ещё не выполнялась.
+
+Analysis/storage subset добавляет compiled `dataset_inspect` и фиксированный
+`python_execute` для помесячных CSV sums. Pinned Python/Matplotlib работает через
+существующий ProcessRunner: 60 с, AS 1 GiB, CPU 45 с, FD 64 и файл до 16 MiB.
+Store 64 MiB учитывает 24 MiB резерв незавершённой операции. CSV/Markdown/PNG
+связаны с operation, immutable revision и input/output hashes из durable
+process stdout; receipt публикуется после проверки всего набора и fsync.
+Старые версии сохраняются при уточнении; показ не запускает вычисление.
+
+Адресные native **5/5** проверили production runtime/supervisor, точные decimal
+итоги, refinement, recovery при потере outcome/receipt без rerun, отсутствие
+нового worker при missing/invalid CSV или отказе по инструкциям, статусы nonzero
+и Cancel, а также порчу parameters/script/input/table/PNG до recovery. Отдельный
+worker **3/3** проверил hostile Matplotlib rc, декодированный PNG 1000x500 и
+manifest. Locked Cargo прошёл **334 native + 9 doctests**; fmt/clippy всех
+targets/features прошли. Независимый source review закрыт после исправлений
+rc, provenance и классификации ошибок. Старый compatibility fixture исправлен:
+исторический pre-edit catalog теперь задан точным набором прежних tools.
+
+Canonical artifact projection, отчёты, PNG и proposed diff добавлены следующим
+WIP slice. `artifact_catalog` использует сохранённый TimelinePage; недописанный
+ToolFinished не выдаёт grant. `artifact_read` сверяет descriptor, receipt,
+hash/размер и тип файла в отдельном bounded filesystem worker. Отчёты сохраняют
+черновик и положение чтения; reconnect сначала восстанавливает canonical grant.
+`editor_open_file` и `editor_propose_diff` публикуют readonly snapshots для
+просмотра в Neovim. Выгруженные буферы и вытесненные cache entries восстанавливаются
+повторным чтением, без исполнения tools.
+
+Pinned Neovim **0.12.5**, Snacks **882c996**, render-markdown **8801162**,
+parsers и ImageMagick включены в Nix package. Источники плагинов проверены hashes.
+PNG capability queries разобраны отдельно от обычного ввода и bracketed paste;
+late callbacks сверяют текущую версию/буфер. Scoped cleanup останавливает также
+queued converters. Предварительное чтение метаданных устраняет оставшийся после
+закрытия progress timer закреплённого renderer.
+
+Реальные **Kitty 0.49.2 / Ghostty 1.3.1**, собственный Weston/software GL:
+**19/19**, со снимками видимых pixels, resize/scroll, сменой буфера, повторным
+открытием, заменой revision и очисткой. Дополнительный сценарий проверил
+native Kitty launch, повторное получение того же pane ID, относительный путь
+из cwd вызывающего процесса и confirmed close. PATH исходного терминала был
+ограничен: конвертер предоставляет wrapper Neovim. Controlled-response TUI
+проверка capability/paste прошла **6/6**; это отдельная проверка от изображения
+на экране. Real pinned Snacks queue regression прошёл **1/1**: отменённый
+четвёртый converter не стартует после завершения трёх занятых jobs.
+
+Neovim artifact lifecycle прошёл **10/10**, prepared documents **9/9**, image
+callbacks/paste **10/10**, launcher unknown-ACK/ownership **6/6**. Независимые
+source review закрыты. Astra дополнительно сама выполнила real UI **19/19**,
+просмотрела Markdown/PNG/proposed diff, проверила documents **8/8**, artifacts
+**9/9** и Markdown renderer (**18 extmarks**). Найденные ею P2 - недоступные
+из меню старые revisions и отсутствие пути/исходного диапазона в diff - исправлены
+и покрыты проверками. В узких панелях подписи графика остаются мелкими.
+
+Evidence: `workspace-bridge-20261117/{graphics-08,conversion-queue-01,
+nvim-artifacts-07,nvim-documents-04,image-lifecycle-03,nvim-probe-05,
+launcher-02,astra-ui-01,astra-ui-03}` в каталоге baselines выше. Полная финальная
+матрица текущего implementation checkpoint ещё не выполнена; GO остаётся `5df02d8`.
+
 ## Carbon: управление, читаемые инструменты и терминал проекта
 
 **GO**, проверенный code checkpoint
@@ -70,6 +232,22 @@ Evidence, проверенные бинарники и package GC root:
 evidence и rollback сохранены. Новых live model calls не было; ожидание
 очереди не измерялось. Следующая работа - реализация
 [terminal workspace из PR #26](https://github.com/junknewera/ansa/pull/26).
+
+## Предложение: Ghostty/Kitty, Neovim и графические результаты
+
+**PROPOSED, docs-only**, 2026-11-16. Добавлен
+[system design рабочей среды](TERMINAL_WORKSPACE_DESIGN.md) на baseline
+[`8b6ecb7`](https://github.com/junknewera/ansa/commit/8b6ecb7f4b67250dd28c9ca8f4ec46f7e3383df0).
+Документ отделяет нынешний inspector и legacy JSONL от предлагаемого production
+bridge, описывает два режима интерфейса, editor tools, сохранение артефактов
+и PNG-графики. Учитывает разные API панелей Kitty и Ghostty/Linux/macOS и связь
+с открытым PTY proposal #17. Этапы и acceptance относятся к будущей реализации.
+
+Проверенные Carbon/M10 checkpoints ниже сохраняют свой статус. Runtime, lockfiles
+и зависимости этим изменением не затрагиваются. Следующий шаг этого направления —
+выбрать protocol/caps и границы первого implementation slice по design proposal;
+очередь ранее согласованных работ остаётся прежней.
+
 
 ## Carbon: темы и diff отдельных правок
 
