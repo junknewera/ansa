@@ -4,10 +4,6 @@
 
 Новая инженерная сессия начинается с [AGENTS.md](AGENTS.md) и [текущего состояния проекта](docs/PROJECT_STATE.md).
 
-Соседний Neovim показывает историю, Markdown-отчёты, графики и предложенные
-правки. Запуск и команды - в [ansa.nvim](integrations/ansa.nvim/README.md),
-границы и протокол - в [дизайне рабочей среды](docs/TERMINAL_WORKSPACE_DESIGN.md).
-
 ## Обычный CLI
 
 Установите Nix и соберите программу из каталога репозитория:
@@ -140,6 +136,14 @@ HEAD к текущему файлу и Markdown Preview с оформление�
 при отсутствии активной работы; ANSA возвращает терминал после выхода редактора.
 Diff не запускает внешние diff/textconv helpers или lazy promisor fetch.
 Без Git/HEAD либо при недоступном объекте Diff явно недоступен.
+
+Отправьте задачу `Построй график продаж по месяцам из sales.csv и покажи его`.
+Carbon откроет PNG из результата анализа рядом с чатом, если видны последние
+сообщения. Готовый PNG можно открыть через `/files chart.png`. Агент в новой
+сессии может открыть такой файл через `show_png`. Esc закрывает просмотр. Строка
+«Открыть график» рядом с вызовом инструмента возвращает его из истории.
+Kitty и Ghostty показывают изображение при прямом подключении. В других
+терминалах панель показывает размер и путь к файлу. Tab и Enter копируют путь.
 
 В `/files` клавиша `q` открывает shell в том же боковом окне и текущем каталоге.
 Одна сессия shell сохраняется при переходах между файлами и терминалом.
@@ -320,6 +324,9 @@ Runtime накапливает контекст между завершённы�
 Ошибка compact приостанавливает turn до Resume. Offline mock возвращает retained user message и synthetic opaque compaction item. Live использует prompt compact, проверенный на сохранении marker после перезапуска; качество длинных сводок остаётся отдельной проверкой. Контракт формы результата взят из официальной документации. [OpenAI compaction](https://developers.openai.com/api/docs/guides/compaction).
 
 ## Границы реализации
+
+Команды интеграции с Neovim описаны в [ansa.nvim](integrations/ansa.nvim/README.md),
+протокол - в [дизайне рабочей среды](docs/TERMINAL_WORKSPACE_DESIGN.md).
 
 - HTTPS bytes обслуживает Hyper/rustls; bounded SSE framer отвечает за события, Responses reducer - за semantic admission.
 - Admission требует successful terminal, согласованных IDs/model/items/arguments и завершённого framing. До проверки всего batch executors недоступны.

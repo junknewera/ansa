@@ -6,6 +6,7 @@ use crate::{
     frontend::{
         carbon::{Choice, Focus, Inspector, InspectorKind, Popup, Selection, Workspace},
         commands::{self, Completion},
+        graphics,
         input::{MouseEvent, MouseKind},
         sessions::{Created, Factory, Kind},
         theme::{Catalog as ThemeCatalog, Preview as ThemePreview, Store as ThemeStore, Theme},
@@ -63,6 +64,7 @@ struct Slot {
     jump_top: bool,
     tool_expanded: std::collections::BTreeSet<String>,
     tool_anchor_limit: Option<usize>,
+    images_through: Option<usize>,
 }
 impl Slot {
     fn new(
@@ -113,6 +115,7 @@ impl Slot {
             jump_top: false,
             tool_expanded: Default::default(),
             tool_anchor_limit: None,
+            images_through: None,
         }
     }
     #[cfg(test)]
@@ -171,6 +174,19 @@ impl Slot {
         }
         self.jump_top = false;
         self.timeline = Some(page.clone());
+    }
+    fn new_image(&mut self, page: &TranscriptPage) -> Option<graphics::Source> {
+        if page.end != page.total {
+            return None;
+        }
+        let previous = self.images_through.replace(page.end)?;
+        page.entries
+            .iter()
+            .skip(previous.saturating_sub(page.begin))
+            .rev()
+            .find_map(|entry| {
+                graphics::Source::from_entry(entry, &self.id).map(|(_, source)| source)
+            })
     }
     fn active(&self) -> bool {
         !self.ready
@@ -431,6 +447,29 @@ impl Slot {
             page.end == page.total,
             |operation| self.state.progress.tool_elapsed(operation, now),
         );
+        for row in page.entries.iter().rev() {
+            let Some((operation, png)) = graphics::Source::from_entry(row, &self.id) else {
+                continue;
+            };
+            let tool_key = format!("{}:{operation}", row.request.0);
+            let Some(index) = entries
+                .iter()
+                .position(|entry| entry.action.as_deref() == Some(&tool_key))
+            else {
+                continue;
+            };
+            entries.insert(
+                index + 1,
+                Entry {
+                    action: Some(format!("image:{operation}")),
+                    edit: None,
+                    output: None,
+                    status: None,
+                    role: "tool_success".into(),
+                    text: format!("> Открыть график · {}", png.name()),
+                },
+            );
+        }
         if page.end == page.total {
             for message in view
                 .followups
@@ -498,6 +537,7 @@ struct CreateIntent {
 enum FileValue {
     Listing(FileListing),
     Document(FileDocument),
+    Image(graphics::Image),
 }
 enum Job {
     Themes {
@@ -651,6 +691,11 @@ enum Panel {
         selected: usize,
     },
     Terminal,
+    Image {
+        token: u64,
+        name: String,
+        view: Option<graphics::Image>,
+    },
     Output {
         view: std::sync::Arc<carbon::OutputView>,
         offset: usize,
@@ -719,6 +764,7 @@ struct Workbench {
     operational_frame: Option<u64>,
     last_frame: Option<carbon::Frame>,
     file_token: u64,
+    graphics_id: Option<u32>,
     preview_job: Option<PreviewJob>,
     editor: Option<super::super::terminal::EditorJob>,
     pending_editor: Option<EditorCommand>,
@@ -823,6 +869,7 @@ impl Workbench {
             operational_frame: None,
             last_frame: None,
             file_token: 0,
+            graphics_id: graphics::supported().then(graphics::image_id).flatten(),
             preview_job: None,
             editor: None,
             pending_editor: None,
@@ -1021,15 +1068,56 @@ impl Workbench {
         })));
         self.focus = Focus::Inspector;
         let host = self.files.clone();
+        let factory = self.factory.clone();
         let stop = self.stop.clone();
         self.jobs.spawn_blocking(move || {
             let result = match host.list(&path, &stop) {
                 Ok(listing) => Ok(FileValue::Listing(listing)),
+                Err("workspace_directory") if graphics::is_png(&path) => {
+                    let source = graphics::Source::File { path, hash: None };
+                    source.load(&host, &factory).map(FileValue::Image)
+                }
                 Err("workspace_directory") => host.open(&path, &stop).map(FileValue::Document),
                 Err(code) => Err(code),
             };
             Job::File { token, result }
         });
+    }
+    fn show_image(&mut self, source: graphics::Source, io: &Io) {
+        if self.input_closed || self.terminating || !self.can_job(io) {
+            return;
+        }
+        self.file_token = self.file_token.wrapping_add(1);
+        let token = self.file_token;
+        self.panel = Some(Panel::Image {
+            token,
+            name: source.name(),
+            view: None,
+        });
+        self.selection = None;
+        let host = self.files.clone();
+        let factory = self.factory.clone();
+        self.jobs.spawn_blocking(move || {
+            let result = source.load(&host, &factory).map(FileValue::Image);
+            Job::File { token, result }
+        });
+    }
+    fn copy_image_path(&mut self, io: &Io) {
+        let Some(Panel::Image {
+            view: Some(image), ..
+        }) = &self.panel
+        else {
+            return;
+        };
+        let copied = io.writer.clipboard(&image.path.to_string_lossy());
+        self.report(
+            io,
+            if copied {
+                "Путь скопирован"
+            } else {
+                "Не удалось скопировать путь"
+            },
+        );
     }
     fn prepare_editor(&mut self, io: &Io) {
         if self.input_closed || self.terminating {
@@ -1581,6 +1669,7 @@ impl Workbench {
         {
             return;
         }
+        let mut image = None;
         match &event.payload {
             EventPayload::CommandAccepted { command, .. }
                 if slot.follow_accepted_submit.as_ref() == Some(command) =>
@@ -1616,6 +1705,7 @@ impl Workbench {
                             .as_ref()
                             .map_or(0, |snapshot| snapshot.timeline_size) =>
             {
+                image = slot.new_image(page);
                 slot.received_timeline(page);
             }
             _ => {}
@@ -1637,6 +1727,18 @@ impl Workbench {
         }
         if reading.is_some() {
             slot.state.reading = reading;
+        }
+        if let Some(image) = image
+            && index == self.current
+            && slot.state.follow_tail
+            && self.menu.is_none()
+            && self.selection.is_none()
+            && self.editor.is_none()
+            && self.pending_editor.is_none()
+            && !self.editor_preparing
+            && !matches!(self.panel, Some(Panel::Terminal))
+        {
+            self.show_image(image, io);
         }
     }
     fn job(&mut self, job: Job, io: &Io) {
@@ -1868,6 +1970,24 @@ impl Workbench {
                 }
             }
             Job::File { token, result } => {
+                if !matches!(&self.panel, Some(Panel::Files(files)) if files.token == token)
+                    && !matches!(&self.panel, Some(Panel::Image { token: active, .. }) if *active == token)
+                {
+                    return;
+                }
+                if let Ok(FileValue::Image(image)) = result {
+                    self.panel = Some(Panel::Image {
+                        token,
+                        name: image
+                            .path
+                            .file_name()
+                            .unwrap_or(image.path.as_os_str())
+                            .to_string_lossy()
+                            .into_owned(),
+                        view: Some(image),
+                    });
+                    return;
+                }
                 if let Some(Panel::Files(files)) = &mut self.panel
                     && files.token == token
                 {
@@ -1878,8 +1998,13 @@ impl Workbench {
                             files.document = Some(document);
                             files.preview_cache = None;
                         }
+                        Ok(FileValue::Image(_)) => unreachable!("handled image"),
                         Err(code) => self.report(io, &format!("Не удалось открыть файл: {code}")),
                     }
+                } else if let Err(code) = result {
+                    self.panel = None;
+                    self.focus = Focus::Chat;
+                    self.report(io, &format!("Не удалось открыть график ({code})"));
                 }
             }
             Job::Preview { token, width, rows } => {
@@ -2125,7 +2250,7 @@ impl Workbench {
                 }
                 Some(Panel::Agents { selected }) => delta(selected, agent_count),
                 Some(Panel::Output { offset, .. }) => delta(offset, output_count),
-                Some(Panel::Terminal) => {}
+                Some(Panel::Terminal | Panel::Image { .. }) => {}
                 None => {}
             },
             None => {
@@ -2213,6 +2338,7 @@ impl Workbench {
                         self.resume(id, io);
                     }
                 }
+                Some(Panel::Image { .. }) => self.copy_image_path(io),
                 _ => {}
             }
             return None;
@@ -2393,6 +2519,21 @@ impl Workbench {
                 if let Some((column, row, key, edit, output)) = self.tool_press.take()
                     && (column, row) == (mouse.column, mouse.row)
                 {
+                    if let Some(operation) = key.strip_prefix("image:") {
+                        let slot = &self.slots[self.current];
+                        let source = slot.timeline.as_ref().and_then(|page| {
+                            page.entries.iter().find_map(|entry| {
+                                graphics::Source::from_entry(entry, &slot.id)
+                                    .filter(|(id, _)| *id == operation)
+                                    .map(|(_, source)| source)
+                            })
+                        });
+                        if let Some(source) = source {
+                            self.show_image(source, io);
+                        }
+                        self.selection = None;
+                        return;
+                    }
                     if key.starts_with("output:") {
                         self.selection = None;
                         if let Some(view) = output {
@@ -2621,6 +2762,27 @@ impl Workbench {
                 offset: selected.saturating_sub(8),
                 footer: "Enter разговор · Esc назад".into(),
                 kind: InspectorKind::Agents,
+                ..Inspector::default()
+            }),
+            Panel::Image { name, view, .. } => Some(Inspector {
+                title: format!("График · {name}"),
+                lines: view.as_ref().map_or_else(
+                    || vec!["Открытие PNG…".into()],
+                    |image| {
+                        let mut lines = vec![format!("PNG · {} × {}", image.width, image.height)];
+                        if self.graphics_id.is_none() {
+                            lines.push(image.path.display().to_string());
+                        }
+                        lines
+                    },
+                ),
+                footer: if self.focus == Focus::Inspector {
+                    "Enter копировать путь · Esc закрыть"
+                } else {
+                    "Tab график · Esc закрыть"
+                }
+                .into(),
+                kind: InspectorKind::Image,
                 ..Inspector::default()
             }),
             Panel::Files(files) => {
@@ -2966,6 +3128,24 @@ impl Workbench {
             && let Some(frame) = &mut frame
         {
             frame.apply_theme(&self.theme);
+        }
+        if self.menu.is_none()
+            && let Some(id) = self.graphics_id
+            && io.color
+            && let Some(Panel::Image {
+                view: Some(image), ..
+            }) = &self.panel
+            && let Some(frame) = &mut frame
+            && let Some((column, row, width, height)) = frame.inspector_bounds()
+            && height > 1
+            && width > 0
+        {
+            frame.image = Some(graphics::Placement::new(
+                id,
+                image,
+                (column, row + 1, width, height - 1),
+                io.input.cell_pixels(),
+            ));
         }
         if let Some(frame) = &frame {
             let slot = &mut self.slots[self.current];

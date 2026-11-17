@@ -77,6 +77,16 @@ impl Descriptor {
             },
         )
     }
+    pub fn cell_pixels(&self) -> Option<(f64, f64)> {
+        let size = rustix::termios::tcgetwinsize(&self.fd).ok()?;
+        if [size.ws_col, size.ws_row, size.ws_xpixel, size.ws_ypixel].contains(&0) {
+            return None;
+        }
+        Some((
+            f64::from(size.ws_xpixel) / f64::from(size.ws_col),
+            f64::from(size.ws_ypixel) / f64::from(size.ws_row),
+        ))
+    }
 }
 /// Capture every original open-file flag before changing any aliased stdio.
 /// Retained duplicates keep identities alive until all writers are joined.

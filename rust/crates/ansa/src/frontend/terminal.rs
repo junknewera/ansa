@@ -14,8 +14,13 @@ use std::{
 const TERMINAL_ENABLE: &str = "\x1b[?2004h\x1b[?1002h\x1b[?1006h";
 const TERMINAL_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?2004l";
 enum Item {
-    Text(String),
+    Text(String, TextMode),
     Frame(u64, Box<Frame>),
+}
+enum TextMode {
+    Ordinary,
+    Clipboard,
+    StopReporting,
 }
 struct Pending {
     queue: VecDeque<Item>,
@@ -92,7 +97,7 @@ impl Writer {
                             state.inflight.store(true, Ordering::Release);
                         }
                         if let Some(item) = p.queue.pop_front() {
-                            if let Item::Text(v) = &item {
+                            if let Item::Text(v, _) = &item {
                                 p.bytes -= v.len();
                             }
                             Some(item)
@@ -106,17 +111,37 @@ impl Writer {
                         break;
                     };
                     let (sequence, text) = match item {
-                        Item::Text(v) => {
+                        Item::Text(v, TextMode::Clipboard) => (0, v),
+                        Item::Text(mut v, _) => {
+                            if let Some(image) =
+                                previous.as_ref().and_then(|frame| frame.image.as_ref())
+                            {
+                                v.insert_str(0, &super::graphics::delete(image.id));
+                            }
                             previous = None;
                             (0, v)
                         }
                         Item::Frame(sequence, v) => {
-                            if state.repaint.swap(false, Ordering::AcqRel) {
-                                previous = None;
+                            let invalidated = state.repaint.swap(false, Ordering::AcqRel);
+                            let redraw_image = previous.as_ref().is_none_or(|old| {
+                                invalidated || v.needs_full_paint(old) || v.image != old.image
+                            });
+                            let mut result = String::new();
+                            if redraw_image
+                                && let Some(image) =
+                                    previous.as_ref().and_then(|frame| frame.image.as_ref())
+                            {
+                                result.push_str(&super::graphics::delete(image.id));
                             }
-                            let result = previous
-                                .as_ref()
-                                .map_or_else(|| v.paint(0), |old| v.paint_changes(old));
+                            result.push_str(
+                                &previous
+                                    .as_ref()
+                                    .filter(|_| !invalidated)
+                                    .map_or_else(|| v.paint(0), |old| v.paint_changes(old)),
+                            );
+                            if redraw_image && let Some(image) = &v.image {
+                                image.paint(&mut result);
+                            }
                             previous = Some(*v);
                             (sequence, result)
                         }
@@ -171,6 +196,9 @@ impl Writer {
         self.shared.changed.notified().await;
     }
     pub fn text(&self, text: String) -> bool {
+        self.enqueue_text(text, TextMode::Ordinary)
+    }
+    fn enqueue_text(&self, text: String, mode: TextMode) -> bool {
         if text.len() > 16 * 1024 * 1024 + 1 {
             self.shared.failed.store(true, Ordering::Release);
             return false;
@@ -187,8 +215,11 @@ impl Writer {
         {
             return false;
         }
+        if matches!(mode, TextMode::StopReporting) {
+            p.frame.take();
+        }
         p.bytes += text.len();
-        p.queue.push_back(Item::Text(text));
+        p.queue.push_back(Item::Text(text, mode));
         self.shared.wake.notify_one();
         true
     }
@@ -208,10 +239,13 @@ impl Writer {
         if text.len() > super::copy::LIMIT {
             return false;
         }
-        self.text(format!(
-            "\x1b]52;c;{}\x07",
-            base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
-        ))
+        self.enqueue_text(
+            format!(
+                "\x1b]52;c;{}\x07",
+                base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+            ),
+            TextMode::Clipboard,
+        )
     }
     pub fn invalidate(&self) {
         self.shared.repaint.store(true, Ordering::Release);
@@ -338,7 +372,10 @@ impl Io {
     /// Writer::finish. A finished writer cannot deliver cleanup from Io::drop.
     pub fn stop_reporting(&mut self) -> Result<()> {
         if self.raw.is_some() && self.reporting_enabled {
-            if !self.writer.text(TERMINAL_DISABLE.into()) {
+            if !self
+                .writer
+                .enqueue_text(TERMINAL_DISABLE.into(), TextMode::StopReporting)
+            {
                 return Err("cli_output");
             }
             self.reporting_enabled = false;

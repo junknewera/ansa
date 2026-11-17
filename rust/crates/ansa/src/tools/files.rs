@@ -2,7 +2,10 @@ use crate::{
     auth::Cancel,
     config::{AgentSettings, Result, agents::saved_instructions, n, path_text, s},
     protocol::{json::Json, legacy_json_v1::sha256},
-    provider::request::{Descriptor, Epoch},
+    provider::{
+        replay::{Effects, Execution},
+        request::{Descriptor, Epoch},
+    },
     tools::{
         command::{ProcessOptions, ProcessRunner},
         invocation::Invocation,
@@ -364,6 +367,54 @@ pub fn local_tools_with_editor(
     super::edit::register(&mut registry, host.clone())?;
     super::workspace::register(&mut registry, host.clone())?;
     super::analysis::register(&mut registry, host.clone())?;
+    let preview = host.clone();
+    registry.register_with_policy(
+        Definition {
+            descriptor: Descriptor {
+                name: "show_png".into(),
+                description: "Open a local PNG in the Carbon graph panel. Use after creating a PNG when the user asks to see it. A compatible terminal can display PNGs of up to 2 MiB and 8 million pixels.".into(),
+                revision: "ansa_show_png_v1".into(),
+                schema: schema(&[("path", "string")])?,
+            },
+            validator: Arc::new(|args| path_argument(args, "path").unwrap_or(false)),
+            executor: Arc::new(|_| Outcome::failed_unknown()),
+        },
+        Policy {
+            read_only: true,
+            invoke: Some(Arc::new(move |invocation, stop| {
+                if stop.cancelled() {
+                    return Outcome::not_started();
+                }
+                let requested = (|| -> Result<Outcome> {
+                    let path = preview.path(invocation.arguments.text_field("path")?)?;
+                    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")) {
+                        return Err("preview_png_extension");
+                    }
+                    if let Some(required) = preview.instructions(path.parent().ok_or("file_path")?, &invocation.arguments)? {
+                        return Ok(required);
+                    }
+                    let bytes = super::artifacts::read_preview_png(&path)?;
+                    Ok(result(Json::object(vec![
+                        ("status", s("png_requested")?),
+                        ("path", s(path.to_str().ok_or("file_path")?)?),
+                        ("sha256", s(&sha256(&bytes))?),
+                    ])?))
+                })();
+                if stop.cancelled() {
+                    Outcome::not_started()
+                } else {
+                    requested.unwrap_or_else(|code| {
+                        Outcome::from_bytes(
+                            Execution::Failed,
+                            Effects::KnownResult,
+                            error(code).output().to_vec(),
+                        )
+                    })
+                }
+            })),
+            ..Policy::default()
+        },
+    )?;
     let maximum = host.settings.process_timeout_ms;
     let run = host.clone();
     let recovery = host.clone();

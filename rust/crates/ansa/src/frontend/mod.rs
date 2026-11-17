@@ -8,6 +8,7 @@ pub mod controller;
 mod copy;
 mod diagnostics;
 pub mod diff;
+mod graphics;
 mod history;
 pub mod input;
 pub mod jsonl;

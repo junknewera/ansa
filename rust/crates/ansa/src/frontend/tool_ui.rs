@@ -117,6 +117,7 @@ fn label(name: &str) -> &str {
         "editor_propose_diff" => "Предложение правки",
         "dataset_inspect" => "Проверка CSV",
         "python_execute" => "Анализ",
+        "show_png" => "Показ PNG",
         _ => name,
     }
 }

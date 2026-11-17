@@ -1,5 +1,6 @@
 """Color workspace acceptance over real PTYs and effective per-cell rendition."""
 import argparse
+import base64
 import codecs
 import hashlib
 import json
@@ -115,8 +116,9 @@ class StyledTerminal:
                     elif command == 'm': self.sgr(values)
                     at += len(match[0])
                     continue
-                if next_char == ']':
-                    ends = [(self.pending.find(ending, at + 2), len(ending)) for ending in ('\x07', '\x1b\\')]
+                if next_char in (']', '_'):
+                    delimiters = ('\x07', '\x1b\\') if next_char == ']' else ('\x1b\\',)
+                    ends = [(self.pending.find(ending, at + 2), len(ending)) for ending in delimiters]
                     ends = [(index, length) for index, length in ends if index >= 0]
                     if not ends:
                         break
@@ -592,10 +594,129 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
             'reduced_motion': quiet_evidence}
 
 
+def image_bytes(screen, since):
+    packets = re.findall(rb'\x1b_G([^;]+);([A-Za-z0-9+/=]*)\x1b\\', screen.raw[since:])
+    for index, (header, payload) in enumerate(packets):
+        if header.startswith(b'a=T,f=100,t=d,'):
+            params = dict(field.split(b'=', 1) for field in header.split(b','))
+            chunks = [payload]
+            while header.endswith(b'm=1'):
+                index += 1
+                if index >= len(packets):
+                    return None
+                header, payload = packets[index]
+                assert header in (b'm=0', b'm=1')
+                chunks.append(payload)
+            return params[b'i'], base64.b64decode(b''.join(chunks), validate=True)
+    return None
+
+
+def native_chart(binary, adapter, root, home, cwd, screens):
+    from PIL import Image, ImageDraw
+
+    (root / 'preview-chart').touch()
+    path = cwd / 'chart.png'
+    chart = Image.new('RGB', (160, 80), (63, 164, 109))
+    draw = ImageDraw.Draw(chart)
+    draw.line([(9, 68), (150, 68)], fill='white')
+    draw.line([(14, 60), (46, 46), (79, 52), (112, 28), (144, 20)], fill='white', width=2)
+    chart.save(path)
+    screen = start(adapter, root, home, cwd, screens, 'chart', adapter=True,
+                   extra_env={'TERM': 'xterm-kitty'})
+    pending = len(screen.raw)
+    screen.send('Покажи график\r')
+    until(screen, lambda text: 'График · chart.png' in text and 'PNG · 160 × 80' in text
+          and completed(root, 'Покажи график'), 'agent opened validated PNG')
+    screen.wait(b'\x1b_Ga=T,f=100,t=d,', pending)
+    assert screen.vt.location('График · chart.png')[1] > screen.vt.cols // 3
+    until(screen, lambda _: image_bytes(screen, pending) is not None, 'complete image transfer')
+    image_id, data = image_bytes(screen, pending)
+    assert data == path.read_bytes()
+    snapshot(screen, 'visible-chart')
+    started = len(screen.raw)
+    screen.send(b'\t')
+    until(screen, lambda text: 'Enter копировать путь' in text, 'graph focused')
+    for _ in range(2):
+        copied_at = len(screen.raw)
+        screen.send(b'\r')
+        assert copied(screen, copied_at) == str(path)
+    assert b'\x1b_Ga=d' not in screen.raw[started:], 'copying the path removed the picture'
+    started = len(screen.raw)
+    escape(screen)
+    delete = b'\x1b_Ga=d,d=I,i=' + image_id + b',q=2;'
+    screen.wait(delete, started)
+    until(screen, lambda text: 'PNG · 160 × 80' not in text, 'Escape closed chart')
+    snapshot(screen, 'closed-chart')
+    row, col = screen.vt.location('Открыть график')
+    started = len(screen.raw)
+    click(screen, col, row)
+    until(screen, lambda text: 'График · chart.png' in text, 'chart reopened from chat')
+    until(screen, lambda _: image_bytes(screen, started) is not None, 'complete reopened chart')
+    snapshot(screen, 'reopened-chart')
+    escape(screen)
+    other = cwd / 'other.png'
+    Image.new('RGB', (240, 120), (40, 90, 190)).save(other)
+    (root / 'preview-other').touch()
+    screen.send('Покажи второй график\r')
+    until(screen, lambda text: 'График · other.png' in text
+          and completed(root, 'Покажи второй график'), 'second chart opened')
+    escape(screen)
+    row, col = screen.vt.location('Открыть график · chart.png')
+    click(screen, col, row)
+    until(screen, lambda text: 'График · chart.png' in text, 'first chart still opens')
+    escape(screen)
+    import struct
+    import zlib
+    good = other.read_bytes()
+    start_idat = good.index(b'IDAT') - 4
+    end_idat = start_idat + 12 + int.from_bytes(good[start_idat:start_idat + 4], 'big')
+    bad = b'IDATnot a zlib stream'
+    other.write_bytes(good[:start_idat] + struct.pack('>I', len(bad) - 4) + bad
+                      + struct.pack('>I', zlib.crc32(bad)) + good[end_idat:])
+    screen.send('Проверь повреждённый PNG\r')
+    until(screen, lambda text: 'preview_png_decode' in text and completed(root, 'Проверь повреждённый PNG'),
+          'invalid PNG rejected visibly')
+    assert 'График · other.png' not in visible(screen)
+    row, col = screen.vt.location('Открыть график · chart.png')
+    reopening = len(screen.raw)
+    click(screen, col, row)
+    until(screen, lambda text: 'График · chart.png' in text and image_bytes(screen, reopening) is not None,
+          'active chart before shutdown')
+    started = len(screen.raw)
+    finish(screen)
+    assert delete in screen.raw[started:]
+    assert screen.raw.rfind(delete) > screen.raw.rfind(b'\x1b_Ga=T,')
+    return {'opened_by_agent': True, 'placement_id': int(image_id), 'bytes': path.stat().st_size,
+            'copies_keep_picture': 2, 'first_chart_reopened': True, 'invalid_png_rejected': True}
+
+
+def dataset_chart(binary, adapter, root, home, cwd, screens):
+    (root / 'preview-dataset').touch()
+    (cwd / 'sales.csv').write_text('date,amount\n2026-01-03,400\n2026-02-04,120\n2026-03-03,550\n')
+    screen = start(adapter, root, home, cwd, screens, 'dataset', adapter=True,
+                   extra_env={'TERM': 'xterm-kitty'})
+    pending = len(screen.raw)
+    screen.send('Построй график продаж по месяцам\r')
+    until(screen, lambda text: 'График · chart.png' in text and image_bytes(screen, pending) is not None
+          and completed(root, 'Построй график продаж по месяцам'), 'CSV analysis opened its PNG', timeout=30)
+    path, = (home / '.ansa/sessions').glob('*/artifacts/*/chart.png')
+    receipt = json.loads(path.with_name('receipt.json').read_text())
+    descriptor, = [item for item in receipt['result']['artifacts'] if item['mime'] == 'image/png']
+    outcome, = [row['result'] for row in records(root) if row['kind'] == 'outcome']
+    assert descriptor in json.loads(outcome['output'])['artifacts']
+    digest = hashlib.sha256(image_bytes(screen, pending)[1]).hexdigest()
+    assert digest == descriptor['sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
+    snapshot(screen, 'dataset-chart')
+    finish(screen)
+    return {'canonical_png_sha256': digest, 'bytes': path.stat().st_size}
+
+
 def main():
     inventory = [('color-tool-selection-resize', colored_lifecycle),
                  ('theme-preview-persistence-dms', theme_preferences),
-                 ('acknowledged-inline-edit-diff', inline_edit)]
+                 ('acknowledged-inline-edit-diff', inline_edit),
+                 ('native-carbon-chart', native_chart),
+                 ('native-carbon-dataset', dataset_chart)]
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--fixture-binary', type=Path, required=True)
@@ -613,7 +734,7 @@ def main():
             continue
         began = time.monotonic()
         screens = []
-        uses_fixture = case is inline_edit
+        uses_fixture = case in (inline_edit, native_chart, dataset_chart)
         record = {'case': name, 'passed': False,
                   'executed_binary': str(adapter if uses_fixture else binary),
                   'executed_binary_sha256': adapter_hash if uses_fixture else binary_hash,

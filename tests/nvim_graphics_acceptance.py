@@ -4,6 +4,7 @@ No connection to the user's desktop. Screenshots are compositor pixels, while
 RPC commands control only the fixture editor's private socket.
 """
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -34,7 +35,79 @@ def stop(child):
             os.killpg(child.pid,signal.SIGKILL);child.wait(timeout=4)
 
 
-def run(nvim,chart,output):
+def carbon_graphics(prefix, terminal, case, env, output, capture):
+    """Replay bytes captured from Carbon's production renderer in a real terminal."""
+    evidence = capture / 'native-carbon-chart-chart'
+    states = json.loads(evidence.with_suffix('.screen.json').read_text())
+    wire = evidence.with_suffix('.pty').read_bytes()
+    dataset = capture / 'native-carbon-dataset-dataset'
+    dataset_states = json.loads(dataset.with_suffix('.screen.json').read_text())
+    dataset_wire = dataset.with_suffix('.pty').read_bytes()
+    fifo = case / 'carbon.fifo'
+    os.mkfifo(fifo, 0o600)
+    with (output / (terminal + '-carbon.log')).open('wb') as log:
+        child = subprocess.Popen([*prefix, shutil.which('cat'), str(fifo)], env=env,
+                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            def connect():
+                if child.poll() is not None:
+                    raise AssertionError('Carbon graphics terminal exited')
+                try:
+                    return os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as error:
+                    if error.errno != errno.ENXIO:
+                        raise
+            descriptor = wait(connect, 'Carbon display writer')
+            observations = []
+            with os.fdopen(descriptor, 'wb') as writer:
+                os.set_blocking(descriptor, True)
+                previous = 0
+                for name in ['visible-chart', 'closed-chart', 'reopened-chart', 'dataset-chart']:
+                    if name == 'dataset-chart':
+                        writer.write(wire[previous:])
+                        writer.write(dataset_wire[:dataset_states[name]['through']])
+                    else:
+                        offset = states[name]['through']
+                        assert offset > previous
+                        writer.write(wire[previous:offset])
+                        previous = offset
+                    writer.flush()
+                    time.sleep(.35)
+                    unchanged = set(case.glob('*.png'))
+                    subprocess.run(['weston-screenshooter'], cwd=case, env=env,
+                                   capture_output=True, check=True, timeout=5)
+                    created = set(case.glob('*.png')) - unchanged
+                    assert len(created) == 1
+                    target = output / f'{terminal}-carbon-{name}.png'
+                    shutil.move(created.pop(), target)
+                    with Image.open(target) as image:
+                        rgb = image.convert('RGB')
+                        pixels = rgb.get_flattened_data()
+                        if name == 'dataset-chart':
+                            positions = [index for index, (r, g, b) in enumerate(pixels)
+                                         if index % rgb.width > rgb.width // 3
+                                         and 75 <= r <= 110 and 150 <= g <= 175 and 110 <= b <= 145]
+                        else:
+                            positions = [index for index, value in enumerate(pixels) if value == (63, 164, 109)]
+                    if name == 'closed-chart':
+                        assert not positions, (terminal, name, len(positions))
+                    else:
+                        xs = [position % rgb.width for position in positions]
+                        ys = [position // rgb.width for position in positions]
+                        assert len(xs) > (80 if name == 'dataset-chart' else 5000) and min(xs) > rgb.width // 3, (terminal, name, len(xs))
+                        if name == 'dataset-chart':
+                            assert max(xs) - min(xs) > 200 and max(ys) - min(ys) > 100
+                        else:
+                            ratio = (max(xs) - min(xs) + 1) / (max(ys) - min(ys) + 1)
+                            assert 1.7 <= ratio <= 2.3, (terminal, name, ratio)
+                    observations.append(dict(terminal=terminal, case='carbon-' + name,
+                                             chart_pixels=len(positions), screenshot=target.name))
+            return observations
+        finally:
+            stop(child)
+
+
+def run(nvim,chart,output,carbon_capture=None):
     output.mkdir(parents=True,exist_ok=False)
     observations=[]
     with tempfile.TemporaryDirectory(prefix='ansa-graphics-',dir='/tmp') as directory:
@@ -185,6 +258,9 @@ end,300)
                         try:lua("vim.schedule(function() vim.cmd('qa!') end);return true")
                         except (AssertionError,subprocess.TimeoutExpired):pass
                     stop(child);log.close()
+                if carbon_capture:
+                    observations.extend(carbon_graphics(command[:-len(common)], terminal, case,
+                                                        env, output, carbon_capture))
         finally:stop(weston);weston_log.close();stop(bus);bus_log.close()
     result=dict(passed=len(observations),cases=observations,environment='owned Weston headless pixman + software GL',
                 versions={tool:subprocess.run([tool,'--version'],capture_output=True,text=True).stdout.splitlines()[0] for tool in ['kitty','ghostty','weston']})
@@ -193,4 +269,5 @@ end,300)
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--nvim',required=True,type=Path);parser.add_argument('--chart',required=True,type=Path);parser.add_argument('--output',required=True,type=Path)
-    args=parser.parse_args();run(args.nvim.absolute(),args.chart.resolve(),args.output)
+    parser.add_argument('--carbon-capture', type=Path)
+    args=parser.parse_args();run(args.nvim.absolute(),args.chart.resolve(),args.output,args.carbon_capture)
