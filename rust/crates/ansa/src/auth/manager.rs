@@ -786,7 +786,7 @@ impl AuthManager {
             let record = self.admit_lease(&lease)?;
             let watch = Watch::new(self.store.clone(), cancel)?;
             let stopped = watch.operation.clone();
-            let mut stream = ResponseStream::new_with_callbacks(
+            let mut stream = ResponseStream::for_siwc(
                 request.clone(),
                 Limits::default(),
                 preview,
@@ -832,7 +832,7 @@ impl AuthManager {
             true,
         )?;
         let stopped = cancel.clone();
-        let mut stream = ResponseStream::new_with_callbacks(
+        let mut stream = ResponseStream::for_siwc(
             request,
             Limits::default(),
             preview,

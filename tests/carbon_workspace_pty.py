@@ -179,11 +179,9 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     submitted = draft + " TYPED_WHILE_READING"
     assert body(screen) == anchor and journals(root) == before, "typing moved reading anchor or dispatched a turn"
     screen.send(b"\r")
+    until(screen, lambda frame: not reading(screen) and "TYPED_WHILE_READING" in body(screen), "Enter returned to latest and showed the submitted message")
     until(screen, lambda frame: completed(root, submitted) and ready(screen), "send while reading completed")
-    assert reading(screen) and body(screen) == anchor, "new events replaced the reading page"
     assert sum(row["kind"] == "accepted" and row["text"] == submitted for row in records(root)) == 1
-    escape(screen)
-    until(screen, lambda frame: not reading(screen) and "TYPED_WHILE_READING" in body(screen), "Esc returned to latest new events")
     local(screen, "/agent CHILD_HISTORY_TASK")
     until(screen, lambda frame: "CHILD_HISTORY_TASK" in screen.vt.line(1) and completed(root, "CHILD_HISTORY_TASK") and ready(screen), "agent completed in titled child chat")
     screen.send("CHILD_DRAFT Ж")
@@ -372,13 +370,21 @@ def mouse_copy(screen, root, cwd):
     mouse(screen, 0, 2 + len("MOUSE_COPY") - 1, row, release=True)
     text = copied(screen, at)
     assert text == "MOUSE_COPY" and "\x1b" not in text, repr(text)
-    escape(screen)
-    until(screen, lambda frame: screen.vt.line(0).split().count(model) == 1, "one model in the narrow live header")
     assert journals(root) == before, "selection or resize changed the canonical conversation"
-    screen.resize(100, 32)
-    screen.vt = Terminal(100, 32)
-    screen.send("still editable")
-    until(screen, lambda frame: "still editable" in frame, "selection return")
+    until(screen, lambda frame: screen.vt.line(0).split().count(model) == 1, "one model in the narrow live header")
+    for _ in range(2):
+        paint_quiet(screen)
+        row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> MOUSE_COPY"))
+        at = len(screen.raw)
+        mouse(screen, 0, 2, row)
+        mouse(screen, 32, 2 + len("MOUSE_COPY") - 1, row)
+        mouse(screen, 0, 2 + len("MOUSE_COPY") - 1, row, release=True)
+        assert copied(screen, at) == "MOUSE_COPY"
+    assert journals(root) == before, "copies changed the canonical conversation"
+    screen.send("AFTER_SELECT Ж\r")
+    until(screen, lambda frame: not reading(screen) and "> AFTER_SELECT Ж" in body(screen), "Enter sent after repeated drag copies")
+    until(screen, lambda frame: completed(root, "AFTER_SELECT Ж") and ready(screen), "post-selection message completed")
+    assert sum(row["kind"] == "accepted" and row["text"] == "AFTER_SELECT Ж" for row in records(root)) == 1
 
 
 def branches(screen, root, cwd):

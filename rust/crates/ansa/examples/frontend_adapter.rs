@@ -482,6 +482,9 @@ fn workspace_edit(root: &Path) -> Result<i32> {
                 .open(root_path.join("generated"))
                 .and_then(|mut file| file.write_all(b"x"))
                 .map_err(|_| "fixture_marker")?;
+            if root_path.join("fail-generation").exists() {
+                return Err("terminal_item_count");
+            }
             if let Some(last) = request.input.last()
                 && last.text_field("type") == Ok("function_call_output")
             {

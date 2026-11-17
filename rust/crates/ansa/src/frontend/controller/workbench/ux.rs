@@ -516,18 +516,6 @@ impl Workbench {
         }
         result
     }
-    pub(super) fn show_latest(&mut self) {
-        let slot = &mut self.slots[self.current];
-        slot.state.follow_tail = true;
-        slot.state.reading = None;
-        slot.state.scroll = 0;
-        slot.timeline_query = GetTranscript {
-            before: 0,
-            limit: 64,
-            forward: false,
-        };
-        slot.refresh = Instant::now();
-    }
 }
 
 fn terminal_mouse(

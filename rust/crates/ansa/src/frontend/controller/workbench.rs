@@ -50,6 +50,7 @@ struct Slot {
     settled: Instant,
     resync: bool,
     pending_prompt: Option<String>,
+    follow_accepted_submit: Option<CommandId>,
     auto_return: bool,
     returned: Option<RequestId>,
     admissions: Vec<(String, bool)>,
@@ -99,6 +100,7 @@ impl Slot {
             settled: Instant::now(),
             resync: true,
             pending_prompt: prompt,
+            follow_accepted_submit: None,
             auto_return,
             returned: None,
             admissions: Vec::new(),
@@ -138,6 +140,18 @@ impl Slot {
                 forward: false,
             };
         }
+    }
+    fn show_latest(&mut self) {
+        self.jump_top = false;
+        self.state.follow_tail = true;
+        self.state.reading = None;
+        self.state.scroll = 0;
+        self.timeline_query = GetTranscript {
+            before: 0,
+            limit: 64,
+            forward: false,
+        };
+        self.refresh = Instant::now();
     }
     fn received_timeline(&mut self, page: &TranscriptPage) {
         if self
@@ -251,9 +265,16 @@ impl Slot {
                 if code.is_some() {
                     self.state.editor.bytes = bytes;
                     self.state.editor.cursor = cursor;
+                } else if self.state.pending.as_ref() != Some(&id) {
+                    // A Steer reply follows its journal write. Submit replies
+                    // only acknowledge queueing; the runtime event confirms it.
+                    self.show_latest();
                 }
             }
             if let Some(code) = code {
+                if self.follow_accepted_submit.as_ref() == Some(&id) {
+                    self.follow_accepted_submit = None;
+                }
                 self.state.exit = 1;
                 self.state.input_history.retry(Some(&id));
                 self.state.copy.rejected(&id);
@@ -380,7 +401,13 @@ impl Slot {
                 CommandPayload::GetSnapshot(0),
                 &mut self.replies,
             );
-        } else if self.active() {
+        } else if self.active()
+            || self
+                .state
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.state == "paused")
+        {
             if let Some(target) = self.state.snapshot.as_ref().and_then(|s| s.request.clone()) {
                 self.state.post(
                     &self.handle,
@@ -1555,6 +1582,27 @@ impl Workbench {
             return;
         }
         match &event.payload {
+            EventPayload::CommandAccepted { command, .. }
+                if slot.follow_accepted_submit.as_ref() == Some(command) =>
+            {
+                slot.follow_accepted_submit = None;
+                slot.show_latest();
+            }
+            EventPayload::FrontendSnapshot(snapshot)
+                if snapshot.durable
+                    && !snapshot.storage_failed
+                    && slot.follow_accepted_submit.is_some()
+                    && slot.follow_accepted_submit == snapshot.submit =>
+            {
+                slot.follow_accepted_submit = None;
+                slot.show_latest();
+            }
+            EventPayload::RuntimeError {
+                command: Some(command),
+                ..
+            } if slot.follow_accepted_submit.as_ref() == Some(command) => {
+                slot.follow_accepted_submit = None;
+            }
             EventPayload::ResyncRequired { .. } => {
                 slot.resync = true;
                 slot.refresh = Instant::now();
@@ -1877,7 +1925,7 @@ impl Workbench {
             return;
         }
         if self.selection.take().is_some() {
-            self.show_latest();
+            self.slots[self.current].show_latest();
             return;
         }
         if matches!(self.panel, Some(Panel::Terminal)) {
@@ -1904,7 +1952,7 @@ impl Workbench {
             return;
         }
         if !self.slots[self.current].state.follow_tail {
-            self.show_latest();
+            self.slots[self.current].show_latest();
             return;
         }
         if let Some(parent) = self.slots[self.current].parent.clone() {
@@ -2390,7 +2438,7 @@ impl Workbench {
                     self.selection = None;
                     return;
                 }
-                if let Some(selection) = &mut self.selection
+                if let Some(mut selection) = self.selection.take()
                     && let Some(text) = selection.finish(mouse.column, mouse.row)
                     && !io.writer.clipboard(&text)
                 {
@@ -3297,7 +3345,18 @@ pub async fn run_attached(
                                         let origin = work.current;
                                         if let Some(text) = work.enter(io) {
                                             let (accepted, done) = work.text(&text, io); finished |= done;
-                                            if accepted { let slot = &mut work.slots[origin]; slot.state.editor.clear(); slot.state.input_history.reset(); if slot.state.follow_tail { slot.state.reading = None; slot.timeline_query = GetTranscript { before: 0, limit: 64, forward: false }; } slot.refresh = Instant::now(); }
+                                            if accepted {
+                                                work.selection = None;
+                                                let slot = &mut work.slots[origin];
+                                                if let Some((id, _, _)) = &slot.state.pending_draft
+                                                    && slot.state.pending.as_ref() == Some(id)
+                                                {
+                                                    slot.follow_accepted_submit = Some(id.clone());
+                                                }
+                                                slot.state.editor.clear();
+                                                slot.state.input_history.reset();
+                                                slot.refresh = Instant::now();
+                                            }
                                         }
                                     }
                                     Action::Complete => { if matches!(work.menu, Some(Menu::Help { .. })) { work.enter(io); } else { work.complete_command(); } }

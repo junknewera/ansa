@@ -308,12 +308,10 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     until(screen, lambda text: 'Аргументы' not in text and '▸' in text, 'colored inline collapse')
     before = journals(root)
     row, column = screen.vt.location('get_test_value')
-    at = len(screen.raw)
     mouse(screen, 0, column, row)
     mouse(screen, 32, column + len('get_test_value') - 1, row)
-    mouse(screen, 0, column + len('get_test_value') - 1, row, True)
-    assert copied(screen, at) == 'get_test_value'
     until(screen, lambda text: attribute_is(screen, 'готово', 0, status_fg), 'selection retained unselected status color')
+    until(screen, lambda text: screen.vt.attribute('get_test_value')[1] is not None, 'selection highlight painted')
     selected_bg = screen.vt.attribute('get_test_value')[1]
     assert selected_bg is not None, 'local text selection has no visible background'
     assert screen.vt.attribute('VISUAL_TASK')[1] == user_bg
@@ -328,8 +326,10 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     assert screen.vt.attribute('get_test_value')[1] == selected_bg, 'resize lost local selection color'
     snapshot(screen, 'resized-selection')
-    escape(screen)
-    until(screen, lambda text: attribute_is(screen, 'get_test_value', 0, target_fg), 'Esc restored tool target color')
+    mouse(screen, 0, column + len('get_test_value') - 1, row, True)
+    assert copied(screen, at) == 'get_test_value'
+    until(screen, lambda text: attribute_is(screen, 'get_test_value', 1, None)
+          and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'release cleared selection and restored composer')
     native_background(screen, 'get_test_value', 'VISUAL_TASK', 'VISUAL_DRAFT Ж')
     assert journals(root) == before, 'color interactions changed canonical journal'
     finish(screen)
@@ -561,7 +561,32 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
                           'termios_restored': quiet.finished['termios_restored'],
                           'flags_restored': quiet.finished['flags_restored'],
                           'generated': False, 'tool_intents': 0}
+    with tempfile.TemporaryDirectory(prefix='ansa-m4-', dir='/tmp') as directory:
+        failed_root = Path(directory)
+        failed_home, failed_cwd = roots(failed_root)
+        rejection = failed_root / 'fail-generation'
+        rejection.touch()
+        paused = start(adapter, failed_root, failed_home, failed_cwd, screens, 'paused-draft', adapter=True)
+        paused.send('FAILED_TURN\r')
+        until(paused, lambda text: 'terminal_item_count' in text and 'пауза' in paused.vt.line(-2),
+              'provider failure paused the request')
+        assert '/resume' in paused.vt.line(-1) and 'Ctrl+C' in paused.vt.line(-1)
+        paused.send('NEXT_TURN Ж\r')
+        until(paused, lambda text: paused.vt.line(-4) == '› NEXT_TURN Ж', 'paused draft preserved')
+        assert sum(row['kind'] == 'accepted' for row in records(failed_root)) == 1
+        snapshot(paused, 'paused')
+        rejection.unlink()
+        paused.child.send_signal(signal.SIGINT)
+        until(paused, lambda text: 'отменено' in paused.vt.line(-2), 'Ctrl+C cancelled the paused request')
+        assert paused.vt.line(-4) == '› NEXT_TURN Ж'
+        paused.send(b'\r')
+        until(paused, lambda text: completed(failed_root, 'NEXT_TURN Ж') and 'EDIT_DONE' in text,
+              'preserved draft sent after cancellation')
+        assert sum(row['kind'] == 'accepted' and row['text'] == 'NEXT_TURN Ж'
+                   for row in records(failed_root)) == 1
+        finish(paused)
     return {'added': 1, 'removed': 1, 'effective_add_bg': added, 'effective_remove_bg': removed,
+            'paused_draft_sent_after_cancel': True,
             'idle_animation': {'row': next(iter(observed))[0], 'spinner_frames': len(observed),
                                'elapsed': idle_elapsed, 'delta_bytes': len(idle_delta)},
             'reduced_motion': quiet_evidence}

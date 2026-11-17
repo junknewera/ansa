@@ -72,6 +72,7 @@ pub(crate) struct Reducer {
     limits: Limits,
     preview: Option<TextPreview>,
     preview_text: String,
+    siwc: bool,
 }
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
 impl Reducer {
@@ -84,6 +85,7 @@ impl Reducer {
             limits,
             preview,
             preview_text: String::new(),
+            siwc: false,
         }
     }
     pub(crate) fn event(&mut self, event: Event) -> Result<(), &'static str> {
@@ -630,14 +632,30 @@ impl Reducer {
         };
         let mut items = Vec::new();
         let output = terminal.field("output")?.elements()?;
-        if output.len() != added.len() || output.len() != done.len() {
-            return Err("terminal_item_count");
-        };
-        for (i, item) in output.iter().enumerate() {
-            if done.get(&i) != Some(item) {
-                return Err("terminal_item_mismatch");
-            };
-            items.push(NativeItem::new(item.clone())?)
+        if self.siwc
+            && output.is_empty()
+            && done.len() == added.len()
+            && calls.is_empty()
+            && done
+                .values()
+                .rev()
+                .find(|item| item.text_field("type") == Ok("message"))
+                .is_some_and(has_final_text)
+        {
+            // A sparse SIWC terminal is usable for a completed text-only reply.
+            for item in done.into_values() {
+                items.push(NativeItem::new(item)?);
+            }
+        } else {
+            if output.len() != added.len() || output.len() != done.len() {
+                return Err("terminal_item_count");
+            }
+            for (i, item) in output.iter().enumerate() {
+                if done.get(&i) != Some(item) {
+                    return Err("terminal_item_mismatch");
+                }
+                items.push(NativeItem::new(item.clone())?);
+            }
         }
         if calls.iter().any(|c| c.call_id.is_empty())
             || calls
@@ -659,6 +677,26 @@ impl Reducer {
             calls,
         }))
     }
+}
+
+fn has_final_text(item: &Json) -> bool {
+    item.field("phase")
+        .ok()
+        .is_none_or(|phase| phase.is_null() || phase.text() == Ok("final_answer"))
+        && item
+            .field("content")
+            .and_then(Json::elements)
+            .is_ok_and(|parts| {
+                parts.iter().any(|part| {
+                    let field = if part.text_field("type") == Ok("refusal") {
+                        "refusal"
+                    } else {
+                        "text"
+                    };
+                    part.text_field(field)
+                        .is_ok_and(|text| !text.trim().is_empty())
+                })
+            })
 }
 
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
@@ -806,6 +844,16 @@ impl ResponseStream {
             closed: false,
             cancelled,
         }
+    }
+    pub(crate) fn for_siwc(
+        request: Request,
+        limits: Limits,
+        preview: Option<TextPreview>,
+        cancelled: Option<Box<dyn Fn() -> bool>>,
+    ) -> Self {
+        let mut stream = Self::new_with_callbacks(request, limits, preview, cancelled);
+        stream.reducer.siwc = true;
+        stream
     }
     #[cfg(feature = "protocol-test-adapter")]
     #[allow(dead_code)]
