@@ -1,7 +1,7 @@
 local M = {}
 local uv = vim.uv or vim.loop
 local cap = 512 * 1024
-local state = { client = string.format('nvim_%d_%.0f', uv.os_getpid(), uv.hrtime()), pending = {}, sequence = 0 }
+local state = { client = string.format('nvim_%d_%.0f', uv.os_getpid(), uv.hrtime()), pending = {}, sequence = 0, watched = {} }
 local messages
 local artifacts
 
@@ -69,6 +69,36 @@ local function invalidate(context)
   if not ok then disconnect(); notify('Подключение ANSA закрыто: не удалось отозвать выделение') end
 end
 
+local function revoke_buffer(buf)
+  local shared = state.shared
+  if shared and shared.buffer == buf then
+    state.shared = nil
+    invalidate(shared)
+  end
+  local pending = state.share_pending
+  if pending and pending.context.buffer == buf and not pending.invalidated then
+    pending.invalidated = true
+    invalidate(pending.context)
+  end
+end
+
+local function watch_buffer(buf)
+  if state.watched[buf] then return true end
+  local function revoke(_, changed)
+    state.watched[changed] = nil
+    revoke_buffer(changed)
+    return true
+  end
+  local attached = vim.api.nvim_buf_attach(buf, false, {
+    on_lines = revoke,
+    on_changedtick = revoke,
+    on_detach = revoke,
+    on_reload = function(_, reloaded) revoke_buffer(reloaded) end,
+  })
+  if attached then state.watched[buf] = true end
+  return attached
+end
+
 local function buffer(name)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_name(buf, name)
@@ -78,16 +108,35 @@ local function buffer(name)
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = 'markdown'
   vim.bo[buf].modifiable = false
+  vim.b[buf].ansa_document_title = 'История ANSA'
   return buf
 end
 
-local function replace(buf, lines)
+local function replace(buf, lines, positions)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   if vim.bo[buf].modified then
     -- Keep edits in their original buffer and publish the new view separately.
     buf = buffer('ansa://history/' .. tostring(uv.hrtime()))
     state.history_buf = buf
     notify('Обновление доступно в новом буфере: предыдущий буфер изменён')
+  end
+  local before = state.history_positions
+  state.history_positions = positions
+  local starts = {}
+  for _, part in ipairs(positions) do starts[part.index] = part end
+  local function relocate(row)
+    for _, old in ipairs(before or {}) do
+      if row >= old.start and row <= old.finish then
+        local next = starts[old.index]
+        if next then return math.min(next.start + row - old.start, next.finish) end
+        -- The bounded page may have dropped the entry being read.
+        for _, part in ipairs(positions) do
+          if part.index > old.index then return part.start end
+        end
+        return #lines
+      end
+    end
+    return math.min(row, #lines)
   end
   local views = {}
   for _, win in ipairs(vim.fn.win_findbuf(buf)) do
@@ -99,6 +148,10 @@ local function replace(buf, lines)
   vim.bo[buf].modifiable = false
   for win, view in pairs(views) do
     if vim.api.nvim_win_is_valid(win) then
+      local top = relocate(view.topline)
+      if top ~= view.topline then view.topfill = 0 end
+      view.topline = top
+      view.lnum = relocate(view.lnum)
       vim.api.nvim_win_call(win, function() vim.fn.winrestview(view) end)
     end
   end
@@ -120,13 +173,18 @@ local function render(snapshot)
     state.history_buf = buffer('ansa://history/' .. state.document_key .. '/' .. tostring(uv.hrtime()))
   end
   local lines = { '# ANSA', '' }
+  local positions = {}
   local page = state.history or {}
   for _, entry in ipairs(page.entries or {}) do
     if entry.role == 'user' or entry.role == 'assistant' then
+      local start = #lines + 1
       table.insert(lines, entry.role == 'user' and '## Вы' or '## Агент')
       table.insert(lines, '')
       vim.list_extend(lines, vim.split(entry.text or '', '\n', { plain = true }))
       table.insert(lines, '')
+      if type(entry.index) == 'number' then
+        table.insert(positions, {index=entry.index, start=start, finish=#lines})
+      end
     end
   end
   local current = snapshot.state or {}
@@ -138,7 +196,7 @@ local function render(snapshot)
     table.insert(lines, '')
     vim.list_extend(lines, vim.split(preview.text, '\n', { plain = true }))
   end
-  replace(state.history_buf, lines)
+  replace(state.history_buf, lines, positions)
   vim.b[state.history_buf].ansa_phase = current.phase
 end
 
@@ -158,6 +216,7 @@ local function receive(message)
       state.document_key = key
       state.history_buf = nil
       state.history = nil
+      state.history_positions = nil
     end
     send({ kind = 'snapshot' })
     history()
@@ -205,12 +264,13 @@ local function receive(message)
     -- or Steer. ACKs and snapshots can share one socket read.
     if state.latest then local latest = state.latest; state.latest = nil; render(latest) end
     local pending = state.share_pending
+    if not pending or message.id ~= pending.id then return end
     state.share_pending = nil
     local context = pending.context
-    if pending.invalidated or not vim.api.nvim_buf_is_valid(context.buffer)
+    if pending.invalidated or not vim.api.nvim_buf_is_loaded(context.buffer)
       or vim.api.nvim_buf_get_changedtick(context.buffer) ~= context.changedtick
       or vim.api.nvim_buf_get_name(context.buffer) ~= pending.name then
-      invalidate(context)
+      if not pending.invalidated then invalidate(context) end
       notify('Выделение изменилось; повторите :AnsaShare')
     else
       state.shared = context
@@ -338,15 +398,41 @@ function M.share(first, last, after)
   local context = { editor_incarnation = state.client, buffer = buf,
     changedtick = vim.api.nvim_buf_get_changedtick(buf), sequence = state.context_sequence,
     path = path, filetype = vim.bo[buf].filetype, first_line = first, text = text }
+  if not watch_buffer(buf) then notify('Не удалось отследить изменения выделения'); return end
   local ok, id = send({ kind = 'publish_context', context = context })
   if ok then state.share_pending = { id = id, context = context, name = name, after = after } else notify(id) end
 end
 
 function M.send(first,last,prompt) messages:submit(first,last,prompt or '') end
 
+function M.statusline()
+  local win = vim.g.statusline_winid or vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
+  local artifact = vim.b[buf].ansa_artifact
+  local name = vim.b[buf].ansa_document_title
+  local hint = '%=%l:%c'
+  local width = vim.api.nvim_win_get_width(win)
+  if artifact then
+    name = artifact.title .. (width >= 44 and ' · ' .. artifact.revision:sub(1, 8) or '')
+    if artifact.mime == 'image/png' then
+      local images = require('ansa.images')
+      local action = images.zoom_action(buf, win)
+      if action == 'zoom' or action == 'return' then
+        hint = '%=Enter ' .. (action == 'return' and 'назад' or 'увеличить')
+        if width >= 65 then hint = hint .. ' · o открыть' end
+      elseif action == 'open' then
+        hint = '%=Enter открыть PNG'
+      end
+    end
+  end
+  if not name then return '%<%f %h%m%r%=%-14.(%l,%c%V%) %P' end
+  return '%<' .. vim.fn.strtrans(name):gsub('%%', '%%%%') .. '%{&modified ? " [+]" : ""} ' .. hint
+end
+
 function M.setup(options)
   options=options or {}
   state.auto_open_history=options.open_history
+  if options.statusline then vim.o.statusline="%!v:lua.require'ansa'.statusline()" end
   if options.render and vim.env.NO_COLOR==nil then
     require('ansa.images').setup()
     local ok,markdown=pcall(require,'render-markdown')
@@ -386,23 +472,8 @@ function M.setup(options)
   end, { desc = 'Обновить историю ANSA' })
   vim.api.nvim_create_user_command('AnsaDetach', disconnect, { desc = 'Отключить viewer ANSA' })
   vim.api.nvim_create_autocmd('VimLeavePre', { callback = disconnect })
-  vim.api.nvim_create_autocmd({'TextChanged', 'TextChangedI', 'BufWipeout', 'BufFilePost'}, {
-    callback = function(args)
-      if not state.attachment then return end
-      local tick = vim.api.nvim_buf_is_valid(args.buf) and vim.api.nvim_buf_get_changedtick(args.buf) or 0
-      local changed_name = args.event == 'BufWipeout' or args.event == 'BufFilePost'
-      local shared = state.shared
-      if shared and shared.buffer == args.buf and (changed_name or tick ~= shared.changedtick) then
-        invalidate(shared)
-        state.shared = nil
-      end
-      local pending = state.share_pending
-      if pending and pending.context.buffer == args.buf
-        and (changed_name or tick ~= pending.context.changedtick) then
-        invalidate(pending.context)
-        pending.invalidated = true
-      end
-    end,
+  vim.api.nvim_create_autocmd({'BufUnload', 'BufDelete', 'BufWipeout', 'BufFilePost'}, {
+    callback = function(args) revoke_buffer(args.buf) end,
   })
 end
 

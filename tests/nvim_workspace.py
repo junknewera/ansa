@@ -66,8 +66,13 @@ def run(output):
                             if connection == 2:
                                 time.sleep(.4)
                             text = "OTHER_DOCUMENT" if connection == 3 else "VIEWER_INITIAL Ж界\n" + "\n".join(f"line {i}" for i in range(90))
+                            entries = [dict(index=1, role="user", text=text)]
+                            if connection == 1:
+                                entries.insert(0, dict(index=0, role="assistant", text="OLD_HEAD"))
+                            elif connection == 2:
+                                entries.append(dict(index=3, role="assistant", text="NEW_TAIL"))
                             emit(dict(type="history", id=request["id"], session=session, incarnation=incarnation,
-                                      begin=0, end=3, total=3, entries=[dict(role="user", text=text)]))
+                                      begin=int(connection==2), end=4, total=4, entries=entries))
                         observations.append(dict(connection=connection, history_requests=count))
             except BaseException as error:
                 errors.append(repr(error))
@@ -96,6 +101,13 @@ local buf = a.status().buffer
 vim.api.nvim_win_set_cursor(0, {60,0})
 vim.fn.winrestview({topline=40,lnum=60,col=0})
 local view=vim.fn.winsaveview()
+local reading=vim.api.nvim_get_current_line()
+local left=vim.api.nvim_get_current_win()
+vim.cmd('vsplit')
+local right=vim.api.nvim_get_current_win()
+vim.api.nvim_win_set_cursor(right,{70,0})
+local right_reading=vim.api.nvim_get_current_line()
+vim.api.nvim_set_current_win(left)
 -- Give an older snapshot time to trigger a bad repeated history loop.
 vim.wait(150, function() return false end, 10)
 vim.cmd('AnsaDetach')
@@ -106,7 +118,9 @@ assert(vim.api.nvim_get_current_buf()==buf, 'reconnect moved buffer')
 assert(vim.api.nvim_win_get_cursor(0)[1]==60, 'reconnect clamped cursor before delayed history')
 assert(vim.fn.winsaveview().topline==view.topline, 'reconnect clamped scroll')
 vim.wait(600, function() return false end, 10)
-assert(vim.api.nvim_win_get_cursor(0)[1]==60, 'history response moved cursor')
+assert(vim.api.nvim_get_current_line()==reading and vim.api.nvim_win_get_cursor(left)[1]==56,'sliding page changed the entry being read')
+assert(vim.api.nvim_win_call(right,vim.api.nvim_get_current_line)==right_reading,'sliding page changed the other window')
+assert(vim.fn.winsaveview().topline==view.topline-4,'sliding page lost the scroll anchor')
 vim.bo[buf].modifiable=true
 vim.api.nvim_buf_set_lines(buf,0,0,false,{'DIRTY_SELECTION'})
 assert(vim.bo[buf].modified, 'viewer buffer does not track edits')
@@ -132,8 +146,8 @@ vim.cmd('qa!')
         assert not worker.is_alive() and not errors, errors
         assert [row["history_requests"] for row in observations] == [5, 1, 1], observations
         assert json.loads(report.read_text())["passed"]
-    result = dict(passed=4, cases=["QueueFull-bounded-retry-and-explicit-refresh", "newer-page-no-read-loop",
-                                "delayed-reconnect-preserves-cursor-scroll", "new-session-preserves-dirty-document"])
+    result = dict(passed=5, cases=["QueueFull-bounded-retry-and-explicit-refresh", "newer-page-no-read-loop",
+                                "delayed-reconnect-preserves-cursor-scroll", "sliding-history-keeps-two-window-anchors", "new-session-preserves-dirty-document"])
     (output / "report.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result))
 

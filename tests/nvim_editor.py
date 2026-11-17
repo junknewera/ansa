@@ -107,7 +107,6 @@ a.share(1,1)
 -- A second share cannot replace the still unacknowledged snapshot.
 a.share(1,1)
 vim.api.nvim_buf_set_lines(buf,0,-1,false,{'edited before ACK'})
-vim.api.nvim_exec_autocmds('TextChanged',{buffer=buf})
 vim.wait(100,function() return false end,10)
 assert(not a.status().shared,'delayed ACK installed stale context')
 a.share(1,1)
@@ -120,6 +119,20 @@ a.share(1,1)
 assert(vim.wait(2000,function() return a.status().shared ~= nil end,10),'renamed context not acknowledged')
 vim.api.nvim_buf_delete(buf,{force=true})
 assert(not a.status().shared,'wipe retained context')
+local hidden=vim.api.nvim_create_buf(true,false)
+vim.api.nvim_buf_set_name(hidden,%s)
+vim.api.nvim_set_current_buf(hidden)
+vim.api.nvim_buf_set_lines(hidden,0,-1,false,{'hidden'})
+a.share(1,1)
+assert(vim.wait(2000,function() return a.status().shared ~= nil end,10),'hidden context acknowledgement')
+vim.api.nvim_set_current_buf(vim.api.nvim_create_buf(true,false))
+vim.api.nvim_buf_set_lines(hidden,0,-1,false,{'changed while hidden'})
+assert(not a.status().shared,'hidden edit retained context')
+vim.api.nvim_set_current_buf(hidden)
+a.share(1,1)
+assert(vim.wait(2000,function() return a.status().shared ~= nil end,10),'context before bdelete')
+vim.cmd('bdelete! '..hidden)
+assert(not vim.api.nvim_buf_is_loaded(hidden) and not a.status().shared,'bdelete retained context')
 local nextbuf=vim.api.nvim_create_buf(true,false)
 vim.api.nvim_set_current_buf(nextbuf)
 vim.api.nvim_buf_set_lines(nextbuf,0,-1,false,{'backpressure'})
@@ -127,7 +140,6 @@ a.share(1,1)
 assert(vim.wait(2000,function() return a.status().shared ~= nil end,10),'backpressure share')
 blocked=true
 vim.api.nvim_buf_set_lines(nextbuf,0,-1,false,{'must revoke'})
-vim.api.nvim_exec_autocmds('TextChanged',{buffer=nextbuf})
 assert(not a.status().connected,'failed invalidate enqueue kept attachment')
 blocked=false
 a.attach(%s,{editor=true})
@@ -136,12 +148,11 @@ a.share(1,1)
 assert(vim.wait(2000,function() return a.status().shared ~= nil end,10),'second share')
 failed=true
 vim.api.nvim_buf_set_lines(nextbuf,0,-1,false,{'async write failure'})
-vim.api.nvim_exec_autocmds('TextChanged',{buffer=nextbuf})
 assert(vim.wait(2000,function() return not a.status().connected end,10),'failed invalidate write kept attachment')
 vim.fn.writefile({vim.json.encode({passed=true})},%s)
 vim.cmd('qa!')
 """ % (json.dumps(str(plugin)), json.dumps(str(endpoint)), json.dumps(str(root / "selection.rs")),
-       json.dumps(str(root / "renamed.rs")), json.dumps(str(endpoint)), json.dumps(str(report))))
+       json.dumps(str(root / "renamed.rs")), json.dumps(str(root / "hidden.rs")), json.dumps(str(endpoint)), json.dumps(str(report))))
         child = subprocess.run(["nvim", "--headless", "--clean", "-l", str(lua)],
                                env=environment(root, root, True), capture_output=True, timeout=12)
         worker.join(timeout=2)
@@ -150,11 +161,11 @@ vim.cmd('qa!')
         (output / "observations.json").write_text(json.dumps(dict(events=events, errors=errors), indent=2))
         assert child.returncode == 0, child.stderr.decode(errors="replace")
         assert not worker.is_alive() and not errors, errors
-        assert [row["sequence"] for row in events if row["connection"] == 0 and row["kind"] == "publish_context"] == [1, 2, 3, 4], events
-        assert all(any(row["connection"] == 0 and row["kind"] == "invalidate_context" and row["sequence"] == seq for row in events) for seq in [1, 2, 3]), events
+        assert [row["sequence"] for row in events if row["connection"] == 0 and row["kind"] == "publish_context"] == [1, 2, 3, 4, 5, 6], events
+        assert [row["sequence"] for row in events if row["connection"] == 0 and row["kind"] == "invalidate_context"] == [1, 2, 3, 4, 5], events
         assert sum(row["kind"] == "closed" for row in events) == 2, events
         assert json.loads(report.read_text())["passed"]
-    result = dict(passed=5, cases=["delayed-ACK-and-one-pending-share", "rename-revokes-with-same-tick",
+    result = dict(passed=7, cases=["delayed-ACK-and-one-pending-share", "rename-revokes-with-same-tick", "hidden-buffer-edit-revokes", "bdelete-revokes",
                                   "wipe-revokes-context", "invalidate-queue-full-disconnects", "invalidate-write-failure-disconnects"])
     (output / "report.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result))

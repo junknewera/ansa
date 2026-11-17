@@ -1,13 +1,14 @@
 local M = {}
 
 function M.new(api)
-  local self = { known = {}, preferred = {}, docs = {}, documents = {}, document_order = {}, prepared = {}, token = 0, retries = 0 }
+  local self = { known = {}, preferred = {}, docs = {}, saved = {}, documents = {}, document_order = {}, prepared = {}, token = 0, retries = 0 }
   local function attachment()
     local value = api.attachment()
     if value and vim.tbl_contains(value.capabilities or {}, 'artifact_catalog') then return value end
   end
   local function key(d) return d.artifact_id .. '/' .. d.revision end
   local function document_key(d) return d.session_id .. '/' .. d.artifact_id end
+  local function saved_key(d) return d.session_id .. '/' .. key(d) end
   local function origin()
     local buf=vim.api.nvim_get_current_buf()
     local view=vim.fn.winsaveview()
@@ -98,15 +99,21 @@ function M.new(api)
         latest and latest.descriptor.revision==d.revision and ' · последняя' or '')
     end}, function(d) if d then self:fetch(d,true) end end)
   end
-  function self:fetch(d, explicit, regranted, from)
+  function self:fetch(d, explicit, regranted, from, pinned)
     if not attachment() then api.notify('Сначала подключитесь к workspace'); return end
     if self.read then
-      if explicit then api.notify('Дождитесь чтения предыдущего артефакта') else self.next_auto = d end
+      if explicit then
+        api.notify('Дождитесь чтения предыдущего артефакта')
+      else
+        self.next_auto = {descriptor=d, origin=from or origin(), pinned=pinned}
+      end
       return
     end
+    local latest = self.preferred[d.artifact_id]
+    if pinned == nil then pinned = explicit and (not latest or latest.descriptor.revision ~= d.revision) end
     local ok, id = api.send({kind='artifact_read',artifact_id=d.artifact_id,revision=d.revision})
     if ok then
-      self.read = {id=id,descriptor=vim.deepcopy(d),explicit=explicit,regranted=regranted,origin=from or origin()}
+      self.read = {id=id,descriptor=vim.deepcopy(d),explicit=explicit,regranted=regranted,origin=from or origin(),pinned=pinned}
       local token=self.token
       vim.defer_fn(function()
         if self.token==token and self.read and self.read.id==id then self.read=nil; self.next_auto=nil; api.notify('Артефакт не ответил: повторите открытие') end
@@ -162,6 +169,7 @@ function M.new(api)
       vim.api.nvim_buf_set_lines(buf,0,-1,false,vim.split(text,'\n',{plain=true}))
       vim.bo[buf].modified=false;vim.bo[buf].modifiable=false
       vim.bo[buf].filetype=doc.kind=='diff' and 'text' or doc.filetype
+      vim.b[buf].ansa_document_title = type(doc.path)=='string' and vim.fn.fnamemodify(doc.path,':t') or 'Выделение'
       return buf
     end
     local function loaded(buf)
@@ -191,17 +199,17 @@ function M.new(api)
       vim.api.nvim_win_set_cursor(0,{math.min(doc.first_line,vim.api.nvim_buf_line_count(prepared.before)),0})
     end
   end
-  local function text_buffer(d, content, explicit)
-    local name = document_key(d)
-    local old = self.docs[name]
+  local function text_buffer(d, content, focus, old)
     local buf = old and old.buffer
     if not buf or not vim.api.nvim_buf_is_valid(buf) or vim.bo[buf].modified then
       if buf and vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].modified then
         api.notify('Новая версия доступна отдельно: предыдущий документ изменён')
       end
       buf = vim.api.nvim_create_buf(false,true)
-      vim.api.nvim_buf_set_name(buf,'ansa://artifact/' .. name .. '/' .. d.revision .. '/' .. tostring(vim.uv.hrtime()))
       vim.bo[buf].buftype='acwrite'; vim.bo[buf].bufhidden='hide'; vim.bo[buf].swapfile=false
+    end
+    if not old or old.buffer ~= buf or old.descriptor.revision ~= d.revision then
+      vim.api.nvim_buf_set_name(buf,'ansa://artifact/' .. saved_key(d) .. '/' .. buf)
     end
     local views = {}
     for _,win in ipairs(vim.fn.win_findbuf(buf)) do views[win]=vim.api.nvim_win_call(win,vim.fn.winsaveview) end
@@ -213,8 +221,8 @@ function M.new(api)
     for win,view in pairs(views) do
       if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_call(win,function() vim.fn.winrestview(view) end) end
     end
-    self.docs[name]={buffer=buf,descriptor=vim.deepcopy(d)}
-    if explicit then vim.cmd('hide buffer ' .. buf) end
+    if focus then vim.cmd('hide buffer ' .. buf) end
+    return buf
   end
   function self:handle(frame)
     if frame.type=='posted' and frame.kind=='artifact_catalog' and frame.id==self.pending then
@@ -270,7 +278,7 @@ function M.new(api)
         local wanted=self.deferred_open
         local d=self.known[wanted.id..'/'..wanted.revision]
         if d then
-          self.deferred_open=nil; self:fetch(d,true,wanted.regranted,wanted.origin)
+          self.deferred_open=nil; self:fetch(d,wanted.explicit~=false,wanted.regranted,wanted.origin,wanted.pinned)
         elseif frame.begin>0 and wanted.pages<16 and (self.before==0 or frame.begin<self.before) then
           wanted.pages=wanted.pages+1; self:refresh(false,frame.begin)
         else
@@ -284,6 +292,12 @@ function M.new(api)
         local latest=self.preferred[doc.descriptor.artifact_id]
         if doc.descriptor.session_id==value.session and doc.buffer==current and latest and (doc.needs_read or latest.descriptor.revision~=doc.descriptor.revision) then self:fetch(latest.descriptor,false); break end
       end
+      for _,doc in pairs(self.saved) do
+        if doc.descriptor.session_id==value.session and doc.buffer==current and doc.descriptor.mime=='image/png'
+          and not require('ansa.images').owned[current] and self.known[key(doc.descriptor)] then
+          self:fetch(doc.descriptor,false,nil,nil,true); break
+        end
+      end
       if self.wanted_total>(self.catalog_total or 0) then self:refresh(false) end
       return true
     elseif frame.type=='document' and self.read and self.read.kind=='document' and frame.id==self.read.id then
@@ -294,23 +308,31 @@ function M.new(api)
       return true
     elseif frame.type=='artifact' and self.read and frame.id==self.read.id then
       local pending=self.read; self.read=nil
+      local queued = self.next_auto
+      self.next_auto = nil
+      local follow = queued and unchanged(queued.origin)
       local value=attachment()
       if not value or not vim.deep_equal(frame.descriptor,pending.descriptor) or frame.descriptor.session_id~=value.session then return true end
-      if frame.descriptor.mime=='image/png' then
+      local d = frame.descriptor
+      local collection = pending.pinned and self.saved or self.docs
+      local name = pending.pinned and saved_key(d) or document_key(d)
+      local old = collection[name]
+      local focus = pending.explicit and unchanged(pending.origin)
+      if d.mime=='image/png' then
         local ok,images=pcall(require,'ansa.images')
         if ok then
-          local name=document_key(frame.descriptor)
-          local doc=self.docs[name]
-          images.open(frame.descriptor,frame.path,{buffer=doc and doc.buffer,focus=pending.explicit and unchanged(pending.origin)},function(buf)
-            self.docs[name]={buffer=buf,descriptor=vim.deepcopy(frame.descriptor)}
+          images.open(d,frame.path,{buffer=old and old.buffer,focus=focus},function(buf)
+            collection[name]={buffer=buf,descriptor=vim.deepcopy(d)}
           end)
         else api.notify('PNG сохранён: '..tostring(frame.path)) end
       elseif type(frame.content)=='string' then
-        local focus=pending.explicit and unchanged(pending.origin)
-        text_buffer(frame.descriptor,frame.content,focus)
+        local buf = text_buffer(d,frame.content,focus,old)
+        collection[name]={buffer=buf,descriptor=vim.deepcopy(d)}
         if pending.explicit and not focus then api.notify('Отчёт готов: :AnsaArtifacts открывает его') end
       end
-      if self.next_auto then local next=self.next_auto; self.next_auto=nil; self:fetch(next,false) end
+      if follow and vim.api.nvim_get_current_buf() == queued.origin.buffer then
+        self:fetch(queued.descriptor,false,nil,nil,queued.pinned)
+      end
       return true
     elseif frame.type=='error' then
       if self.pending and frame.id==self.pending then
@@ -327,7 +349,8 @@ function M.new(api)
           self:refresh(false)
         elseif pending.kind~='document' and frame.code=='artifact_not_committed' and not pending.regranted then
           self.known[key(pending.descriptor)]=nil
-          self.deferred_open={id=pending.descriptor.artifact_id,revision=pending.descriptor.revision,pages=0,regranted=true,origin=pending.origin}
+          self.deferred_open={id=pending.descriptor.artifact_id,revision=pending.descriptor.revision,pages=0,
+            regranted=true,origin=pending.origin,pinned=pending.pinned,explicit=pending.explicit}
           self:refresh(false)
         else api.notify('Артефакт недоступен: '..tostring(frame.code)) end
         return true

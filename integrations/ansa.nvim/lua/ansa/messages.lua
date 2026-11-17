@@ -94,6 +94,7 @@ function M.new(api)
         query.message.receipt = receipt
         if frame.ready and not frame.storage_failed and receipt.admission_durable then
           self.last = query.message
+          if receipt.kind == 'submit' then self.own_submit = query.message end
           if self.pending == query.message then
             self.pending = nil
             self.token = self.token + 1
@@ -162,12 +163,18 @@ function M.new(api)
 
   function self:cancel()
     local attachment = current()
-    local message = self.pending or self.last
+    local message = self.own_submit
     local receipt = message and message.receipt
-    if not attachment or not message or message.session ~= attachment.session or not receipt or receipt.kind ~= 'submit'
+    if not attachment or not message or message.session ~= attachment.session
       or not receipt.request or receipt.request == vim.NIL then
       api.notify('Сначала подтвердите свою задачу через :AnsaPending'); return
     end
+    local snapshot = api.snapshot()
+    local active = snapshot and snapshot.state
+    if not active or active.turn ~= receipt.turn or active.request ~= receipt.request then
+      api.notify('В этом разговоре сейчас другая задача'); return
+    end
+    if self.cancel_request then return end
     local ok, id = api.send({kind='cancel_message',message=message.id,target=receipt.request,turn=receipt.turn})
     if ok then self.cancel_request = id else api.notify(id) end
   end

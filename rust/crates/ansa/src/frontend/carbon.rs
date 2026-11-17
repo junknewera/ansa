@@ -1,5 +1,8 @@
 //! Carbon layout in the main screen buffer. All untrusted bytes are sanitized.
 use super::cells as display_cells;
+
+pub(super) const NARROW_WORKSPACE_COLUMNS: usize = 80;
+
 /// Immutable, decoded output belonging to the tool row that was displayed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputView {
@@ -1331,7 +1334,12 @@ pub fn layout_workspace(
     let (editor, editor_cursor_row, editor_cursor) =
         editor_rows(input, cursor, width, (height / 4).clamp(1, 4), color);
     let body_height = height.saturating_sub(7 + editor.len()).max(1);
-    let mut rows = vec![heading(&format!("ANSA  {context}"), "", width, color)];
+    let mut rows = vec![heading(
+        &format!("ANSA  {context}"),
+        &ui.model,
+        width,
+        color,
+    )];
     let location = if ui.breadcrumb.is_empty() {
         "main"
     } else {
@@ -1461,28 +1469,30 @@ pub fn layout_workspace(
         metadata.push_str(&ui.effort);
     }
     let detail = status.lines().next().unwrap_or_default();
-    if !detail.is_empty() {
-        if !metadata.is_empty() {
+    let narrow = columns <= NARROW_WORKSPACE_COLUMNS;
+    let terminal = ui.focus == Focus::Inspector
+        && ui.popup.is_none()
+        && ui
+            .inspector
+            .as_ref()
+            .is_some_and(|panel| panel.kind == InspectorKind::Command);
+    let hint = match (terminal, narrow) {
+        (true, false) => "Клик по чату · Ctrl+C прервать",
+        (true, true) => "Ctrl+C",
+        (false, false) => "/ команды · Tab фокус · ? помощь",
+        (false, true) => "? помощь",
+    };
+    if narrow && !detail.is_empty() {
+        // Give the active mode, focus and lifecycle status the available
+        // cells before the model. The model is also shown in the header.
+        rows.push(heading(detail, hint, width, color));
+    } else {
+        if !detail.is_empty() && !metadata.is_empty() {
             metadata.push_str(" · ");
         }
         metadata.push_str(detail);
+        rows.push(heading(&metadata, hint, width, color));
     }
-    rows.push(heading(
-        &metadata,
-        if ui.focus == Focus::Inspector
-            && ui.popup.is_none()
-            && ui
-                .inspector
-                .as_ref()
-                .is_some_and(|panel| panel.kind == InspectorKind::Command)
-        {
-            "Клик по чату · Ctrl+C прервать"
-        } else {
-            "/ команды · Tab фокус · ? помощь"
-        },
-        width,
-        color,
-    ));
     // Diagnostics are separate from frozen transcript rows.
     let notice = status.lines().nth(1).unwrap_or_default();
     let notice = if notice.is_empty() {

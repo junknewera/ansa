@@ -63,7 +63,9 @@ Analysis MVP предоставляет `dataset_inspect` и `python_execute`: �
 Worker ограничен 60 с wall time, 45 с CPU, 1 GiB address space, 64 FD и 16 MiB
 на файл. Store резервирует 24 MiB на незавершённую операцию внутри общей quota
 64 MiB; известный failed/cancelled result снимает резерв. Исходный dataset
-сохраняется отдельным неизменяемым snapshot. Durable process stdout содержит
+сохраняется отдельным неизменяемым snapshot. Начальные пустые строки хранятся
+отдельно, если они есть. Проверяются хеши исходных байтов и данных для worker.
+Durable process stdout содержит
 hash всех inputs, summary и каждого output. Recovery сверяет весь набор и
 дописывает receipt/outcome без нового запуска. Несовпадение требует явного
 восстановления. Descriptor доступен viewer только после canonical outcome;

@@ -423,12 +423,11 @@ fn text(args: &[String]) -> Result<i32> {
         "ansa session {} (full access, sudo disabled)\n",
         selected.id
     ));
-    let context = format!("{}  {}", settings.cwd.display(), settings.model);
     if io.raw.is_some() {
         return reactor()?.block_on(controller::workbench::run_attached(
             runtime,
             &mut io,
-            &context,
+            &settings.cwd.to_string_lossy(),
             factory,
             selected.id,
             root_kind,
@@ -450,6 +449,7 @@ fn text(args: &[String]) -> Result<i32> {
     if parsed.workspace.is_some() {
         return Err("workspace_requires_tty");
     }
+    let context = format!("{}  {}", settings.cwd.display(), settings.model);
     reactor()?.block_on(controller::run(
         &mut runtime,
         &mut io,

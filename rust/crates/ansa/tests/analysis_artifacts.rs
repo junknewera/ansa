@@ -8,7 +8,11 @@ mod support {
 use ansa::{
     config::agent_epoch,
     protocol::json::Json,
-    provider::{native, replay::Effects, request::Request},
+    provider::{
+        native,
+        replay::{Effects, Execution},
+        request::Request,
+    },
     runtime::*,
     session::journal_v1::{Observer, Point},
     tools::{artifacts::Store, files::local_tools, registry::Snapshot},
@@ -105,11 +109,15 @@ async fn runtime(
     runtime.ready().await.unwrap();
     runtime
 }
-async fn outcome(handle: &Handle) -> (Json, OperationId) {
+async fn finished_tool(handle: &Handle) -> Finished {
     let event = f::until(handle, |p| matches!(p, EventPayload::ToolFinished(_))).await;
     let EventPayload::ToolFinished(result) = event.payload else {
         unreachable!()
     };
+    result
+}
+async fn outcome(handle: &Handle) -> (Json, OperationId) {
+    let result = finished_tool(handle).await;
     assert_eq!(result.effects, Effects::KnownResult, "{}", result.output);
     (Json::parse(&result.output).unwrap(), result.operation)
 }
@@ -134,7 +142,7 @@ async fn monthly_analysis_publishes_exact_table_report_png_and_reopens_without_e
     let root = Root::new();
     local::write(
         &root.cwd().join("data.csv"),
-        "date,value,note\n2026-01-02,0.1,\"Ж,界\"\n2026-01-03,0.2,x\n2026-02-01,-0.05,y\n2026-02-02,,missing\n",
+        "\r\n\ndate,value,note\r\n2026-01-02,0.1,\"Ж,界\"\n\n2026-01-03,0.2,x\n2026-02-01,-0.05,y\n2026-02-02,,missing\n",
     );
     let catalog = tools(&root);
     assert!(catalog.read_only().definition("dataset_inspect").is_some());
@@ -353,6 +361,107 @@ async fn completed_worker_with_lost_outcome_is_reconciled_after_restart_without_
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn restart_commits_saved_pre_start_cancel_without_starting_a_worker() {
+    let root = Root::new();
+    local::write(&root.cwd().join("data.csv"), "date,value\n2026-01-01,1\n");
+    let observer = Arc::new(|point, kind: &str| {
+        if point == Point::BeforeWrite && kind == "outcome" {
+            Err("injected_outcome_failure")
+        } else {
+            Ok(())
+        }
+    });
+    let input = args(&root, "data.csv", "cancelled");
+    let mut run = runtime(
+        &root,
+        input.clone(),
+        Some(observer),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let handle = run.handle();
+    f::submit(&handle, "analysis", "aggregate", "turn").await;
+    let (result, operation) = outcome(&handle).await;
+    loop {
+        match f::event(&handle).await.payload {
+            EventPayload::FrontendSnapshot(s) if s.storage_failed => break,
+            EventPayload::RuntimeError { diagnostic, .. } => {
+                assert_eq!(diagnostic, "injected_outcome_failure")
+            }
+            _ => {}
+        }
+    }
+    let store = Store::new(&root.0.join("session")).unwrap();
+    let descriptor = &result.field("artifacts").unwrap().elements().unwrap()[0];
+    let report = store.resolve(descriptor).unwrap();
+    f::finish(&mut run).await;
+
+    // Recreate the exact persisted state at the cancellation boundary using
+    // the real admitted invocation and prepared inputs. No scheduler race.
+    let job = report.parent().unwrap();
+    let process = root
+        .0
+        .join("session/operations")
+        .join(job.file_name().unwrap());
+    fs::remove_dir_all(&process).unwrap();
+    for name in ["report.md", "chart.png", "summary.json"] {
+        fs::remove_file(job.join(name)).unwrap();
+    }
+    fs::remove_dir_all(job.join("mpl-cache")).unwrap();
+    let receipt_path = job.join("receipt.json");
+    let ready = Json::parse(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    let saved = ready.with("result", Json::parse(r#"{"status":"cancelled","error":"analysis_cancelled","process":{"error":"cancelled"}}"#).unwrap()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    fs::write(&receipt_path, saved.dump()).unwrap();
+    let mut reopened = runtime(&root, input.clone(), None, calls.clone()).await;
+    let failed = f::snapshot(&reopened.handle(), "contradictory_output").await;
+    assert_eq!(failed.recovery_operation, Some(operation.clone()));
+    f::finish(&mut reopened).await;
+    fs::remove_file(job.join("table.csv")).unwrap();
+
+    let forged = saved
+        .with(
+            "invocation",
+            ready
+                .field("invocation")
+                .unwrap()
+                .with("call", s("wrong_call"))
+                .unwrap(),
+        )
+        .unwrap();
+    fs::write(&receipt_path, forged.dump()).unwrap();
+    let mut reopened = runtime(&root, input.clone(), None, calls.clone()).await;
+    let failed = f::snapshot(&reopened.handle(), "forged_receipt").await;
+    assert_eq!(failed.recovery_operation, Some(operation.clone()));
+    assert_eq!(failed.diagnostic, "operation_recovery_failed");
+    f::finish(&mut reopened).await;
+
+    fs::write(&receipt_path, saved.dump()).unwrap();
+    let mut reopened = runtime(&root, input, None, calls.clone()).await;
+    let recovered = f::snapshot(&reopened.handle(), "recovered_cancel").await;
+    assert!(recovered.recovery_operation.is_none(), "{recovered:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!process.exists());
+    let journal = fs::read_dir(root.0.join("session"))
+        .unwrap()
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            path.file_name()?
+                .to_str()?
+                .starts_with("part-")
+                .then(|| fs::read_to_string(path).unwrap())
+        })
+        .collect::<String>();
+    assert_eq!(
+        journal.matches("analysis_cancelled").count(),
+        1,
+        "{journal}"
+    );
+    f::finish(&mut reopened).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn invalid_or_missing_dataset_is_known_and_does_not_start_a_worker() {
     let root = Root::new();
     for (index, path) in ["missing.csv", "invalid.csv", "nested/data.csv"]
@@ -381,7 +490,12 @@ async fn invalid_or_missing_dataset_is_known_and_does_not_start_a_worker() {
             &format!("turn_{index}"),
         )
         .await;
-        let (result, _) = outcome(&run.handle()).await;
+        let event = finished_tool(&run.handle()).await;
+        assert_eq!(
+            (event.execution, event.effects),
+            (Execution::Failed, Effects::KnownResult)
+        );
+        let result = Json::parse(&event.output).unwrap();
         assert!(result.has("error"));
         f::until(&run.handle(), |p| matches!(p, EventPayload::Done)).await;
         assert!(!root.0.join("session/artifacts").exists());
@@ -497,9 +611,13 @@ async fn corrupt_recovery_inputs_and_outputs_are_unavailable_and_never_reexecute
         "input.csv",
         "table.csv",
         "chart.png",
+        "leading-empty.csv",
     ] {
         let root = Root::new();
-        local::write(&root.cwd().join("data.csv"), "date,value\n2026-01-01,1\n");
+        local::write(
+            &root.cwd().join("data.csv"),
+            "\r\ndate,value\n2026-01-01,1\n",
+        );
         let observer = Arc::new(|point, kind: &str| {
             if point == Point::BeforeWrite && kind == "outcome" {
                 Err("injected_outcome_failure")
@@ -528,8 +646,25 @@ async fn corrupt_recovery_inputs_and_outputs_are_unavailable_and_never_reexecute
         let report = store.resolve(&descriptors[0]).unwrap();
         let job = report.parent().unwrap();
         fs::remove_file(job.join("receipt.json")).unwrap();
+        if filename == "leading-empty.csv" {
+            // Change the prefix and both local manifests consistently. The
+            // original worker proof must still reject the changed source hash.
+            let path = job.join("analysis.json");
+            let saved = Json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+            let hash = ansa::protocol::legacy_json_v1::sha256(b"\ndate,value\n2026-01-01,1\n");
+            fs::write(&path, saved.with("input_sha256", s(&hash)).unwrap().dump()).unwrap();
+            let path = job.join("parameters.json");
+            let parameters = Json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+            fs::write(
+                &path,
+                parameters.with("source_sha256", s(&hash)).unwrap().dump(),
+            )
+            .unwrap();
+        }
         let damaged = if filename == "parameters.json" {
             br#"{"date_column":"date","value_column":"other"}"#.as_slice()
+        } else if filename == "leading-empty.csv" {
+            b"\n".as_slice()
         } else {
             b"CORRUPTED"
         };
