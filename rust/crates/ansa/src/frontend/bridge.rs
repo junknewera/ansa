@@ -18,6 +18,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
+mod assets;
 mod control;
 
 pub const FRAME_BYTES: usize = 128 * 1024;
@@ -27,6 +28,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct BridgeOptions {
     pub directory: PathBuf,
     pub editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    pub artifact_store: Option<crate::tools::artifacts::Store>,
 }
 
 fn obj(fields: Vec<(&str, Json)>) -> Json {
@@ -84,16 +86,19 @@ pub struct Bridge {
     pages: Arc<Mutex<Pages>>,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
     control: Arc<control::Control>,
+    assets: Option<Arc<assets::Assets>>,
 }
 #[derive(Default)]
 struct Pages {
     next: usize,
     latest_total: usize,
+    latest_timeline: usize,
     pending: Vec<PendingPage>,
 }
 struct PendingPage {
     token: usize,
     minimum_total: usize,
+    timeline: bool,
     query: GetTranscript,
     reply: oneshot::Sender<TranscriptPage>,
 }
@@ -147,6 +152,14 @@ impl Bridge {
         handle: Handle,
         editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
     ) -> Result<Self> {
+        Self::start_with_artifacts(directory, handle, editor, None)
+    }
+    pub fn start_with_artifacts(
+        directory: &Path,
+        handle: Handle,
+        editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+        store: Option<crate::tools::artifacts::Store>,
+    ) -> Result<Self> {
         let directory = std::path::absolute(directory).map_err(|_| "workspace_directory")?;
         ansa_linux::fs::create_private(&directory).map_err(|_| "workspace_permissions")?;
         let owned =
@@ -171,6 +184,8 @@ impl Bridge {
         let task_editor = editor.clone();
         let control = control::Control::new(handle.clone(), editor.clone());
         let task_control = control.clone();
+        let assets = store.map(|store| assets::Assets::new(store, &handle.session().0));
+        let task_assets = assets.clone();
         let task = tokio::spawn(async move {
             serve(
                 listener,
@@ -181,6 +196,7 @@ impl Bridge {
                 task_pages,
                 task_editor,
                 task_control,
+                task_assets,
             )
             .await;
         });
@@ -195,6 +211,7 @@ impl Bridge {
             pages,
             editor,
             control,
+            assets,
         })
     }
     pub fn socket(&self) -> &Path {
@@ -228,10 +245,11 @@ impl Bridge {
         self.control.publish(event);
         match &event.payload {
             EventPayload::FrontendSnapshot(snapshot) => {
-                self.pages
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .latest_total = snapshot.transcript_size;
+                {
+                    let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+                    pages.latest_total = snapshot.transcript_size;
+                    pages.latest_timeline = snapshot.timeline_size;
+                }
                 self.view.state = obj(vec![
                     ("phase", s(&snapshot.state).unwrap()),
                     ("turn", s(&event.turn.0).unwrap()),
@@ -267,6 +285,7 @@ impl Bridge {
                         ),
                     ),
                     ("transcript_total", n(snapshot.transcript_size)),
+                    ("timeline_total", n(snapshot.timeline_size)),
                     (
                         "mode",
                         s(if snapshot.mode == AgentMode::Plan {
@@ -300,11 +319,16 @@ impl Bridge {
                     ),
                 ]);
             }
-            EventPayload::TranscriptPage(page) => {
+            EventPayload::TranscriptPage(page) | EventPayload::TimelinePage(page) => {
+                let timeline = matches!(event.payload, EventPayload::TimelinePage(_));
+                if timeline && let Some(assets) = &self.assets {
+                    assets.observe(page);
+                }
                 let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
                 let mut index = 0;
                 while index < pages.pending.len() {
-                    if pages.pending[index].query == page.query
+                    if pages.pending[index].timeline == timeline
+                        && pages.pending[index].query == page.query
                         && page.total >= pages.pending[index].minimum_total
                     {
                         let pending = pages.pending.swap_remove(index);
@@ -356,6 +380,9 @@ impl Bridge {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
+        if let Some(assets) = &self.assets {
+            assets.shutdown().await;
+        }
     }
 }
 impl Drop for Bridge {
@@ -382,6 +409,7 @@ async fn serve(
     pages: Arc<Mutex<Pages>>,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
     control: Arc<control::Control>,
+    assets: Option<Arc<assets::Assets>>,
 ) {
     let mut clients = JoinSet::new();
     let mut connection = 0usize;
@@ -398,7 +426,8 @@ async fn serve(
                     let p = pages.clone();
                     let e = editor.clone();
                     let c=control.clone();
-                    clients.spawn(async move { let _ = client(stream, h, v, stopped, p, prefix, e, c).await; });
+                    let a=assets.clone();
+                    clients.spawn(async move { let _ = client(stream, h, v, stopped, p, prefix, e, c, a).await; });
                 }
             }
         }
@@ -460,6 +489,7 @@ async fn client(
     prefix: String,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
     control: Arc<control::Control>,
+    assets: Option<Arc<assets::Assets>>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut read = FrameReader::new(BufReader::new(read));
@@ -498,18 +528,28 @@ async fn client(
         ("incarnation", s(&handle.incarnation().0)?),
         (
             "capabilities",
-            Json::array(if role == "editor" {
-                vec![
-                    s("snapshot")?,
-                    s("history")?,
-                    s("publish_context")?,
-                    s("invalidate_context")?,
-                    s("submit_message")?,
-                    s("message_lookup")?,
-                    s("cancel_message")?,
-                ]
-            } else {
-                vec![s("snapshot")?, s("history")?]
+            Json::array({
+                let mut capabilities = if role == "editor" {
+                    vec![
+                        s("snapshot")?,
+                        s("history")?,
+                        s("publish_context")?,
+                        s("invalidate_context")?,
+                        s("submit_message")?,
+                        s("message_lookup")?,
+                        s("cancel_message")?,
+                    ]
+                } else {
+                    vec![s("snapshot")?, s("history")?]
+                };
+                if assets.is_some() {
+                    capabilities.extend([
+                        s("artifact_catalog")?,
+                        s("artifact_read")?,
+                        s("document_read")?,
+                    ]);
+                }
+                capabilities
             })?,
         ),
         ("max_frame_bytes", n(FRAME_BYTES)),
@@ -551,10 +591,16 @@ async fn client(
         let mut page_job: Option<PageJob> = None;
         let mut control_job: Option<control::Job> = None;
         let mut cancel_job: Option<control::Job> = None;
+        let mut file_job: Option<control::Job> = None;
         loop {
             let frame = tokio::select! { biased;
                 _ = stop.changed() => break,
                 _ = out.closed() => break,
+                response = async { file_job.as_mut().expect("enabled").await }, if file_job.is_some() => {
+                    file_job=None;
+                    out.try_send(response).map_err(|_|"workspace_slow_reader")?;
+                    continue;
+                }
                 response = async { cancel_job.as_mut().expect("enabled").await }, if cancel_job.is_some() => {
                     cancel_job=None;
                     out.try_send(response).map_err(|_|"workspace_slow_reader")?;
@@ -584,6 +630,25 @@ async fn client(
                 return Err("workspace_request_id");
             }
             let kind = frame.text_field("kind")?;
+            if matches!(kind, "artifact_read" | "document_read")
+                && let Some(assets) = &assets
+            {
+                if file_job.is_some() {
+                    out.try_send(encoded(&obj(vec![
+                        ("type", s("error")?),
+                        ("id", s(id)?),
+                        ("code", s("workspace_busy")?),
+                    ]))?)
+                    .map_err(|_| "workspace_slow_reader")?;
+                } else {
+                    file_job = Some(if kind == "document_read" {
+                        assets.read_document(&frame)
+                    } else {
+                        assets.read(&frame)
+                    });
+                }
+                continue;
+            }
             if role == "editor"
                 && matches!(kind, "submit_message" | "cancel_message" | "message_lookup")
             {
@@ -608,7 +673,7 @@ async fn client(
                 }
                 continue;
             }
-            if kind == "history" && page_job.is_some() {
+            if matches!(kind, "history" | "artifact_catalog") && page_job.is_some() {
                 out.try_send(encoded(&obj(vec![
                     ("type", s("posted")?),
                     ("id", s(id)?),
@@ -681,6 +746,13 @@ async fn client(
                     limit: frame.usize_field("limit")?,
                     forward: frame.field("forward")?.boolean()?,
                 }),
+                "artifact_catalog" if assets.is_some() => {
+                    CommandPayload::GetTimeline(GetTranscript {
+                        before: frame.usize_field("before")?,
+                        limit: frame.usize_field("limit")?,
+                        forward: frame.field("forward")?.boolean()?,
+                    })
+                }
                 _ => {
                     out.try_send(encoded(&obj(vec![
                         ("type", s("error")?),
@@ -699,7 +771,9 @@ async fn client(
                 command: CommandId(format!("{prefix}_{sequence}")),
                 payload,
             };
-            let page_wait = if let CommandPayload::GetTranscript(query) = &command.payload {
+            let page_wait = if let CommandPayload::GetTranscript(query)
+            | CommandPayload::GetTimeline(query) = &command.payload
+            {
                 if query.limit == 0 || query.limit > 64 {
                     return Err("transcript_page_limit");
                 }
@@ -710,10 +784,16 @@ async fn client(
                 }
                 pending.next += 1;
                 let token = pending.next;
-                let minimum_total = pending.latest_total;
+                let timeline = matches!(command.payload, CommandPayload::GetTimeline(_));
+                let minimum_total = if timeline {
+                    pending.latest_timeline
+                } else {
+                    pending.latest_total
+                };
                 pending.pending.push(PendingPage {
                     token,
                     minimum_total,
+                    timeline,
                     query: query.clone(),
                     reply,
                 });
@@ -743,11 +823,27 @@ async fn client(
             {
                 let id = id.to_owned();
                 let handle = handle.clone();
+                let assets = assets.clone();
+                let timeline = kind == "artifact_catalog";
                 page_job = Some(Box::pin(async move {
                     let _guard = _guard;
                     match tokio::time::timeout(IO_TIMEOUT, receiver).await {
-                        Ok(Ok(page)) => history(&page, &id, &handle).unwrap_or_else(error_encoded),
-                        _ => error_encoded("workspace_history_timeout"),
+                        Ok(Ok(page)) => {
+                            if timeline {
+                                assets
+                                    .as_ref()
+                                    .expect("artifact grant")
+                                    .page(&page, &id, &handle)
+                            } else {
+                                history(&page, &id, &handle).unwrap_or_else(error_encoded)
+                            }
+                        }
+                        _ => encoded(&obj(vec![
+                            ("type", s("error").unwrap()),
+                            ("id", s(&id).unwrap()),
+                            ("code", s("workspace_history_timeout").unwrap()),
+                        ]))
+                        .unwrap(),
                     }
                 }));
             }

@@ -435,7 +435,16 @@ fn text(args: &[String]) -> Result<i32> {
             parent,
             parsed
                 .workspace
-                .map(|directory| super::bridge::BridgeOptions { directory, editor }),
+                .map(|directory| -> Result<_> {
+                    Ok(super::bridge::BridgeOptions {
+                        directory,
+                        editor,
+                        artifact_store: Some(crate::tools::artifacts::Store::new(
+                            &selected.directory,
+                        )?),
+                    })
+                })
+                .transpose()?,
         ));
     }
     if parsed.workspace.is_some() {

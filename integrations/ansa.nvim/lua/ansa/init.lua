@@ -3,6 +3,7 @@ local uv = vim.uv or vim.loop
 local cap = 512 * 1024
 local state = { client = string.format('nvim_%d_%.0f', uv.os_getpid(), uv.hrtime()), pending = {}, sequence = 0 }
 local messages
+local artifacts
 
 local function notify(message)
   vim.notify(message, vim.log.levels.INFO, { title = 'ANSA' })
@@ -10,6 +11,7 @@ end
 
 local function disconnect()
   if messages then messages:disconnected() end
+  if artifacts then artifacts:disconnected() end
   if state.pipe then
     state.pipe:read_stop()
     if not state.pipe:is_closing() then state.pipe:close() end
@@ -109,6 +111,7 @@ local function render(snapshot)
   if type(snapshot.through) ~= 'number' or snapshot.through < (state.through or 0) then return end
   state.through = snapshot.through
   state.snapshot = snapshot
+  artifacts:observe(snapshot)
   if not state.history and state.history_buf and vim.api.nvim_buf_is_valid(state.history_buf) then
     history()
     return
@@ -140,6 +143,7 @@ local function render(snapshot)
 end
 
 local function receive(message)
+  if artifacts and artifacts:handle(message) then return end
   if messages and messages:handle(message) then return end
   if message.type == 'welcome' then
     if message.version ~= 1 or message.role ~= state.requested_role then
@@ -158,6 +162,7 @@ local function receive(message)
     send({ kind = 'snapshot' })
     history()
     messages:attached()
+    artifacts:attached()
   elseif message.type == 'snapshot' then
     render(message)
   elseif message.type == 'history' then
@@ -170,6 +175,11 @@ local function receive(message)
       state.history_retry_token = state.history_retry_token + 1
       state.history = message
       if state.snapshot then render(state.snapshot) end
+      local open=state.open_history
+      state.open_history=nil
+      if open and state.history_buf and vim.api.nvim_get_current_buf()==open.buffer
+        and vim.api.nvim_buf_get_changedtick(open.buffer)==open.tick then M.open() end
+      artifacts:refresh(false)
     end
   elseif message.type == 'posted' and message.kind == 'history'
     and message.id == state.pending_history and message.status ~= 'Accepted' then
@@ -228,6 +238,11 @@ function M.attach(path, options)
   if not path or path == '' then notify('Укажите путь к workspace.sock'); return end
   state.buffered = ''
   state.requested_role = options and options.editor and 'editor' or 'viewer'
+  state.open_history=nil
+  if state.auto_open_history and vim.fn.argc()==0 and vim.api.nvim_buf_get_name(0)==''
+    and vim.deep_equal(vim.api.nvim_buf_get_lines(0,0,-1,false),{''}) then
+    state.open_history={buffer=vim.api.nvim_get_current_buf(),tick=vim.api.nvim_buf_get_changedtick(0)}
+  end
   local role = state.requested_role
   local pipe = uv.new_pipe(false)
   local epoch = state.epoch
@@ -301,7 +316,9 @@ end
 
 function M.status()
   return { connected = state.attachment ~= nil, snapshot = state.snapshot, buffer = state.history_buf, shared = state.shared,
-    pending_message = messages.pending, last_message = messages.last, message_draft = messages.draft }
+    pending_message = messages.pending, last_message = messages.last, message_draft = messages.draft,
+    artifacts = artifacts.known, artifact_documents = artifacts.docs, artifact_read_pending = artifacts.read ~= nil,
+    documents = artifacts.documents, prepared_documents = artifacts.prepared }
 end
 
 function M.share(first, last, after)
@@ -327,7 +344,27 @@ end
 
 function M.send(first,last,prompt) messages:submit(first,last,prompt or '') end
 
-function M.setup()
+function M.setup(options)
+  options=options or {}
+  state.auto_open_history=options.open_history
+  if options.render and vim.env.NO_COLOR==nil then
+    require('ansa.images').setup()
+    local ok,markdown=pcall(require,'render-markdown')
+    if ok then markdown.setup({latex={enabled=false}}) end
+  end
+  vim.api.nvim_create_user_command('AnsaArtifacts',function() artifacts:refresh(true) end,{desc='Выбрать сохранённый отчёт, CSV или PNG'})
+  vim.api.nvim_create_user_command('AnsaDocuments',function(args)
+    if args.args~='' then artifacts:open_document(args.args) else artifacts:document_picker(false) end
+  end,{nargs='?',desc='Открыть подготовленный файл или proposed diff'})
+  vim.api.nvim_create_user_command('AnsaDocumentsEarlier',function() artifacts:document_picker(true) end,{desc='Предыдущая страница подготовленных документов'})
+  vim.api.nvim_create_user_command('AnsaArtifactsEarlier',function()
+    if not artifacts.begin or artifacts.begin==0 then notify('Более ранних страниц артефактов нет'); return end
+    artifacts:refresh(true,artifacts.begin)
+  end,{desc='Загрузить предыдущую страницу артефактов'})
+  vim.api.nvim_create_user_command('AnsaArtifact',function(args)
+    if #args.fargs~=2 then notify(':AnsaArtifact ID REVISION'); return end
+    artifacts:open(args.fargs[1],args.fargs[2])
+  end,{nargs='+',desc='Открыть загруженный artifact ID и revision'})
   vim.api.nvim_create_user_command('AnsaAttach', function(args) M.attach(args.args, {editor=args.bang}) end,
     { nargs = 1, bang = true, complete = 'file', desc = 'Подключиться к Carbon workspace; ! передаёт контекст редактора' })
   vim.api.nvim_create_user_command('AnsaShare', function(args) M.share(args.line1, args.line2) end,
@@ -372,5 +409,6 @@ end
 messages=require('ansa.messages').new({send=send,notify=notify,client=function() return state.client end,
   attachment=function() return state.attachment end,snapshot=function() return state.snapshot end,
   share=function(...) return M.share(...) end})
+artifacts=require('ansa.artifacts').new({send=send,notify=notify,attachment=function() return state.attachment end})
 
 return M

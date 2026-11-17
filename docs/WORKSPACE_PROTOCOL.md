@@ -9,7 +9,7 @@ Endpoint создаётся явно через `--workspace-dir PATH` в privat
 граница API для процессов пользователя. Runtime, journal и auth остаются одними.
 
 Wire format - UTF-8 JSONL v1. Handshake содержит `version`, `role`, `client`.
-Роль viewer разрешает snapshot/resync и страницы истории. Editor grant выдаёт
+Роль viewer разрешает snapshot/resync, страницы истории и показ результатов. Editor grant выдаёт
 owner при запуске; клиент не может выдать его себе. Controller, GetContext,
 Resume и SetGeneration через bridge запрещены. Команды несут session,
 incarnation и ID; действия над turn требуют также turn и request. Успешная
@@ -49,6 +49,9 @@ opaque reasoning и raw tool outputs не сериализуются. Польз
 | Analysis jobs | 1 на сессию, до 60 с |
 | Dataset / blob / session artifacts | 4 / 16 / 64 MiB |
 | PNG | До 8 миллионов pixels |
+| Дескрипторы артефактов / кэш документов | 384 / 64 |
+| Чтение артефактов | Очередь из 8, один filesystem worker |
+| Поиск старой версии в Neovim | До 16 страниц, один повтор после вытеснения grant |
 
 Analysis MVP предоставляет `dataset_inspect` и `python_execute`: второй запускает
 фиксированный помесячный sum для CSV через pinned Python/Matplotlib. Он принимает
@@ -73,5 +76,23 @@ snapshot с through cursor. Медленный socket не задерживае�
 
 Прямые editor writes, отдельный headless frontend, persistent kernels и MCP
 относятся к этапу 4. Файлы и proposed diff открываются без автоматического save.
-Графический этап требует отдельной реальной приёмки backend; Markdown и ссылка
-на PNG сами по себе не закрывают проверку отображения изображений.
+`artifact_catalog` читает correlated canonical TimelinePage. `ToolFinished`
+сам по себе не выдаёт доступ: его outcome ещё может ожидать fsync. `artifact_read`
+принимает только опубликованные ID/revision и сверяет receipt, hash, размер,
+тип и права файла. PNG возвращается проверенным локальным путём, Markdown/CSV -
+также текстом. Кэш документов пополняется canonical результатами
+`editor_open_file` и `editor_propose_diff`; `document_read` читает этот кэш.
+После вытеснения клиент заново получает grant из страниц журнала.
+
+Neovim и плагины закреплены в [workspace-neovim.nix](../nix/workspace-neovim.nix).
+Renderer сначала проверяет ответ терминала на RGB и PNG queries. APC replies
+с собственными случайными ID отделены от ввода, включая bracketed paste;
+прочие байты передаются прежнему обработчику Neovim. Закрытие attachment,
+буфера и смена revision очищают только принадлежащие viewer placements.
+Отложенные callbacks сверяют attachment, буфер, revision и changedtick.
+SSH, tmux, несколько UI и `NO_COLOR` используют текстовый fallback.
+
+Графическая приёмка использует настоящие Kitty 0.49.2 и Ghostty 1.3.1
+в изолированном Weston с software GL. Снимки проверяют видимые pixels при
+resize, scroll, переключении буфера, замене revision и очистке. Эта проверка
+отделена от controlled-response PTY тестов capability negotiation.

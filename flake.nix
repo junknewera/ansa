@@ -7,7 +7,10 @@
       each = nixpkgs.lib.genAttrs systems;
       analysisFor = pkgs: pkgs.python3.withPackages (ps: [ ps.matplotlib ]);
       rustPackage = system:
-        let pkgs = import nixpkgs { inherit system; }; in
+        let
+          pkgs = import nixpkgs { inherit system; };
+          workspaceVim = pkgs.callPackage ./nix/workspace-neovim.nix { integration = ./integrations/ansa.nvim; };
+        in
         pkgs.rustPlatform.buildRustPackage {
           pname = "ansa";
           version = "0.1.0";
@@ -19,13 +22,19 @@
           };
           cargoLock.lockFile = ./rust/Cargo.lock;
           strictDeps = true;
-          nativeBuildInputs = [ pkgs.python3 ];
+          nativeBuildInputs = [ pkgs.python3 pkgs.makeWrapper ];
           nativeCheckInputs = [ pkgs.gitMinimal pkgs.zsh ];
           cargoBuildFlags = [ "--workspace" ];
           cargoTestFlags = [ "--workspace" ];
           doCheck = true;
           postInstall = ''
             ln -s ansa "$out/bin/ansa-rs"
+            mkdir -p "$out/share/ansa/nvim"
+            cp -R ${./integrations/ansa.nvim}/. "$out/share/ansa/nvim/"
+            makeWrapper ${analysisFor pkgs}/bin/python3 "$out/bin/ansa-nvim" \
+              --add-flags "$out/share/ansa/nvim/launcher.py" \
+              --set ANSA_WORKSPACE_NVIM ${workspaceVim}/bin/nvim \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.kitty ]}
           '';
           ANSA_PARITY_ROOT = ./tests/parity;
           ANSA_PROTOCOL_FIXTURES = ./tests/fixtures;
@@ -41,6 +50,8 @@
       packages = each (system: {
         default = rustPackage system;
         ansa-rust = rustPackage system;
+        workspace-neovim = let pkgs = import nixpkgs { inherit system; }; in
+          pkgs.callPackage ./nix/workspace-neovim.nix { integration = ./integrations/ansa.nvim; };
       });
       checks = each (system: {
         rust = rustPackage system;
@@ -50,6 +61,9 @@
           default = pkgs.mkShell {
             packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh ];
             ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
+          };
+          graphics = pkgs.mkShell {
+            packages = [ (analysisFor pkgs) pkgs.kitty pkgs.ghostty pkgs.weston pkgs.imagemagick pkgs.dbus ];
           };
         } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
           quality = pkgs.mkShell {

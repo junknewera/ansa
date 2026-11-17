@@ -71,8 +71,44 @@ targets/features прошли. Независимый source review закрыт
 rc, provenance и классификации ошибок. Старый compatibility fixture исправлен:
 исторический pre-edit catalog теперь задан точным набором прежних tools.
 
-Это WIP: canonical artifact projection, открытие отчётов, PNG renderer,
-proposed diff и реальная Kitty/Ghostty приёмка ещё не реализованы.
+Canonical artifact projection, отчёты, PNG и proposed diff добавлены следующим
+WIP slice. `artifact_catalog` использует сохранённый TimelinePage; недописанный
+ToolFinished не выдаёт grant. `artifact_read` сверяет descriptor, receipt,
+hash/размер и тип файла в отдельном bounded filesystem worker. Отчёты сохраняют
+черновик и положение чтения; reconnect сначала восстанавливает canonical grant.
+`editor_open_file` и `editor_propose_diff` публикуют readonly snapshots для
+просмотра в Neovim. Выгруженные буферы и вытесненные cache entries восстанавливаются
+повторным чтением, без исполнения tools.
+
+Pinned Neovim **0.12.5**, Snacks **882c996**, render-markdown **8801162**,
+parsers и ImageMagick включены в Nix package. Источники плагинов проверены hashes.
+PNG capability queries разобраны отдельно от обычного ввода и bracketed paste;
+late callbacks сверяют текущую версию/буфер. Scoped cleanup останавливает также
+queued converters. Предварительное чтение метаданных устраняет оставшийся после
+закрытия progress timer закреплённого renderer.
+
+Реальные **Kitty 0.49.2 / Ghostty 1.3.1**, собственный Weston/software GL:
+**19/19**, со снимками видимых pixels, resize/scroll, сменой буфера, повторным
+открытием, заменой revision и очисткой. Дополнительный сценарий проверил
+native Kitty launch, повторное получение того же pane ID, относительный путь
+из cwd вызывающего процесса и confirmed close. PATH исходного терминала был
+ограничен: конвертер предоставляет wrapper Neovim. Controlled-response TUI
+проверка capability/paste прошла **6/6**; это отдельная проверка от изображения
+на экране. Real pinned Snacks queue regression прошёл **1/1**: отменённый
+четвёртый converter не стартует после завершения трёх занятых jobs.
+
+Neovim artifact lifecycle прошёл **10/10**, prepared documents **9/9**, image
+callbacks/paste **10/10**, launcher unknown-ACK/ownership **6/6**. Независимые
+source review закрыты. Astra дополнительно сама выполнила real UI **19/19**,
+просмотрела Markdown/PNG/proposed diff, проверила documents **8/8**, artifacts
+**9/9** и Markdown renderer (**18 extmarks**). Найденные ею P2 - недоступные
+из меню старые revisions и отсутствие пути/исходного диапазона в diff - исправлены
+и покрыты проверками. В узких панелях подписи графика остаются мелкими.
+
+Evidence: `workspace-bridge-20261117/{graphics-08,conversion-queue-01,
+nvim-artifacts-07,nvim-documents-04,image-lifecycle-03,nvim-probe-05,
+launcher-02,astra-ui-01,astra-ui-03}` в каталоге baselines выше. Полная финальная
+матрица текущего implementation checkpoint ещё не выполнена; GO остаётся `5df02d8`.
 
 ## Carbon: управление, читаемые инструменты и терминал проекта
 

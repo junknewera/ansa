@@ -560,3 +560,173 @@ async fn corrupt_recovery_inputs_and_outputs_are_unavailable_and_never_reexecute
         f::finish(&mut reopened).await;
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn artifact_bridge_requires_canonical_outcome_and_reads_after_recovery_without_compute() {
+    use ansa::frontend::bridge::Bridge;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    async fn reply(
+        runtime: &mut Runtime,
+        bridge: &mut Bridge,
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        kind: &str,
+        id: Option<&str>,
+    ) -> Json {
+        tokio::time::timeout(std::time::Duration::from_secs(3),async {
+            let mut line=vec![];
+            loop {tokio::select! {
+                event=runtime.next_event()=>bridge.publish(&event.unwrap()),
+                count=reader.read_until(b'\n',&mut line)=>{
+                    assert!(count.unwrap()>0);
+                    let value=Json::parse(std::str::from_utf8(&line).unwrap()).unwrap();line.clear();
+                    if value.text_field("type").ok()==Some(kind) && id.is_none_or(|id|value.text_field("id").ok()==Some(id)) {return value;}
+                }
+            }}
+        }).await.expect("artifact bridge response")
+    }
+    let root = Root::new();
+    local::write(&root.cwd().join("data.csv"), "date,value\n2026-01-01,1\n");
+    let observer = Arc::new(|point, kind: &str| {
+        if point == Point::BeforeWrite && kind == "outcome" {
+            Err("injected_outcome_failure")
+        } else {
+            Ok(())
+        }
+    });
+    let mut run = runtime(
+        &root,
+        args(&root, "data.csv", "bridge"),
+        Some(observer),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let store = Store::new(&root.0.join("session")).unwrap();
+    let mut bridge = Bridge::start_with_artifacts(
+        &root.0.join("bridge"),
+        run.handle(),
+        None,
+        Some(store.clone()),
+    )
+    .unwrap();
+    f::submit(&run.handle(), "analysis", "aggregate", "turn").await;
+    let event = f::until(&run.handle(), |p| {
+        matches!(p, EventPayload::ToolFinished(_))
+    })
+    .await;
+    bridge.publish(&event);
+    let EventPayload::ToolFinished(ref finished) = event.payload else {
+        unreachable!()
+    };
+    let result = Json::parse(&finished.output).unwrap();
+    let descriptor = result.field("artifacts").unwrap().elements().unwrap()[0].clone();
+    loop {
+        if matches!(f::event(&run.handle()).await.payload,EventPayload::FrontendSnapshot(s) if s.storage_failed)
+        {
+            break;
+        }
+    }
+    for recovered in [false, true] {
+        let stream = tokio::net::UnixStream::connect(bridge.socket())
+            .await
+            .unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(b"{\"version\":1,\"role\":\"viewer\",\"client\":\"artifact_viewer\"}\n")
+            .await
+            .unwrap();
+        reply(&mut run, &mut bridge, &mut reader, "welcome", None).await;
+        let wire = |id: &str, kind: &str, fields: Vec<(&str, Json)>| {
+            let mut base = vec![
+                ("version", local::n(1)),
+                ("session", s(&run.handle().session().0)),
+                ("incarnation", s(&run.handle().incarnation().0)),
+                ("id", s(id)),
+                ("kind", s(kind)),
+            ];
+            base.extend(fields);
+            format!("{}\n", Json::object(base).unwrap().dump())
+        };
+        let read = wire(
+            "read",
+            "artifact_read",
+            vec![
+                (
+                    "artifact_id",
+                    descriptor.field("artifact_id").unwrap().clone(),
+                ),
+                ("revision", descriptor.field("revision").unwrap().clone()),
+            ],
+        );
+        writer.write_all(read.as_bytes()).await.unwrap();
+        assert_eq!(
+            reply(&mut run, &mut bridge, &mut reader, "error", Some("read"))
+                .await
+                .text_field("code")
+                .unwrap(),
+            "artifact_not_committed"
+        );
+        let catalog = Json::object(vec![
+            ("version", local::n(1)),
+            ("session", s(&run.handle().session().0)),
+            ("incarnation", s(&run.handle().incarnation().0)),
+            ("id", s("catalog")),
+            ("kind", s("artifact_catalog")),
+            ("before", local::n(0)),
+            ("limit", local::n(64)),
+            ("forward", Json::parse("false").unwrap()),
+        ])
+        .unwrap();
+        writer
+            .write_all(format!("{}\n", catalog.dump()).as_bytes())
+            .await
+            .unwrap();
+        let page = reply(
+            &mut run,
+            &mut bridge,
+            &mut reader,
+            "artifact_catalog",
+            Some("catalog"),
+        )
+        .await;
+        assert_eq!(
+            page.field("artifacts").unwrap().elements().unwrap().len(),
+            if recovered { 3 } else { 0 }
+        );
+        if recovered {
+            writer.write_all(read.as_bytes()).await.unwrap();
+            let file = reply(&mut run, &mut bridge, &mut reader, "artifact", Some("read")).await;
+            assert_eq!(file.field("descriptor").unwrap(), &descriptor);
+            assert!(
+                file.text_field("content")
+                    .unwrap()
+                    .contains("# Monthly totals")
+            );
+            assert_eq!(
+                file.text_field("path").unwrap(),
+                store.resolve(&descriptor).unwrap().to_str().unwrap()
+            );
+            break;
+        }
+        bridge.shutdown().await;
+        f::finish(&mut run).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        run = runtime(
+            &root,
+            args(&root, "data.csv", "bridge"),
+            None,
+            calls.clone(),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        bridge = Bridge::start_with_artifacts(
+            &root.0.join("bridge"),
+            run.handle(),
+            None,
+            Some(store.clone()),
+        )
+        .unwrap();
+    }
+    bridge.shutdown().await;
+    f::finish(&mut run).await;
+}

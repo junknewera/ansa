@@ -4,9 +4,9 @@
 
 Новая инженерная сессия начинается с [AGENTS.md](AGENTS.md) и [текущего состояния проекта](docs/PROJECT_STATE.md).
 
-Предлагаемая интеграция Ghostty/Kitty, соседнего Neovim, Markdown и графиков
-описана в [system design рабочей среды](docs/TERMINAL_WORKSPACE_DESIGN.md).
-Статус — docs-only proposal; API и этапы реализации перечислены в документе.
+Соседний Neovim показывает историю, Markdown-отчёты, графики и предложенные
+правки. Запуск и команды - в [ansa.nvim](integrations/ansa.nvim/README.md),
+границы и протокол - в [дизайне рабочей среды](docs/TERMINAL_WORKSPACE_DESIGN.md).
 
 ## Обычный CLI
 
@@ -323,7 +323,7 @@ Runtime накапливает контекст между завершённы�
 - HTTPS bytes обслуживает Hyper/rustls; bounded SSE framer отвечает за события, Responses reducer - за semantic admission.
 - Admission требует successful terminal, согласованных IDs/model/items/arguments и завершённого framing. До проверки всего batch executors недоступны.
 - Owning JSON сохраняет порядок native items, opaque strings и числовые tokens без округления. Replay использует исходные prefix, context epoch и advertised tool snapshot.
-- `ToolRegistry` хранит compiled descriptor/schema/validator/executor/revision. Provider получает только descriptions. Обычный CLI регистрирует `list_directory`, `read_file`, `search_files`, `run_command` и детерминированный `get_test_value`; JSONL сохраняет прежний pure snapshot.
+- `ToolRegistry` хранит compiled descriptor/schema/validator/executor/revision. Provider получает описания инструментов. Обычный CLI предоставляет файлы, команды, workspace/выделение и CSV-анализ; продолжение сессии сохраняет её прежний каталог. Legacy JSONL сохраняет pure snapshot.
 - Один control owner ведёт состояние turn. Worker выполняет mock generation, подготовку и dispatch tool и строит continuation. Commands/events v1 и snapshot/resync общие для JSONL и текстового frontend.
 
 CLI предоставляет self-check, offline round trip и live SIWC. Mock строит финальный response из фактического результата tool в continuation.

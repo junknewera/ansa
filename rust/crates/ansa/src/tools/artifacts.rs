@@ -195,6 +195,9 @@ impl Store {
     /// Caller supplies a descriptor obtained from a canonical transcript page,
     /// never an arbitrary client path or an uncommitted execution receipt.
     pub fn resolve(&self, descriptor: &Json) -> Result<PathBuf> {
+        self.load(descriptor).map(|(path, _)| path)
+    }
+    pub fn load(&self, descriptor: &Json) -> Result<(PathBuf, Vec<u8>)> {
         validate_descriptor(descriptor, &self.session, None)?;
         let operation = descriptor.text_field("producer_operation_id")?;
         let revision = descriptor.text_field("revision")?;
@@ -225,7 +228,7 @@ impl Store {
             return Err("artifact_corrupt");
         }
         check_blob(descriptor.text_field("mime")?, &bytes)?;
-        Ok(path.join(filename))
+        Ok((path.join(filename), bytes))
     }
 }
 fn measure(path: &Path, depth: usize) -> Result<usize> {

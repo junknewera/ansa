@@ -3008,10 +3008,11 @@ pub async fn run_attached(
     let mut bridge = bridge_options
         .as_ref()
         .map(|options| {
-            super::super::bridge::Bridge::start_with_editor(
+            super::super::bridge::Bridge::start_with_artifacts(
                 &options.directory,
                 runtime.handle(),
                 options.editor.clone(),
+                options.artifact_store.clone(),
             )
         })
         .transpose()?;

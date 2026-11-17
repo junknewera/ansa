@@ -1,10 +1,42 @@
 # Ghostty/Kitty, Neovim и графические результаты: system design
 
-Статус: **PROPOSED, docs-only**. Дата: 2026-11-16.
-Проверенный baseline исходников: [`main@8b6ecb7`][ansa-base].
-Документ описывает предлагаемое расширение; `ansa.nvim`, workspace bridge,
-новые tools и artifact API ещё не реализованы. Имена будущих операций ниже
-обозначают проектный контракт, а не доступные команды или окончательную schema.
+Статус: **этапы 0–3 реализованы, финальная приёмка PR #26 выполняется**.
+Дизайн от 2026-11-16, реализация от 2026-11-17. Последний полностью проверенный
+checkpoint и текущие gates - в [PROJECT_STATE](PROJECT_STATE.md).
+
+## Реализация
+
+Carbon предоставляет private Unix endpoint над своим production runtime.
+Два клиента читают одну сессию; editor grant разрешает явную передачу
+несохранённого выделения и задачи. Полномочия, numeric caps и команды
+зафиксированы в [WORKSPACE_PROTOCOL](WORKSPACE_PROTOCOL.md).
+
+Пакет включает соседний Neovim 0.12.5 с закреплёнными Markdown parsers,
+`render-markdown.nvim` и `snacks.image`. Kitty launcher сохраняет ID панели
+и сверяет собственный tag при потере подтверждения. Ghostty/Linux подключается
+из созданного пользователем split. [Запуск и команды](../integrations/ansa.nvim/README.md).
+
+`dataset_inspect` читает CSV; `python_execute` выполняет фиксированные
+помесячные суммы через supervised pinned Python/Matplotlib. Итоги считаются
+точно, Markdown/CSV/PNG сохраняются неизменяемыми версиями. Viewer получает
+дескрипторы из canonical outcome и повторно проверяет файлы перед показом.
+Чтение после reconnect и recovery не повторяет анализ.
+
+`editor_open_file` и `editor_propose_diff` подготавливают сохранённый в журнале
+документ для `:AnsaDocuments`. `:AnsaArtifact ID REVISION` реализует адресный
+показ сохранённого результата; отдельный model tool `artifact_show` в первой
+версии не добавляется. Эти операции сохраняют исходный файл и dirty buffer.
+Прямое применение правок, самостоятельный headless frontend, MCP и persistent
+kernels относятся к этапу 4.
+
+Реальная графическая проверка выполнена на Kitty 0.49.2 и Ghostty 1.3.1
+в собственном Weston с software GL: видимость PNG, смена буфера, resize,
+scroll, замена версии, очистка attachment и закрытие просмотра. Версии
+закреплены текущим Nix input. tmux/SSH и несколько Neovim UI пока используют
+текстовый fallback. Поддержка новых версий терминалов требует отдельной проверки.
+
+Ниже сохранены исходный design и анализ baseline [`main@8b6ecb7`][ansa-base].
+Предлагаемые имена и расширения в нём сверяются с контрактом реализации выше.
 
 ## 1. Задача и выбранная граница
 
@@ -147,7 +179,8 @@ authorization, loop limits и cancel/recovery. Тестовый legacy JSONL с�
 `snacks.image`. Markdown остаётся настоящим текстовым буфером. Renderer оформляет
 заголовки, код, списки, ссылки и таблицы; изображения показывает отдельный backend.
 Нужны совместимые зафиксированные версии и parsers `markdown`/`markdown_inline`.
-Конвертеры других форматов не становятся обязательными для PNG-only MVP.
+В закреплённом Snacks ImageMagick нужен и для получения метаданных PNG;
+пакет Neovim предоставляет его в своём PATH.
 Источники: [render-markdown][render-markdown], [Snacks image][snacks-image].
 
 Обновления применяются пачками, сохраняют cursor/scroll position и черновик.
@@ -355,10 +388,9 @@ runtime на той же session directory.
 | Analysis lifecycle | Timeout/Cancel, output flood, известный late outcome, неизвестный эффект, cleanup descendants и bounded dataset/results. |
 | Fallbacks | Plain terminal, NO_COLOR, graphics unavailable; SSH и tmux только после отдельных transport/passthrough checks. |
 
-Проверки перечислены как требования. В этом docs-only изменении runtime build,
-native GUI/PTY matrix и live model calls не выполняются. Для документа проверяются
-diff, ссылки, согласованность с исходниками и независимые review. Перед включением
-runtime slice действуют [AGENTS.md](../AGENTS.md) и применимые gates проекта.
+Проверки перечислены как требования к реализации. Их фактический результат
+и проверенный SHA фиксируются в [PROJECT_STATE](PROJECT_STATE.md).
+Применимые gates и порядок review описаны в [AGENTS.md](../AGENTS.md).
 
 ## 10. Альтернативы и открытые решения
 
@@ -374,11 +406,9 @@ runtime slice действуют [AGENTS.md](../AGENTS.md) и применимы
 собственного VT слоя. Она не создаёт готовый Markdown renderer или Neovim bridge.
 Источник: [libghostty-vt][libghostty].
 
-Открытые решения перед соответствующим implementation slice: exact protocol и
-caps; storage location/retention; pinned Neovim/plugin versions; UX открытия
-панели и её закрытия; восстановление editor mutations; автоматический Linux
-Ghostty split backend, если он станет требованием. Они не мешают проверить
-базовый сценарий с заранее открытым Neovim и статическим PNG.
+Protocol/caps, хранилище, pinned зависимости и открытие панели выбраны
+в реализации этапов 0–3. Открыты восстановление прямых editor mutations
+и автоматический Linux Ghostty split backend; это отдельные расширения.
 
 ## Источники
 
