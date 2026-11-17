@@ -411,7 +411,7 @@ fn text(args: &[String]) -> Result<i32> {
     ));
     let context = format!("{}  {}", settings.cwd.display(), settings.model);
     if io.raw.is_some() {
-        return reactor()?.block_on(controller::workbench::run(
+        return reactor()?.block_on(controller::workbench::run_attached(
             runtime,
             &mut io,
             &context,
@@ -419,7 +419,11 @@ fn text(args: &[String]) -> Result<i32> {
             selected.id,
             root_kind,
             parent,
+            parsed.workspace,
         ));
+    }
+    if parsed.workspace.is_some() {
+        return Err("workspace_requires_tty");
     }
     reactor()?.block_on(controller::run(
         &mut runtime,

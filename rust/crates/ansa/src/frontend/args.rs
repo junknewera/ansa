@@ -12,6 +12,7 @@ pub struct Options {
     pub model: Option<String>,
     pub returned_model: Option<String>,
     pub prompt: Option<String>,
+    pub workspace: Option<PathBuf>,
 }
 impl Options {
     pub fn parse(args: &[String], cwd: PathBuf, auth: PathBuf) -> super::Result<Self> {
@@ -25,6 +26,7 @@ impl Options {
             model: None,
             returned_model: None,
             prompt: None,
+            workspace: None,
         };
         let mut seen = BTreeSet::new();
         let mut index = 0;
@@ -53,6 +55,7 @@ impl Options {
                         "--auth-dir" => value.auth = next.into(),
                         "--model" => value.model = Some(next.clone()),
                         "--returned-model" => value.returned_model = Some(next.clone()),
+                        "--workspace-dir" => value.workspace = Some(next.into()),
                         _ => return Err("unknown_cli_option"),
                     }
                 }

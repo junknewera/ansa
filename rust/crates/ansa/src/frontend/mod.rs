@@ -1,5 +1,6 @@
 pub mod app;
 pub mod args;
+pub mod bridge;
 pub mod carbon;
 pub mod cells;
 pub mod commands;

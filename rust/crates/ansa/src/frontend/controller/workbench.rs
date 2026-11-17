@@ -2973,7 +2973,7 @@ fn model_choices(value: Json) -> Result<Vec<(String, String, Vec<String>)>> {
 }
 
 pub async fn run(
-    mut runtime: Runtime,
+    runtime: Runtime,
     io: &mut Io,
     context: &str,
     factory: Factory,
@@ -2981,9 +2981,30 @@ pub async fn run(
     kind: Kind,
     parent: Option<String>,
 ) -> Result<i32> {
+    run_attached(runtime, io, context, factory, root_id, kind, parent, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_attached(
+    mut runtime: Runtime,
+    io: &mut Io,
+    context: &str,
+    factory: Factory,
+    root_id: String,
+    kind: Kind,
+    parent: Option<String>,
+    bridge_directory: Option<PathBuf>,
+) -> Result<i32> {
     if io.raw.is_none() {
+        if bridge_directory.is_some() {
+            return Err("workspace_requires_tty");
+        }
         return super::run(&mut runtime, io, None, false, context).await;
     }
+    let mut bridge = bridge_directory
+        .as_ref()
+        .map(|directory| super::super::bridge::Bridge::start(directory, runtime.handle()))
+        .transpose()?;
     let mut work = Workbench::new(runtime, factory, root_id, kind, parent)?;
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3017,7 +3038,10 @@ pub async fn run(
                 event = work.events.recv() => { if let Some((id, event)) = event {
                     match event {
                         SessionEvent::Ready(result) => work.readiness(&id, result, io),
-                        SessionEvent::Runtime(event) => work.event(&id, Some(event), io),
+                        SessionEvent::Runtime(event) => {
+                            if let Some(bridge) = &mut bridge { bridge.publish(&event); }
+                            work.event(&id, Some(event), io)
+                        },
                         SessionEvent::Closed => work.event(&id, None, io),
                     }
                     dirty = true;
@@ -3426,6 +3450,9 @@ pub async fn run(
     }
     if let Some(code) = failure {
         io.status(&format!("ansa: {}\n", diagnostics::error(code)));
+    }
+    if let Some(bridge) = bridge.take() {
+        bridge.shutdown().await;
     }
     exit_result(exit, failure)
 }

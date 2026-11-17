@@ -1,5 +1,29 @@
 # Состояние ansa
 
+## Workspace bridge: implementation WIP
+
+2026-11-17, ветка `feat/terminal-workspace`, реализация PR #26 продолжается.
+Первый slice добавляет opt-in `--workspace-dir PATH`: private Unix socket
+над исходным production runtime Carbon и readonly Neovim viewer. Подключение
+не меняет цель при переходе Carbon в fork. История запрашивается отдельными
+correlated страницами; заменяемые snapshots имеют собственный cursor и gap.
+DTO исключает native context, opaque reasoning и внутренние tool outputs.
+Полномочия editor/controller пока отклоняются.
+
+Адресно прошли 3 native bridge-теста, fmt/clippy всех targets/features,
+7 сценариев с production offline Carbon, двумя клиентами и настоящим Neovim,
+а также 4 Neovim fault-сценария: QueueFull с bounded retry, более свежая
+страница при старом snapshot, задержанный reconnect с сохранением cursor/scroll
+и смена сессии с сохранением dirty document. Независимый адресный review Astra
+закрыт без открытых замечаний. Предыдущие failed capture сохранены, включая
+ошибку учёта dirty state у Neovim `nofile` buffer; используется `acwrite`.
+
+Evidence: `~/Workspace/pet/ansa-baselines/workspace-bridge-20261117/`.
+Это WIP checkpoint: editor context/selection, analysis worker, durable artifacts,
+PNG renderer и полная финальная матрица ещё впереди. Последний проверенный
+GO runtime остаётся `5df02d8`, описанный ниже. Контракт расширения -
+[WORKSPACE_PROTOCOL](WORKSPACE_PROTOCOL.md).
+
 ## Carbon: управление, читаемые инструменты и терминал проекта
 
 **GO**, проверенный code checkpoint
