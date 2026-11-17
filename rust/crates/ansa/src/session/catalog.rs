@@ -1,4 +1,5 @@
 //! Explicit session selection. Never discovers HOME or opens a user profile.
+pub use super::summary::{SessionSummary, SummaryStatus};
 use super::{Result, need, num};
 use crate::{protocol::json::Json, provider::contracts::valid_id};
 use std::path::{Path, PathBuf};
@@ -80,8 +81,12 @@ impl Catalog {
         self.create_kind("main", None)
     }
     pub fn entries(&self) -> Result<Vec<CatalogEntry>> {
+        self.entries_checked(|| Ok(()))
+    }
+    fn entries_checked(&self, check: impl Fn() -> Result<()>) -> Result<Vec<CatalogEntry>> {
         let mut entries = Vec::new();
         for id in self.files.entries().map_err(|_| "session_catalog_limit")? {
+            check()?;
             let Some(info) = self.metadata(&id)? else {
                 continue;
             };
@@ -126,6 +131,22 @@ impl Catalog {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
         );
         self.create_named_kind(&id, kind, parent)
+    }
+    /// Derived display observations only. A shared byte budget prevents a large
+    /// catalogue from multiplying per-journal limits into unbounded I/O.
+    pub fn summaries(&self, stop: &crate::auth::Cancel) -> Result<Vec<SessionSummary>> {
+        let mut budget = 64 * 1024 * 1024;
+        let mut summaries = Vec::new();
+        for entry in self.entries_checked(|| stop.check())? {
+            stop.check()?;
+            summaries.push(super::summary::read(
+                &self.root.join(&entry.id),
+                entry,
+                &mut budget,
+                stop,
+            )?);
+        }
+        Ok(summaries)
     }
     pub fn create_named(&self, id: &str) -> Result<Selected> {
         self.create_named_kind(id, "main", None)

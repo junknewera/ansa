@@ -120,7 +120,7 @@ fn jsonl_rejects_invalid_types_fields_and_versions() {
     );
 }
 #[test]
-fn editor_preserves_utf8_boundaries_and_escape_following_text() {
+fn editor_preserves_utf8_boundaries_and_consumes_alt_prefix() {
     let mut editor = Editor::default();
     for &ch in "привет".as_bytes() {
         editor.feed(ch, true);
@@ -135,7 +135,7 @@ fn editor_preserves_utf8_boundaries_and_escape_following_text() {
     for &ch in b"\x1babc" {
         editor.feed(ch, true);
     }
-    assert_eq!(editor.text(), Ok("abc"));
+    assert_eq!(editor.text(), Ok("bc"));
     assert_eq!(editor.feed(9, true), Some(Action::FocusNext));
     assert_eq!(editor.feed(6, true), None);
     for (sequence, expected) in [
@@ -167,6 +167,7 @@ fn entry(role: &str, text: &str) -> Entry {
     Entry {
         action: None,
         edit: None,
+        output: None,
         status: None,
         role: role.into(),
         text: text.into(),
@@ -498,4 +499,50 @@ fn large_valid_snapshot_is_encoded_with_complete_tool_results() {
             .iter()
             .all(|tool| tool.text_field("output") == Ok(output.as_str()))
     );
+}
+
+#[test]
+fn alt_keys_never_leave_the_composer_or_split_utf8() {
+    let mut editor = Editor::default();
+    for &byte in "первое второе".as_bytes() {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    for &byte in b"\x1bb" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.cursor, "первое ".len());
+    for &byte in b"\x1bf" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.cursor, editor.bytes.len());
+    for &byte in "\x1bж".as_bytes() {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.text().unwrap(), "первое второе");
+    editor.feed(b'!', true);
+    assert_eq!(editor.text().unwrap(), "первое второе!");
+    editor.feed(27, true);
+    assert_eq!(editor.flush_escape(), Some(Action::Escape));
+}
+#[test]
+fn right_arrow_completes_only_with_an_open_suggestion() {
+    let mut editor = Editor::default();
+    for &byte in b"/mo" {
+        editor.feed(byte, true);
+    }
+    editor.set_completion(true);
+    for &byte in b"\x1b[" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.feed(b'C', true), Some(Action::Complete));
+    assert_eq!(editor.text().unwrap(), "/mo");
+    editor.set_completion(false);
+    for &byte in b"\x1b[D" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.cursor, 2);
+    for &byte in b"\x1b[C" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.cursor, 3);
 }

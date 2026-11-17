@@ -808,8 +808,8 @@ fn case_lazy() -> Result<()> {
         &Cancel::default(),
     )?;
     ensure(
-        s.catalogs.load(Ordering::Acquire) == 3,
-        "selected_generation_not_validated",
+        s.catalogs.load(Ordering::Acquire) == 2,
+        "selected_generation_lost_shared_cache",
     )?;
     let unsupported = request.with_effort(Some("unconfirmed".into()))?;
     ensure(
@@ -826,7 +826,7 @@ fn case_lazy() -> Result<()> {
                 )
                 .is_err()
             && s.inference.load(Ordering::Acquire) == 0
-            && s.catalogs.load(Ordering::Acquire) == 4,
+            && s.catalogs.load(Ordering::Acquire) == 2,
         "unconfirmed_effort_authorized",
     )?;
     let mut wrong = expired.clone();
@@ -849,7 +849,7 @@ fn case_lazy() -> Result<()> {
     )?;
     guard.check_dispatch(1, &Cancel::default())?;
     ensure(
-        guard.session() != original.session && s.catalogs.load(Ordering::Acquire) == 5,
+        guard.session() != original.session && s.catalogs.load(Ordering::Acquire) == 3,
         "resume_failed_revalidation",
     )
 }

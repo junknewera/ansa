@@ -3,6 +3,7 @@ use super::{
     carbon::Entry,
     protocol_v1::{Activity, Snapshot},
 };
+use crate::protocol::json::Json;
 use crate::{
     provider::replay::{Effects, Execution},
     session::transcript::{self, ToolDetail, ToolPhase},
@@ -21,6 +22,9 @@ struct Tool {
     output_suffix_missing: bool,
     running: bool,
     uncertain: bool,
+    arguments_json: Option<Json>,
+    output_json: Option<Json>,
+    volatile_outcome: bool,
 }
 enum Item {
     Text(Entry),
@@ -28,7 +32,7 @@ enum Item {
 }
 use super::diff::EditView;
 fn parsed_edit(tool: &Tool) -> Option<EditView> {
-    use crate::protocol::{json::Json, legacy_json_v1::sha256};
+    use crate::protocol::legacy_json_v1::sha256;
     if tool.detail.name != "edit_file"
         || tool.partial_output
         || tool.uncertain
@@ -42,7 +46,7 @@ fn parsed_edit(tool: &Tool) -> Option<EditView> {
     {
         return None;
     }
-    let value = Json::parse(&tool.output).ok()?;
+    let value = tool.output_json.as_ref()?;
     if !value.field("applied").ok()?.boolean().ok()? {
         return None;
     }
@@ -87,13 +91,16 @@ fn edit_view(entries: &[transcript::Entry], key: &str) -> Option<EditView> {
         request: String::new(),
         detail: detail?,
         arguments: String::new(),
-        output,
+        output: output.clone(),
         partial_arguments: false,
         partial_output: first.unwrap_or(true) || !last,
         arguments_suffix_missing: false,
         output_suffix_missing: false,
         running: false,
         uncertain: false,
+        arguments_json: None,
+        output_json: Json::parse(&output).ok(),
+        volatile_outcome: false,
     })
 }
 
@@ -109,6 +116,46 @@ fn label(name: &str) -> &str {
 }
 fn read(name: &str) -> bool {
     matches!(name, "list_directory" | "read_file" | "search_files")
+}
+fn flag(value: &Json, name: &str) -> bool {
+    value.field(name).and_then(Json::boolean) == Ok(true)
+}
+fn output_notice(tool: &Tool) -> Option<&'static str> {
+    if tool.volatile_outcome {
+        return Some("результат не сохранён");
+    }
+    if tool.partial_output {
+        return Some("вывод частичный");
+    }
+    let Some(value) = tool.output_json.as_ref() else {
+        return (tool.detail.name == "run_command"
+            && matches!(tool.detail.phase, ToolPhase::Finished { .. }))
+        .then_some("код завершения неизвестен");
+    };
+    if flag(value, "cleanup_unknown")
+        || value.field("cleanup_complete").and_then(Json::boolean) == Ok(false)
+    {
+        Some("завершение процессов не подтверждено")
+    } else if flag(value, "timed_out") {
+        Some("превышено время")
+    } else if flag(value, "cancelled") || value.text_field("error") == Ok("cancelled") {
+        Some("остановлен")
+    } else if value.text_field("status") == Ok("instructions_required") {
+        Some("не запускался · нужны инструкции")
+    } else if value.has("error")
+        || (tool.detail.name == "run_command"
+            && value
+                .field("exit_code")
+                .is_ok_and(|code| code.dump() != "0"))
+    {
+        Some("ошибка")
+    } else if tool.detail.name == "run_command" && !value.has("exit_code") {
+        Some("код завершения неизвестен")
+    } else if flag(value, "truncated") {
+        Some("вывод сокращён")
+    } else {
+        None
+    }
 }
 fn status(tool: &Tool) -> &'static str {
     if tool.uncertain {
@@ -134,7 +181,7 @@ fn status(tool: &Tool) -> &'static str {
             ..
         } => "ошибка · не запускался",
         ToolPhase::Finished { execution, .. } => match execution {
-            Execution::Succeeded => "готово",
+            Execution::Succeeded => output_notice(tool).unwrap_or("готово"),
             Execution::Failed => "ошибка",
             Execution::Cancelled => "остановлен",
             Execution::Denied => "отклонён",
@@ -143,6 +190,7 @@ fn status(tool: &Tool) -> &'static str {
 }
 fn failed(tool: &Tool) -> bool {
     tool.uncertain
+        || output_notice(tool).is_some()
         || matches!(tool.detail.phase, ToolPhase::Finished { execution, effects }
         if execution != Execution::Succeeded || effects != Effects::KnownResult)
 }
@@ -165,6 +213,17 @@ fn presentation_role(tool: &Tool) -> &'static str {
                 ..
             }
         )
+        || output_notice(tool).is_some_and(|notice| {
+            matches!(
+                notice,
+                "результат не сохранён"
+                    | "вывод частичный"
+                    | "вывод сокращён"
+                    | "завершение процессов не подтверждено"
+                    | "не запускался · нужны инструкции"
+                    | "код завершения неизвестен"
+            )
+        })
     {
         "tool_warning"
     } else if failed(tool) {
@@ -191,7 +250,248 @@ fn entry(text: String, action: Option<String>, role: &str) -> Entry {
         text,
         action,
         edit: None,
+        output: None,
         status: None,
+    }
+}
+fn hidden(key: &str) -> bool {
+    matches!(
+        key,
+        "instruction_token"
+            | "instructions"
+            | "instruction_scopes"
+            | "operation"
+            | "operation_id"
+            | "call"
+            | "call_id"
+            | "execution"
+            | "effects"
+            | "before_hash"
+            | "after_hash"
+    )
+}
+fn readable(value: &Json, depth: usize, lines: &mut Vec<String>) {
+    if depth > 6 || lines.len() > 2048 {
+        return;
+    }
+    if let Ok(text) = value.text() {
+        lines.extend(text.lines().map(String::from));
+    } else if let Ok(items) = value.elements() {
+        for item in items {
+            readable(item, depth + 1, lines);
+        }
+    } else if let Ok(keys) = value.keys() {
+        for key in keys.into_iter().filter(|key| !hidden(key)) {
+            if let Ok(item) = value.field(key) {
+                if let Ok(text) = item.text() {
+                    lines.push(format!("{key}: {text}"));
+                } else if item.is_object() || item.is_array() {
+                    readable(item, depth + 1, lines);
+                } else {
+                    lines.push(format!("{key}: {}", item.dump()));
+                }
+            }
+        }
+    } else {
+        lines.push(value.dump());
+    }
+}
+fn fallback(raw: &str, parsed: Option<&Json>, lines: &mut Vec<String>) {
+    if let Some(value) = parsed {
+        readable(value, 0, lines);
+    } else if raw.trim_start().starts_with(['{', '[']) {
+        lines.push("Неполный структурированный вывод".into());
+    } else {
+        lines.extend(raw.lines().map(String::from));
+    }
+}
+fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
+    let mut lines = Vec::new();
+    if !tool.arguments.is_empty() {
+        lines.push(
+            if tool.partial_arguments {
+                "Аргументы (фрагмент):"
+            } else {
+                "Аргументы:"
+            }
+            .into(),
+        );
+        if let Some(args) = &tool.arguments_json {
+            if let Ok(argv) = args.field("argv").and_then(Json::elements) {
+                let command = argv
+                    .iter()
+                    .filter_map(|arg| arg.text().ok())
+                    .map(|arg| {
+                        if !arg.is_empty()
+                            && arg
+                                .chars()
+                                .all(|ch| ch.is_alphanumeric() || "_./=-".contains(ch))
+                        {
+                            arg.into()
+                        } else {
+                            format!("'{}'", arg.replace('\'', "'\\''"))
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join(" ");
+                lines.push(format!("$ {command}"));
+            }
+            for (key, label) in [
+                ("command", "$"),
+                ("path", "Путь:"),
+                ("cwd", "Каталог:"),
+                ("query", "Поиск:"),
+                ("offset", "Смещение:"),
+                ("max_bytes", "Байт:"),
+                ("start_line", "Со строки:"),
+                ("end_line", "До строки:"),
+            ] {
+                if let Ok(value) = args.field(key) {
+                    lines.push(format!(
+                        "{label} {}",
+                        value
+                            .text()
+                            .map(String::from)
+                            .unwrap_or_else(|_| value.dump())
+                    ));
+                }
+            }
+            if !matches!(
+                tool.detail.name.as_str(),
+                "run_command" | "read_file" | "list_directory" | "search_files" | "edit_file"
+            ) {
+                readable(args, 0, &mut lines);
+            }
+        } else {
+            fallback(&tool.arguments, None, &mut lines);
+        }
+    }
+    if include_output && !tool.output.is_empty() {
+        lines.push(
+            if tool.partial_output {
+                "Вывод (фрагмент):"
+            } else {
+                "Вывод:"
+            }
+            .into(),
+        );
+        let begin = lines.len();
+        if let Some(value) = &tool.output_json {
+            if let Ok(error) = value.text_field("error") {
+                lines.push(format!("Ошибка: {error}"));
+            }
+            if value.text_field("status") == Ok("instructions_required") {
+                lines.push("Нужны инструкции каталога; действие ещё не выполнено".into());
+            }
+            match tool.detail.name.as_str() {
+                "read_file" => {
+                    if let Ok(path) = value.text_field("path") {
+                        let range = value
+                            .field("offset")
+                            .ok()
+                            .zip(value.field("next_offset").ok())
+                            .map(|(start, end)| format!(" · байты {}-{}", start.dump(), end.dump()))
+                            .unwrap_or_default();
+                        lines.push(format!("{path}{range}"));
+                    }
+                    if let Ok(text) = value.text_field("content") {
+                        lines.extend(text.split('\n').map(String::from));
+                    }
+                }
+                "list_directory" => {
+                    if let Ok(path) = value.text_field("path") {
+                        lines.push(path.into());
+                    }
+                    if let Ok(entries) = value.field("entries").and_then(Json::elements) {
+                        for item in entries {
+                            if let Ok(name) = item.text_field("name") {
+                                lines.push(format!(
+                                    "{name}{}{}",
+                                    if flag(item, "directory") { "/" } else { "" },
+                                    if flag(item, "symlink") {
+                                        " (ссылка)"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                            }
+                        }
+                        if entries.is_empty() {
+                            lines.push("Каталог пуст".into());
+                        }
+                    }
+                }
+                "search_files" => {
+                    if let Ok(matches) = value.field("matches").and_then(Json::elements) {
+                        for item in matches {
+                            if let Ok(path) = item.text_field("path") {
+                                let line = item
+                                    .field("line")
+                                    .ok()
+                                    .map(|line| format!(":{}", line.dump()))
+                                    .unwrap_or_default();
+                                let text = item
+                                    .text_field("text")
+                                    .ok()
+                                    .map(|text| format!(": {text}"))
+                                    .unwrap_or_default();
+                                lines.push(format!("{path}{line}{text}"));
+                            }
+                        }
+                        if matches.is_empty() {
+                            lines.push("Совпадений нет".into());
+                        }
+                    }
+                }
+                "run_command" => {
+                    for (key, label) in [("stdout", "stdout:"), ("stderr", "stderr:")] {
+                        if let Ok(text) = value.text_field(key)
+                            && !text.is_empty()
+                        {
+                            lines.push(label.into());
+                            lines.extend(text.split('\n').map(String::from));
+                        }
+                    }
+                    if let Ok(exit) = value.field("exit_code") {
+                        lines.push(format!("Код завершения: {}", exit.dump()));
+                    }
+                    if flag(value, "timed_out") {
+                        lines.push("Превышено время выполнения".into());
+                    }
+                    if flag(value, "cancelled") {
+                        lines.push("Команда остановлена".into());
+                    }
+                    if flag(value, "cleanup_unknown")
+                        || value.field("cleanup_complete").and_then(Json::boolean) == Ok(false)
+                    {
+                        lines.push("Завершение процессов не подтверждено".into());
+                    }
+                }
+                _ => readable(value, 0, &mut lines),
+            }
+            if flag(value, "truncated") {
+                lines.push("Вывод сокращён инструментом".into());
+            }
+        }
+        if lines.len() == begin {
+            fallback(&tool.output, tool.output_json.as_ref(), &mut lines);
+        }
+    }
+    if tool.partial_output && tool.output.is_empty() {
+        lines.push("Вывод (фрагмент) недоступен на этой странице".into());
+    }
+    let text = super::workspace::display_text(&lines.join("\n"));
+    let mut text = text.chars().take(128 * 1024).collect::<String>();
+    if text.len() < lines.iter().map(String::len).sum() {
+        text.push_str("\nВывод сокращён для просмотра");
+    }
+    super::carbon::OutputView {
+        title: format!(
+            "{} {}",
+            label(&tool.detail.name),
+            preview(&tool.detail.target, 140)
+        ),
+        text,
     }
 }
 fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mut Vec<Entry>) {
@@ -213,7 +513,22 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
     }
     let start = title.len();
     title.push_str(status(tool));
-    let end = title.len();
+    title.push_str(if status(tool).contains("неизвестен") {
+        " ?"
+    } else if status(tool).starts_with("остановлен") {
+        " ■"
+    } else if status(tool).starts_with("отклонён") {
+        " ⊘"
+    } else {
+        match presentation_role(tool) {
+            "tool_success" => " ✓",
+            "tool_error" => " ✕",
+            "tool_warning" => " !",
+            "tool_running" => " ◷",
+            _ => "",
+        }
+    });
+    let end = start + status(tool).len();
     title.push_str(&elapsed(&tool.detail.operation));
     let action = if edit.is_some() {
         format!("diff:{}", tool.key)
@@ -261,43 +576,51 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         }
     }
     if expanded {
-        let mut detail = String::new();
-        if !tool.detail.purpose.is_empty() {
-            detail.push_str(&format!("  {}\n", tool.detail.purpose));
+        let full = std::sync::Arc::new(details(tool, edit.is_none()));
+        let visible = full
+            .text
+            .lines()
+            .take(12)
+            .map(|line| {
+                let shown = line.chars().take(180).collect::<String>();
+                format!(
+                    "    {shown}{}",
+                    if shown.len() < line.len() { "…" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !visible.is_empty() {
+            out.push(entry(visible, None, "tool_detail"));
         }
-        detail.push_str(&format!(
-            "  {} · {}\n",
-            tool.detail.operation, tool.detail.call
-        ));
-        for (label, value, partial) in [
-            ("Аргументы", &tool.arguments, tool.partial_arguments),
-            ("Вывод", &tool.output, tool.partial_output),
-        ] {
-            if !value.is_empty() && !(edit.is_some() && label == "Вывод") {
-                detail.push_str(&format!(
-                    "  {label}{}:\n",
-                    if partial { " (фрагмент)" } else { "" }
-                ));
-                for line in value.lines() {
-                    detail.push_str("    ");
-                    detail.push_str(line);
-                    detail.push('\n');
+        if !full.text.is_empty() {
+            let mut link = entry(
+                "  Весь вывод".into(),
+                Some(format!("output:{}", tool.key)),
+                "tool_output",
+            );
+            link.output = Some(full);
+            out.push(link);
+        }
+    } else if failed(tool) && !tool.output.is_empty() {
+        let mut summary = Vec::new();
+        if let Some(value) = &tool.output_json {
+            for key in ["error", "stderr"] {
+                if let Ok(text) = value.text_field(key)
+                    && !text.is_empty()
+                {
+                    summary.push(text.into());
                 }
             }
+            if let Ok(exit) = value.field("exit_code") {
+                summary.push(format!("Код завершения: {}", exit.dump()));
+            }
         }
-        if let ToolPhase::Finished { execution, effects } = tool.detail.phase {
-            detail.push_str(&format!("  execution={execution:?}, effects={effects:?}"));
+        if summary.is_empty() {
+            fallback(&tool.output, tool.output_json.as_ref(), &mut summary);
         }
-        out.push(Entry {
-            role: "tool_detail".into(),
-            text: detail.trim_end().into(),
-            action: None,
-            edit: None,
-            status: None,
-        });
-    } else if failed(tool) && !tool.output.is_empty() {
         out.push(entry(
-            format!("  {}", preview(&tool.output, 240)),
+            format!("  {}", preview(&summary.join("\n"), 240)),
             None,
             presentation_role(tool),
         ));
@@ -330,6 +653,7 @@ pub(super) fn project(
                 text,
                 action: None,
                 edit: None,
+                output: None,
                 status: None,
             }));
             continue;
@@ -349,6 +673,9 @@ pub(super) fn project(
                 output_suffix_missing: false,
                 running: false,
                 uncertain: false,
+                arguments_json: None,
+                output_json: None,
+                volatile_outcome: false,
             });
             items.push(Item::Tool(index));
             index
@@ -417,6 +744,9 @@ pub(super) fn project(
                 output_suffix_missing: false,
                 running: false,
                 uncertain: false,
+                arguments_json: None,
+                output_json: None,
+                volatile_outcome: false,
             });
             items.push(Item::Tool(index));
             index
@@ -432,8 +762,9 @@ pub(super) fn project(
                     execution: finish.execution,
                     effects: finish.effects,
                 };
-                tool.output = finish.output.chars().take(2048).collect();
+                tool.output = finish.output.chars().take(120 * 1024).collect();
                 tool.partial_output = tool.output.len() < finish.output.len();
+                tool.volatile_outcome = view.storage_failed || !view.durable;
             }
         }
     }
@@ -465,9 +796,20 @@ pub(super) fn project(
                 output_suffix_missing: false,
                 running: false,
                 uncertain: true,
+                arguments_json: None,
+                output_json: None,
+                volatile_outcome: false,
             });
             items.push(Item::Tool(index));
         }
+    }
+    for tool in &mut tools {
+        tool.arguments_json = (!tool.partial_arguments)
+            .then(|| Json::parse_with_limits(&tool.arguments, 128 * 1024, 64, 131072).ok())
+            .flatten();
+        tool.output_json = (!tool.partial_output)
+            .then(|| Json::parse_with_limits(&tool.output, 128 * 1024, 64, 131072).ok())
+            .flatten();
     }
     let mut result = Vec::new();
     let mut at = 0;
@@ -513,7 +855,7 @@ pub(super) fn project(
             {
                 " · подготовлено".into()
             } else {
-                " · готово".into()
+                " · готово ✓".into()
             };
             let mut seen = BTreeSet::new();
             let targets = group
@@ -657,6 +999,168 @@ mod tests {
             .map(|row| row.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    #[test]
+    fn command_exit_timeout_cancel_and_cleanup_never_claim_success() {
+        for (output, expected) in [
+            (
+                r#"{"exit_code":7,"stdout":"","stderr":"command failed\nnext line"}"#,
+                "ошибка",
+            ),
+            (r#"{"exit_code":0,"timed_out":true}"#, "превышено время"),
+            (r#"{"exit_code":0,"cancelled":true}"#, "остановлен"),
+            (
+                r#"{"exit_code":0,"cleanup_complete":false}"#,
+                "завершение процессов не подтверждено",
+            ),
+            (r#"{"exit_code":0,"truncated":true}"#, "вывод сокращён"),
+            (r#"{"error":"protected_file"}"#, "ошибка"),
+            ("legacy output", "код завершения неизвестен"),
+        ] {
+            let result = row(
+                "op",
+                "run_command",
+                ToolPhase::Finished {
+                    execution: Execution::Succeeded,
+                    effects: Effects::KnownResult,
+                },
+                output,
+            );
+            let shown = project(&[result], &view(), &BTreeSet::new(), false, false, |_| {
+                String::new()
+            });
+            assert!(shown[0].text.contains(expected), "{}", shown[0].text);
+            assert_ne!(shown[0].role, "tool_success");
+            assert!(!shown[0].text.contains('✓'));
+        }
+        let success = row(
+            "ok",
+            "run_command",
+            ToolPhase::Finished {
+                execution: Execution::Succeeded,
+                effects: Effects::KnownResult,
+            },
+            r#"{"exit_code":0,"stdout":"ok\n","stderr":"","cleanup_complete":true}"#,
+        );
+        let shown = project(&[success], &view(), &BTreeSet::new(), false, false, |_| {
+            String::new()
+        });
+        assert_eq!(shown[0].role, "tool_success");
+        assert!(shown[0].text.contains('✓'));
+    }
+    #[test]
+    fn known_outputs_decode_newlines_and_hide_internal_fields() {
+        for (name, output, expected) in [
+            (
+                "read_file",
+                r#"{"path":"file.rs","offset":0,"next_offset":12,"content":"one\ntwo\n","truncated":false}"#,
+                "one\n",
+            ),
+            (
+                "list_directory",
+                r#"{"path":"src","entries":[{"name":"child","directory":true,"symlink":false}],"truncated":false}"#,
+                "child/",
+            ),
+            (
+                "search_files",
+                r#"{"matches":[{"path":"src/file.rs","line":12,"text":"needle"}],"instruction_scopes":["hidden"],"truncated":false}"#,
+                "src/file.rs:12: needle",
+            ),
+            (
+                "run_command",
+                r#"{"exit_code":0,"stdout":"one\ntwo\n","stderr":"","truncated":false}"#,
+                "one\n",
+            ),
+        ] {
+            let rows = [
+                row(
+                    "op",
+                    name,
+                    ToolPhase::Prepared,
+                    r#"{"path":"src","argv":["printf","one\ntwo"],"instruction_token":"HIDDEN_TOKEN"}"#,
+                ),
+                row(
+                    "op",
+                    name,
+                    ToolPhase::Finished {
+                        execution: Execution::Succeeded,
+                        effects: Effects::KnownResult,
+                    },
+                    output,
+                ),
+            ];
+            let shown = project(&rows, &view(), &BTreeSet::new(), true, false, |_| {
+                String::new()
+            });
+            let full = shown
+                .iter()
+                .find_map(|entry| entry.output.as_ref())
+                .unwrap();
+            assert!(full.text.contains(expected), "{}", full.text);
+            for hidden in [
+                "HIDDEN_TOKEN",
+                "instruction_token",
+                "instruction_scopes",
+                "execution=",
+                "effects=",
+                "call-op",
+                "Purpose from descriptor",
+                r#"\n"#,
+            ] {
+                assert!(!full.text.contains(hidden), "{hidden}: {}", full.text);
+            }
+        }
+    }
+    #[test]
+    fn full_output_is_captured_from_the_displayed_page_and_preview_is_bounded() {
+        use super::super::carbon::{self, Workspace};
+        let stdout = (0..40)
+            .map(|line| format!("line_{line} {}界😀", "x".repeat(300)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = Json::object(vec![
+            (
+                "stdout",
+                Json::string(&format!("{stdout}\n\x1b]52;blocked")).unwrap(),
+            ),
+            ("exit_code", Json::parse("0").unwrap()),
+        ])
+        .unwrap()
+        .dump();
+        let result = row(
+            "long",
+            "run_command",
+            ToolPhase::Finished {
+                execution: Execution::Succeeded,
+                effects: Effects::KnownResult,
+            },
+            &output,
+        );
+        let shown = project(&[result], &view(), &BTreeSet::new(), true, false, |_| {
+            String::new()
+        });
+        assert!(text(&shown).len() < 4096);
+        assert!(!text(&shown).contains("line_39"));
+        let frame = carbon::layout_workspace(
+            &shown,
+            b"draft",
+            0,
+            "",
+            0,
+            "project",
+            (80, 32),
+            false,
+            &Workspace::default(),
+        )
+        .unwrap();
+        let full = frame.output_view("output:request:long").unwrap();
+        drop(shown);
+        let _other_page = project(&[], &view(), &BTreeSet::new(), true, false, |_| {
+            String::new()
+        });
+        assert!(full.text.contains("line_39") && full.text.contains("界😀"));
+        assert!(!full.text.contains('\x1b'));
+        assert_eq!(frame.output_view("output:request:long").unwrap(), full);
     }
     #[test]
     fn status_range_ignores_separators_in_command_arguments() {
@@ -894,8 +1398,8 @@ mod tests {
         let compact = project(&rows, &view, &BTreeSet::new(), false, true, |_| {
             String::new()
         });
-        assert_eq!(compact.len(), 1);
-        assert!(compact[0].text.contains("готово"));
+        assert_eq!(compact.len(), 2);
+        assert!(compact[0].text.contains("код завершения неизвестен"));
         assert!(!text(&compact).contains("KnownResult"));
         let open = project(
             &rows,
@@ -905,12 +1409,9 @@ mod tests {
             true,
             |_| String::new(),
         );
-        assert_eq!(open.iter().filter(|e| e.action.is_some()).count(), 1);
-        assert!(
-            text(&open).contains("printf ok")
-                && text(&open).contains("OUTPUT_CANARY")
-                && text(&open).contains("Purpose from descriptor")
-        );
+        assert_eq!(open.iter().filter(|e| e.action.is_some()).count(), 2);
+        assert!(text(&open).contains("printf ok") && text(&open).contains("OUTPUT_CANARY"));
+        assert!(!text(&open).contains("Purpose from descriptor"));
     }
     #[test]
     fn read_groups_keep_denials_and_unknown_effects_visible_when_collapsed() {
@@ -1052,7 +1553,7 @@ mod tests {
         assert!(shown.contains("Вывод (фрагмент)"));
         assert_eq!(
             projected.iter().filter(|row| row.action.is_some()).count(),
-            1
+            2
         );
     }
 }

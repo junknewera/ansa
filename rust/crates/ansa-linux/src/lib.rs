@@ -8,6 +8,8 @@ pub mod fs;
 pub mod journal;
 pub mod local;
 pub mod managed;
+pub mod model_catalog;
 pub mod process;
+pub mod pty;
 pub mod supervisor;
 pub mod terminal;

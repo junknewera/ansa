@@ -199,6 +199,14 @@ def escape(screen):
     for _ in range(8): screen.drain(.01)
 
 
+def local(screen, command):
+    assert command.startswith('/') and '\n' not in command and '\r' not in command
+    # Bare commands first insert their completion, then submit it; arguments
+    # supply the token delimiter. The workspace suite checks each Enter alone.
+    command = command.rstrip()
+    screen.send(command + ('\r' if any(char.isspace() for char in command) else '\r\r'))
+
+
 def mouse(screen, button, column, row, release=False):
     screen.send(f'\x1b[<{button};{column + 1};{row + 1}{"m" if release else "M"}')
 
@@ -221,8 +229,9 @@ def completed(root, text):
     return any(row['kind'] == 'done' and row['turn'] in turns for row in rows)
 
 
-def start(binary, root, home, cwd, screens, label, adapter=False, size=(112, 40)):
+def start(binary, root, home, cwd, screens, label, adapter=False, size=(112, 40), extra_env=None):
     extra = {'XDG_CACHE_HOME': str(root / 'cache')}
+    extra.update(extra_env or {})
     argv = None if adapter else ['--offline', '--cwd', str(cwd)]
     screen = Pty(str(binary), root, home, cwd, 'workspace-edit' if adapter else '', False,
                  size=size, argv=argv, extra_env=extra)
@@ -261,6 +270,14 @@ def attribute_is(screen, text, index, value):
     return bool(locations) and screen.vt.attrs[locations[0][0]][locations[0][1]][index] == value
 
 
+def native_background(screen, *labels):
+    assert body_background(screen) is None, 'workspace painted over the native terminal background'
+    for label in labels:
+        locations = screen.vt.locations(label)
+        assert locations, ('missing native surface label', label)
+        assert all(screen.vt.attrs[row][column][1] is None for row, column in locations), ('non-native surface', label)
+
+
 def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     screen = start(binary, root, home, cwd, screens, 'lifecycle')
     screen.send('VISUAL_TASK\r')
@@ -271,12 +288,13 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     answer_fg = screen.vt.attribute('OMH_TOOL_OK:OMH_FIXED_VALUE_42')[0]
     status_fg = screen.vt.attribute('готово')[0]
     assert target_fg is not None and status_fg is not None and target_fg != answer_fg
-    user_bg = screen.vt.attribute('VISUAL_TASK')[1]
-    assert user_bg is not None and user_bg != body_background(screen)
+    user_bg = screen.vt.attribute('VISUAL_TASK', last=True)[1]
+    assert screen.vt.attribute('VISUAL_TASK', last=True)[2], 'user text lost its visual emphasis'
+    native_background(screen, 'VISUAL_TASK', 'get_test_value', 'OMH_TOOL_OK:OMH_FIXED_VALUE_42')
     screen.send('VISUAL_DRAFT Ж')
     until(screen, lambda text: 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'pinned colored draft')
     input_bg = screen.vt.attribute('VISUAL_DRAFT Ж')[1]
-    assert input_bg is not None and input_bg != body_background(screen)
+    native_background(screen, 'VISUAL_TASK', 'VISUAL_DRAFT Ж')
     snapshot(screen, 'compact')
     row, column = screen.vt.location('get_test_value')
     click(screen, column, row)
@@ -296,6 +314,8 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     mouse(screen, 0, column + len('get_test_value') - 1, row, True)
     assert copied(screen, at) == 'get_test_value'
     until(screen, lambda text: attribute_is(screen, 'готово', 0, status_fg), 'selection retained unselected status color')
+    selected_bg = screen.vt.attribute('get_test_value')[1]
+    assert selected_bg is not None, 'local text selection has no visible background'
     assert screen.vt.attribute('VISUAL_TASK')[1] == user_bg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     snapshot(screen, 'selected')
@@ -306,13 +326,16 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     until(screen, lambda text: 'get_test_value' in text and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'colored frozen resize')
     assert screen.vt.attribute('готово')[0] == status_fg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
+    assert screen.vt.attribute('get_test_value')[1] == selected_bg, 'resize lost local selection color'
     snapshot(screen, 'resized-selection')
     escape(screen)
     until(screen, lambda text: attribute_is(screen, 'get_test_value', 0, target_fg), 'Esc restored tool target color')
+    native_background(screen, 'get_test_value', 'VISUAL_TASK', 'VISUAL_DRAFT Ж')
     assert journals(root) == before, 'color interactions changed canonical journal'
     finish(screen)
     return {'effective_target_fg': target_fg, 'effective_status_fg': status_fg,
-            'effective_user_bg': user_bg, 'effective_input_bg': input_bg}
+            'effective_user_bg': user_bg, 'effective_input_bg': input_bg,
+            'effective_selection_bg': selected_bg, 'effective_body_bg': body_background(screen)}
 
 
 def preferences(home):
@@ -342,7 +365,7 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     screen = start(binary, root, home, cwd, screens, 'theme-first')
     baseline = screen.vt.attribute('ANSA')[0]
     before = journals(root)
-    screen.send('/theme\r')
+    local(screen, '/theme')
     until(screen, lambda text: 'Предпросмотр темы' in text, 'theme picker')
     screen.send(b'\x1b[B')
     until(screen, lambda text: 'ANSA' in text and not attribute_is(screen, 'ANSA', 0, baseline), 'Pink live preview')
@@ -350,7 +373,7 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     escape(screen)
     until(screen, lambda text: 'Предпросмотр темы' not in text and attribute_is(screen, 'ANSA', 0, baseline), 'Esc rolled back theme')
     assert preferences(home) is None, 'preview wrote preferences before Enter'
-    screen.send('/theme\r')
+    local(screen, '/theme')
     until(screen, lambda text: 'Предпросмотр темы' in text, 'theme picker for commit')
     screen.send(b'\x1b[B')
     until(screen, lambda text: 'ANSA' in text and not attribute_is(screen, 'ANSA', 0, baseline), 'Pink second preview')
@@ -361,9 +384,10 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     choices = []
     last = pink
     for name in ['red', 'blue', 'amber']:
-        screen.send(f'/theme {name}\r')
+        local(screen, f'/theme {name}')
         until(screen, lambda text: 'ANSA' in text and 'Загрузка' not in text and not attribute_is(screen, 'ANSA', 0, last), f'rapid {name} accepted')
         last = screen.vt.attribute('ANSA')[0]
+        native_background(screen, 'ANSA', '›')
         choices.append(name)
     until(screen, lambda text: preferences(home) == 'amber', 'latest accepted theme persisted')
     assert journals(root) == before, 'theme selection dispatched model/runtime changes'
@@ -371,28 +395,35 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     restarted = start(binary, root, home, cwd, screens, 'theme-restart')
     until(restarted, lambda text: attribute_is(restarted, 'ANSA', 0, last), 'theme restored after restart')
     custom = home / '.ansa/themes/rose.json'
-    atomic_json(custom, {'name': 'Fixture Rose', 'colors': {'accent': '#CB6D99', 'input': '#271A2A'}})
-    restarted.send('/theme custom:rose\r')
+    atomic_json(custom, {'name': 'Fixture Rose', 'colors': {'accent': '#CB6D99', 'background': '#111219', 'input': '#271A2A'}})
+    local(restarted, '/theme custom:rose')
     until(restarted, lambda text: preferences(home) == 'custom:rose' and attribute_is(restarted, 'ANSA', 0, (203, 109, 153)), 'custom palette applied')
     restarted.send('THEME_DRAFT')
-    until(restarted, lambda text: 'THEME_DRAFT' in restarted.vt.line(-4), 'custom input surface')
-    assert restarted.vt.attribute('THEME_DRAFT')[1] == (39, 26, 42)
+    until(restarted, lambda text: 'THEME_DRAFT' in restarted.vt.line(-4), 'custom accent with native composer')
+    native_background(restarted, 'ANSA', 'THEME_DRAFT')
     restarted.send(b'\x15')
     palette = root / 'cache/dms/dms-colors.json'
     atomic_json(palette, material('#AACC99'))
-    restarted.send('/theme dms\r')
+    local(restarted, '/theme dms')
     until(restarted, lambda text: preferences(home) == 'dms' and attribute_is(restarted, 'ANSA', 0, (170, 204, 153)), 'Auto DMS applied')
     atomic_json(palette, material('#F088BA', '#201723', '#2A1C2D'))
-    until(restarted, lambda text: attribute_is(restarted, 'ANSA', 0, (240, 136, 186)) and attribute_is(restarted, '›', 1, (42, 28, 45)), 'Auto DMS followed atomic cache update', timeout=5)
+    until(restarted, lambda text: attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'Auto DMS followed atomic cache update', timeout=5)
+    native_background(restarted, 'ANSA', '›')
     snapshot(restarted, 'dms-updated')
     prefs_before = (home / '.ansa/ui.json').read_bytes()
-    restarted.send('/theme\r')
+    local(restarted, '/theme')
     until(restarted, lambda text: 'Предпросмотр темы' in text, 'DMS theme picker')
     restarted.send(b'\x1b[A')
     until(restarted, lambda text: 'ANSA' in text and not attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'DMS picker preview')
     escape(restarted)
     until(restarted, lambda text: 'Предпросмотр темы' not in text and attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'DMS preview rollback')
     assert (home / '.ansa/ui.json').read_bytes() == prefs_before
+    restarted.send('/')
+    until(restarted, lambda text: attribute_is(restarted, '/model', 1, (73, 56, 71)), 'DMS colors the local completion selection')
+    native_background(restarted, 'ANSA', '›')
+    snapshot(restarted, 'dms-local-selection-native-body')
+    escape(restarted)
+    restarted.send(b'\x15')
     assert all(row['kind'] != 'accepted' for row in records(root)), 'UI-only themes submitted a turn'
     finish(restarted)
     return {'rapid_choices': choices, 'restored_accent': last, 'dms_updated_accent': [240, 136, 186]}
@@ -400,7 +431,40 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
 
 def inline_edit(binary, adapter, root, home, cwd, screens):
     screen = start(adapter, root, home, cwd, screens, 'edit', adapter=True, size=(96, 40))
-    screen.send('EDIT_VISUAL_TASK\r')
+    hold = root / 'hold-generation'
+    hold.touch()
+    try:
+        screen.send('EDIT_VISUAL_TASK\r')
+        spinners = set('⠋⠙⠹⠸⠼⠴⠦⠧')
+
+        def activity():
+            return [(row, screen.vt.line(row)[0]) for row in range(3, screen.vt.rows - 5)
+                    if screen.vt.line(row)[:1] in spinners and 'ожидание модели' in screen.vt.line(row)]
+
+        until(screen, lambda text: 'EDIT_VISUAL_TASK' in screen.vt.line(3) and bool(activity()),
+              'accepted user body and generating activity under fixture hold', timeout=3)
+        assert not (root / 'generated').exists(), 'fixture did not hold the first generation'
+        since = len(screen.raw)
+        began = time.monotonic()
+        observed = set(activity())
+        # No user input, provider reply or file change drives these repaints.
+        # The owner must schedule animation beyond its one-second clock.
+        while time.monotonic() - began < .65:
+            screen.drain(.01)
+            visible(screen)
+            current = activity()
+            assert current and screen.child.poll() is None, ('activity vanished during idle animation', visible(screen))
+            observed.update(current)
+        idle_elapsed = time.monotonic() - began
+        assert idle_elapsed < .95, ('animation observation overscheduled', idle_elapsed)
+        idle_delta = screen.raw[since:]
+        assert len({row for row, _ in observed}) == 1, ('activity moved screen rows', observed)
+        assert len({glyph for _, glyph in observed}) >= 3, ('activity did not animate independently of the one-second clock', observed)
+        assert len(idle_delta) < 8 * 1024 and b'\x1b[2J' not in idle_delta, ('animation repainted the canvas', len(idle_delta))
+        assert not (root / 'generated').exists(), 'provider fixture completed during idle observation'
+        snapshot(screen, 'idle-animation')
+    finally:
+        hold.unlink(missing_ok=True)
     until(screen, lambda text: completed(root, 'EDIT_VISUAL_TASK') and 'EDIT_DONE' in text and 'Изменён' in text, 'acknowledged edit inline diff')
     assert (cwd / 'edit-target.rs').read_text() == 'fn main() {\n    new();\n}\n'
     assert '(+1 -1)' in visible(screen)
@@ -414,9 +478,11 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     added = screen.vt.attribute('new();')[1]
     context = screen.vt.attribute('fn main()')[1]
     assert removed is not None and added is not None and removed != added
-    assert removed != context and added != context, 'diff lines lost colored backgrounds'
+    assert context is None and removed != context and added != context, 'diff colors must stay local against native context rows'
+    native_background(screen, 'EDIT_VISUAL_TASK')
     screen.send('EDIT_DRAFT Ж')
     until(screen, lambda text: 'EDIT_DRAFT Ж' in screen.vt.line(-4), 'edit draft')
+    native_background(screen, 'EDIT_DRAFT Ж')
     before = journals(root)
     snapshot(screen, 'inline-diff')
     row, column = screen.vt.location('Изменён')
@@ -429,6 +495,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     click(screen, column, row)
     until(screen, lambda text: 'Diff правки' in text and 'j/k строки' in text, 'complete per-edit Diff inspector')
     assert screen.vt.attribute('old();')[1] == removed and screen.vt.attribute('new();')[1] == added
+    assert screen.vt.attribute('fn main()')[1] is None
     assert 'EDIT_DRAFT Ж' in screen.vt.line(-4)
     snapshot(screen, 'full-diff')
     escape(screen)
@@ -447,14 +514,68 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     assert value['after_hash'] == hashlib.sha256(value['after'].encode()).hexdigest()
     assert (root / 'generated').read_bytes() == b'xx', 'unexpected repeated model dispatch'
     finish(screen)
-    return {'added': 1, 'removed': 1, 'effective_add_bg': added, 'effective_remove_bg': removed}
+    with tempfile.TemporaryDirectory(prefix='ansa-m4-', dir='/tmp') as directory:
+        quiet_root = Path(directory)
+        quiet_home, quiet_cwd = roots(quiet_root)
+        quiet_hold = quiet_root / 'hold-generation'
+        quiet_hold.touch()
+        quiet = start(adapter, quiet_root, quiet_home, quiet_cwd, screens, 'edit-reduced-motion',
+                      adapter=True, size=(96, 40), extra_env={'ANSA_NO_ANIMATION': '1'})
+        try:
+            quiet.send('EDIT_REDUCED_MOTION_TASK\r')
+
+            def quiet_activity():
+                return [row for row in range(3, quiet.vt.rows - 5)
+                        if quiet.vt.line(row).startswith('◷ ') and 'ожидание модели' in quiet.vt.line(row)]
+
+            until(quiet, lambda text: 'EDIT_REDUCED_MOTION_TASK' in quiet.vt.line(3) and bool(quiet_activity()),
+                  'reduced-motion activity under fixture hold', timeout=3)
+            quiet_row = quiet_activity()
+            assert len(quiet_row) == 1 and not (quiet_root / 'generated').exists()
+            quiet_style = quiet.vt.attrs[quiet_row[0]].copy()
+            quiet_since = len(quiet.raw)
+            quiet_began = time.monotonic()
+            while time.monotonic() - quiet_began < .65:
+                quiet.drain(.01)
+                text = visible(quiet)
+                assert quiet_activity() == quiet_row, ('reduced-motion activity moved', text)
+                assert not any(glyph in text for glyph in spinners), ('reduced motion emitted an animated spinner', text)
+                assert quiet.vt.attrs[quiet_row[0]] == quiet_style, 'reduced motion retained a foreground shimmer'
+                assert quiet.child.poll() is None and not (quiet_root / 'generated').exists()
+            quiet_elapsed = time.monotonic() - quiet_began
+            quiet_delta_bytes = len(quiet.raw) - quiet_since
+            snapshot(quiet, 'reduced-motion-idle')
+        finally:
+            try:
+                finish(quiet)
+            finally:
+                quiet_hold.unlink(missing_ok=True)
+        assert not (quiet_root / 'generated').exists(), 'cancelled held generation replied'
+        assert (quiet_cwd / 'edit-target.rs').read_text() == 'fn main() {\n    old();\n}\n'
+        quiet_records = records(quiet_root)
+        assert sum(row['kind'] == 'accepted' and row['text'] == 'EDIT_REDUCED_MOTION_TASK'
+                   for row in quiet_records) == 1
+        assert not any(row['kind'] in ('intent', 'outcome') for row in quiet_records), 'reduced-motion probe executed an edit'
+        quiet_evidence = {'row': quiet_row[0], 'glyph': '◷', 'elapsed': quiet_elapsed,
+                          'delta_bytes': quiet_delta_bytes,
+                          'termios_restored': quiet.finished['termios_restored'],
+                          'flags_restored': quiet.finished['flags_restored'],
+                          'generated': False, 'tool_intents': 0}
+    return {'added': 1, 'removed': 1, 'effective_add_bg': added, 'effective_remove_bg': removed,
+            'idle_animation': {'row': next(iter(observed))[0], 'spinner_frames': len(observed),
+                               'elapsed': idle_elapsed, 'delta_bytes': len(idle_delta)},
+            'reduced_motion': quiet_evidence}
 
 
 def main():
+    inventory = [('color-tool-selection-resize', colored_lifecycle),
+                 ('theme-preview-persistence-dms', theme_preferences),
+                 ('acknowledged-inline-edit-diff', inline_edit)]
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--fixture-binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--case', action='append', choices=[name for name, _ in inventory], dest='selected_cases')
     args = parser.parse_args()
     binary, adapter = args.binary.resolve(strict=True), args.fixture_binary.resolve(strict=True)
     binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
@@ -462,9 +583,9 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     oracle_controls()
     cases = []
-    for name, case in [('color-tool-selection-resize', colored_lifecycle),
-                       ('theme-preview-persistence-dms', theme_preferences),
-                       ('acknowledged-inline-edit-diff', inline_edit)]:
+    for name, case in inventory:
+        if args.selected_cases and name not in args.selected_cases:
+            continue
         began = time.monotonic()
         screens = []
         uses_fixture = case is inline_edit

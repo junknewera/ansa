@@ -86,6 +86,17 @@ fn allowed(models: &[ModelCapability], selection: &GenerationSelection) -> Resul
     }
     Ok(())
 }
+fn allowed_live(
+    auth: &AuthManager,
+    models: &[ModelCapability],
+    selection: &GenerationSelection,
+) -> Result<()> {
+    let result = allowed(models, selection);
+    if result == Err("model_not_available") {
+        auth.invalidate_models();
+    }
+    result
+}
 pub struct Authorization {
     auth: Arc<AuthManager>,
     account: String,
@@ -133,7 +144,7 @@ impl Authorization {
             return Err("auth_required");
         }
         let models = catalog_models(&self.auth.models(cancel)?, Some(&selection.model))?;
-        allowed(&models, selection)?;
+        allowed_live(&self.auth, &models, selection)?;
         let verified = self.auth.access(cancel, false)?;
         if verified.account != self.account {
             return Err("auth_account_mismatch");
@@ -160,7 +171,8 @@ impl Authorization {
                 Some(&request.binding.requested_model),
             )?;
         }
-        allowed(
+        allowed_live(
+            &self.auth,
             &self.models,
             &GenerationSelection {
                 model: request.binding.requested_model.clone(),
@@ -206,7 +218,8 @@ impl Authorization {
         if !self.model_checked || epoch != self.epoch {
             let catalog = self.auth.models(cancel)?;
             let models = catalog_models(&catalog, Some(&self.model))?;
-            allowed(
+            allowed_live(
+                &self.auth,
                 &models,
                 &GenerationSelection {
                     model: self.model.clone(),

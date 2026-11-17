@@ -106,6 +106,19 @@ def footer_phase(terminal, phase):
     return re.match(r'^(?:basic|plan)  '+re.escape(phase)+r'(?=$|[\s;])', terminal.line(-1)) is not None
 
 
+def workspace_ready(screen):
+    """Production Workbench, deliberately distinct from the legacy fixtures."""
+    until(screen, lambda: screen.vt.line(0).startswith('ANSA')
+          and 'Работа' in screen.vt.line(-2)
+          # The default 80-column footer clips готов to гот before the hints.
+          and re.search(r' · (?:готов|гот)(?=\s|$)', screen.vt.line(-2)) is not None,
+          'production workspace ready')
+
+
+def workspace_reading(screen):
+    return 'История' in screen.vt.line(1)
+
+
 def frame_text(terminal):
     return '\n'.join(terminal.line(row) for row in range(terminal.rows))
 
@@ -161,10 +174,10 @@ def recall(binary, output):
         argv = ["--offline", "--cwd", str(cwd), "--session", session]
         screen = Pty(str(binary), root, home, cwd, "", True, argv=argv)
         try:
-            screen.wait("basic")
+            workspace_ready(screen)
             screen.send("DRAFT Ж界😀")
             editor(screen, "DRAFT Ж界😀")
-            assert screen.vt.line(0).startswith('ANSA') and 'basic' in screen.vt.line(-2)
+            assert screen.vt.line(0).startswith('ANSA') and 'Работа' in screen.vt.line(-2)
             frame='\n'.join(screen.vt.line(i) for i in range(screen.vt.rows))
             assert all(hint not in frame for hint in ['Ctrl+F','PgUp','PgDn','↑/↓'])
             assert b'\x1b]52;' not in screen.raw
@@ -195,18 +208,23 @@ def recall(binary, output):
             while time.monotonic()<deadline:screen.drain(.01)
             screen.vt.update(screen.raw)
             assert 'seed-39' in '\n'.join(screen.vt.line(i) for i in range(3,19)),'polling lost tail'
-            if 'HISTORY' not in screen.vt.line(1):
-                screen.send(b'\x1b')
-                until(screen,lambda:'HISTORY' in screen.vt.line(1),'Esc entered reading')
+            if not workspace_reading(screen):
+                screen.send(b'\x1b[5~')
+                until(screen,lambda:workspace_reading(screen),'page navigation entered reading')
             screen.send(b'\x06')
             editor(screen,'DRAFT Ж界😀')
-            assert 'HISTORY' in screen.vt.line(1),'removed Ctrl+F binding changed reading mode'
+            assert workspace_reading(screen),'removed Ctrl+F binding changed reading mode'
             screen.send(b'\x1b')
-            until(screen,lambda:'HISTORY' not in screen.vt.line(1),'Esc returned to live')
+            until(screen,lambda:not workspace_reading(screen),'Esc returned to latest')
+            screen.send(b'\x1b')
+            for _ in range(8): screen.drain(.01)
+            screen.vt.update(screen.raw)
+            assert not workspace_reading(screen),'Esc at latest toggled into reading'
+            assert journals(root)==before,'copy/page/escape navigation changed the journal'
             screen.resize(100,32)
             screen.vt=Terminal(100,32)
             editor(screen,'DRAFT Ж界😀')
-            assert screen.vt.line(0).startswith('ANSA') and 'basic' in screen.vt.line(-2)
+            assert screen.vt.line(0).startswith('ANSA') and 'Работа' in screen.vt.line(-2)
             screen.resize(80,24)
             screen.vt=Terminal()
             editor(screen,'DRAFT Ж界😀')
@@ -242,7 +260,7 @@ def recall(binary, output):
             screen.close()
         screen = Pty(str(binary), root, home, cwd, "", True, argv=argv)
         try:
-            screen.wait("basic")
+            workspace_ready(screen)
             screen.send(b"\x1b[A")
             editor(screen, "seed-39 Ж界😀")
             screen.send(b"\x1b[B\x04")
@@ -274,7 +292,9 @@ def busy(adapter, output):
             screen.send(b"\x1b[B")
             editor(screen, message, at)
             screen.send(b'\r')
-            until(screen,lambda:'Сообщение сохранено' in frame_text(screen.vt),'followup acknowledgement')
+            until(screen,lambda:screen.vt.line(-1).startswith('basic  ')
+                  and 'сообщений ожидает: 1' in screen.vt.line(-1),
+                  'legacy followup counter acknowledgement')
             until(screen,lambda:any(event['kind']=='queued' and event['text']==message for event in journal_events(root)),
                   'followup durable before interrupt')
             queued=[event for event in journal_events(root) if event['kind']=='queued']
@@ -438,14 +458,30 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--fixture-binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    names = ['recall', 'busy-steer-draft-preview', 'tools-plain', 'tools-color', 'tool-error',
+             'reading-failure-copy', 'cancel-tool-settled-next-task', 'paused-sigterm', 'paused-sighup']
+    parser.add_argument('--case', action='append', choices=names, dest='selected_cases',
+                        help='recall includes both page/overflow and restart checks')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     binary, adapter = args.binary.resolve(strict=True), args.fixture_binary.resolve(strict=True)
-    rows = recall(binary, args.output)
-    rows += [busy(adapter, args.output), tools(adapter, args.output),
-             tools(adapter, args.output, plain=False), tools(adapter, args.output, failed=True),
-             reading_failure(adapter,args.output),cancel_tool(adapter,args.output),
-             paused_signal(adapter,args.output,signal.SIGTERM),paused_signal(adapter,args.output,signal.SIGHUP)]
+    checks = [lambda: recall(binary, args.output), lambda: busy(adapter, args.output),
+              lambda: tools(adapter, args.output), lambda: tools(adapter, args.output, plain=False),
+              lambda: tools(adapter, args.output, failed=True), lambda: reading_failure(adapter,args.output),
+              lambda: cancel_tool(adapter,args.output), lambda: paused_signal(adapter,args.output,signal.SIGTERM),
+              lambda: paused_signal(adapter,args.output,signal.SIGHUP)]
+    rows = []
+    for name, check in zip(names, checks):
+        if args.selected_cases and name not in args.selected_cases:
+            continue
+        try:
+            result = check()
+        except BaseException as error:
+            (args.output / 'report.json').write_text(json.dumps({'passed': len(rows), 'cases': rows,
+                'failed_case': name, 'error': repr(error)}, indent=2) + '\n')
+            raise
+        rows.extend(result if isinstance(result, list) else [result])
+        (args.output / 'report.json').write_text(json.dumps({'passed': len(rows), 'cases': rows}, indent=2) + '\n')
     report = {"passed": len(rows), "cases": rows}
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

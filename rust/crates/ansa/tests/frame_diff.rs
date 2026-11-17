@@ -102,6 +102,7 @@ fn scrolling_the_split_inspector_never_erases_or_rewrites_stable_chat_cells() {
             text: "CHAT_STAYS_VISIBLE 👩\u{200d}💻 e\u{301} 🇷🇺".into(),
             action: None,
             edit: None,
+            output: None,
             status: None,
         }];
         let before = carbon::layout_workspace(
@@ -272,6 +273,7 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
                     text: text.clone(),
                     action: None,
                     edit: None,
+                    output: None,
                     status: None,
                 }];
                 let frame = carbon::layout_workspace(
@@ -320,6 +322,7 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
             text: "**❤**\u{fe0f}1️⃣".into(),
             action: None,
             edit: None,
+            output: None,
             status: None,
         }],
         b"",
