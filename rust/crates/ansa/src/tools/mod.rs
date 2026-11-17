@@ -1,4 +1,6 @@
 pub mod admission;
+mod analysis;
+pub mod artifacts;
 pub mod command;
 mod edit;
 pub mod editor_context;

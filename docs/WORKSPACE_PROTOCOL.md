@@ -50,6 +50,22 @@ opaque reasoning и raw tool outputs не сериализуются. Польз
 | Dataset / blob / session artifacts | 4 / 16 / 64 MiB |
 | PNG | До 8 миллионов pixels |
 
+Analysis MVP предоставляет `dataset_inspect` и `python_execute`: второй запускает
+фиксированный помесячный sum для CSV через pinned Python/Matplotlib. Он принимает
+путь, названия date/value columns и report_key; произвольный Python source
+в этой версии не передаётся. Дата - YYYY-MM-DD, числа - до 18 целых и 6 дробных
+цифр. Строки с пустой датой или значением учитываются отдельно и пропускаются.
+Точные итоги сохраняются в CSV/Markdown; график использует их числовое представление.
+
+Worker ограничен 60 с wall time, 45 с CPU, 1 GiB address space, 64 FD и 16 MiB
+на файл. Store резервирует 24 MiB на незавершённую операцию внутри общей quota
+64 MiB; известный failed/cancelled result снимает резерв. Исходный dataset
+сохраняется отдельным неизменяемым snapshot. Durable process stdout содержит
+hash всех inputs, summary и каждого output. Recovery сверяет весь набор и
+дописывает receipt/outcome без нового запуска. Несовпадение требует явного
+восстановления. Descriptor доступен viewer только после canonical outcome;
+наличие execution receipt само по себе не подтверждает committed artifact.
+
 У проекции свой cursor, привязанный к runtime incarnation. Это не journal
 offset. При пропуске обновлений клиент получает gap и полный заменяющий
 snapshot с through cursor. Медленный socket не задерживает Carbon или Cancel.

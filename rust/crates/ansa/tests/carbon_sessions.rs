@@ -294,7 +294,15 @@ async fn pre_edit_catalog_resumes_and_forks_without_upgrading_saved_tools_or_con
     // descriptors and the same durable/read-only policies as before edit_file.
     let mut legacy = Registry::new();
     for descriptor in &current.advertisement().descriptors {
-        if descriptor.name == "edit_file" {
+        if ![
+            "list_directory",
+            "read_file",
+            "search_files",
+            "run_command",
+            "get_test_value",
+        ]
+        .contains(&descriptor.name.as_str())
+        {
             continue;
         }
         legacy
@@ -339,13 +347,16 @@ async fn pre_edit_catalog_resumes_and_forks_without_upgrading_saved_tools_or_con
     original.ready().await.unwrap();
     complete(&original, "old_turn", "old catalogue message").await;
     let expected = context(&original, "old_context").await.request().unwrap();
-    assert!(
-        !expected
-            .tools
-            .descriptors
-            .iter()
-            .any(|d| d.name == "edit_file")
-    );
+    assert!(!expected.tools.descriptors.iter().any(|d| {
+        [
+            "edit_file",
+            "workspace_describe",
+            "editor_get_context",
+            "dataset_inspect",
+            "python_execute",
+        ]
+        .contains(&d.name.as_str())
+    }));
     assert!(
         expected
             .input

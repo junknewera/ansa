@@ -53,6 +53,27 @@ bounded status reads, конфликт ID, сохранение черновик
 гонка маршрутизации по старому snapshot исправлена. fmt/clippy всех
 targets/features прошли. Полная финальная матрица PR #26 ещё не выполнялась.
 
+Analysis/storage subset добавляет compiled `dataset_inspect` и фиксированный
+`python_execute` для помесячных CSV sums. Pinned Python/Matplotlib работает через
+существующий ProcessRunner: 60 с, AS 1 GiB, CPU 45 с, FD 64 и файл до 16 MiB.
+Store 64 MiB учитывает 24 MiB резерв незавершённой операции. CSV/Markdown/PNG
+связаны с operation, immutable revision и input/output hashes из durable
+process stdout; receipt публикуется после проверки всего набора и fsync.
+Старые версии сохраняются при уточнении; показ не запускает вычисление.
+
+Адресные native **5/5** проверили production runtime/supervisor, точные decimal
+итоги, refinement, recovery при потере outcome/receipt без rerun, отсутствие
+нового worker при missing/invalid CSV или отказе по инструкциям, статусы nonzero
+и Cancel, а также порчу parameters/script/input/table/PNG до recovery. Отдельный
+worker **3/3** проверил hostile Matplotlib rc, декодированный PNG 1000x500 и
+manifest. Locked Cargo прошёл **334 native + 9 doctests**; fmt/clippy всех
+targets/features прошли. Независимый source review закрыт после исправлений
+rc, provenance и классификации ошибок. Старый compatibility fixture исправлен:
+исторический pre-edit catalog теперь задан точным набором прежних tools.
+
+Это WIP: canonical artifact projection, открытие отчётов, PNG renderer,
+proposed diff и реальная Kitty/Ghostty приёмка ещё не реализованы.
+
 ## Carbon: управление, читаемые инструменты и терминал проекта
 
 **GO**, проверенный code checkpoint

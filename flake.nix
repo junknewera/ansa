@@ -5,6 +5,7 @@
     let
       systems = [ "aarch64-linux" "x86_64-linux" ];
       each = nixpkgs.lib.genAttrs systems;
+      analysisFor = pkgs: pkgs.python3.withPackages (ps: [ ps.matplotlib ]);
       rustPackage = system:
         let pkgs = import nixpkgs { inherit system; }; in
         pkgs.rustPlatform.buildRustPackage {
@@ -30,6 +31,7 @@
           ANSA_PROTOCOL_FIXTURES = ./tests/fixtures;
           ANSA_AUTH_FIXTURES = ./tests/fixtures/auth;
           ANSA_SESSION_FIXTURES = ./tests/fixtures/sessions;
+          ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
           preBuild = ''
             python3 ${./tests/parity/check_toolchain.py} --workspace .
           '';
@@ -46,11 +48,13 @@
       devShells = each (system:
         let pkgs = import nixpkgs { inherit system; }; in {
           default = pkgs.mkShell {
-            packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy pkgs.python3 pkgs.gitMinimal pkgs.zsh ];
+            packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh ];
+            ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
           };
         } // pkgs.lib.optionalAttrs (system == "aarch64-linux") {
           quality = pkgs.mkShell {
-            packages = [ (pkgs.callPackage ./nix/quality-toolchain.nix {}) pkgs.python3 pkgs.gitMinimal pkgs.zsh ];
+            packages = [ (pkgs.callPackage ./nix/quality-toolchain.nix {}) (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh ];
+            ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
           };
         });
     };

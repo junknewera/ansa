@@ -97,6 +97,28 @@ pub fn create(directory: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
     )?;
     directory.sync_all()
 }
+/// Sync an owned immutable output through the same anchored, nofollow boundary.
+pub fn sync_regular(directory: &File, name: &str) -> io::Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') {
+        return Err(io::Error::other("local_file_name"));
+    }
+    let fd = rustix::fs::openat(
+        directory,
+        name,
+        read_flags() | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let file = File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.nlink() != 1
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o077 != 0
+    {
+        return Err(io::Error::other("local_file_permissions"));
+    }
+    file.sync_all()
+}
 /// Atomically publish the small UI preference file inside an owned private
 /// directory. It carries no runtime state and has last-writer-wins semantics.
 pub fn replace_ui(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()> {

@@ -363,6 +363,7 @@ pub fn local_tools_with_editor(
     }
     super::edit::register(&mut registry, host.clone())?;
     super::workspace::register(&mut registry, host.clone())?;
+    super::analysis::register(&mut registry, host.clone())?;
     let maximum = host.settings.process_timeout_ms;
     let run = host.clone();
     let recovery = host.clone();
