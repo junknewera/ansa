@@ -16,14 +16,14 @@ from parity.frontend_io import environment, journals
 
 
 class Client:
-    def __init__(self, path, name="viewer"):
+    def __init__(self, path, name="viewer", role="viewer"):
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.connect(str(path))
         self.socket.setblocking(False)
         self.buffer = b""
         self.messages = []
         self.sequence = 0
-        self.send(dict(version=1, role="viewer", client=name))
+        self.send(dict(version=1, role=role, client=name))
         self.until(lambda rows: any(row.get("type") == "welcome" for row in rows))
         self.welcome = next(row for row in self.messages if row.get("type") == "welcome")
 
@@ -83,7 +83,7 @@ def run(binary, output):
         root = Path(directory)
         home, cwd = roots(root)
         endpoint = root / "bridge"
-        screen = start(binary, root, home, cwd, argv_extra=["--workspace-dir", str(endpoint)])
+        screen = start(binary, root, home, cwd, argv_extra=["--workspace-dir", str(endpoint), "--workspace-editor"])
         clients = []
         try:
             first = Client(endpoint / "workspace.sock", "first")
@@ -98,6 +98,21 @@ def run(binary, output):
             first.until(lambda rows: any(row.get("code") == "workspace_permission_denied" for row in rows))
             assert journals(root) == before
             observations.append("private-socket-viewer-denied")
+
+            editor = Client(endpoint / "workspace.sock", "explicit-editor", role="editor")
+            clients.append(editor)
+            context = dict(editor_incarnation="nvim_one", buffer=1, changedtick=2, sequence=1,
+                           path=str(cwd / "unsaved.rs"), filetype="rust", first_line=1, text="UNSAVED_CONTEXT_ONLY")
+            share = editor.command("publish_context", context=context)
+            editor.until(lambda rows: any(row.get("type") == "context_published" and row.get("id") == share for row in rows))
+            revoke = editor.command("invalidate_context", editor_incarnation="nvim_one", buffer=1, sequence=1)
+            editor.until(lambda rows: any(row.get("type") == "context_invalidated" and row.get("id") == revoke for row in rows))
+            old = editor.command("publish_context", context=context)
+            editor.until(lambda rows: any(row.get("type") == "error" and row.get("id") == old and row.get("code") == "stale_editor_context" for row in rows))
+            editor.close()
+            clients.remove(editor)
+            assert journals(root) == before, "sharing editor context dispatched model work"
+            observations.append("explicit-editor-grant-share-withdraw-and-stale-rejection")
 
             text = "BRIDGE_SHARED_Привет_界"
             screen.send(text + "\r")
@@ -133,12 +148,22 @@ def run(binary, output):
 vim.opt.runtimepath:prepend(%s)
 local ansa = require('ansa')
 ansa.setup()
-ansa.attach(%s)
+ansa.attach(%s,{editor=true})
 assert(vim.wait(4000, function()
   local s = ansa.status()
   return s.connected and s.snapshot and s.snapshot.state.phase == 'completed'
     and s.buffer and table.concat(api.nvim_buf_get_lines(s.buffer, 0, -1, false), '\\n'):find('BRIDGE_SHARED_', 1, true)
 end, 10), 'Neovim viewer did not receive the shared transcript')
+ansa.open()
+local source=api.nvim_create_buf(true,false)
+api.nvim_set_current_buf(source)
+api.nvim_buf_set_name(source,%s)
+api.nvim_buf_set_lines(source,0,-1,false,{'UNSAVED_REAL_NVIM Ж界'})
+ansa.share(1,1)
+assert(vim.wait(2000,function() return ansa.status().shared ~= nil end,10),'real editor context not acknowledged')
+api.nvim_buf_set_lines(source,0,-1,false,{'REVOKED_REAL_NVIM'})
+api.nvim_exec_autocmds('TextChanged',{buffer=source})
+assert(not ansa.status().shared,'real editor context was not invalidated')
 ansa.open()
 local buf = ansa.status().buffer
 local cursor = {2, 0}
@@ -163,7 +188,7 @@ assert(api.nvim_get_current_buf() == buf, 'attachment moved the current buffer')
 assert(api.nvim_win_get_cursor(0)[1] == 3, 'attachment moved the cursor')
 vim.fn.writefile({vim.json.encode({passed=true, dirty_preserved=true, current_buffer_preserved=true})}, %s)
 vim.cmd('qa!')
-""" % (json.dumps(str(plugin)), json.dumps(str(endpoint / "workspace.sock")),
+""" % (json.dumps(str(plugin)), json.dumps(str(endpoint / "workspace.sock")), json.dumps(str(cwd / 'actual-editor.rs')),
        json.dumps(str(endpoint / "workspace.sock")), json.dumps(str(report) + '.debug'), json.dumps(str(report))))
             child = subprocess.run(["nvim", "--headless", "--clean", "-l", str(lua)],
                                    env=environment(home, root, True), capture_output=True, timeout=12)

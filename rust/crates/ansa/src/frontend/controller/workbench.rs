@@ -2993,17 +2993,23 @@ pub async fn run_attached(
     root_id: String,
     kind: Kind,
     parent: Option<String>,
-    bridge_directory: Option<PathBuf>,
+    bridge_options: Option<super::super::bridge::BridgeOptions>,
 ) -> Result<i32> {
     if io.raw.is_none() {
-        if bridge_directory.is_some() {
+        if bridge_options.is_some() {
             return Err("workspace_requires_tty");
         }
         return super::run(&mut runtime, io, None, false, context).await;
     }
-    let mut bridge = bridge_directory
+    let mut bridge = bridge_options
         .as_ref()
-        .map(|directory| super::super::bridge::Bridge::start(directory, runtime.handle()))
+        .map(|options| {
+            super::super::bridge::Bridge::start_with_editor(
+                &options.directory,
+                runtime.handle(),
+                options.editor.clone(),
+            )
+        })
         .transpose()?;
     let mut work = Workbench::new(runtime, factory, root_id, kind, parent)?;
     let mut interval = tokio::time::interval(Duration::from_millis(10));
@@ -3026,6 +3032,10 @@ pub async fn run_attached(
     let mut editor_cancel_since: Option<Instant> = None;
     let result: Result<()> = async {
         while !finished || work.editor.is_some() {
+            if let Some(bridge) = &bridge
+                && let Some(root) = work.slots.iter().find(|slot| slot.id == work.root_id) {
+                bridge.set_input_mode(root.state.mode);
+            }
             work.update_displayed(io);
             let mut input_guard = None; let mut signal_guard = None;
             let input_enabled = work.terminal_pending_input.is_empty() && !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing

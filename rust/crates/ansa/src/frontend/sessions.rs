@@ -10,7 +10,7 @@ use crate::{
         catalog::{CatalogEntry, Selected},
         journal_v1::Journal,
     },
-    tools::files::local_tools,
+    tools::files::local_tools_with_editor,
 };
 use std::{path::PathBuf, sync::Arc};
 const CONSOLE_ACCOUNT: &str = "ansa-local-console";
@@ -44,6 +44,7 @@ pub struct Factory {
     pub offline: bool,
     account: String,
     auth: Option<Arc<AuthManager>>,
+    editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
 }
 pub struct Created {
     pub runtime: Runtime,
@@ -65,7 +66,16 @@ impl Factory {
             offline,
             account,
             auth,
+            editor: None,
         }
+    }
+    pub fn with_editor(
+        mut self,
+        directory: PathBuf,
+        editor: Arc<crate::tools::editor_context::EditorHub>,
+    ) -> Self {
+        self.editor = Some((directory, editor));
+        self
     }
     fn profile(&self) -> &'static str {
         if self.offline { "offline" } else { "live" }
@@ -187,12 +197,16 @@ impl Factory {
         {
             return Err("session_configuration_mismatch");
         }
-        let tools = local_tools(
+        let tools = local_tools_with_editor(
             self.settings.clone(),
             initial_epoch.clone(),
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
+            self.editor
+                .as_ref()
+                .filter(|(directory, _)| directory == &selected.directory)
+                .map(|(_, hub)| hub.clone()),
         )?;
         // Resume/fork retains the exact saved tool catalogue. Adding a compiled
         // tool only affects new sessions; saved descriptors cannot install code.

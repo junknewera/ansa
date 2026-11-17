@@ -1,7 +1,7 @@
 local M = {}
 local uv = vim.uv or vim.loop
 local cap = 512 * 1024
-local state = { client = tostring(uv.hrtime()), pending = {}, sequence = 0 }
+local state = { client = string.format('nvim_%d_%.0f', uv.os_getpid(), uv.hrtime()), pending = {}, sequence = 0 }
 
 local function notify(message)
   vim.notify(message, vim.log.levels.INFO, { title = 'ANSA' })
@@ -20,6 +20,8 @@ local function disconnect()
   state.snapshot = nil
   state.scheduled = false
   state.pending_history = nil
+  state.share_pending = nil
+  state.shared = nil
   state.history_retries = 0
   state.history_blocked = false
   state.history_retry_scheduled = false
@@ -40,8 +42,11 @@ local function send(fields)
   if (state.pipe:get_write_queue_size() or 0) + #line > 256 * 1024 then
     return false, 'Подключение ANSA занято'
   end
-  state.pipe:write(line, function(err)
-    if err then vim.schedule(function() notify('ANSA: соединение потеряно; запрос не повторён') end) end
+  local pipe = state.pipe
+  pipe:write(line, function(err)
+    if err then vim.schedule(function()
+      if state.pipe == pipe then disconnect(); notify('Соединение ANSA потеряно; проверьте состояние задачи') end
+    end) end
   end)
   return true, fields.id
 end
@@ -51,6 +56,12 @@ local function history()
   local ok, id = send({ kind = 'history', before = 0, limit = 64, forward = false })
   if ok then state.pending_history = id
   else state.history_blocked = true; notify(id) end
+end
+
+local function invalidate(context)
+  local ok = send({kind='invalidate_context', editor_incarnation=context.editor_incarnation,
+    buffer=context.buffer, sequence=context.sequence})
+  if not ok then disconnect(); notify('Подключение ANSA закрыто: не удалось отозвать выделение') end
 end
 
 local function buffer(name)
@@ -127,7 +138,7 @@ end
 
 local function receive(message)
   if message.type == 'welcome' then
-    if message.version ~= 1 or message.role ~= 'viewer' then
+    if message.version ~= 1 or message.role ~= state.requested_role then
       disconnect()
       notify('Несовместимый workspace protocol')
       return
@@ -174,10 +185,28 @@ local function receive(message)
       state.history_blocked = true
       notify('История ANSA недоступна: ' .. tostring(message.status) .. '. :AnsaRefresh повторяет чтение')
     end
+  elseif message.type == 'context_published' and state.share_pending and message.id == state.share_pending.id then
+    local pending = state.share_pending
+    state.share_pending = nil
+    local context = pending.context
+    if pending.invalidated or not vim.api.nvim_buf_is_valid(context.buffer)
+      or vim.api.nvim_buf_get_changedtick(context.buffer) ~= context.changedtick
+      or vim.api.nvim_buf_get_name(context.buffer) ~= pending.name then
+      invalidate(context)
+      notify('Выделение изменилось; повторите :AnsaShare')
+    else
+      state.shared = context
+      notify('Выделение передано в workspace')
+    end
   elseif message.type == 'gap' then
     -- Every update is a complete replacement snapshot with its own barrier.
     state.gap = message.through
   elseif message.type == 'error' then
+    if state.share_pending and message.id == state.share_pending.id then
+      state.share_pending = nil
+      notify('ANSA: ' .. tostring(message.code))
+      return
+    end
     state.pending_history = nil
     state.history_blocked = true
     state.history_retry_scheduled = false
@@ -186,10 +215,12 @@ local function receive(message)
   end
 end
 
-function M.attach(path)
+function M.attach(path, options)
   disconnect()
   if not path or path == '' then notify('Укажите путь к workspace.sock'); return end
   state.buffered = ''
+  state.requested_role = options and options.editor and 'editor' or 'viewer'
+  local role = state.requested_role
   local pipe = uv.new_pipe(false)
   local epoch = state.epoch
   state.pipe = pipe
@@ -198,7 +229,7 @@ function M.attach(path)
       if state.pipe == pipe then disconnect(); notify('Не удалось подключиться к ANSA') end
     end); return end
     if state.pipe ~= pipe then return end
-    pipe:write(vim.json.encode({ version = 1, role = 'viewer', client = state.client }) .. '\n')
+    pipe:write(vim.json.encode({ version = 1, role = role, client = state.client }) .. '\n')
     pipe:read_start(function(read_error, chunk)
       if read_error or not chunk then
         vim.schedule(function() if state.pipe == pipe then disconnect(); notify('ANSA отключена') end end)
@@ -258,12 +289,35 @@ function M.open()
 end
 
 function M.status()
-  return { connected = state.attachment ~= nil, snapshot = state.snapshot, buffer = state.history_buf }
+  return { connected = state.attachment ~= nil, snapshot = state.snapshot, buffer = state.history_buf, shared = state.shared }
+end
+
+function M.share(first, last)
+  if state.share_pending then notify('Дождитесь подтверждения предыдущего выделения'); return end
+  if not state.attachment or state.attachment.role ~= 'editor' then
+    notify('Для передачи выделения нужны --workspace-editor и :AnsaAttach!'); return
+  end
+  local buf = vim.api.nvim_get_current_buf()
+  local lines = vim.api.nvim_buf_get_lines(buf, first - 1, last, false)
+  local text = table.concat(lines, '\n')
+  if #text > 16 * 1024 then notify('Выделение превышает 16 KiB'); return end
+  local path = vim.api.nvim_buf_get_name(buf)
+  local name = path
+  if path:match('^ansa://') then path = '' end
+  if path ~= '' then path = uv.fs_realpath(path) or path end
+  state.context_sequence = (state.context_sequence or 0) + 1
+  local context = { editor_incarnation = state.client, buffer = buf,
+    changedtick = vim.api.nvim_buf_get_changedtick(buf), sequence = state.context_sequence,
+    path = path, filetype = vim.bo[buf].filetype, first_line = first, text = text }
+  local ok, id = send({ kind = 'publish_context', context = context })
+  if ok then state.share_pending = { id = id, context = context, name = name } else notify(id) end
 end
 
 function M.setup()
-  vim.api.nvim_create_user_command('AnsaAttach', function(args) M.attach(args.args) end,
-    { nargs = 1, complete = 'file', desc = 'Подключиться к Carbon workspace' })
+  vim.api.nvim_create_user_command('AnsaAttach', function(args) M.attach(args.args, {editor=args.bang}) end,
+    { nargs = 1, bang = true, complete = 'file', desc = 'Подключиться к Carbon workspace; ! передаёт контекст редактора' })
+  vim.api.nvim_create_user_command('AnsaShare', function(args) M.share(args.line1, args.line2) end,
+    { range = true, desc = 'Передать выбранные строки агенту без сохранения файла' })
   vim.api.nvim_create_user_command('AnsaHistory', M.open, { desc = 'Открыть историю ANSA' })
   vim.api.nvim_create_user_command('AnsaRefresh', function()
     state.history_retries = 0
@@ -275,6 +329,24 @@ function M.setup()
   end, { desc = 'Обновить историю ANSA' })
   vim.api.nvim_create_user_command('AnsaDetach', disconnect, { desc = 'Отключить viewer ANSA' })
   vim.api.nvim_create_autocmd('VimLeavePre', { callback = disconnect })
+  vim.api.nvim_create_autocmd({'TextChanged', 'TextChangedI', 'BufWipeout', 'BufFilePost'}, {
+    callback = function(args)
+      if not state.attachment then return end
+      local tick = vim.api.nvim_buf_is_valid(args.buf) and vim.api.nvim_buf_get_changedtick(args.buf) or 0
+      local changed_name = args.event == 'BufWipeout' or args.event == 'BufFilePost'
+      local shared = state.shared
+      if shared and shared.buffer == args.buf and (changed_name or tick ~= shared.changedtick) then
+        invalidate(shared)
+        state.shared = nil
+      end
+      local pending = state.share_pending
+      if pending and pending.context.buffer == args.buf
+        and (changed_name or tick ~= pending.context.changedtick) then
+        invalidate(pending.context)
+        pending.invalidated = true
+      end
+    end,
+  })
 end
 
 return M

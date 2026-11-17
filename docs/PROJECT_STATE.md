@@ -8,7 +8,12 @@
 не меняет цель при переходе Carbon в fork. История запрашивается отдельными
 correlated страницами; заменяемые snapshots имеют собственный cursor и gap.
 DTO исключает native context, opaque reasoning и внутренние tool outputs.
-Полномочия editor/controller пока отклоняются.
+`--workspace-editor` разрешает явную передачу выделения через `:AnsaAttach!`
+и `:AnsaShare`. Контекст ограничен 16 KiB и связан с editor incarnation,
+buffer, changedtick и sequence. Редактирование, переименование, закрытие буфера
+и потеря соединения отзывают его. `editor_get_context` проверяет актуальную
+версию, разрешённый путь и инструкции каталога в tool worker. Сервис доступен
+исходной сессии; fork и субагенты получают недоступный editor context.
 
 Адресно прошли 3 native bridge-теста, fmt/clippy всех targets/features,
 7 сценариев с production offline Carbon, двумя клиентами и настоящим Neovim,
@@ -19,10 +24,18 @@ DTO исключает native context, opaque reasoning и внутренние 
 ошибку учёта dirty state у Neovim `nofile` buffer; используется `acwrite`.
 
 Evidence: `~/Workspace/pet/ansa-baselines/workspace-bridge-20261117/`.
-Это WIP checkpoint: editor context/selection, analysis worker, durable artifacts,
+Это WIP checkpoint: отправка задачи из редактора, analysis worker, durable artifacts,
 PNG renderer и полная финальная матрица ещё впереди. Последний проверенный
 GO runtime остаётся `5df02d8`, описанный ниже. Контракт расширения -
 [WORKSPACE_PROTOCOL](WORKSPACE_PROTOCOL.md).
+
+Context subset дополнительно прошёл locked Cargo **319 native + 9 doctests**,
+8 сценариев с настоящими Carbon/Neovim/Unix clients и 5 Neovim fault-сценариев
+для delayed ACK, rename без смены tick, wipe, переполнения очереди и ошибки
+write при отзыве контекста. Отдельные native-тесты проверяют отмену чтения
+частичного frame и завершение history между фрагментами следующей команды.
+Независимый source review context subset закрыт без открытых замечаний.
+Следующий шаг - typed selection submit с проверяемым исходом по ID.
 
 ## Carbon: управление, читаемые инструменты и терминал проекта
 

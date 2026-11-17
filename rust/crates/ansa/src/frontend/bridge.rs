@@ -23,6 +23,10 @@ pub const FRAME_BYTES: usize = 128 * 1024;
 pub const OUTPUT_BYTES: usize = 512 * 1024;
 pub const CLIENTS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+pub struct BridgeOptions {
+    pub directory: PathBuf,
+    pub editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+}
 
 fn obj(fields: Vec<(&str, Json)>) -> Json {
     Json::object(fields).expect("bounded bridge fields")
@@ -77,6 +81,7 @@ pub struct Bridge {
     socket: PathBuf,
     identity: (u64, u64),
     pages: Arc<Mutex<Pages>>,
+    editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
 }
 #[derive(Default)]
 struct Pages {
@@ -133,6 +138,13 @@ fn history(page: &TranscriptPage, id: &str, handle: &Handle) -> Result<Arc<Strin
 }
 impl Bridge {
     pub fn start(directory: &Path, handle: Handle) -> Result<Self> {
+        Self::start_with_editor(directory, handle, None)
+    }
+    pub fn start_with_editor(
+        directory: &Path,
+        handle: Handle,
+        editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    ) -> Result<Self> {
         let directory = std::path::absolute(directory).map_err(|_| "workspace_directory")?;
         ansa_linux::fs::create_private(&directory).map_err(|_| "workspace_permissions")?;
         let owned =
@@ -154,8 +166,18 @@ impl Bridge {
         let task_handle = handle.clone();
         let pages = Arc::new(Mutex::new(Pages::default()));
         let task_pages = pages.clone();
+        let task_editor = editor.clone();
         let task = tokio::spawn(async move {
-            serve(listener, task_handle, receiver, stopped, uid, task_pages).await;
+            serve(
+                listener,
+                task_handle,
+                receiver,
+                stopped,
+                uid,
+                task_pages,
+                task_editor,
+            )
+            .await;
         });
         Ok(Self {
             handle,
@@ -166,10 +188,16 @@ impl Bridge {
             socket,
             identity,
             pages,
+            editor,
         })
     }
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+    pub fn set_input_mode(&self, mode: AgentMode) {
+        if let Some(editor) = &self.editor {
+            editor.set_mode(mode);
+        }
     }
 
     pub fn publish(&mut self, event: &RuntimeEvent) {
@@ -307,6 +335,7 @@ async fn serve(
     mut stop: watch::Receiver<bool>,
     uid: u32,
     pages: Arc<Mutex<Pages>>,
+    editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
 ) {
     let mut clients = JoinSet::new();
     let mut connection = 0usize;
@@ -321,7 +350,8 @@ async fn serve(
                     let prefix = format!("w_{}_{}", &handle.incarnation().0[..8], connection);
                     let h = handle.clone(); let v = view.clone(); let stopped = stop.clone();
                     let p = pages.clone();
-                    clients.spawn(async move { let _ = client(stream, h, v, stopped, p, prefix).await; });
+                    let e = editor.clone();
+                    clients.spawn(async move { let _ = client(stream, h, v, stopped, p, prefix, e).await; });
                 }
             }
         }
@@ -330,37 +360,50 @@ async fn serve(
     while clients.join_next().await.is_some() {}
 }
 
-/// Enforce the frame bound before a complete line or JSON tree is allocated.
-pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> Result<Option<Json>> {
-    let mut bytes = Vec::new();
-    loop {
-        let buffer = reader.fill_buf().await.map_err(|_| "workspace_read")?;
-        if buffer.is_empty() {
-            return if bytes.is_empty() {
-                Ok(None)
-            } else {
-                Err("workspace_incomplete_frame")
-            };
+/// Partial bytes belong to the connection, so completing another query cannot
+/// discard a consumed prefix of its next command.
+struct FrameReader<R> {
+    reader: R,
+    bytes: Vec<u8>,
+}
+impl<R: tokio::io::AsyncBufRead + Unpin> FrameReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            bytes: vec![],
         }
-        let count = buffer
-            .iter()
-            .position(|v| *v == b'\n')
-            .map_or(buffer.len(), |i| i + 1);
-        if count > FRAME_BYTES - bytes.len() {
-            return Err("workspace_frame_limit");
-        }
-        let complete = buffer[count - 1] == b'\n';
-        bytes.extend_from_slice(&buffer[..count]);
-        reader.consume(count);
-        if complete {
-            let text = std::str::from_utf8(&bytes).map_err(|_| "workspace_utf8")?;
-            return Json::parse_with_limits(text, FRAME_BYTES, 16, 4096).map(Some);
+    }
+    async fn next(&mut self) -> Result<Option<Json>> {
+        loop {
+            let buffer = self.reader.fill_buf().await.map_err(|_| "workspace_read")?;
+            if buffer.is_empty() {
+                return if self.bytes.is_empty() {
+                    Ok(None)
+                } else {
+                    Err("workspace_incomplete_frame")
+                };
+            }
+            let count = buffer
+                .iter()
+                .position(|v| *v == b'\n')
+                .map_or(buffer.len(), |i| i + 1);
+            if count > FRAME_BYTES - self.bytes.len() {
+                return Err("workspace_frame_limit");
+            }
+            let complete = buffer[count - 1] == b'\n';
+            self.bytes.extend_from_slice(&buffer[..count]);
+            self.reader.consume(count);
+            if complete {
+                let text = std::str::from_utf8(&self.bytes).map_err(|_| "workspace_utf8")?;
+                let result = Json::parse_with_limits(text, FRAME_BYTES, 16, 4096).map(Some);
+                self.bytes.clear();
+                return result;
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn client(
     stream: UnixStream,
     handle: Handle,
@@ -368,15 +411,17 @@ async fn client(
     mut stop: watch::Receiver<bool>,
     pages: Arc<Mutex<Pages>>,
     prefix: String,
+    editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
-    let mut read = BufReader::new(read);
-    let hello = tokio::time::timeout(IO_TIMEOUT, read_frame(&mut read))
+    let mut read = FrameReader::new(BufReader::new(read));
+    let hello = tokio::time::timeout(IO_TIMEOUT, read.next())
         .await
         .map_err(|_| "workspace_handshake_timeout")??
         .ok_or("workspace_handshake")?;
+    let role = hello.text_field("role")?;
     if hello.usize_field("version")? != 1
-        || hello.text_field("role")? != "viewer"
+        || !(role == "viewer" || role == "editor" && editor.is_some())
         || !crate::provider::contracts::valid_id(hello.text_field("client")?)
     {
         let _ = tokio::time::timeout(
@@ -386,15 +431,35 @@ async fn client(
         .await;
         return Err("workspace_handshake");
     }
+    let client_id = hello.text_field("client")?;
+    let _editor_attachment = if role == "editor" {
+        Some(
+            editor
+                .as_ref()
+                .ok_or("workspace_permission_denied")?
+                .attach(client_id)?,
+        )
+    } else {
+        None
+    };
     let welcome = obj(vec![
         ("type", s("welcome")?),
         ("version", n(1)),
-        ("role", s("viewer")?),
+        ("role", s(role)?),
         ("session", s(&handle.session().0)?),
         ("incarnation", s(&handle.incarnation().0)?),
         (
             "capabilities",
-            Json::array(vec![s("snapshot")?, s("history")?])?,
+            Json::array(if role == "editor" {
+                vec![
+                    s("snapshot")?,
+                    s("history")?,
+                    s("publish_context")?,
+                    s("invalidate_context")?,
+                ]
+            } else {
+                vec![s("snapshot")?, s("history")?]
+            })?,
         ),
         ("max_frame_bytes", n(FRAME_BYTES)),
     ]);
@@ -431,11 +496,18 @@ async fn client(
     };
     let mut sequence = 0usize;
     let reader = async {
+        type PageJob = std::pin::Pin<Box<dyn std::future::Future<Output = Arc<String>> + Send>>;
+        let mut page_job: Option<PageJob> = None;
         loop {
             let frame = tokio::select! { biased;
                 _ = stop.changed() => break,
                 _ = out.closed() => break,
-                frame = read_frame(&mut read) => match frame? { Some(frame) => frame, None => break },
+                response = async { page_job.as_mut().expect("enabled").await }, if page_job.is_some() => {
+                    page_job = None;
+                    out.try_send(response).map_err(|_| "workspace_slow_reader")?;
+                    continue;
+                }
+                frame = read.next() => match frame? { Some(frame) => frame, None => break },
             };
             if frame.usize_field("version")? != 1
                 || frame.text_field("session")? != handle.session().0
@@ -449,6 +521,61 @@ async fn client(
                 return Err("workspace_request_id");
             }
             let kind = frame.text_field("kind")?;
+            if kind == "history" && page_job.is_some() {
+                out.try_send(encoded(&obj(vec![
+                    ("type", s("posted")?),
+                    ("id", s(id)?),
+                    ("kind", s(kind)?),
+                    ("status", s("QueueFull")?),
+                ]))?)
+                .map_err(|_| "workspace_slow_reader")?;
+                continue;
+            }
+            if kind == "invalidate_context" && role == "editor" {
+                let result = editor
+                    .as_ref()
+                    .ok_or("workspace_permission_denied")?
+                    .invalidate(
+                        client_id,
+                        frame.text_field("editor_incarnation")?,
+                        frame.usize_field("buffer")?,
+                        frame.usize_field("sequence")?,
+                    );
+                let response = match result {
+                    Ok(()) => obj(vec![("type", s("context_invalidated")?), ("id", s(id)?)]),
+                    Err(code) => obj(vec![
+                        ("type", s("error")?),
+                        ("id", s(id)?),
+                        ("code", s(code)?),
+                    ]),
+                };
+                out.try_send(encoded(&response)?)
+                    .map_err(|_| "workspace_slow_reader")?;
+                continue;
+            }
+            if kind == "publish_context" && role == "editor" {
+                let response = match editor
+                    .as_ref()
+                    .ok_or("workspace_permission_denied")?
+                    .publish(client_id, frame.field("context")?)
+                {
+                    Ok(context) => obj(vec![
+                        ("type", s("context_published")?),
+                        ("id", s(id)?),
+                        ("buffer", n(context.buffer)),
+                        ("changedtick", n(context.changedtick)),
+                        ("sequence", n(context.sequence)),
+                    ]),
+                    Err(code) => obj(vec![
+                        ("type", s("error")?),
+                        ("id", s(id)?),
+                        ("code", s(code)?),
+                    ]),
+                };
+                out.try_send(encoded(&response)?)
+                    .map_err(|_| "workspace_slow_reader")?;
+                continue;
+            }
             let payload = match kind {
                 "snapshot" => CommandPayload::GetSnapshot(0),
                 "history" => CommandPayload::GetTranscript(GetTranscript {
@@ -512,12 +639,15 @@ async fn client(
             if let Some((_guard, receiver)) = page_wait
                 && status == crate::runtime::PostStatus::Accepted
             {
-                let response = match tokio::time::timeout(IO_TIMEOUT, receiver).await {
-                    Ok(Ok(page)) => history(&page, id, &handle).unwrap_or_else(error_encoded),
-                    _ => error_encoded("workspace_history_timeout"),
-                };
-                out.try_send(response)
-                    .map_err(|_| "workspace_slow_reader")?;
+                let id = id.to_owned();
+                let handle = handle.clone();
+                page_job = Some(Box::pin(async move {
+                    let _guard = _guard;
+                    match tokio::time::timeout(IO_TIMEOUT, receiver).await {
+                        Ok(Ok(page)) => history(&page, &id, &handle).unwrap_or_else(error_encoded),
+                        _ => error_encoded("workspace_history_timeout"),
+                    }
+                }));
             }
         }
         Ok(())
@@ -568,7 +698,8 @@ mod tests {
                 write.write_all(&[*byte]).await.unwrap();
             }
         });
-        let value = read_frame(&mut BufReader::new(read))
+        let value = FrameReader::new(BufReader::new(read))
+            .next()
             .await
             .unwrap()
             .unwrap();
@@ -580,12 +711,139 @@ mod tests {
             (b"{\"v\":1}".to_vec(), "workspace_incomplete_frame"),
         ] {
             assert_eq!(
-                read_frame(&mut BufReader::new(bytes.as_slice()))
+                FrameReader::new(BufReader::new(bytes.as_slice()))
+                    .next()
                     .await
                     .unwrap_err(),
                 expected
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_frame_read_retains_consumed_prefix() {
+        let (mut write, read) = tokio::io::duplex(64);
+        let mut frames = FrameReader::new(BufReader::new(read));
+        write.write_all(b"{\"text\":\"").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), frames.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(frames.bytes, b"{\"text\":\"");
+        write.write_all("Ж界\"}\n".as_bytes()).await.unwrap();
+        assert_eq!(
+            frames
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .text_field("text")
+                .unwrap(),
+            "Ж界"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_completion_between_command_fragments_keeps_connection_and_frame() {
+        let root = Directory::new();
+        let mut runtime = super::super::app::offline_runtime(None, false).unwrap();
+        runtime.ready().await.unwrap();
+        let handle = runtime.handle();
+        let mut bridge = Bridge::start(&root.0, handle.clone()).unwrap();
+        let stream = UnixStream::connect(bridge.socket()).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut replies = FrameReader::new(BufReader::new(read));
+        write
+            .write_all(b"{\"version\":1,\"role\":\"viewer\",\"client\":\"fragment_test\"}\n")
+            .await
+            .unwrap();
+        async fn wait_kind<R: tokio::io::AsyncBufRead + Unpin>(
+            read: &mut FrameReader<R>,
+            kind: &str,
+        ) -> Json {
+            tokio::time::timeout(IO_TIMEOUT, async {
+                loop {
+                    let frame = read.next().await.unwrap().expect("connection closed");
+                    if frame.text_field("type").unwrap() == kind {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .expect("expected frame")
+        }
+        wait_kind(&mut replies, "welcome").await;
+        let base = obj(vec![
+            ("version", n(1)),
+            ("session", s(&handle.session().0).unwrap()),
+            ("incarnation", s(&handle.incarnation().0).unwrap()),
+        ]);
+        let query = base
+            .with("id", s("page").unwrap())
+            .unwrap()
+            .with("kind", s("history").unwrap())
+            .unwrap()
+            .with("before", n(0))
+            .unwrap()
+            .with("limit", n(1))
+            .unwrap()
+            .with("forward", flag(false))
+            .unwrap();
+        write
+            .write_all(encoded(&query).unwrap().as_bytes())
+            .await
+            .unwrap();
+        let page = tokio::time::timeout(IO_TIMEOUT, async {
+            loop {
+                let event = runtime.next_event().await.unwrap();
+                if matches!(event.payload, EventPayload::TranscriptPage(_)) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            wait_kind(&mut replies, "posted")
+                .await
+                .text_field("status")
+                .unwrap(),
+            "Accepted"
+        );
+        let command = base
+            .with("id", s("fragment").unwrap())
+            .unwrap()
+            .with("kind", s("publish_context").unwrap())
+            .unwrap()
+            .with("text", s("Ж界").unwrap())
+            .unwrap();
+        let frame = encoded(&command).unwrap();
+        let (first, second) = frame.as_bytes().split_at(frame.len() / 2);
+        write.write_all(first).await.unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // The accepted read is deliberately withheld until the next command's
+        // prefix is already on the socket, then completed in the same session.
+        bridge.publish(&page);
+        assert_eq!(
+            wait_kind(&mut replies, "history")
+                .await
+                .text_field("id")
+                .unwrap(),
+            "page"
+        );
+        write.write_all(second).await.unwrap();
+        assert_eq!(
+            wait_kind(&mut replies, "error")
+                .await
+                .text_field("code")
+                .unwrap(),
+            "workspace_permission_denied"
+        );
+        bridge.shutdown().await;
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -13,6 +13,7 @@ pub struct Options {
     pub returned_model: Option<String>,
     pub prompt: Option<String>,
     pub workspace: Option<PathBuf>,
+    pub workspace_editor: bool,
 }
 impl Options {
     pub fn parse(args: &[String], cwd: PathBuf, auth: PathBuf) -> super::Result<Self> {
@@ -27,6 +28,7 @@ impl Options {
             returned_model: None,
             prompt: None,
             workspace: None,
+            workspace_editor: false,
         };
         let mut seen = BTreeSet::new();
         let mut index = 0;
@@ -46,6 +48,7 @@ impl Options {
                 "--offline" => value.offline = true,
                 "--continue" => value.resume = true,
                 "--print-config" => value.print_config = true,
+                "--workspace-editor" => value.workspace_editor = true,
                 _ => {
                     let next = args.get(index).ok_or("cli_option_value")?;
                     index += 1;
@@ -60,6 +63,9 @@ impl Options {
                     }
                 }
             }
+        }
+        if value.workspace_editor && value.workspace.is_none() {
+            return Err("workspace_editor_requires_endpoint");
         }
         if value.prompt.as_deref().is_some_and(|s| {
             matches!(

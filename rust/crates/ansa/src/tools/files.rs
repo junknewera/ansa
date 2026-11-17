@@ -35,6 +35,7 @@ pub(crate) struct Host {
     pub processes: ProcessRunner,
     pub auth: PathBuf,
     pub session: PathBuf,
+    pub editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
 }
 impl Host {
     pub(crate) fn protected_path(&self, path: &Path) -> bool {
@@ -262,12 +263,23 @@ pub fn local_tools(
     auth: &Path,
     worker: &Path,
 ) -> Result<Arc<Snapshot>> {
+    local_tools_with_editor(settings, epoch, session, auth, worker, None)
+}
+pub fn local_tools_with_editor(
+    settings: AgentSettings,
+    epoch: Epoch,
+    session: &Path,
+    auth: &Path,
+    worker: &Path,
+    editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+) -> Result<Arc<Snapshot>> {
     let host = Arc::new(Host {
         processes: ProcessRunner::new(&session.join("operations"), worker)?,
         auth: ansa_linux::fs::weakly_canonical(auth).map_err(|_| "file_access_failed")?,
         session: ansa_linux::fs::weakly_canonical(session).map_err(|_| "file_access_failed")?,
         settings,
         epoch,
+        editor,
     });
     let mut registry = Registry::new();
     type Action = fn(&Host, &Json, &Cancel) -> Result<Outcome>;
@@ -350,6 +362,7 @@ pub fn local_tools(
         )?;
     }
     super::edit::register(&mut registry, host.clone())?;
+    super::workspace::register(&mut registry, host.clone())?;
     let maximum = host.settings.process_timeout_ms;
     let run = host.clone();
     let recovery = host.clone();
