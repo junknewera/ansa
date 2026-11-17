@@ -961,6 +961,78 @@ fn streaming_preview_emits_ordered_utf8_and_cancels_before_next_event() {
 }
 
 #[test]
+fn siwc_empty_terminal_output_requires_completed_text_without_calls() {
+    use provider::responses::ResponseStream;
+
+    let decode = |events: &[Json], siwc: bool| {
+        let mut stream = if siwc {
+            ResponseStream::for_siwc(request(), Limits::default(), Some(Box::new(|_| {})), None)
+        } else {
+            ResponseStream::new(request(), Limits::default())
+        };
+        stream.feed(&wire(events))?;
+        stream.finish()
+    };
+    let set_output = |events: &mut [Json], output: &str| {
+        let terminal = events.last_mut().unwrap();
+        let response = terminal.field("response").unwrap();
+        *terminal = with(
+            terminal,
+            "response",
+            with(response, "output", Json::parse(output).unwrap()),
+        );
+    };
+    let mut message = fixture_events("round2.sse");
+    let canonical = decode(&message, false).unwrap();
+    set_output(&mut message, "[]");
+    assert_eq!(decode(&message, false).unwrap_err(), "terminal_item_count");
+    let response = decode(&message, true).unwrap();
+    assert_eq!(response.items(), canonical.items());
+    assert!(!response.items().is_empty());
+    assert!(response.calls().is_empty());
+
+    let tail = message.len() - 1;
+    for (field, value) in [
+        ("phase", r#""commentary""#),
+        ("content", "[]"),
+        ("content", r#"[{"type":"output_text","text":"  "}]"#),
+    ] {
+        let done = &message[tail - 1];
+        let item = with(
+            done.field("item").unwrap(),
+            field,
+            Json::parse(value).unwrap(),
+        );
+        let closed = [
+            message[0].clone(),
+            message[1].clone(),
+            with(done, "item", item),
+            message[tail].clone(),
+        ];
+        assert_eq!(decode(&closed, true).unwrap_err(), "terminal_item_count");
+    }
+    assert_eq!(
+        decode(&message[..tail], true).unwrap_err(),
+        "response_premature_eof"
+    );
+    message.remove(tail - 1);
+    assert_eq!(decode(&message, true).unwrap_err(), "terminal_item_count");
+    set_output(&mut message, "[{}]");
+    assert_eq!(decode(&message, true).unwrap_err(), "terminal_item_count");
+
+    let mut mismatch = fixture_events("round2.sse");
+    set_output(&mut mismatch, "[{}]");
+    assert_eq!(
+        decode(&mismatch, true).unwrap_err(),
+        "terminal_item_mismatch"
+    );
+
+    let mut calls = fixture_events("round1.sse");
+    set_output(&mut calls, "[]");
+    assert_eq!(decode(&calls, true).unwrap_err(), "terminal_item_count");
+}
+
+#[test]
 fn replay_serializes_prefix_native_values_and_matching_results() {
     let response = decode("round1.sse").unwrap();
     let mut registry = Registry::new();

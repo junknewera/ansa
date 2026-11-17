@@ -152,6 +152,7 @@ fn explanation(code: &str) -> &'static str {
         "provider_usage_limit" => "Достигнут лимит использования провайдера",
         "session_interrupted" => "Незавершённый запрос восстановлен после перезапуска",
         "opaque_conflict" => "Зашифрованный блок ответа изменился во время получения",
+        "terminal_item_count" => "Части ответа расходятся",
         "cli_output_stalled" => "Приём вывода остановился; сообщение передано не полностью",
         "cli_output_interrupted" => "Передача вывода прервана пользователем",
         "cli_output" => "Не удалось завершить передачу вывода",
@@ -169,7 +170,11 @@ pub(crate) fn pause_notice(view: &Snapshot) -> String {
         return "runtime_failure: Причина паузы не сообщена".into();
     }
     let code = safe_code(&view.diagnostic);
-    format!("{code}: {}", explanation(code))
+    if view.resume_available && view.request.is_some() {
+        format!("{code} · /resume · Ctrl+C · {}", explanation(code))
+    } else {
+        format!("{code}: {}", explanation(code))
+    }
 }
 pub(crate) fn needs_attention(view: &Snapshot) -> bool {
     view.state == "paused" || view.storage_failed || view.recovery_operation.is_some()
