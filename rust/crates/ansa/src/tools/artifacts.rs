@@ -7,12 +7,14 @@ use crate::{
 };
 use std::{
     fs::File,
+    io::Read,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
 pub const DATASET_BYTES: usize = 4 * 1024 * 1024;
 pub const BLOB_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const PREVIEW_PNG_BYTES: usize = 2 * 1024 * 1024;
 const STORE_BYTES: usize = 64 * 1024 * 1024;
 const RESERVATION: usize = 24 * 1024 * 1024;
 pub const OUTPUTS: [(&str, &str); 3] = [
@@ -342,6 +344,41 @@ pub fn validate_descriptor(d: &Json, session: &str, operation: Option<&str>) -> 
     }
     Ok(())
 }
+pub(crate) fn read_preview_png(path: &Path) -> Result<Vec<u8>> {
+    let file = ansa_linux::fs::open_nofollow(path, ansa_linux::local::read_flags())
+        .map_err(|_| "workspace_file_access")?;
+    if !ansa_linux::fs::regular_single(&file).map_err(|_| "workspace_file_type")? {
+        return Err("workspace_file_type");
+    }
+    let mut bytes = Vec::new();
+    file.take(PREVIEW_PNG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "workspace_file_read")?;
+    if bytes.len() > PREVIEW_PNG_BYTES {
+        return Err("preview_png_size");
+    }
+    check_blob("image/png", &bytes)?;
+    let mut decoder = png::Decoder::new_with_limits(
+        std::io::Cursor::new(bytes.as_slice()),
+        png::Limits {
+            bytes: 8 * 1024 * 1024,
+        },
+    );
+    decoder.set_ignore_iccp_chunk(true);
+    decoder.set_ignore_text_chunk(true);
+    let mut reader = decoder.read_info().map_err(|_| "preview_png_decode")?;
+    if reader.info().animation_control.is_some() {
+        return Err("preview_png_animation");
+    }
+    while reader
+        .next_row()
+        .map_err(|_| "preview_png_decode")?
+        .is_some()
+    {}
+    reader.finish().map_err(|_| "preview_png_decode")?;
+    Ok(bytes)
+}
+
 fn check_blob(mime: &str, bytes: &[u8]) -> Result<()> {
     if mime == "image/png" {
         if bytes.len() < 33 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {

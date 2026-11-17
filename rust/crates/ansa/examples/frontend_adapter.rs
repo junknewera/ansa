@@ -485,33 +485,73 @@ fn workspace_edit(root: &Path) -> Result<i32> {
             if root_path.join("fail-generation").exists() {
                 return Err("terminal_item_count");
             }
+            let image = root_path.join("preview-chart").exists();
+            let dataset = root_path.join("preview-dataset").exists();
             if let Some(last) = request.input.last()
                 && last.text_field("type") == Ok("function_call_output")
             {
                 let output = Json::parse(last.text_field("output")?)?;
+                if image || dataset {
+                    return final_response(
+                        request,
+                        output.text_field("status").unwrap_or("PNG_REJECTED"),
+                    );
+                }
                 if !output.field("applied")?.boolean()? {
                     return Err("fixture_edit_not_applied");
                 }
                 return final_response(request, "EDIT_DONE");
             }
-            let arguments = obj(vec![
-                ("path", s("edit-target.rs")),
-                ("old_text", s("old();")),
-                ("new_text", s("new();")),
-                ("instruction_token", s(&instruction_token)),
-            ]);
+            let (name, arguments) = if dataset {
+                (
+                    "python_execute",
+                    obj(vec![
+                        ("path", s("sales.csv")),
+                        ("date_column", s("date")),
+                        ("value_column", s("amount")),
+                        ("report_key", s("sales")),
+                        ("instruction_token", s(&instruction_token)),
+                    ]),
+                )
+            } else if image {
+                let path = if root_path.join("preview-other").exists() {
+                    "other.png"
+                } else {
+                    "chart.png"
+                };
+                (
+                    "show_png",
+                    obj(vec![
+                        ("path", s(path)),
+                        ("instruction_token", s(&instruction_token)),
+                    ]),
+                )
+            } else {
+                (
+                    "edit_file",
+                    obj(vec![
+                        ("path", s("edit-target.rs")),
+                        ("old_text", s("old();")),
+                        ("new_text", s("new();")),
+                        ("instruction_token", s(&instruction_token)),
+                    ]),
+                )
+            };
             let call = obj(vec![
                 ("type", s("function_call")),
-                ("id", s("visual_edit_item")),
-                ("call_id", s("visual_edit_call")),
+                ("id", s(&format!("visual_item_{}", request.input.len()))),
+                (
+                    "call_id",
+                    s(&format!("visual_call_{}", request.input.len())),
+                ),
                 ("namespace", s("omh")),
-                ("name", s("edit_file")),
+                ("name", s(name)),
                 ("arguments", s(&arguments.dump())),
                 ("status", s("completed")),
             ]);
             native::load(&obj(vec![
                 ("request", request.save()?),
-                ("id", s("visual_edit_response")),
+                ("id", s(&format!("visual_response_{}", request.input.len()))),
                 ("model", s(&request.binding.returned_model)),
                 ("items", Json::array(vec![call])?),
             ]))

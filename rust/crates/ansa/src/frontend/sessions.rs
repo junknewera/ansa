@@ -91,6 +91,10 @@ impl Factory {
     pub fn summaries(&self, stop: &Cancel) -> Result<Vec<crate::session::catalog::SessionSummary>> {
         self.settings.catalog(self.profile())?.summaries(stop)
     }
+    pub(super) fn artifacts(&self, id: &str) -> Result<crate::tools::artifacts::Store> {
+        let selected = self.settings.catalog(self.profile())?.explicit(id)?;
+        crate::tools::artifacts::Store::new(&selected.directory)
+    }
     pub fn create(&self, kind: Kind, seed: Option<ForkSeed>) -> Result<Created> {
         if matches!(kind, Kind::Fork | Kind::Btw | Kind::Agent) && seed.is_none() {
             return Err("session_context_required");

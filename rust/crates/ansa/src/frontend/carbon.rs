@@ -38,6 +38,7 @@ pub struct Frame {
     output_views: std::collections::BTreeMap<String, std::sync::Arc<OutputView>>,
     inspector_bounds: Option<(usize, usize, usize, usize)>,
     terminal_rows: std::collections::BTreeSet<usize>,
+    pub(super) image: Option<super::graphics::Placement>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRow {
@@ -54,6 +55,12 @@ impl PaneRow {
     }
 }
 impl Frame {
+    pub(super) fn needs_full_paint(&self, previous: &Self) -> bool {
+        self.viewport.is_none()
+            || self.viewport != previous.viewport
+            || self.lines.len() != previous.lines.len()
+    }
+
     pub fn output_view(&self, key: &str) -> Option<std::sync::Arc<OutputView>> {
         self.output_views.get(key).cloned()
     }
@@ -204,10 +211,7 @@ impl Frame {
         out
     }
     pub fn paint_changes(&self, previous: &Self) -> String {
-        if self.viewport.is_none()
-            || self.viewport != previous.viewport
-            || self.lines.len() != previous.lines.len()
-        {
+        if self.needs_full_paint(previous) {
             return self.paint(previous.lines.len());
         }
         let mut out = String::from("\r");
@@ -835,6 +839,7 @@ fn layout_impl(
         panes: Vec::new(),
         themed: false,
         selection_style: None,
+        image: None,
     })
 }
 
@@ -853,6 +858,7 @@ pub enum InspectorKind {
     Diff,
     Markdown,
     Command,
+    Image,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inspector {
@@ -1358,9 +1364,17 @@ pub fn layout_workspace(
         color,
     ));
     rows.push(rule(width, color));
-    let side_by_side = ui.inspector.is_some() && width >= 100;
+    let picture = ui
+        .inspector
+        .as_ref()
+        .is_some_and(|p| p.kind == InspectorKind::Image);
+    let side_by_side = ui.inspector.is_some() && (width >= 100 || picture && width >= 63);
     let panel_width = if side_by_side {
-        (width * 2 / 5).max(34)
+        if picture {
+            width / 2
+        } else {
+            (width * 2 / 5).max(34)
+        }
     } else {
         width
     };
@@ -1545,6 +1559,7 @@ pub fn layout_workspace(
     Some(Frame {
         lines: rows,
         status_rows: vec![height - 2, height - 1],
+        image: None,
         panes,
         themed: false,
         selection_style: None,
@@ -1942,6 +1957,7 @@ impl Selection {
     /// the source bytes used by `finish`. Reflow resumes after the drag ends.
     pub fn frame_at(&self, size: (usize, usize), color: bool) -> Frame {
         let mut frame = self.frozen.clone();
+        frame.image = None;
         let columns = size.0.saturating_sub(1);
         frame.lines.clear();
         frame.panes = vec![None; size.1];
