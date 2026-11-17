@@ -4,34 +4,56 @@ use ansa::{
         protocol_v1::*,
         sessions::{Factory, Kind},
     },
-    runtime::Runtime,
+    runtime::{PostStatus, Runtime},
 };
 use std::{
-    path::PathBuf,
+    fs::{self, DirBuilder},
+    io::ErrorKind,
+    os::unix::fs::DirBuilderExt,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ansa-carbon-sessions-{}-{}",
-            std::process::id(),
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self::with_clock(
+            &std::env::temp_dir(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
-        ));
-        for name in ["", "home", "work"] {
-            ansa_linux::fs::create_private(&path.join(name)).unwrap();
+                .as_nanos(),
+            &NEXT,
+        )
+    }
+    fn with_clock(parent: &Path, clock: u128, next: &AtomicU64) -> Self {
+        let fixture = loop {
+            let suffix = next.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                "ansa-carbon-sessions-{}-{clock}-{suffix}",
+                std::process::id()
+            ));
+            match DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => break Self(path),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("fixture directory: {error}"),
+            }
+        };
+        for name in ["home", "work"] {
+            ansa_linux::fs::create_private(&fixture.0.join(name)).unwrap();
         }
-        Self(path)
+        fixture
     }
     fn factory(&self) -> Factory {
-        let settings = load_agent_settings(&self.0.join("work"), &self.0.join("home")).unwrap();
+        Self::factory_at(&self.0)
+    }
+    fn factory_at(root: &Path) -> Factory {
+        let settings = load_agent_settings(&root.join("work"), &root.join("home")).unwrap();
         Factory::new(
             settings,
-            self.0.join("auth"),
+            root.join("auth"),
             true,
             "offline-fixture".into(),
             None,
@@ -42,6 +64,131 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn fixture_clock_collisions_and_cleanup_preserve_another_live_journal() {
+    use std::os::unix::fs::PermissionsExt;
+    struct LegacyFixture(PathBuf);
+    impl LegacyFixture {
+        fn with_fixed_clock(parent: &Path, clock: u128) -> Self {
+            let path = parent.join(format!(
+                "ansa-carbon-sessions-{}-{clock}",
+                std::process::id()
+            ));
+            // Reproduce the old reuse of an existing root only inside the
+            // regression's exclusively owned evidence directory.
+            for name in ["", "home", "work"] {
+                ansa_linux::fs::create_private(&path.join(name)).unwrap();
+            }
+            Self(path)
+        }
+    }
+    impl Drop for LegacyFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    async fn plan(runtime: &Runtime, id: &str) -> ansa::frontend::protocol_v1::Snapshot {
+        assert_eq!(
+            runtime
+                .post(command(
+                    runtime,
+                    id,
+                    CommandPayload::Submit(Submit {
+                        text: "inspect only".into(),
+                        mode: AgentMode::Plan,
+                    })
+                ))
+                .await
+                .unwrap(),
+            PostStatus::Accepted,
+        );
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), runtime.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            match event.payload {
+                EventPayload::FrontendSnapshot(view)
+                    if view.storage_failed
+                        || view.state == "paused"
+                        || view.submit.as_ref().is_some_and(|submit| submit.0 == id)
+                            && view.state == "completed"
+                            && !view.worker_busy =>
+                {
+                    return *view;
+                }
+                EventPayload::ResyncRequired { .. } => panic!("fixture regression event overflow"),
+                _ => {}
+            }
+        }
+    }
+    const CLOCK: u128 = 42;
+    let evidence = Fixture::new();
+    {
+        let first = LegacyFixture::with_fixed_clock(&evidence.0, CLOCK);
+        let second = LegacyFixture::with_fixed_clock(&evidence.0, CLOCK);
+        assert_eq!(first.0, second.0);
+        let mut main = Fixture::factory_at(&second.0)
+            .create(Kind::Main, None)
+            .unwrap();
+        main.runtime.ready().await.unwrap();
+        let part = main
+            .selected
+            .directory
+            .join("part-00000000000000000000.log");
+        assert!(part.is_file());
+        drop(first);
+        assert!(!part.exists());
+        let view = plan(&main.runtime, "old_fixture_plan").await;
+        assert_eq!(view.state, "paused");
+        assert!(view.storage_failed);
+        assert_eq!(view.diagnostic, "journal_write_conflict");
+        main.runtime.shutdown().await.unwrap();
+        drop(second);
+    }
+    assert!(evidence.0.is_dir());
+    let stale = evidence.0.join(format!(
+        "ansa-carbon-sessions-{}-{CLOCK}-0",
+        std::process::id()
+    ));
+    DirBuilder::new().mode(0o700).create(&stale).unwrap();
+    fs::write(stale.join("marker"), b"stale owned evidence").unwrap();
+    let next = AtomicU64::new(0);
+    let first = Fixture::with_clock(&evidence.0, CLOCK, &next);
+    let second = Fixture::with_clock(&evidence.0, CLOCK, &next);
+    assert_ne!(first.0, second.0);
+    assert_ne!(first.0, stale);
+    assert_ne!(second.0, stale);
+    assert_eq!(
+        fs::metadata(&first.0).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&second.0).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let mut main = second.factory().create(Kind::Main, None).unwrap();
+    main.runtime.ready().await.unwrap();
+    let part = main
+        .selected
+        .directory
+        .join("part-00000000000000000000.log");
+    let before = fs::read(&part).unwrap();
+    assert!(!before.is_empty());
+    drop(first);
+    assert!(second.0.is_dir());
+    assert_eq!(fs::read(&part).unwrap(), before);
+    let view = plan(&main.runtime, "owned_fixture_plan").await;
+    assert_eq!(view.state, "completed", "{}", view.diagnostic);
+    assert!(!view.storage_failed, "{}", view.diagnostic);
+    assert!(part.is_file());
+    assert!(fs::read(&part).unwrap().len() > before.len());
+    assert_eq!(
+        fs::read(stale.join("marker")).unwrap(),
+        b"stale owned evidence"
+    );
+    main.runtime.shutdown().await.unwrap();
 }
 fn command(runtime: &Runtime, id: &str, payload: CommandPayload) -> RuntimeCommand {
     let h = runtime.handle();
