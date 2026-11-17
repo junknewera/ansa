@@ -16,6 +16,16 @@ incarnation и ID; действия над turn требуют также turn �
 передача команды означает posted, durable acceptance подтверждается отдельно.
 Reconnect сам по себе не повторяет действие и не меняет ID.
 
+Editor capability `submit_message` передаёт полный текст, turn, target и
+expected_mode. При target=null создаётся Submit, при точном request - Steer.
+Stable native ID включает hash клиентского namespace и исходный message ID.
+`message_lookup` возвращает метаданные исходного Submit/Steer и hash текста,
+без самого текста или tool output. `admission_durable` подтверждает сохранение
+сообщения; `state_durable` отдельно подтверждает сохранение показанного состояния.
+Отсутствие receipt не доказывает, что переданный ранее запрос не будет принят.
+Клиент повторяет только bounded status reads. `cancel_message` использует
+подтверждённые turn/request своей задачи и отдельную priority очередь runtime.
+
 DTO содержит подтверждённые реплики, явно обозначенный preview, состояние
 turn и проверенные descriptors артефактов. Внутренние credentials, fork seed,
 opaque reasoning и raw tool outputs не сериализуются. Пользовательский текст

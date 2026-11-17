@@ -77,6 +77,11 @@ impl Factory {
         self.editor = Some((directory, editor));
         self
     }
+    pub fn set_editor_mode(&self, mode: crate::runtime::AgentMode) {
+        if let Some((_, hub)) = &self.editor {
+            hub.set_mode(mode);
+        }
+    }
     fn profile(&self) -> &'static str {
         if self.offline { "offline" } else { "live" }
     }

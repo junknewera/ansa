@@ -2,12 +2,14 @@ local M = {}
 local uv = vim.uv or vim.loop
 local cap = 512 * 1024
 local state = { client = string.format('nvim_%d_%.0f', uv.os_getpid(), uv.hrtime()), pending = {}, sequence = 0 }
+local messages
 
 local function notify(message)
   vim.notify(message, vim.log.levels.INFO, { title = 'ANSA' })
 end
 
 local function disconnect()
+  if messages then messages:disconnected() end
   if state.pipe then
     state.pipe:read_stop()
     if not state.pipe:is_closing() then state.pipe:close() end
@@ -16,6 +18,7 @@ local function disconnect()
   state.attachment = nil
   state.buffered = ''
   state.pending = {}
+  state.pending_bytes = 0
   state.latest = nil
   state.snapshot = nil
   state.scheduled = false
@@ -137,6 +140,7 @@ local function render(snapshot)
 end
 
 local function receive(message)
+  if messages and messages:handle(message) then return end
   if message.type == 'welcome' then
     if message.version ~= 1 or message.role ~= state.requested_role then
       disconnect()
@@ -153,6 +157,7 @@ local function receive(message)
     end
     send({ kind = 'snapshot' })
     history()
+    messages:attached()
   elseif message.type == 'snapshot' then
     render(message)
   elseif message.type == 'history' then
@@ -186,6 +191,9 @@ local function receive(message)
       notify('История ANSA недоступна: ' .. tostring(message.status) .. '. :AnsaRefresh повторяет чтение')
     end
   elseif message.type == 'context_published' and state.share_pending and message.id == state.share_pending.id then
+    -- Apply the already received projection before routing a send as Submit
+    -- or Steer. ACKs and snapshots can share one socket read.
+    if state.latest then local latest = state.latest; state.latest = nil; render(latest) end
     local pending = state.share_pending
     state.share_pending = nil
     local context = pending.context
@@ -196,7 +204,7 @@ local function receive(message)
       notify('Выделение изменилось; повторите :AnsaShare')
     else
       state.shared = context
-      notify('Выделение передано в workspace')
+      if pending.after then pending.after(context, message.mode) else notify('Выделение доступно агенту') end
     end
   elseif message.type == 'gap' then
     -- Every update is a complete replacement snapshot with its own barrier.
@@ -254,7 +262,9 @@ function M.attach(path, options)
           return
         end
         if message.type == 'snapshot' then state.latest = message
-        elseif #state.pending < 4 then table.insert(state.pending, message)
+        elseif #state.pending < 8 and state.pending_bytes + #line <= 2 * 1024 * 1024 then
+          table.insert(state.pending, message)
+          state.pending_bytes = state.pending_bytes + #line
         else
           pipe:read_stop()
           vim.schedule(function() if state.pipe == pipe then disconnect(); notify('Переполнена очередь workspace') end end)
@@ -273,6 +283,7 @@ function M.attach(path, options)
           state.scheduled = false
           local messages = state.pending
           state.pending = {}
+          state.pending_bytes = 0
           for _, message in ipairs(messages) do receive(message) end
           if state.latest then local latest = state.latest; state.latest = nil; receive(latest) end
         end)
@@ -289,10 +300,11 @@ function M.open()
 end
 
 function M.status()
-  return { connected = state.attachment ~= nil, snapshot = state.snapshot, buffer = state.history_buf, shared = state.shared }
+  return { connected = state.attachment ~= nil, snapshot = state.snapshot, buffer = state.history_buf, shared = state.shared,
+    pending_message = messages.pending, last_message = messages.last, message_draft = messages.draft }
 end
 
-function M.share(first, last)
+function M.share(first, last, after)
   if state.share_pending then notify('Дождитесь подтверждения предыдущего выделения'); return end
   if not state.attachment or state.attachment.role ~= 'editor' then
     notify('Для передачи выделения нужны --workspace-editor и :AnsaAttach!'); return
@@ -310,14 +322,22 @@ function M.share(first, last)
     changedtick = vim.api.nvim_buf_get_changedtick(buf), sequence = state.context_sequence,
     path = path, filetype = vim.bo[buf].filetype, first_line = first, text = text }
   local ok, id = send({ kind = 'publish_context', context = context })
-  if ok then state.share_pending = { id = id, context = context, name = name } else notify(id) end
+  if ok then state.share_pending = { id = id, context = context, name = name, after = after } else notify(id) end
 end
+
+function M.send(first,last,prompt) messages:submit(first,last,prompt or '') end
 
 function M.setup()
   vim.api.nvim_create_user_command('AnsaAttach', function(args) M.attach(args.args, {editor=args.bang}) end,
     { nargs = 1, bang = true, complete = 'file', desc = 'Подключиться к Carbon workspace; ! передаёт контекст редактора' })
   vim.api.nvim_create_user_command('AnsaShare', function(args) M.share(args.line1, args.line2) end,
     { range = true, desc = 'Передать выбранные строки агенту без сохранения файла' })
+  vim.api.nvim_create_user_command('AnsaSend',function(args) M.send(args.line1,args.line2,args.args) end,
+    {range=true,nargs='*',desc='Отправить задачу с выделением или уточнение текущей задачи'})
+  vim.api.nvim_create_user_command('AnsaPending',function() messages:inspect(true) end,{desc='Проверить исход отправки по ID'})
+  vim.api.nvim_create_user_command('AnsaCancel',function() messages:cancel() end,{desc='Остановить свою подтверждённую задачу'})
+  vim.api.nvim_create_user_command('AnsaForgetPending',function(args) messages:forget(args.bang) end,
+    {bang=true,desc='Забыть локальную неподтверждённую отправку после проверки истории'})
   vim.api.nvim_create_user_command('AnsaHistory', M.open, { desc = 'Открыть историю ANSA' })
   vim.api.nvim_create_user_command('AnsaRefresh', function()
     state.history_retries = 0
@@ -348,5 +368,9 @@ function M.setup()
     end,
   })
 end
+
+messages=require('ansa.messages').new({send=send,notify=notify,client=function() return state.client end,
+  attachment=function() return state.attachment end,snapshot=function() return state.snapshot end,
+  share=function(...) return M.share(...) end})
 
 return M

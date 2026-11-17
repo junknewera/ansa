@@ -1438,7 +1438,11 @@ impl Workbench {
                 } else {
                     text
                 };
-                slot.state.text(routed, &slot.handle, io, &mut slot.replies)
+                let result = slot.state.text(routed, &slot.handle, io, &mut slot.replies);
+                if slot.id == self.root_id {
+                    self.factory.set_editor_mode(slot.state.mode);
+                }
+                result
             }
         }
     }
@@ -3032,7 +3036,7 @@ pub async fn run_attached(
     let mut editor_cancel_since: Option<Instant> = None;
     let result: Result<()> = async {
         while !finished || work.editor.is_some() {
-            if let Some(bridge) = &bridge
+            if let Some(bridge) = &mut bridge
                 && let Some(root) = work.slots.iter().find(|slot| slot.id == work.root_id) {
                 bridge.set_input_mode(root.state.mode);
             }

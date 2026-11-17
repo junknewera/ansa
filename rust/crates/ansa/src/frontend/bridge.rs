@@ -18,6 +18,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
+mod control;
 
 pub const FRAME_BYTES: usize = 128 * 1024;
 pub const OUTPUT_BYTES: usize = 512 * 1024;
@@ -82,6 +83,7 @@ pub struct Bridge {
     identity: (u64, u64),
     pages: Arc<Mutex<Pages>>,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    control: Arc<control::Control>,
 }
 #[derive(Default)]
 struct Pages {
@@ -167,6 +169,8 @@ impl Bridge {
         let pages = Arc::new(Mutex::new(Pages::default()));
         let task_pages = pages.clone();
         let task_editor = editor.clone();
+        let control = control::Control::new(handle.clone(), editor.clone());
+        let task_control = control.clone();
         let task = tokio::spawn(async move {
             serve(
                 listener,
@@ -176,6 +180,7 @@ impl Bridge {
                 uid,
                 task_pages,
                 task_editor,
+                task_control,
             )
             .await;
         });
@@ -189,14 +194,28 @@ impl Bridge {
             identity,
             pages,
             editor,
+            control,
         })
     }
     pub fn socket(&self) -> &Path {
         &self.socket
     }
-    pub fn set_input_mode(&self, mode: AgentMode) {
+    pub fn set_input_mode(&mut self, mode: AgentMode) {
         if let Some(editor) = &self.editor {
             editor.set_mode(mode);
+            let label = if mode == AgentMode::Plan {
+                "plan"
+            } else {
+                "basic"
+            };
+            if self.view.state.text_field("input_mode").ok() != Some(label) {
+                self.view.state = self
+                    .view
+                    .state
+                    .with("input_mode", s(label).unwrap())
+                    .unwrap();
+                self.changed();
+            }
         }
     }
 
@@ -206,6 +225,7 @@ impl Bridge {
         {
             return;
         }
+        self.control.publish(event);
         match &event.payload {
             EventPayload::FrontendSnapshot(snapshot) => {
                 self.pages
@@ -225,6 +245,27 @@ impl Bridge {
                     ),
                     ("durable", flag(snapshot.durable)),
                     ("busy", flag(snapshot.worker_busy)),
+                    (
+                        "input_mode",
+                        self.editor.as_ref().map_or_else(
+                            || {
+                                s(if snapshot.mode == AgentMode::Plan {
+                                    "plan"
+                                } else {
+                                    "basic"
+                                })
+                                .unwrap()
+                            },
+                            |e| {
+                                s(if e.mode() == AgentMode::Plan {
+                                    "plan"
+                                } else {
+                                    "basic"
+                                })
+                                .unwrap()
+                            },
+                        ),
+                    ),
                     ("transcript_total", n(snapshot.transcript_size)),
                     (
                         "mode",
@@ -300,6 +341,9 @@ impl Bridge {
             }
             _ => return,
         }
+        self.changed();
+    }
+    fn changed(&mut self) {
         self.view.cursor += 1;
         let frame = self
             .view
@@ -328,6 +372,7 @@ impl Drop for Bridge {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     listener: UnixListener,
     handle: Handle,
@@ -336,6 +381,7 @@ async fn serve(
     uid: u32,
     pages: Arc<Mutex<Pages>>,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    control: Arc<control::Control>,
 ) {
     let mut clients = JoinSet::new();
     let mut connection = 0usize;
@@ -351,7 +397,8 @@ async fn serve(
                     let h = handle.clone(); let v = view.clone(); let stopped = stop.clone();
                     let p = pages.clone();
                     let e = editor.clone();
-                    clients.spawn(async move { let _ = client(stream, h, v, stopped, p, prefix, e).await; });
+                    let c=control.clone();
+                    clients.spawn(async move { let _ = client(stream, h, v, stopped, p, prefix, e, c).await; });
                 }
             }
         }
@@ -412,6 +459,7 @@ async fn client(
     pages: Arc<Mutex<Pages>>,
     prefix: String,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    control: Arc<control::Control>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut read = FrameReader::new(BufReader::new(read));
@@ -456,6 +504,9 @@ async fn client(
                     s("history")?,
                     s("publish_context")?,
                     s("invalidate_context")?,
+                    s("submit_message")?,
+                    s("message_lookup")?,
+                    s("cancel_message")?,
                 ]
             } else {
                 vec![s("snapshot")?, s("history")?]
@@ -498,10 +549,22 @@ async fn client(
     let reader = async {
         type PageJob = std::pin::Pin<Box<dyn std::future::Future<Output = Arc<String>> + Send>>;
         let mut page_job: Option<PageJob> = None;
+        let mut control_job: Option<control::Job> = None;
+        let mut cancel_job: Option<control::Job> = None;
         loop {
             let frame = tokio::select! { biased;
                 _ = stop.changed() => break,
                 _ = out.closed() => break,
+                response = async { cancel_job.as_mut().expect("enabled").await }, if cancel_job.is_some() => {
+                    cancel_job=None;
+                    out.try_send(response).map_err(|_|"workspace_slow_reader")?;
+                    continue;
+                }
+                response = async { control_job.as_mut().expect("enabled").await }, if control_job.is_some() => {
+                    control_job=None;
+                    out.try_send(response).map_err(|_|"workspace_slow_reader")?;
+                    continue;
+                }
                 response = async { page_job.as_mut().expect("enabled").await }, if page_job.is_some() => {
                     page_job = None;
                     out.try_send(response).map_err(|_| "workspace_slow_reader")?;
@@ -521,6 +584,30 @@ async fn client(
                 return Err("workspace_request_id");
             }
             let kind = frame.text_field("kind")?;
+            if role == "editor"
+                && matches!(kind, "submit_message" | "cancel_message" | "message_lookup")
+            {
+                let job = if kind == "cancel_message" {
+                    &mut cancel_job
+                } else {
+                    &mut control_job
+                };
+                if job.is_some() {
+                    out.try_send(encoded(&obj(vec![
+                        ("type", s("error")?),
+                        ("id", s(id)?),
+                        ("code", s("workspace_busy")?),
+                    ]))?)
+                    .map_err(|_| "workspace_slow_reader")?;
+                } else {
+                    *job = Some(if kind == "message_lookup" {
+                        control.read(client_id, &frame, format!("{prefix}_{sequence}"))
+                    } else {
+                        control.send(client_id, &frame)
+                    });
+                }
+                continue;
+            }
             if kind == "history" && page_job.is_some() {
                 out.try_send(encoded(&obj(vec![
                     ("type", s("posted")?),
@@ -565,6 +652,17 @@ async fn client(
                         ("buffer", n(context.buffer)),
                         ("changedtick", n(context.changedtick)),
                         ("sequence", n(context.sequence)),
+                        (
+                            "mode",
+                            s(
+                                if editor.as_ref().expect("editor grant").mode() == AgentMode::Plan
+                                {
+                                    "plan"
+                                } else {
+                                    "basic"
+                                },
+                            )?,
+                        ),
                     ]),
                     Err(code) => obj(vec![
                         ("type", s("error")?),
@@ -584,8 +682,12 @@ async fn client(
                     forward: frame.field("forward")?.boolean()?,
                 }),
                 _ => {
-                    out.try_send(encoded(&error("workspace_permission_denied"))?)
-                        .map_err(|_| "workspace_slow_reader")?;
+                    out.try_send(encoded(&obj(vec![
+                        ("type", s("error")?),
+                        ("id", s(id)?),
+                        ("code", s("workspace_permission_denied")?),
+                    ]))?)
+                    .map_err(|_| "workspace_slow_reader")?;
                     continue;
                 }
             };

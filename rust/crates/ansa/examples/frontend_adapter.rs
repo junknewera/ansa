@@ -74,6 +74,9 @@ fn command(c: &RuntimeCommand) -> Json {
             ("effort", v.effort.as_deref().map_or_else(null, s)),
         ]),
         CommandPayload::GetContext => f.push(("type", s("context"))),
+        CommandPayload::GetMessageReceipt(v) => {
+            f.extend([("type", s("message_receipt_query")), ("target", s(&v.0))])
+        }
         CommandPayload::Resume(v) => f.extend([("type", s("resume")), ("target", s(&v.0))]),
         CommandPayload::GetSnapshot(v) => {
             f.extend([("type", s("snapshot")), ("after_sequence", n(*v as usize))])

@@ -37,6 +37,22 @@ write при отзыве контекста. Отдельные native-тест
 Независимый source review context subset закрыт без открытых замечаний.
 Следующий шаг - typed selection submit с проверяемым исходом по ID.
 
+Editor sender добавлен в WIP: `:AnsaSend` передаёт выделение как typed Submit
+или Steer текущего request. `:AnsaPending` проверяет исход по прежнему ID и
+hash текста. Отдельно возвращается сохранность сообщения и текущего состояния;
+нет автоматического повтора вычисления при отсутствии подтверждения.
+`:AnsaCancel` адресует свою подтверждённую задачу через priority Cancel.
+Проверка настоящего bridge с удержанным journal fsync подтвердила отмену при
+занятой отправке и заполненной обычной очереди.
+
+Sender subset прошёл **324 native + 9 doctests**, дополнительную native
+регрессию priority Cancel, production Carbon/Neovim **7/7** и Neovim fault
+**6/6**. Последние проверяют потерю ACK и reconnect, неизменный payload,
+bounded status reads, конфликт ID, сохранение черновика при смене режима
+и ACK вместе со свежим snapshot. Независимый source review закрыт; найденная
+гонка маршрутизации по старому snapshot исправлена. fmt/clippy всех
+targets/features прошли. Полная финальная матрица PR #26 ещё не выполнялась.
+
 ## Carbon: управление, читаемые инструменты и терминал проекта
 
 **GO**, проверенный code checkpoint
