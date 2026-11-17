@@ -1,5 +1,8 @@
 //! Carbon layout in the main screen buffer. All untrusted bytes are sanitized.
 use super::cells as display_cells;
+
+pub(super) const NARROW_WORKSPACE_COLUMNS: usize = 80;
+
 /// Immutable, decoded output belonging to the tool row that was displayed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputView {
@@ -1333,7 +1336,7 @@ pub fn layout_workspace(
     let body_height = height.saturating_sub(7 + editor.len()).max(1);
     let mut rows = vec![heading(
         &format!("ANSA  {context}"),
-        if width < 79 { &ui.model } else { "" },
+        &ui.model,
         width,
         color,
     )];
@@ -1466,7 +1469,7 @@ pub fn layout_workspace(
         metadata.push_str(&ui.effort);
     }
     let detail = status.lines().next().unwrap_or_default();
-    let narrow = width < 79;
+    let narrow = columns <= NARROW_WORKSPACE_COLUMNS;
     let terminal = ui.focus == Focus::Inspector
         && ui.popup.is_none()
         && ui

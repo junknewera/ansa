@@ -354,24 +354,29 @@ def input_and_copy(screen, root, cwd):
 
 
 def mouse_copy(screen, root, cwd):
+    model = screen.vt.line(0).split()[-1]
     screen.send("MOUSE_COPY Ж界😀\r")
     until(screen, lambda frame: completed(root, "MOUSE_COPY Ж界😀") and ready(screen), "mouse-copy conversation content")
+    paint_quiet(screen)
     row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> MOUSE_COPY"))
     before = journals(root)
     at = len(screen.raw)
     mouse(screen, 0, 2, row)
     mouse(screen, 32, 2 + len("MOUSE_COPY") - 1, row)
-    screen.resize(70, 20)
-    screen.vt = Terminal(70, 20)
-    for _ in range(12):
-        screen.drain(.01)
+    screen.wait(b"\x1b[7mM", at)
+    before_resize = len(screen.raw)
+    screen.resize(80, 20)
+    screen.vt = Terminal(80, 20)
+    screen.wait(b"\x1b[7mMOUSE_COPY", before_resize)
+    until(screen, lambda frame: "Работа · Чат · готов" in screen.vt.line(-2), "compact status after resize")
     mouse(screen, 0, 2 + len("MOUSE_COPY") - 1, row, release=True)
     text = copied(screen, at)
     assert text == "MOUSE_COPY" and "\x1b" not in text, repr(text)
+    escape(screen)
+    until(screen, lambda frame: screen.vt.line(0).split().count(model) == 1, "one model in the narrow live header")
     assert journals(root) == before, "selection or resize changed the canonical conversation"
     screen.resize(100, 32)
     screen.vt = Terminal(100, 32)
-    escape(screen)
     screen.send("still editable")
     until(screen, lambda frame: "still editable" in frame, "selection return")
 

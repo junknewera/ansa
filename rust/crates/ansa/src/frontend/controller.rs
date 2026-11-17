@@ -784,8 +784,8 @@ impl State {
             .is_some_and(|p| !p.text.is_empty() && p.state == "preview")
             && self.preview_request == view.request;
         let phase = Progress::phase(view, preview);
+        let narrow = io.size.0 <= carbon::NARROW_WORKSPACE_COLUMNS;
         let mut status = if let Some(ui) = ui {
-            let narrow = io.size.0 < 80;
             let terminal = ui.focus == carbon::Focus::Inspector
                 && ui
                     .inspector
@@ -842,7 +842,7 @@ impl State {
         }
         if !self.follow_tail {
             let unread = view.transcript_size.saturating_sub(self.reading_total);
-            if ui.is_some() && io.size.0 < 80 {
+            if ui.is_some() && narrow {
                 status.push_str(&format!(" · +{unread}"));
             } else {
                 status.push_str(&format!("  чтение, новых: {unread}"));
