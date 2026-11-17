@@ -229,8 +229,9 @@ def completed(root, text):
     return any(row['kind'] == 'done' and row['turn'] in turns for row in rows)
 
 
-def start(binary, root, home, cwd, screens, label, adapter=False, size=(112, 40)):
+def start(binary, root, home, cwd, screens, label, adapter=False, size=(112, 40), extra_env=None):
     extra = {'XDG_CACHE_HOME': str(root / 'cache')}
+    extra.update(extra_env or {})
     argv = None if adapter else ['--offline', '--cwd', str(cwd)]
     screen = Pty(str(binary), root, home, cwd, 'workspace-edit' if adapter else '', False,
                  size=size, argv=argv, extra_env=extra)
@@ -430,7 +431,40 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
 
 def inline_edit(binary, adapter, root, home, cwd, screens):
     screen = start(adapter, root, home, cwd, screens, 'edit', adapter=True, size=(96, 40))
-    screen.send('EDIT_VISUAL_TASK\r')
+    hold = root / 'hold-generation'
+    hold.touch()
+    try:
+        screen.send('EDIT_VISUAL_TASK\r')
+        spinners = set('⠋⠙⠹⠸⠼⠴⠦⠧')
+
+        def activity():
+            return [(row, screen.vt.line(row)[0]) for row in range(3, screen.vt.rows - 5)
+                    if screen.vt.line(row)[:1] in spinners and 'ожидание модели' in screen.vt.line(row)]
+
+        until(screen, lambda text: 'EDIT_VISUAL_TASK' in screen.vt.line(3) and bool(activity()),
+              'accepted user body and generating activity under fixture hold', timeout=3)
+        assert not (root / 'generated').exists(), 'fixture did not hold the first generation'
+        since = len(screen.raw)
+        began = time.monotonic()
+        observed = set(activity())
+        # No user input, provider reply or file change drives these repaints.
+        # The owner must schedule animation beyond its one-second clock.
+        while time.monotonic() - began < .65:
+            screen.drain(.01)
+            visible(screen)
+            current = activity()
+            assert current and screen.child.poll() is None, ('activity vanished during idle animation', visible(screen))
+            observed.update(current)
+        idle_elapsed = time.monotonic() - began
+        assert idle_elapsed < .95, ('animation observation overscheduled', idle_elapsed)
+        idle_delta = screen.raw[since:]
+        assert len({row for row, _ in observed}) == 1, ('activity moved screen rows', observed)
+        assert len({glyph for _, glyph in observed}) >= 3, ('activity did not animate independently of the one-second clock', observed)
+        assert len(idle_delta) < 8 * 1024 and b'\x1b[2J' not in idle_delta, ('animation repainted the canvas', len(idle_delta))
+        assert not (root / 'generated').exists(), 'provider fixture completed during idle observation'
+        snapshot(screen, 'idle-animation')
+    finally:
+        hold.unlink(missing_ok=True)
     until(screen, lambda text: completed(root, 'EDIT_VISUAL_TASK') and 'EDIT_DONE' in text and 'Изменён' in text, 'acknowledged edit inline diff')
     assert (cwd / 'edit-target.rs').read_text() == 'fn main() {\n    new();\n}\n'
     assert '(+1 -1)' in visible(screen)
@@ -480,7 +514,57 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     assert value['after_hash'] == hashlib.sha256(value['after'].encode()).hexdigest()
     assert (root / 'generated').read_bytes() == b'xx', 'unexpected repeated model dispatch'
     finish(screen)
-    return {'added': 1, 'removed': 1, 'effective_add_bg': added, 'effective_remove_bg': removed}
+    with tempfile.TemporaryDirectory(prefix='ansa-m4-', dir='/tmp') as directory:
+        quiet_root = Path(directory)
+        quiet_home, quiet_cwd = roots(quiet_root)
+        quiet_hold = quiet_root / 'hold-generation'
+        quiet_hold.touch()
+        quiet = start(adapter, quiet_root, quiet_home, quiet_cwd, screens, 'edit-reduced-motion',
+                      adapter=True, size=(96, 40), extra_env={'ANSA_NO_ANIMATION': '1'})
+        try:
+            quiet.send('EDIT_REDUCED_MOTION_TASK\r')
+
+            def quiet_activity():
+                return [row for row in range(3, quiet.vt.rows - 5)
+                        if quiet.vt.line(row).startswith('◷ ') and 'ожидание модели' in quiet.vt.line(row)]
+
+            until(quiet, lambda text: 'EDIT_REDUCED_MOTION_TASK' in quiet.vt.line(3) and bool(quiet_activity()),
+                  'reduced-motion activity under fixture hold', timeout=3)
+            quiet_row = quiet_activity()
+            assert len(quiet_row) == 1 and not (quiet_root / 'generated').exists()
+            quiet_style = quiet.vt.attrs[quiet_row[0]].copy()
+            quiet_since = len(quiet.raw)
+            quiet_began = time.monotonic()
+            while time.monotonic() - quiet_began < .65:
+                quiet.drain(.01)
+                text = visible(quiet)
+                assert quiet_activity() == quiet_row, ('reduced-motion activity moved', text)
+                assert not any(glyph in text for glyph in spinners), ('reduced motion emitted an animated spinner', text)
+                assert quiet.vt.attrs[quiet_row[0]] == quiet_style, 'reduced motion retained a foreground shimmer'
+                assert quiet.child.poll() is None and not (quiet_root / 'generated').exists()
+            quiet_elapsed = time.monotonic() - quiet_began
+            quiet_delta_bytes = len(quiet.raw) - quiet_since
+            snapshot(quiet, 'reduced-motion-idle')
+        finally:
+            try:
+                finish(quiet)
+            finally:
+                quiet_hold.unlink(missing_ok=True)
+        assert not (quiet_root / 'generated').exists(), 'cancelled held generation replied'
+        assert (quiet_cwd / 'edit-target.rs').read_text() == 'fn main() {\n    old();\n}\n'
+        quiet_records = records(quiet_root)
+        assert sum(row['kind'] == 'accepted' and row['text'] == 'EDIT_REDUCED_MOTION_TASK'
+                   for row in quiet_records) == 1
+        assert not any(row['kind'] in ('intent', 'outcome') for row in quiet_records), 'reduced-motion probe executed an edit'
+        quiet_evidence = {'row': quiet_row[0], 'glyph': '◷', 'elapsed': quiet_elapsed,
+                          'delta_bytes': quiet_delta_bytes,
+                          'termios_restored': quiet.finished['termios_restored'],
+                          'flags_restored': quiet.finished['flags_restored'],
+                          'generated': False, 'tool_intents': 0}
+    return {'added': 1, 'removed': 1, 'effective_add_bg': added, 'effective_remove_bg': removed,
+            'idle_animation': {'row': next(iter(observed))[0], 'spinner_frames': len(observed),
+                               'elapsed': idle_elapsed, 'delta_bytes': len(idle_delta)},
+            'reduced_motion': quiet_evidence}
 
 
 def main():

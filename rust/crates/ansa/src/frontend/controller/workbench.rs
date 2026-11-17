@@ -2720,20 +2720,25 @@ impl Workbench {
                 .as_ref()
                 .filter(|_| self.menu.is_none() && self.focus == Focus::Chat)
                 .map(Completion::popup),
-            animate: self.selection.is_none()
-                && slot.state.follow_tail
-                && self.menu.is_none()
-                && self.completion.is_none()
-                && snapshot.is_some_and(|view| {
-                    view.worker_busy
-                        && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
-                })
-                && std::env::var_os("ANSA_NO_ANIMATION").is_none(),
-            animation_frame: {
-                static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-                ((START.get_or_init(Instant::now).elapsed().as_millis() / 120) % 32) as u8
-            },
+            animate: self.animation_enabled(),
+            animation_frame: Self::animation_frame(),
         }
+    }
+    fn animation_enabled(&self) -> bool {
+        let slot = &self.slots[self.current];
+        self.selection.is_none()
+            && slot.state.follow_tail
+            && self.menu.is_none()
+            && self.completion.is_none()
+            && slot.state.snapshot.as_ref().is_some_and(|view| {
+                view.worker_busy
+                    && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
+            })
+            && std::env::var_os("ANSA_NO_ANIMATION").is_none()
+    }
+    fn animation_frame() -> u8 {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        ((START.get_or_init(Instant::now).elapsed().as_millis() / 120) % 32) as u8
     }
     fn update_displayed(&mut self, io: &Io) {
         sync_displayed(&mut self.frames, &mut self.displayed, |sequence| {
@@ -2993,6 +2998,7 @@ pub async fn run(
     let mut exit = 0;
     let mut escape_at = None;
     let mut dirty = true;
+    let mut animated_frame = None;
     let mut deferred_input = std::collections::VecDeque::new();
     let mut failure: Option<&'static str> = None;
     let mut terminating_since = None;
@@ -3114,6 +3120,9 @@ pub async fn run(
                 }
             } else { work.terminal_escape_at = None; }
             work.prepare_theme(now);
+            let next_animation = (io.color && work.animation_enabled()).then(Workbench::animation_frame);
+            dirty |= next_animation != animated_frame;
+            animated_frame = next_animation;
             let mut admissions = Vec::new();
             for slot in &mut work.slots {
                 dirty |= slot.poll_replies(io)?;

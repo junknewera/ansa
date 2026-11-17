@@ -363,6 +363,10 @@ impl Workbench {
         }
     }
     pub(super) fn terminal_bytes(&mut self, bytes: &[u8], io: &Io) {
+        if !bytes.is_empty() {
+            self.selection = None;
+            self.tool_press = None;
+        }
         if bytes == [3] {
             self.terminal_pending_input.clear();
         }

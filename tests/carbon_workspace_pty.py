@@ -61,7 +61,7 @@ def mouse(screen, button, column, row, release=False):
     screen.send(f"\x1b[<{button};{column + 1};{row + 1}{'m' if release else 'M'}")
 
 
-def click(screen, column, row):
+def paint_quiet(screen):
     # Hit targets belong to a completed paint. Seeing an input row can precede
     # the trailing status writes, so wait for the retained frame to settle.
     deadline = time.monotonic() + 1
@@ -72,6 +72,10 @@ def click(screen, column, row):
         visible(screen)
         quiet = quiet + 1 if len(screen.raw) == before else 0
         assert screen.child.poll() is None and time.monotonic() < deadline, "click frame readiness"
+
+
+def click(screen, column, row):
+    paint_quiet(screen)
     mouse(screen, 0, column, row)
     mouse(screen, 0, column, row, release=True)
 
@@ -417,12 +421,49 @@ def files_and_terminal(screen, root, cwd):
     screen.send("printf '%s:%s\\n' \"$ANSA_PTY_VALUE\" \"$$\" > terminal-state-again; false; printf ' STATUS:%s ' \"$?\"\r")
     until(screen, lambda frame: (cwd / "terminal-state-again").exists() and "STATUS:1" in frame and shell_ready(screen), "persistent shell environment and status")
     assert (cwd / "terminal-state-again").read_text() == state, "q created a second shell or lost its environment"
+    terminal_copy_then_input(screen, root, cwd)
     escape(screen)
     until(screen, lambda frame: "q терминал" in frame and "Esc к файлам" not in frame, "terminal returned to files again")
     escape(screen)
     until(screen, lambda frame: "q терминал" not in frame, "Files returned to chat")
     assert "CONSOLE_ONLY" not in body(screen), "manual terminal output leaked into model conversation"
     assert journals(root) == before, "manual shell activity entered the canonical journal"
+
+
+def terminal_copy_then_input(screen, root, cwd):
+    """New manual input must resume terminal painting after an OSC52 copy."""
+    before = journals(root)
+    canary, after = "PTY_OUTPUT_CANARY", "PTY_AFTER_COPY"
+    # The complete canaries are absent from the echoed command text, so the VT
+    # assertions prove child output rather than merely input echo.
+    screen.send("printf '\\nPTY_%s_%s\\n' OUTPUT CANARY\r")
+    until(screen, lambda frame: canary in frame and shell_ready(screen), "terminal output ready for selection")
+    paint_quiet(screen)
+    row = next(row for row in range(3, screen.vt.rows - 5) if canary in screen.vt.line(row))
+    column = screen.vt.line(row).index(canary)
+    at = len(screen.raw)
+    mouse(screen, 0, column, row)
+    mouse(screen, 32, column + len(canary) - 1, row)
+    mouse(screen, 0, column + len(canary) - 1, row, release=True)
+    assert copied(screen, at) == canary, "manual terminal selection did not copy its displayed output"
+    screen.send("printf reached > terminal-copy-command; printf '\\nPTY_%s_%s\\n' AFTER COPY\r")
+    until(screen, lambda frame: (cwd / "terminal-copy-command").exists()
+          and (cwd / "terminal-copy-command").read_text() == "reached", "command after terminal selection executed")
+    observation = {"label": "terminal-input-after-copy", "owned_marker": "terminal-copy-command",
+                   "owned_marker_content": "reached", "new_output_visible": False}
+    screen.observations.append(observation)
+    try:
+        until(screen, lambda frame: after in frame and shell_ready(screen), "terminal paints new output after copied selection", timeout=1.5)
+    except AssertionError:
+        # Preserve a concrete recovery proof before failing the regression.
+        escape(screen)
+        until(screen, lambda frame: "q терминал" in frame and "Esc к файлам" not in frame, "Files after frozen terminal selection")
+        screen.send("q")
+        until(screen, lambda frame: after in frame and shell_ready(screen), "new child output becomes visible after reopening terminal")
+        observation["visible_after_reopen"] = True
+        raise AssertionError("terminal command executed, but copied selection hid new output until Files/reopen") from None
+    observation["new_output_visible"] = True
+    assert journals(root) == before, "manual terminal copying/input changed the canonical journal"
 
 
 def editor_case(screen, root, cwd, cancel):
@@ -777,6 +818,7 @@ def main():
                 (args.output / (name + ".pty")).write_bytes(screen.raw)
                 (args.output / (name + ".journals.json")).write_text(json.dumps(journals(root)) + "\n")
                 (args.output / (name + ".screen.txt")).write_text(visible(screen))
+                (args.output / (name + ".observations.json")).write_text(json.dumps(screen.observations, ensure_ascii=False, indent=2) + "\n")
                 (args.output / "report.json").write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n")
                 screen.close()
                 for label, extra in getattr(screen, "additional_screens", []):

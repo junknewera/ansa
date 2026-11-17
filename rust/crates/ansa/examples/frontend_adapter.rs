@@ -455,8 +455,21 @@ fn workspace_edit(root: &Path) -> Result<i32> {
     binding.returned_model = settings.returned_model.clone();
     let configuration = Request::new(binding, epoch, tools.advertisement().clone(), vec![])?;
     let root_path = root.to_owned();
+    let first_generation = std::sync::atomic::AtomicBool::new(true);
     let generate = Arc::new(
         move |request: &Request, stop: &Cancel, _: ansa::runtime::PreviewSink| {
+            if first_generation.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while root_path.join("hold-generation").exists() {
+                    if stop.cancelled() {
+                        return Err("offline_cancelled");
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("fixture_hold_timeout");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             if stop.cancelled() {
                 return Err("offline_cancelled");
             }

@@ -66,6 +66,15 @@ fn fixtures() -> PathBuf {
 fn golden() -> Json {
     Json::parse(&fs::read_to_string(fixtures().join("golden.json")).unwrap()).unwrap()
 }
+fn copy_fixture(name: &str, destination: &Path) {
+    let source = fixtures().join(name);
+    let original = sha256(&fs::read(&source).unwrap());
+    fs::copy(&source, destination).unwrap();
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(sha256(&fs::read(destination).unwrap()), original);
+    assert_eq!(sha256(&fs::read(&source).unwrap()), original);
+    assert_eq!(fs::metadata(destination).unwrap().mode() & 0o777, 0o600);
+}
 fn fingerprints(path: &Path) -> BTreeMap<String, (String, u64, u64, u32)> {
     fs::read_dir(path)
         .unwrap()
@@ -244,8 +253,7 @@ fn legacy_cpp_codec_summary_is_read_only_and_never_creates_a_lock() {
     let catalog = root.catalog();
     let selected = catalog.create_named("fixture").unwrap();
     let part = selected.directory.join("part-00000000000000000000.log");
-    fs::copy(fixtures().join("completed.log"), &part).unwrap();
-    fs::set_permissions(&part, fs::Permissions::from_mode(0o600)).unwrap();
+    copy_fixture("completed.log", &part);
     let before = fingerprints(&selected.directory);
     let summary = catalog.summaries(&Cancel::default()).unwrap().remove(0);
     let data = golden();
@@ -274,8 +282,7 @@ fn malformed_missing_partial_and_linked_journals_are_unavailable_without_recover
         SummaryStatus::Unavailable
     );
     let part = selected.directory.join("part-00000000000000000000.log");
-    fs::copy(fixtures().join("completed.log"), &part).unwrap();
-    fs::set_permissions(&part, fs::Permissions::from_mode(0o600)).unwrap();
+    copy_fixture("completed.log", &part);
     OpenOptions::new()
         .append(true)
         .open(&part)
@@ -288,7 +295,7 @@ fn malformed_missing_partial_and_linked_journals_are_unavailable_without_recover
     assert_eq!(summary.title, None);
     assert_eq!(fingerprints(&selected.directory), before);
     assert!(!selected.directory.join("lock").exists());
-    fs::copy(fixtures().join("completed.log"), &part).unwrap();
+    copy_fixture("completed.log", &part);
     let mut corrupt = fs::read(&part).unwrap();
     *corrupt.last_mut().unwrap() ^= 1;
     fs::write(&part, corrupt).unwrap();
@@ -298,7 +305,7 @@ fn malformed_missing_partial_and_linked_journals_are_unavailable_without_recover
         SummaryStatus::Unavailable
     );
     assert_eq!(fingerprints(&selected.directory), before);
-    fs::copy(fixtures().join("completed.log"), &part).unwrap();
+    copy_fixture("completed.log", &part);
     fs::hard_link(&part, root.0.join("part-alias")).unwrap();
     assert_eq!(
         catalog.summaries(&Cancel::default()).unwrap()[0].status,
