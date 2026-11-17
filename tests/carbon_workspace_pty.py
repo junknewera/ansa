@@ -186,6 +186,9 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     until(screen, lambda frame: "CHILD_HISTORY_TASK" in screen.vt.line(1) and completed(root, "CHILD_HISTORY_TASK") and ready(screen), "agent completed in titled child chat")
     screen.send("CHILD_DRAFT Ж")
     until(screen, lambda frame: screen.vt.line(-4) == "› CHILD_DRAFT Ж", "child draft")
+    paint_quiet(screen)
+    until(screen, lambda frame: ready(screen) and "CHILD_HISTORY_TASK" in screen.vt.line(1),
+          "completed child frame before Ctrl+C")
     screen.send(b"\x03")
     until(screen, lambda frame: "Нет активного шага" in frame, "child handled Ctrl+C")
     mouse(screen, 64, 2, 5)
