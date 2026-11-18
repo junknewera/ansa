@@ -71,6 +71,10 @@ async fn late_summary_cancel() {
     fixture::summary(true).await;
 }
 #[tokio::test(flavor = "current_thread")]
+async fn summary_budget_uses_serialized_request() {
+    fixture::summary_budget().await;
+}
+#[tokio::test(flavor = "current_thread")]
 async fn checkpoint_cancellation() {
     fixture::checkpoint_cancellation().await;
 }

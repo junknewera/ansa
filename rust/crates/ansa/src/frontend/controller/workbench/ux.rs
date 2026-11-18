@@ -22,7 +22,10 @@ impl Workbench {
         }
     }
     pub(super) fn refresh_completion(&mut self) {
-        if self.menu.is_some() || self.focus != Focus::Chat {
+        if self.menu.is_some()
+            || self.focus != Focus::Chat
+            || self.selection.as_ref().is_some_and(Selection::is_chat)
+        {
             self.completion = None;
             return;
         }
@@ -94,7 +97,7 @@ impl Workbench {
         }
         id
     }
-    pub(super) fn agent_rows(&self) -> Vec<(String, String, String)> {
+    pub(super) fn agent_rows(&self) -> Vec<(String, carbon::AgentLine)> {
         let root = self.conversation_root();
         let mut candidates: Vec<(String, Option<String>, String)> = self
             .summaries
@@ -117,9 +120,9 @@ impl Workbench {
             }
         }
         let mut result = Vec::new();
-        let mut pending = vec![(root, 0usize)];
+        let mut pending = vec![(root.clone(), String::new(), String::new())];
         let mut seen = std::collections::BTreeSet::new();
-        while let Some((parent, depth)) = pending.pop() {
+        while let Some((parent, tree, branch)) = pending.pop() {
             if !seen.insert(parent.clone()) || seen.len() > 128 {
                 continue;
             }
@@ -130,10 +133,27 @@ impl Workbench {
                 })
                 .collect();
             // Depth-first order keeps a child's rows adjacent to its parent.
-            for (id, _, kind) in children.iter().rev() {
-                pending.push((id.clone(), depth + usize::from(kind == "agent")));
+            let indent = format!(
+                "{tree}{}",
+                match branch.as_str() {
+                    "├─ " => "│  ",
+                    "└─ " => "   ",
+                    _ => "",
+                }
+            );
+            let mut visible_after = false;
+            for (id, _, kind) in children.into_iter().rev() {
+                let connector = if kind != "agent" {
+                    ""
+                } else if visible_after {
+                    "├─ "
+                } else {
+                    "└─ "
+                };
+                visible_after |= kind == "agent";
+                pending.push((id.clone(), indent.clone(), connector.into()));
             }
-            if parent == self.conversation_root() {
+            if parent == root {
                 continue;
             }
             let Some((id, _, kind)) = candidates.iter().find(|(id, _, _)| *id == parent) else {
@@ -176,14 +196,20 @@ impl Workbench {
                     )
                 })
                 .unwrap_or_default();
+            let elapsed = live.and_then(|slot| slot.state.progress.elapsed());
+            let detail = match (generation.is_empty(), elapsed) {
+                (false, Some(elapsed)) => format!("{indent}{generation} · {elapsed}"),
+                (false, None) => format!("{indent}{generation}"),
+                (true, Some(elapsed)) => format!("{indent}{elapsed}"),
+                (true, None) => String::new(),
+            };
             result.push((
                 id.clone(),
-                format!(
-                    "{}{} · {state}",
-                    "  ".repeat(depth.saturating_sub(1).min(8)),
-                    self.title(id)
-                ),
-                generation,
+                carbon::AgentLine {
+                    title: format!("{tree}{branch}{}", self.title(id)),
+                    state: state.into(),
+                    detail,
+                },
             ));
         }
         result

@@ -291,18 +291,18 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     status_fg = screen.vt.attribute('готово')[0]
     assert target_fg is not None and status_fg is not None and target_fg != answer_fg
     user_bg = screen.vt.attribute('VISUAL_TASK', last=True)[1]
-    assert screen.vt.attribute('VISUAL_TASK', last=True)[2], 'user text lost its visual emphasis'
-    native_background(screen, 'VISUAL_TASK', 'get_test_value', 'OMH_TOOL_OK:OMH_FIXED_VALUE_42')
+    assert user_bg is not None and screen.vt.attribute('VISUAL_TASK', last=True)[2], 'user text lost its visual emphasis'
+    native_background(screen, 'get_test_value', 'OMH_TOOL_OK:OMH_FIXED_VALUE_42')
     screen.send('VISUAL_DRAFT Ж')
     until(screen, lambda text: 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'pinned colored draft')
     input_bg = screen.vt.attribute('VISUAL_DRAFT Ж')[1]
-    native_background(screen, 'VISUAL_TASK', 'VISUAL_DRAFT Ж')
+    native_background(screen, 'VISUAL_DRAFT Ж')
     snapshot(screen, 'compact')
     row, column = screen.vt.location('get_test_value')
     click(screen, column, row)
     until(screen, lambda text: 'Аргументы' in text and 'Вывод' in text and '▾' in text, 'colored inline expand')
     assert screen.vt.attribute('get_test_value')[0] == target_fg
-    assert screen.vt.attribute('VISUAL_TASK')[1] == user_bg
+    assert screen.vt.attribute('VISUAL_TASK', last=True)[1] == user_bg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     snapshot(screen, 'expanded')
     row, column = screen.vt.location('get_test_value')
@@ -316,7 +316,7 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     until(screen, lambda text: screen.vt.attribute('get_test_value')[1] is not None, 'selection highlight painted')
     selected_bg = screen.vt.attribute('get_test_value')[1]
     assert selected_bg is not None, 'local text selection has no visible background'
-    assert screen.vt.attribute('VISUAL_TASK')[1] == user_bg
+    assert screen.vt.attribute('VISUAL_TASK', last=True)[1] == user_bg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     snapshot(screen, 'selected')
     at = len(screen.raw)
@@ -332,7 +332,7 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     assert copied(screen, at) == 'get_test_value'
     until(screen, lambda text: attribute_is(screen, 'get_test_value', 1, None)
           and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'release cleared selection and restored composer')
-    native_background(screen, 'get_test_value', 'VISUAL_TASK', 'VISUAL_DRAFT Ж')
+    native_background(screen, 'get_test_value', 'VISUAL_DRAFT Ж')
     assert journals(root) == before, 'color interactions changed canonical journal'
     finish(screen)
     return {'effective_target_fg': target_fg, 'effective_status_fg': status_fg,
@@ -481,7 +481,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     context = screen.vt.attribute('fn main()')[1]
     assert removed is not None and added is not None and removed != added
     assert context is None and removed != context and added != context, 'diff colors must stay local against native context rows'
-    native_background(screen, 'EDIT_VISUAL_TASK')
+    assert screen.vt.attribute('EDIT_VISUAL_TASK', last=True)[1] is not None
     screen.send('EDIT_DRAFT Ж')
     until(screen, lambda text: 'EDIT_DRAFT Ж' in screen.vt.line(-4), 'edit draft')
     native_background(screen, 'EDIT_DRAFT Ж')

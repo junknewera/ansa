@@ -18,7 +18,7 @@ pub type Result<T> = std::result::Result<T, &'static str>;
 pub type PreviewSink = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 pub type Generate =
     Arc<dyn Fn(&Request, &Cancel, PreviewSink) -> Result<AdmittedResponse> + Send + Sync>;
-pub type Compact = Arc<dyn Fn(&Request, &Cancel) -> Result<CompactedContext> + Send + Sync>;
+pub type Compact = Arc<dyn Fn(&Request, usize, &Cancel) -> Result<CompactedContext> + Send + Sync>;
 pub type CheckDispatch = Arc<dyn Fn(u64, &Cancel) -> Result<()> + Send + Sync>;
 pub type CheckRequest = Arc<dyn Fn(&Request, u64, &Cancel) -> Result<()> + Send + Sync>;
 pub type SelectGeneration = Arc<dyn Fn(&GenerationSelection, &Cancel) -> Result<()> + Send + Sync>;

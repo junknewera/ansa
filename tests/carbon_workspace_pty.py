@@ -301,6 +301,7 @@ def inline_tool_details(screen, root, cwd):
     until(screen, lambda frame: "Аргументы" not in body(screen) and "> get_test_value" in body(screen), "tool row collapsed")
 
     # Dragging a tool row selects text rather than activating its click target.
+    paint_quiet(screen)
     row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> get_test_value"))
     at = len(screen.raw)
     mouse(screen, 0, 2, row)
@@ -369,7 +370,7 @@ def mouse_copy(screen, root, cwd):
     screen.resize(80, 20)
     screen.vt = Terminal(80, 20)
     screen.wait(b"\x1b[7mMOUSE_COPY", before_resize)
-    until(screen, lambda frame: "Работа · Чат · готов" in screen.vt.line(-2), "compact status after resize")
+    until(screen, lambda frame: ready(screen) and "Сообщение агенту" not in screen.vt.line(-2), "compact status after resize")
     mouse(screen, 0, 2 + len("MOUSE_COPY") - 1, row, release=True)
     text = copied(screen, at)
     assert text == "MOUSE_COPY" and "\x1b" not in text, repr(text)
@@ -388,6 +389,49 @@ def mouse_copy(screen, root, cwd):
     until(screen, lambda frame: not reading(screen) and "> AFTER_SELECT Ж" in body(screen), "Enter sent after repeated drag copies")
     until(screen, lambda frame: completed(root, "AFTER_SELECT Ж") and ready(screen), "post-selection message completed")
     assert sum(row["kind"] == "accepted" and row["text"] == "AFTER_SELECT Ж" for row in records(root)) == 1
+
+
+def selection_scroll(screen, root, cwd):
+    (cwd / "panel").mkdir()
+    (cwd / "panel" / "notes.txt").write_text("INSPECTOR_NEVER_COPY\n")
+    session = seed_history(screen.child.args[0], root, cwd)
+    local(screen, f"/sessions {session}")
+    until(screen, lambda frame: "HISTORY_SEED_19" in frame and ready(screen), "selectable canonical tail")
+    screen.resize(126, 32)
+    screen.vt = Terminal(126, 32)
+    local(screen, "/files")
+    until(screen, lambda frame: "panel/" in frame and "l каталог" in frame, "split file listing")
+    screen.send(b"\r")
+    paint_quiet(screen)
+    assert "panel/" in visible(screen), "Enter entered a directory"
+    screen.send("l")
+    until(screen, lambda frame: "notes.txt" in frame, "l entered the selected directory")
+    screen.send("h")
+    until(screen, lambda frame: "panel/" in frame, "h returned to the parent")
+    escape(screen)
+    local(screen, "/files panel/notes.txt")
+    until(screen, lambda frame: "INSPECTOR_NEVER_COPY" in frame and "HISTORY_SEED_19" in frame, "split pane for selection")
+    paint_quiet(screen)
+    row = next(row for row in range(3, 27) if "HISTORY_SEED_19" in screen.vt.line(row))
+    first = body(screen)
+    at = len(screen.raw)
+    mouse(screen, 0, len("> HISTORY_SEED_19") - 1, row)
+    mouse(screen, 32, 10, 3)
+    until(screen, lambda frame: body(screen) != first and reading(screen), "drag at the top edge scrolls")
+    for _ in range(240):
+        mouse(screen, 64, 6, 5)
+        screen.drain(.014)
+        if "> HISTORY_FIRST" in body(screen):
+            break
+    else:
+        raise AssertionError("selection did not scroll across a journal page")
+    row = next(row for row in range(3, 27) if "> HISTORY_FIRST" in screen.vt.line(row))
+    paint_quiet(screen)
+    mouse(screen, 0, 2, row, release=True)
+    text = copied(screen, at)
+    assert "HISTORY_FIRST" in text and "HISTORY_SEED_19" in text, text[-500:]
+    assert "INSPECTOR_NEVER_COPY" not in text and "Файлы" not in text and "\x1b" not in text
+    assert screen.raw[at:].count(b"\x1b]52;c;") == 1
 
 
 def branches(screen, root, cwd):
@@ -685,12 +729,12 @@ def completion_and_help(screen, root, cwd):
     command_rows = [match for row in range(screen.vt.rows)
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
-    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agent", "/agents", "/sessions", "/fork", "/btw", "/send", "/basic", "/plan", "/status", "/copy", "/resume", "/help", "/exit"}
-    assert expected.issubset(labels) and len(labels) == len(set(labels)), "help does not give each command its own row"
+    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions", "/fork", "/btw", "/plan", "/copy", "/resume", "/help", "/exit"}
+    assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert "/run" not in visible(screen), "removed /run remains advertised"
-    screen.send(b"\r")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Команды ANSA" not in frame, "help Enter only inserts")
+    screen.send(b"\x1b[B\r")
+    until(screen, lambda frame: screen.vt.line(-4) == "› /effort" and "Команды ANSA" not in frame, "help arrows select and Enter only inserts")
     assert journals(root) == before
     screen.send(b"\x15")
     screen.send("text?")
@@ -700,9 +744,9 @@ def completion_and_help(screen, root, cwd):
     # An ordinary whitespace delimiter is also valid for no-argument local
     # commands. It must never turn /exit or a mode switch into a model prompt.
     screen.send("/plan \r")
-    until(screen, lambda frame: "Планирование" in screen.vt.line(-2) and screen.vt.line(-4) == "›", "trailing-space /plan routed locally")
-    screen.send("/status \r/basic \r")
-    until(screen, lambda frame: "Работа" in screen.vt.line(-2) and screen.vt.line(-4) == "›", "trailing-space local status and basic")
+    until(screen, lambda frame: "План" in screen.vt.line(-2) and screen.vt.line(-4) == "›", "trailing-space /plan routed locally")
+    screen.send("/plan \r")
+    until(screen, lambda frame: "План" not in screen.vt.line(-2) and screen.vt.line(-4) == "›", "/plan returns to work")
     assert journals(root) == before, "whitespace in local commands dispatched canonical user turns"
     screen.send("/exit \r")
     return "normal"
@@ -732,12 +776,30 @@ def model_effort_pair(screen, root, cwd):
     assert not any(row["kind"] in {"accepted", "response", "intent"} for row in events), "model selection dispatched generation or tools"
 
 
+def plan_agent_inherits(screen, root, cwd):
+    parent, child = "PLAN_PARENT", "PLAN_AGENT"
+    screen.send(parent + "\r")
+    until(screen, lambda frame: completed(root, parent) and ready(screen), "parent title committed")
+    local(screen, "/plan")
+    until(screen, lambda frame: "План" in screen.vt.line(-2), "parent entered plan")
+    screen.send("Запусти субагента: " + child + "\r")
+    until(screen, lambda frame: completed(root, child) and parent in screen.vt.line(1)
+          and f"Результат субагента «{child}»" in frame and ready(screen), "plan child returned its result")
+    child_turn, = [row for row in records(root) if row['kind'] == 'accepted' and row['text'] == child]
+    assert child_turn['mode'] == 'plan'
+
+
 def session_agent_titles_restart(screen, root, cwd):
     parent, child, nested = "PARENT_TITLE", "AGENT_TITLE", "NESTED_TITLE"
     screen.send(parent + "\r")
     until(screen, lambda frame: completed(root, parent) and ready(screen), "parent title committed")
-    local(screen, "/agent " + child)
-    until(screen, lambda frame: completed(root, child) and child in screen.vt.line(1) and ready(screen), "agent own title committed")
+    screen.send("Запусти субагента: " + child + "\r")
+    until(screen, lambda frame: completed(root, child) and parent in screen.vt.line(1)
+          and f"Результат субагента «{child}»" in frame and ready(screen), "explicit request returned its child result to the parent")
+    local(screen, "/agents")
+    until(screen, lambda frame: "Агенты разговора" in frame and child in frame, "background child listed")
+    screen.send(b"\r")
+    until(screen, lambda frame: child in screen.vt.line(1) and ready(screen), "open completed child from agent tree")
     local(screen, "/agent " + nested)
     until(screen, lambda frame: completed(root, nested) and nested in screen.vt.line(1) and ready(screen), "nested agent own title committed")
     escape(screen)
@@ -777,6 +839,7 @@ def session_agent_titles_restart(screen, root, cwd):
 
 def main():
     cases = [("input-copy-resize", input_and_copy), ("mouse-copy-resize", mouse_copy),
+             ("mouse-selection-scroll", selection_scroll),
              ("fork-btw", branches), ("files-terminal-persistence", files_and_terminal),
              ("mouse-history-send-child-escape", mouse_history_send_and_child_escape),
              ("split-source-scroll", split_source_scroll),
@@ -784,6 +847,7 @@ def main():
              ("inline-tool-details", inline_tool_details),
              ("slash-completion-help", completion_and_help),
              ("model-effort-pair", model_effort_pair),
+             ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),
              ("terminal-interrupt-app-escape", terminal_interrupt_and_app_escape),
              ("terminal-eof-exit", terminal_eof_and_exit),

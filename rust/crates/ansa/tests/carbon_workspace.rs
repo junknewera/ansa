@@ -158,10 +158,7 @@ fn selection_and_resize_preserve_unselected_colors_and_backgrounds() {
             .any(|line| line.contains("\x1b[38;2;188;166;242m")),
         "clipping dropped user accent"
     );
-    assert!(
-        !frame.lines.join("\n").contains("\x1b[48;2;"),
-        "chat must retain terminal background"
-    );
+    only_user_background(&frame, "USER COLOR");
     assert_eq!(selection.finish(4, row).as_deref(), Some("Color"));
     assert!(!selection.text().unwrap().contains('\x1b'));
 }
@@ -227,7 +224,7 @@ fn semantic_palette_keeps_statuses_distinct_and_plain_output_unstyled() {
             row("ошибка").split("Запуск").next()
         );
         assert!(raw.contains("▸") && raw.contains("│"));
-        assert!(!raw.contains("\x1b[48;2;"));
+        only_user_background(&colored, "Прочитай README");
         assert!(
             !raw.contains("\x1b[31m"),
             "untrusted controls became styles"
@@ -262,7 +259,7 @@ fn every_theme_keeps_the_terminal_background_and_local_selection() {
         .unwrap();
         frame.apply_theme(&Theme::builtin(id).unwrap());
         let raw = frame.lines.join("\n");
-        assert!(!raw.contains("\x1b[48;"), "{id} painted a background");
+        only_user_background(&frame, "USER");
         assert!(raw.contains("\x1b[49m"));
         let row = frame
             .plain_lines()
@@ -274,6 +271,20 @@ fn every_theme_keeps_the_terminal_background_and_local_selection() {
         assert!(selection.frame(true).lines[row].contains("\x1b[48;"));
         assert_eq!(selection.text().as_deref(), Some("THEM"));
     }
+}
+
+fn only_user_background(frame: &carbon::Frame, message: &str) {
+    let mut highlighted = 0;
+    for (rendered, plain) in frame.lines.iter().zip(frame.plain_lines()) {
+        let user = plain.starts_with('›') && plain.contains(message);
+        assert_eq!(
+            rendered.contains("\x1b[48;2;"),
+            user,
+            "background on {plain:?}"
+        );
+        highlighted += usize::from(user);
+    }
+    assert_eq!(highlighted, 1);
 }
 
 #[test]

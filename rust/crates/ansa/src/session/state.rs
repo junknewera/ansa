@@ -33,6 +33,7 @@ pub struct ForkSeed {
     request: Arc<Request>,
     transcript: Arc<Transcript>,
     timeline: Arc<super::timeline::Timeline>,
+    completed_starts: Arc<Vec<usize>>,
 }
 impl PartialEq for ForkSeed {
     fn eq(&self, other: &Self) -> bool {
@@ -41,6 +42,7 @@ impl PartialEq for ForkSeed {
             && self.request == other.request
             && Arc::ptr_eq(&self.transcript, &other.transcript)
             && Arc::ptr_eq(&self.timeline, &other.timeline)
+            && self.completed_starts == other.completed_starts
     }
 }
 impl Eq for ForkSeed {}
@@ -124,14 +126,25 @@ impl ForkSeed {
         Json::array(entries)
     }
     pub(crate) fn event(&self) -> Result<Json> {
-        Json::object(vec![
+        let seed = Json::object(vec![
             ("kind", Json::string("fork")?),
             ("source_session", Json::string(&self.source_session.0)?),
             ("source_turn", Json::string(&self.source_turn.0)?),
             ("context", self.request.save()?),
             ("transcript", Self::entries(&self.transcript)?),
             ("timeline", self.timeline.save()?),
-        ])
+        ])?;
+        if self.completed_starts.is_empty() {
+            Ok(seed)
+        } else {
+            let starts = self
+                .completed_starts
+                .iter()
+                .copied()
+                .map(num)
+                .collect::<Result<Vec<_>>>()?;
+            seed.with("completed_starts", Json::array(starts)?)
+        }
     }
 }
 #[derive(Clone, Debug)]
@@ -148,6 +161,7 @@ pub struct SavedTurn {
     pub receipt: Receipt,
     pub operation_run: String,
     pub next: Request,
+    start_item: usize,
     pub response: Option<Arc<AdmittedResponse>>,
     pub tools_response: Option<Arc<AdmittedResponse>>,
     pub results: Vec<SavedResult>,
@@ -171,6 +185,7 @@ pub struct State {
     pub epoch: Epoch,
     pub history: Vec<Json>,
     pub history_bytes: usize,
+    completed_starts: Arc<Vec<usize>>,
     pub submits: BTreeMap<String, Receipt>,
     pub turn: Option<SavedTurn>,
     pub next_request: usize,
@@ -196,6 +211,7 @@ impl State {
             configuration,
             history: vec![],
             history_bytes: 2,
+            completed_starts: Arc::default(),
             submits: BTreeMap::new(),
             turn: None,
             next_request: 0,
@@ -211,6 +227,16 @@ impl State {
     }
     pub fn transcript(&self) -> Arc<Transcript> {
         self.transcript.clone()
+    }
+    pub(crate) fn compaction_prefix(&self) -> Option<usize> {
+        let index = self.completed_starts.len().checked_sub(2)?;
+        self.completed_starts
+            .get(index)
+            .copied()
+            .filter(|prefix| *prefix > 0)
+    }
+    pub(crate) fn completed_context_turns(&self) -> usize {
+        self.completed_starts.len()
     }
     pub fn fork_seed(&self) -> Result<ForkSeed> {
         need(self.initialized, "session_missing_init")?;
@@ -240,6 +266,7 @@ impl State {
             request: Arc::new(request),
             transcript: self.transcript.clone(),
             timeline: self.timeline.clone(),
+            completed_starts: self.completed_starts.clone(),
         })
     }
     pub fn pending_followups(&self) -> impl Iterator<Item = &Followup> {
@@ -384,6 +411,7 @@ impl State {
             epoch: self.epoch.clone(),
             history: self.history.clone(),
             history_bytes: self.history_bytes,
+            completed_starts: self.completed_starts.clone(),
             submits: BTreeMap::new(),
             turn: self.turn.clone(),
             next_request: self.next_request,
@@ -467,6 +495,27 @@ impl State {
             )?;
             self.history = context.input;
             self.history_bytes = Json::array(self.history.clone())?.dump().len();
+            if event.has("completed_starts") {
+                let offsets = event.field("completed_starts")?.elements()?;
+                need(offsets.len() <= self.history.len(), "fork_completed_starts")?;
+                let mut starts = Vec::with_capacity(offsets.len());
+                for value in offsets {
+                    let index = value
+                        .dump()
+                        .parse::<usize>()
+                        .map_err(|_| "fork_completed_starts")?;
+                    need(
+                        starts.last().is_none_or(|last| index > *last)
+                            && self.history.get(index).is_some_and(|item| {
+                                item.text_field("role") == Ok("user")
+                                    && item.field("content").is_ok_and(Json::is_string)
+                            }),
+                        "fork_completed_starts",
+                    )?;
+                    starts.push(index);
+                }
+                self.completed_starts = Arc::new(starts);
+            }
             self.generation.effort = context.effort;
             self.fork_source = Some(source.into());
             let mut transcript = Transcript::default();
@@ -698,6 +747,7 @@ impl State {
             self.turn = Some(SavedTurn {
                 receipt: receipt.clone(),
                 operation_run: run.into(),
+                start_item: next.input.len() - 1,
                 next,
                 response: None,
                 tools_response: None,
@@ -754,6 +804,21 @@ impl State {
                 compacted.output()?.len() + 1 < COMPACT_ITEM_THRESHOLD,
                 "compaction_item_limit",
             )?;
+            if compacted.native().text_field("object")? == "omh.summary.v2" {
+                need(
+                    compacted.summary_prefix()? == self.compaction_prefix(),
+                    "session_compaction_boundary",
+                )?;
+            }
+            self.completed_starts = Arc::new(match compacted.summary_prefix()? {
+                Some(prefix) => self
+                    .completed_starts
+                    .iter()
+                    .filter(|index| **index >= prefix)
+                    .map(|index| index - prefix + 1)
+                    .collect(),
+                None => Vec::new(),
+            });
             self.compactions += 1;
             self.epoch = compact_epoch(&self.configuration.epoch, self.compactions, &compacted)?;
             self.history = compacted.output()?.to_vec();
@@ -765,6 +830,7 @@ impl State {
             next.binding = current.next.binding.clone();
             next.effort = current.next.effort.clone();
             let current = self.turn.as_mut().ok_or("session_turn_identity")?;
+            current.start_item = next.input.len() - 1;
             current.next = next;
             current.stage = "generating".into();
         } else {
@@ -921,6 +987,7 @@ impl State {
                     self.history
                         .extend(response.items().iter().map(|i| i.value().clone()));
                     self.history_bytes = Json::array(self.history.clone())?.dump().len();
+                    Arc::make_mut(&mut self.completed_starts).push(current.start_item);
                     current.stage = "completed".into();
                 }
                 "cancel" => {

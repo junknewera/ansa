@@ -48,7 +48,6 @@ pub(crate) struct Owner {
     initialized: bool,
     starting: bool,
     recovery_attempted: bool,
-    profile_bytes: usize,
     phase: String,
     diagnostic: String,
     storage_failed: bool,
@@ -127,7 +126,6 @@ impl Owner {
             initialized: false,
             starting: true,
             recovery_attempted: false,
-            profile_bytes: 0,
             phase: "loading".into(),
             diagnostic: String::new(),
             storage_failed: false,
@@ -1000,21 +998,21 @@ impl Owner {
         self.pending_pause = None;
         let limits = self.limits;
         let keep = self.options.keep_recent_turns;
-        let profile = self.profile_bytes;
         self.persist(
             workers,
             Kind::Accepted,
             Box::new(move |state| {
                 let next = state.request_for(&submitted.text, submitted.mode)?;
-                let users = state
-                    .history
-                    .iter()
-                    .filter(|v| v.has("role") && v.text_field("role").is_ok_and(|r| r == "user"))
-                    .count();
-                let compact = users > keep
-                    && (next.input.len() >= COMPACT_ITEM_THRESHOLD
-                        || state.history_bytes + receipt.text.len() * 6 + profile
-                            >= limits.compact_bytes);
+                let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;
+                let compact =
+                    if inherited_incomplete_turn || state.completed_context_turns() <= keep {
+                        false
+                    } else if state.compaction_prefix().is_some() {
+                        next.input.len() >= COMPACT_ITEM_THRESHOLD
+                            || next.json()?.dump().len() >= limits.compact_bytes
+                    } else {
+                        false
+                    };
                 Json::object(vec![
                     ("kind", Json::string("accepted")?),
                     ("command", Json::string(&receipt.command.0)?),
@@ -1867,7 +1865,6 @@ impl Owner {
                             return Err("session_command_limit");
                         }
                         self.state = ready.state;
-                        self.profile_bytes = ready.profile_bytes;
                         self.diagnostic = ready.diagnostic.into();
                         self.storage_failed = !ready.diagnostic.is_empty();
                         self.recovered_pause = ready.requires_resume;

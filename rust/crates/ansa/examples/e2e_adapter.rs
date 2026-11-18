@@ -265,7 +265,7 @@ async fn run(row: &Json, frontend: Option<&mut ansa::frontend::terminal::Io>) ->
     });
     let compactions = Arc::new(AtomicUsize::new(0));
     let compact_count = compactions.clone();
-    let compact: Compact = Arc::new(move |request, stop| {
+    let compact: Compact = Arc::new(move |request, _, stop| {
         compact_count.fetch_add(1, Ordering::SeqCst);
         offline::compact(request, stop)
     });

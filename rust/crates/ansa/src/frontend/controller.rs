@@ -784,33 +784,25 @@ impl State {
             .is_some_and(|p| !p.text.is_empty() && p.state == "preview")
             && self.preview_request == view.request;
         let phase = Progress::phase(view, preview);
-        let narrow = io.size.0 <= carbon::NARROW_WORKSPACE_COLUMNS;
         let mut status = if let Some(ui) = ui {
             let terminal = ui.focus == carbon::Focus::Inspector
                 && ui
                     .inspector
                     .as_ref()
                     .is_some_and(|p| p.kind == carbon::InspectorKind::Command);
-            format!(
-                "{} · {}{}",
-                match (self.mode, narrow) {
-                    (AgentMode::Plan, true) => "План",
-                    (AgentMode::Plan, false) => "Планирование",
-                    _ => "Работа",
-                },
-                match (terminal, narrow) {
-                    (true, true) => "Терминал",
-                    (true, false) => "Ввод в терминале",
-                    (false, true) if ui.focus == carbon::Focus::Inspector => "Панель",
-                    (false, true) => "Чат",
-                    (false, false) => "Сообщение агенту",
-                },
-                if view.worker_busy {
-                    String::new()
+            [
+                (self.mode == AgentMode::Plan).then_some("План"),
+                (ui.focus == carbon::Focus::Inspector).then_some(if terminal {
+                    "Терминал"
                 } else {
-                    format!(" · {phase}")
-                }
-            )
+                    "Панель"
+                }),
+                (!view.worker_busy).then_some(phase),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ")
         } else {
             format!("{}  {phase}", jsonl::mode(self.mode))
         };
@@ -840,13 +832,9 @@ impl State {
         if !self.follow_tail && self.reading.is_none() {
             self.reading = Some(entries.clone());
         }
-        if !self.follow_tail {
+        if !self.follow_tail && ui.is_none() {
             let unread = view.transcript_size.saturating_sub(self.reading_total);
-            if ui.is_some() && narrow {
-                status.push_str(&format!(" · +{unread}"));
-            } else {
-                status.push_str(&format!("  чтение, новых: {unread}"));
-            }
+            status.push_str(&format!("  чтение, новых: {unread}"));
         }
         // A live notice has a reserved row outside the frozen conversation.
         // Keep the code first so even a narrow terminal shows the failure.

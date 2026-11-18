@@ -109,9 +109,7 @@ def footer_phase(terminal, phase):
 def workspace_ready(screen):
     """Production Workbench, deliberately distinct from the legacy fixtures."""
     until(screen, lambda: screen.vt.line(0).startswith('ANSA')
-          and 'Работа' in screen.vt.line(-2)
-          # The default 80-column footer clips готов to гот before the hints.
-          and re.search(r' · (?:готов|гот)(?=\s|$)', screen.vt.line(-2)) is not None,
+          and re.search(r'(?<!\S)готов(?=\s|$)', screen.vt.line(-2)) is not None,
           'production workspace ready')
 
 
@@ -177,7 +175,7 @@ def recall(binary, output):
             workspace_ready(screen)
             screen.send("DRAFT Ж界😀")
             editor(screen, "DRAFT Ж界😀")
-            assert screen.vt.line(0).startswith('ANSA') and 'Работа' in screen.vt.line(-2)
+            workspace_ready(screen)
             frame='\n'.join(screen.vt.line(i) for i in range(screen.vt.rows))
             assert all(hint not in frame for hint in ['Ctrl+F','PgUp','PgDn','↑/↓'])
             assert b'\x1b]52;' not in screen.raw
@@ -224,7 +222,7 @@ def recall(binary, output):
             screen.resize(100,32)
             screen.vt=Terminal(100,32)
             editor(screen,'DRAFT Ж界😀')
-            assert screen.vt.line(0).startswith('ANSA') and 'Работа' in screen.vt.line(-2)
+            workspace_ready(screen)
             screen.resize(80,24)
             screen.vt=Terminal()
             editor(screen,'DRAFT Ж界😀')
