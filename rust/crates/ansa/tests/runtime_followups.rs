@@ -139,20 +139,23 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
             _ => {}
         }
         observed.fetch_add(1, Ordering::SeqCst);
-        let tokens = if last == "D" { "499999" } else { "499998" };
-        native::load(
-            &fixture::saved_response(request, Some("done"), 0)
-                .with("context_tokens", Json::parse(tokens)?)?
-                .with("context_window", Json::parse("1000000")?)?,
-        )
+        let saved = fixture::saved_response(request, Some("done"), 0);
+        let saved = if last == "D" {
+            saved.with("measured_context_tokens", Json::parse("499999")?)?
+        } else {
+            saved
+                .with("context_tokens", Json::parse("499998")?)?
+                .with("context_window", Json::parse("1000000")?)?
+        };
+        native::load(&saved)
     });
-    let start = || {
+    let start = |compact_bytes| {
         fixture::setup(
             Arc::new(AtomicUsize::new(0)),
             None,
             provider.clone(),
             Limits {
-                compact_bytes: 12 * 1024,
+                compact_bytes,
                 ..Limits::default()
             },
             Options {
@@ -163,7 +166,7 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
             },
         )
     };
-    let mut runtime = start().await;
+    let mut runtime = start(12 * 1024).await;
     let handle = runtime.handle();
     for (id, text) in [("A", large.as_str()), ("B", "B"), ("C", "C"), ("D", "D")] {
         fixture::submit(&handle, id, text, id).await;
@@ -175,12 +178,75 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
     );
     fixture::finish(&mut runtime).await;
 
-    let mut runtime = start().await;
+    let mut runtime = start(64 * 1024).await;
     let handle = runtime.handle();
     fixture::submit(&handle, "E", "E", "E").await;
     fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
     assert_eq!(fixture::snapshot(&handle, "at_half").await.compactions, 1);
     assert_eq!(calls.load(Ordering::SeqCst), 5);
+    fixture::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn autocompact_estimates_the_known_window_without_usage_after_reopen() {
+    let root = fixture::Root::new();
+    let older = "a".repeat(14 * 1024);
+    let crosses_half = "e".repeat(6 * 1024);
+    let expected = older.clone();
+    let provider: Generate = Arc::new(move |request, _, _| {
+        let last = request.input.last().unwrap().text_field("content")?;
+        let mut saved = fixture::saved_response(request, Some("done"), 0);
+        if last == expected {
+            saved = saved.with("model_context_window", Json::parse("10000")?)?;
+        } else if last == "D" {
+            assert!(has_user(request, &expected));
+        } else if last.starts_with('e') {
+            assert!(!has_user(request, &expected));
+            assert!(has_user(request, "C") && has_user(request, "D"));
+        }
+        native::load(&saved)
+    });
+    let start = |compact_bytes| {
+        fixture::setup(
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            provider.clone(),
+            Limits {
+                compact_bytes,
+                ..Limits::default()
+            },
+            Options {
+                directory: Some(root.journal()),
+                keep_recent_turns: 2,
+                compact: Some(Arc::new(ansa::frontend::offline::compact_retained)),
+                ..Options::default()
+            },
+        )
+    };
+    let mut runtime = start(12 * 1024).await;
+    let handle = runtime.handle();
+    for (id, text) in [("A", older.as_str()), ("B", "B"), ("C", "C"), ("D", "D")] {
+        fixture::submit(&handle, id, text, id).await;
+        fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    }
+    assert_eq!(
+        fixture::snapshot(&handle, "estimate_below_half")
+            .await
+            .compactions,
+        0
+    );
+    fixture::finish(&mut runtime).await;
+
+    let mut runtime = start(64 * 1024).await;
+    let handle = runtime.handle();
+    fixture::submit(&handle, "E", &crosses_half, "E").await;
+    fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    assert_eq!(
+        fixture::snapshot(&handle, "estimate_at_half")
+            .await
+            .compactions,
+        1
+    );
     fixture::finish(&mut runtime).await;
 }
 

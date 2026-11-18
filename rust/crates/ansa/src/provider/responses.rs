@@ -4,7 +4,10 @@ use crate::{
         json::Json,
         sse::{Event, Limits, Parser},
     },
-    provider::{native::NativeItem, request::Request},
+    provider::{
+        native::{ContextBudget, NativeItem},
+        request::Request,
+    },
 };
 use std::collections::{BTreeMap, HashSet};
 pub(crate) type TextPreview = Box<dyn FnMut(&str)>;
@@ -65,8 +68,14 @@ impl AdmittedResponse {
     pub fn calls(&self) -> &[FunctionCall] {
         &self.calls
     }
-    pub(crate) fn context_usage(&self) -> Option<(usize, usize)> {
-        self.tokens.zip(self.context_window)
+    pub(crate) fn context_budget(&self) -> Option<ContextBudget> {
+        self.context_window.map(|window| ContextBudget {
+            window,
+            tokens: self.tokens,
+        })
+    }
+    pub(crate) fn token_usage(&self) -> Option<usize> {
+        self.tokens
     }
     pub(crate) fn with_token_usage(mut self, tokens: Option<usize>) -> Self {
         self.tokens = tokens.filter(|tokens| *tokens > 0);

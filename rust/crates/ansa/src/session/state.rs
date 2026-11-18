@@ -6,13 +6,17 @@ use super::{
     transcript::{Entry, Transcript},
 };
 use crate::{
-    context::{epoch::compact_epoch, legacy_compact::CompactedContext},
+    context::{
+        epoch::compact_epoch, estimate_request_tokens, estimate_text_tokens,
+        legacy_compact::CompactedContext,
+    },
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::{
         contracts::{
             AgentMode, CommandId, Followup, GenerationSelection, RequestId, SessionId, TurnId,
             valid_id,
         },
+        native::ContextBudget,
         replay::{Effects, Execution},
         request::{Advertisement, Binding, Epoch, Request},
         responses::AdmittedResponse,
@@ -43,7 +47,7 @@ pub struct ForkSeed {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ForkContext {
     completed_starts: Arc<Vec<usize>>,
-    usage: Option<(usize, usize)>,
+    budget: Option<ContextBudget>,
 }
 impl PartialEq for ForkSeed {
     fn eq(&self, other: &Self) -> bool {
@@ -94,7 +98,9 @@ impl ForkSeed {
         };
         request.tools = tools.clone();
         result.request = Arc::new(request);
-        Arc::make_mut(&mut result.context).usage = None;
+        if let Some(budget) = &mut Arc::make_mut(&mut result.context).budget {
+            budget.tokens = None;
+        }
         Ok(result)
     }
     fn entries(transcript: &Transcript) -> Result<Json> {
@@ -137,18 +143,18 @@ impl ForkSeed {
         Json::array(entries)
     }
     pub(crate) fn event(&self) -> Result<Json> {
-        let mut seed = Json::object(vec![
+        let mut fields = vec![
             ("kind", Json::string("fork")?),
             ("source_session", Json::string(&self.source_session.0)?),
             ("source_turn", Json::string(&self.source_turn.0)?),
             ("context", self.request.save()?),
             ("transcript", Self::entries(&self.transcript)?),
             ("timeline", self.timeline.save()?),
-        ])?;
-        if let Some((tokens, window)) = self.context.usage {
-            seed = seed.with("context_tokens", num(tokens)?)?;
-            seed = seed.with("context_window", num(window)?)?;
+        ];
+        if let Some(budget) = self.context.budget {
+            budget.save(&mut fields)?;
         }
+        let seed = Json::object(fields)?;
         if self.context.completed_starts.is_empty() {
             Ok(seed)
         } else {
@@ -200,17 +206,15 @@ struct ContextUsage {
     binding: Binding,
     epoch: String,
     tools: String,
-    tokens: usize,
-    window: usize,
+    budget: ContextBudget,
 }
 impl ContextUsage {
-    fn new(request: &Request, tokens: usize, window: usize) -> Self {
+    fn new(request: &Request, budget: ContextBudget) -> Self {
         Self {
             binding: request.binding.clone(),
             epoch: request.epoch.id.clone(),
             tools: request.tools.revision.clone(),
-            tokens,
-            window,
+            budget,
         }
     }
 }
@@ -277,19 +281,24 @@ impl State {
     pub(crate) fn completed_context_turns(&self) -> usize {
         self.completed_starts.len()
     }
-    fn context_usage_for(&self, request: &Request) -> Option<(usize, usize)> {
+    fn context_budget_for(&self, request: &Request) -> Option<ContextBudget> {
         let usage = self.context_usage.as_ref()?;
-        (usage.binding == request.binding
-            && usage.epoch == request.epoch.id
-            && usage.tools == request.tools.revision)
-            .then_some((usage.tokens, usage.window))
+        if usage.binding != request.binding {
+            return None;
+        }
+        let mut budget = usage.budget;
+        if usage.epoch != request.epoch.id || usage.tools != request.tools.revision {
+            budget.tokens = None;
+        }
+        Some(budget)
     }
     pub(crate) fn context_at_half(&self, request: &Request, submitted: &str) -> Option<bool> {
-        let (tokens, window) = self.context_usage_for(request)?;
-        // The provider measures the completed prefix. Estimate only the text
-        // that has not been sent to it yet.
-        let added = submitted.chars().count().div_ceil(4);
-        Some(tokens.saturating_add(added) >= window.div_ceil(2))
+        let budget = self.context_budget_for(request)?;
+        let tokens = budget.tokens.map_or_else(
+            || estimate_request_tokens(request),
+            |tokens| tokens.saturating_add(estimate_text_tokens(submitted)),
+        );
+        Some(tokens >= budget.window.div_ceil(2))
     }
     pub fn fork_seed(&self) -> Result<ForkSeed> {
         need(self.initialized, "session_missing_init")?;
@@ -314,11 +323,12 @@ impl State {
             self.request_for("fork", AgentMode::Basic)?
                 .with_input(self.history.clone())?
         };
-        let context_usage = if request.input == self.history {
-            self.context_usage_for(&request)
-        } else {
-            None
-        };
+        let budget = self.context_budget_for(&request).map(|mut budget| {
+            if budget.tokens.is_some() && request.input != self.history {
+                budget.tokens = None;
+            }
+            budget
+        });
         Ok(ForkSeed {
             source_session: self.session.clone(),
             source_turn: self
@@ -330,7 +340,7 @@ impl State {
             timeline: self.timeline.clone(),
             context: Arc::new(ForkContext {
                 completed_starts: self.completed_starts.clone(),
-                usage: context_usage,
+                budget,
             }),
         })
     }
@@ -609,14 +619,12 @@ impl State {
                     && context.final_format() == self.configuration.final_format(),
                 "session_fork_binding",
             )?;
-            if event.has("context_tokens") || event.has("context_window") {
-                let tokens = event.usize_field("context_tokens")?;
-                let window = event.usize_field("context_window")?;
+            if let Some(budget) = ContextBudget::load(event)? {
                 need(
-                    tokens > 0 && window >= 2 && !context.input.is_empty(),
+                    budget.tokens.is_none() || !context.input.is_empty(),
                     "fork_context_usage",
                 )?;
-                self.context_usage = Some(ContextUsage::new(&context, tokens, window));
+                self.context_usage = Some(ContextUsage::new(&context, budget));
             }
             self.history = context.input;
             self.history_bytes = Json::array(self.history.clone())?.dump().len();
@@ -959,7 +967,9 @@ impl State {
             self.compactions += 1;
             self.epoch = compact_epoch(&self.configuration.epoch, self.compactions, &compacted)?;
             self.history = compacted.output()?.to_vec();
-            self.context_usage = None;
+            if let Some(usage) = &mut self.context_usage {
+                usage.budget.tokens = None;
+            }
             self.history_bytes = Json::array(self.history.clone())?.dump().len();
             let current = self.turn.as_ref().ok_or("session_turn_identity")?;
             let mut next = self.request_for(&current.receipt.text, current.receipt.mode)?;
@@ -1124,9 +1134,16 @@ impl State {
                     self.history = response.request().input.clone();
                     self.history
                         .extend(response.items().iter().map(|i| i.value().clone()));
-                    self.context_usage = response.context_usage().map(|(tokens, window)| {
-                        ContextUsage::new(response.request(), tokens, window)
+                    let budget = response.context_budget().or_else(|| {
+                        self.context_usage.as_ref().and_then(|usage| {
+                            (usage.binding == response.request().binding).then_some(ContextBudget {
+                                window: usage.budget.window,
+                                tokens: response.token_usage(),
+                            })
+                        })
                     });
+                    self.context_usage =
+                        budget.map(|budget| ContextUsage::new(response.request(), budget));
                     self.history_bytes = Json::array(self.history.clone())?.dump().len();
                     Arc::make_mut(&mut self.completed_starts).push(current.start_item);
                     current.stage = "completed".into();
