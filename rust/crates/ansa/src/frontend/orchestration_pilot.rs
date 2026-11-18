@@ -15,6 +15,7 @@ use crate::{
 use serde_json::{Value, json};
 use std::{
     fs::File,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -492,7 +493,7 @@ pub fn run() -> Result<()> {
             }
         })
         .map_err(|_| "pilot_deadline_watchdog")?;
-    let result = scenario(&pilot, &stop);
+    let result = scenario(&pilot, &stop, &mut std::io::stdout());
     let _ = finish.send(());
     watchdog.join().map_err(|_| "pilot_deadline_watchdog")?;
     println!(
@@ -525,14 +526,41 @@ impl Drop for Sandbox {
     }
 }
 
-fn scenario(pilot: &Arc<Pilot>, stop: &Cancel) -> Result<()> {
+fn check_scenario_scope(
+    plan: &crate::orchestration::plan::Plan,
+    report: &mut impl Write,
+) -> Result<()> {
+    use crate::orchestration::plan::Access;
+    let steps = plan.steps();
+    let status = match steps {
+        [step] if step.access != Access::Write => "step_access",
+        [step] if step.paths != ["report.txt"] => "step_paths",
+        [_] => "accepted",
+        _ => "step_count",
+    };
+    let scopes: Vec<_> = steps
+        .iter()
+        .map(|step| json!({"access":step.access,"paths":step.paths}))
+        .collect();
+    writeln!(
+        report,
+        "{}",
+        json!({"event":"pilot_plan_scope","status":status,"step_count":steps.len(),"steps":scopes})
+    )
+    .map_err(|_| "pilot_plan_evidence")?;
+    if status != "accepted" {
+        return Err("pilot_plan_scope");
+    }
+    Ok(())
+}
+
+fn scenario(pilot: &Arc<Pilot>, stop: &Cancel, report: &mut impl Write) -> Result<()> {
     use super::{
         orchestration::{self, Proposal},
         sessions::{Factory, Kind},
     };
-    use crate::{
-        orchestration::plan::Access,
-        runtime::{AgentMode, CommandPayload, EventPayload, PostStatus, RuntimeCommand, Submit},
+    use crate::runtime::{
+        AgentMode, CommandPayload, EventPayload, PostStatus, RuntimeCommand, Submit,
     };
     let storage = Sandbox::create()?;
     let home = storage.0.join("home");
@@ -552,8 +580,8 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel) -> Result<()> {
     };
     let git = |args: &[&str]| git_at(&cwd, args);
     git(&["init", "--quiet", "--template="])?;
-    let report = cwd.join("report.txt");
-    std::fs::write(&report, "Report title: demo\nStatus: unverified\n")
+    let report_path = cwd.join("report.txt");
+    std::fs::write(&report_path, "Report title: demo\nStatus: unverified\n")
         .map_err(|_| "pilot_fixture")?;
     git(&["add", "--", "report.txt"])?;
     git(&[
@@ -602,14 +630,14 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel) -> Result<()> {
         }
         Err("pilot_parent_context")
     })?;
-    let prompt = "In this synthetic repository update report.txt: replace Status: unverified with Status: verified. Use one write step scoped exactly to report.txt and verify that report.txt contains Status: verified. Provide the exact old and new lines to the helper. The coordinator arranges an independent review after the edit. Leave all other lines and files unchanged.";
+    let prompt = concat!(
+        "In this synthetic repository, replace the line Status: unverified with Status: verified in report.txt. ",
+        "Return exactly one entry in steps, with access write and paths [\"report.txt\"]. Give the helper both exact lines. ",
+        "Put the assertion that report.txt contains Status: verified in checks. The coordinator runs the check and ",
+        "independent review automatically. Leave all other lines and files unchanged."
+    );
     let proposal = Proposal::generate(&factory, seed, prompt.into(), stop)?;
-    let [step] = proposal.plan.steps() else {
-        return Err("pilot_plan_scope");
-    };
-    if step.access != Access::Write || step.paths != ["report.txt"] {
-        return Err("pilot_plan_scope");
-    }
+    check_scenario_scope(&proposal.plan, report)?;
     let completed = orchestration::execute(&factory, proposal, stop)?;
     let candidate = completed
         .candidate
@@ -630,7 +658,7 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel) -> Result<()> {
                 &candidate.commit,
             ],
         )? != b"report.txt\0"
-        || std::fs::read_to_string(&report).map_err(|_| "pilot_fixture")?
+        || std::fs::read_to_string(&report_path).map_err(|_| "pilot_fixture")?
             != "Report title: demo\nStatus: unverified\n"
         || git(&["status", "--short"])? != before
         || git(&["rev-parse", "HEAD"])? != head
@@ -788,6 +816,41 @@ mod tests {
     }
 
     #[test]
+    fn rejected_synthetic_plan_reports_the_scope_and_reason() {
+        use crate::orchestration::plan::Plan;
+        let edit = json!({"id":"edit","task":"Update the report","access":"write","paths":["report.txt"],"depends_on":[],"acceptance":"Report verified"});
+        let inspect = json!({"id":"inspect","task":"Read the report","access":"read","paths":["report.txt"],"depends_on":[],"acceptance":"Report read"});
+        let mut expanded = edit.clone();
+        expanded["paths"] = json!(["report.txt", "other.txt"]);
+        for (status, steps) in [
+            ("step_count", json!([edit, inspect])),
+            ("step_access", json!([inspect])),
+            ("step_paths", json!([expanded])),
+        ] {
+            let plan = Plan::parse(
+                &json!({"schema_version":1,"summary":"Check the report","steps":steps}).to_string(),
+            )
+            .unwrap();
+            let mut report = Vec::new();
+            assert_eq!(
+                check_scenario_scope(&plan, &mut report),
+                Err("pilot_plan_scope")
+            );
+            let actual: Value = serde_json::from_slice(&report).unwrap();
+            let steps: Vec<_> = steps
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| json!({"access":step["access"],"paths":step["paths"]}))
+                .collect();
+            assert_eq!(
+                actual,
+                json!({"event":"pilot_plan_scope","status":status,"step_count":steps.len(),"steps":steps})
+            );
+        }
+    }
+
+    #[test]
     fn full_synthetic_scenario_fits_remaining_requests_after_preflight() {
         let root = Sandbox::create().unwrap();
         let ledger = root.0.join("budget");
@@ -871,7 +934,12 @@ mod tests {
             &stop,
         )
         .unwrap();
-        scenario(&pilot, &stop).unwrap();
+        let mut report = Vec::new();
+        scenario(&pilot, &stop, &mut report).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&report).unwrap(),
+            json!({"event":"pilot_plan_scope","status":"accepted","step_count":1,"steps":[{"access":"write","paths":["report.txt"]}]}),
+        );
         assert_eq!(pilot.requests(), Ok(12));
         drop(pilot);
         assert!(matches!(
