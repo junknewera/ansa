@@ -1,4 +1,6 @@
 //! Feature-gated, metered OpenRouter pilot. The normal CLI has no such route.
+mod trace;
+
 use super::Result;
 use crate::{
     auth::{
@@ -156,36 +158,35 @@ pub(super) struct Pilot {
     exchange: Exchange,
     budget: Mutex<Budget>,
     deadline: Instant,
+    trace: trace::Trace,
 }
 
 impl Pilot {
-    fn authorize(
-        key: Secret,
-        exchange: Exchange,
-        budget: Budget,
-        allow_unlimited_key: bool,
-        stop: &Cancel,
-    ) -> Result<Arc<Self>> {
-        let meter = Self {
+    fn new(key: Secret, exchange: Exchange, budget: Budget) -> Self {
+        Self {
             key,
             exchange,
             budget: Mutex::new(budget),
             deadline: Instant::now() + DURATION,
-        };
-        let catalog = meter.exchange("GET", CATALOG, None, stop)?;
+            trace: trace::Trace::default(),
+        }
+    }
+
+    fn preflight(&self, allow_unlimited_key: bool, stop: &Cancel) -> Result<()> {
+        let catalog = self.exchange("catalog", "GET", CATALOG, None, stop)?;
         verify_catalog(&catalog)?;
-        let credits = meter.exchange("GET", KEY, None, stop)?;
+        let credits = self.exchange("key", "GET", KEY, None, stop)?;
         verify_credit_limit(&credits, allow_unlimited_key)?;
         // The successful scenario needs a schema probe, plan, tool+final for
         // each child, and a parent summary.
-        if CALLS - meter.requests()? < 7 {
+        if CALLS - self.requests()? < 7 {
             return Err("pilot_insufficient_scenario_budget");
         }
         let challenge = json!({"type":"json_schema","json_schema":{"name":"ansa_native_schema_probe","strict":true,"schema":{
             "type":"object","properties":{"value":{"type":"string","enum":["schema-enforced"]}},
             "required":["value"],"additionalProperties":false
         }}});
-        let value = meter.exchange("POST", API, Some(json!({
+        let value = self.exchange("schema_probe", "POST", API, Some(json!({
             "model": MODEL, "provider": route(), "max_tokens": 256, "reasoning":{"enabled":false},
             "messages": [{"role":"user","content":"Answer with the JSON object {\"value\":\"replace-this\"}. Never use the phrase schema-enforced."}],
             "response_format": challenge,
@@ -201,11 +202,12 @@ impl Pilot {
         if answer != json!({"value":"schema-enforced"}) {
             return Err("pilot_schema_enforcement");
         }
-        Ok(Arc::new(meter))
+        Ok(())
     }
 
     fn exchange(
         &self,
+        phase: &'static str,
         method: &'static str,
         url: &'static str,
         body: Option<Value>,
@@ -216,10 +218,11 @@ impl Pilot {
         if body.len() > 256 * 1024 {
             return Err("pilot_request_size");
         }
-        self.budget
-            .lock()
-            .map_err(|_| "pilot_budget_lock")?
-            .reserve(method, url)?;
+        let request = {
+            let mut budget = self.budget.lock().map_err(|_| "pilot_budget_lock")?;
+            budget.reserve(method, url)?;
+            budget.used
+        };
         let timeout = self
             .deadline
             .checked_duration_since(Instant::now())
@@ -236,15 +239,24 @@ impl Pilot {
                 timeout_ms: (timeout.as_millis() as u64).clamp(1, 75_000),
             },
             stop,
-        )?;
-        if reply.head.status != 200
-            || reply.head.content_types.len() != 1
-            || reply.head.content_types[0].split(';').next() != Some("application/json")
-        {
-            return Err("pilot_http");
-        }
-        let strict = Json::parse_with_limits(&reply.body, 512 * 1024, 64, 131072)?;
-        serde_json::from_str(&strict.dump()).map_err(|_| "pilot_json")
+        );
+        // The exchange exposes headers only together with a complete body.
+        let status = reply.as_ref().ok().map(|reply| reply.head.status);
+        let value = reply.and_then(|reply| {
+            if reply.head.status != 200
+                || reply.head.content_types.len() != 1
+                || reply.head.content_types[0].split(';').next() != Some("application/json")
+            {
+                return Err("pilot_http");
+            }
+            let strict = Json::parse_with_limits(&reply.body, 512 * 1024, 64, 131072)?;
+            serde_json::from_str::<Value>(&strict.dump()).map_err(|_| "pilot_json")
+        });
+        let finish = (method == "POST")
+            .then(|| value.as_ref().ok().map(trace::finish_reason))
+            .flatten();
+        self.trace.add(json!({"kind":"http","phase":phase,"request":request,"status":status,"finish_reason":finish,"code":value.as_ref().err()}))?;
+        value
     }
 
     fn requests(&self) -> Result<u8> {
@@ -268,8 +280,11 @@ impl Pilot {
             return Err("pilot_binding");
         }
         let body = encode(request)?;
-        let response = self.exchange("POST", API, Some(body), stop)?;
-        decode(request, &response)
+        let phase = trace::phase(request);
+        let response = self.exchange(phase, "POST", API, Some(body), stop)?;
+        let admitted = decode(request, &response);
+        self.trace.add(json!({"kind":"response_admission","phase":phase,"accepted":admitted.is_ok(),"code":admitted.as_ref().err()}))?;
+        admitted
     }
 }
 
@@ -474,14 +489,18 @@ pub fn run() -> Result<()> {
         return Err("pilot_key_pipe");
     }
     let stop = Cancel::default();
-    let pilot = Pilot::authorize(
+    let pilot = Arc::new(Pilot::new(
         Secret::new(key.into()),
         Arc::new(crate::transport::client::pilot_exchange),
         Budget::open(&ledger, prior)?,
-        allow_unlimited_key,
-        &stop,
-    )?;
+    ));
     drop(token);
+    let result = pilot.preflight(allow_unlimited_key, &stop);
+    let mut report = std::io::stdout();
+    if result.is_err() {
+        pilot.trace.write(&mut report)?;
+        return result;
+    }
     let (finish, finished) = std::sync::mpsc::channel::<()>();
     let watchdog_stop = stop.clone();
     let remaining = pilot.deadline.saturating_duration_since(Instant::now());
@@ -493,9 +512,10 @@ pub fn run() -> Result<()> {
             }
         })
         .map_err(|_| "pilot_deadline_watchdog")?;
-    let result = scenario(&pilot, &stop, &mut std::io::stdout());
+    let result = scenario(&pilot, &stop, &mut report);
     let _ = finish.send(());
     watchdog.join().map_err(|_| "pilot_deadline_watchdog")?;
+    pilot.trace.write(&mut report)?;
     println!(
         "model={MODEL} endpoint={ENDPOINT} requests={} result={}",
         pilot.requests()?,
@@ -555,18 +575,41 @@ fn check_scenario_scope(
 }
 
 fn scenario(pilot: &Arc<Pilot>, stop: &Cancel, report: &mut impl Write) -> Result<()> {
-    use super::{
-        orchestration::{self, Proposal},
-        sessions::{Factory, Kind},
-    };
-    use crate::runtime::{
-        AgentMode, CommandPayload, EventPayload, PostStatus, RuntimeCommand, Submit,
-    };
     let storage = Sandbox::create()?;
     let home = storage.0.join("home");
     let cwd = storage.0.join("repo");
     ansa_linux::fs::create_private_leaf(&home).map_err(|_| "pilot_storage")?;
     ansa_linux::fs::create_private_leaf(&cwd).map_err(|_| "pilot_storage")?;
+    let settings = crate::config::load_agent_settings(&cwd, &home)?;
+    let factory =
+        super::sessions::Factory::new(settings, home.join("auth"), true, String::new(), None)
+            .with_pilot(pilot.clone());
+    let result = run_synthetic(pilot, stop, report, &factory);
+    // The scenario and its workers have stopped. Give a timed-out run a
+    // separate, short window to collect its last durable outcomes.
+    let evidence = pilot.trace.collect_journals(&factory.settings);
+    if let Err(code) = evidence {
+        pilot
+            .trace
+            .add(json!({"kind":"journal_capture_error","code":code}))?;
+    }
+    result.and(evidence)
+}
+
+fn run_synthetic(
+    pilot: &Pilot,
+    stop: &Cancel,
+    report: &mut impl Write,
+    factory: &super::sessions::Factory,
+) -> Result<()> {
+    use super::{
+        orchestration::{self, Proposal},
+        sessions::Kind,
+    };
+    use crate::runtime::{
+        AgentMode, CommandPayload, EventPayload, PostStatus, RuntimeCommand, Submit,
+    };
+    let cwd = factory.settings.cwd.as_path();
     let git_at = |directory: &std::path::Path, args: &[&str]| match crate::process::git::run(
         directory,
         args,
@@ -578,7 +621,7 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel, report: &mut impl Write) -> Resul
         crate::process::git::GitOutput::Success(output) => Ok(output),
         _ => Err("pilot_git"),
     };
-    let git = |args: &[&str]| git_at(&cwd, args);
+    let git = |args: &[&str]| git_at(cwd, args);
     git(&["init", "--quiet", "--template="])?;
     let report_path = cwd.join("report.txt");
     std::fs::write(&report_path, "Report title: demo\nStatus: unverified\n")
@@ -597,9 +640,6 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel, report: &mut impl Write) -> Resul
     let before = git(&["status", "--short"])?;
     let head = git(&["rev-parse", "HEAD"])?;
     let index = git(&["ls-files", "--stage", "-z"])?;
-    let settings = crate::config::load_agent_settings(&cwd, &home)?;
-    let factory = Factory::new(settings, home.join("auth"), true, String::new(), None)
-        .with_pilot(pilot.clone());
     let mut root = factory.create(Kind::Main, None)?.runtime;
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -636,9 +676,9 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel, report: &mut impl Write) -> Resul
         "Put the assertion that report.txt contains Status: verified in checks. The coordinator runs the check and ",
         "independent review automatically. Leave all other lines and files unchanged."
     );
-    let proposal = Proposal::generate(&factory, seed, prompt.into(), stop)?;
+    let proposal = Proposal::generate(factory, seed, prompt.into(), stop)?;
     check_scenario_scope(&proposal.plan, report)?;
-    let completed = orchestration::execute(&factory, proposal, stop)?;
+    let completed = orchestration::execute(factory, proposal, stop)?;
     let candidate = completed
         .candidate
         .as_ref()
@@ -767,22 +807,21 @@ mod tests {
         ));
         let native_calls = Arc::new(AtomicU8::new(0));
         let calls = native_calls.clone();
-        let meter = Pilot {
-            key: Secret::new("dummy".into()),
-            budget: Mutex::new(Budget::open(&ledger, None).unwrap()),
-            deadline: Instant::now() + DURATION,
-            exchange: Arc::new(move |_, _| {
+        let meter = Pilot::new(
+            Secret::new("dummy".into()),
+            Arc::new(move |_, _| {
                 calls.fetch_add(1, Ordering::AcqRel);
                 Ok(reply(json!({})))
             }),
-        };
+            Budget::open(&ledger, None).unwrap(),
+        );
         for _ in 4..CALLS {
             meter
-                .exchange("GET", KEY, None, &Cancel::default())
+                .exchange("key", "GET", KEY, None, &Cancel::default())
                 .unwrap();
         }
         assert_eq!(
-            meter.exchange("GET", KEY, None, &Cancel::default()),
+            meter.exchange("key", "GET", KEY, None, &Cancel::default()),
             Err("pilot_request_budget")
         );
         assert_eq!(native_calls.load(Ordering::Acquire), CALLS - 4);
@@ -852,6 +891,64 @@ mod tests {
 
     #[test]
     fn full_synthetic_scenario_fits_remaining_requests_after_preflight() {
+        let (result, trace) = synthetic_scenario(FixtureWriter::Complete);
+        assert_eq!(result, Ok(()));
+        for phase in ["writer", "reviewer", "summary"] {
+            assert!(
+                trace
+                    .iter()
+                    .any(|event| event["phase"] == phase && event["kind"] == "done")
+            );
+        }
+        assert!(trace.iter().any(|event| event["phase"] == "writer"
+            && event["kind"] == "tool_admitted"
+            && event["tool"] == "edit_file"));
+        assert!(trace.iter().any(|event| event["phase"] == "writer"
+            && event["kind"] == "tool_outcome"
+            && event["execution"] == "succeeded"
+            && event["effects"] == "known_result"));
+    }
+
+    #[test]
+    fn rejected_and_incomplete_writer_responses_have_distinct_traces() {
+        let (result, trace) = synthetic_scenario(FixtureWriter::OutsideScope);
+        assert!(result.is_err());
+        assert!(
+            trace.iter().any(|event| event["phase"] == "writer"
+                && event["kind"] == "tool_outcome"
+                && event["effects"] == "not_started"
+                && event["code"] == "task_path_scope"),
+            "{trace:?}"
+        );
+
+        let (result, trace) = synthetic_scenario(FixtureWriter::Incomplete);
+        assert!(result.is_err());
+        assert!(trace.iter().any(|event| event["phase"] == "writer"
+            && event["kind"] == "http"
+            && event["status"] == 200
+            && event["finish_reason"] == "length"));
+        assert!(trace.iter().any(|event| event["phase"] == "writer"
+            && event["kind"] == "response_admission"
+            && event["accepted"] == false
+            && event["code"] == "pilot_incomplete"));
+        assert!(trace.iter().any(|event| event["phase"] == "writer"
+            && event["kind"] == "paused"
+            && event["code"] == "pilot_incomplete"));
+        assert!(
+            !trace
+                .iter()
+                .any(|event| event["kind"] == "tool_admitted" || event["kind"] == "tool_outcome")
+        );
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FixtureWriter {
+        Complete,
+        OutsideScope,
+        Incomplete,
+    }
+
+    fn synthetic_scenario(writer: FixtureWriter) -> (Result<()>, Vec<Value>) {
         let root = Sandbox::create().unwrap();
         let ledger = root.0.join("budget");
         let stop = Cancel::default();
@@ -886,6 +983,11 @@ mod tests {
                 return Err("fixture_strict_schema");
             }
             let messages = body["messages"].as_array().ok_or("fixture_messages")?;
+            if step == 4 && writer == FixtureWriter::Incomplete {
+                return Ok(reply(
+                    json!({"id":"fixture4","model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"private-fixture-fragment"}}]}),
+                ));
+            }
             let output = match step {
                 2 => json!({"value":"schema-enforced"}).to_string(),
                 3 => json!({
@@ -896,7 +998,8 @@ mod tests {
                 4 | 6 => {
                     let token = messages[0]["content"].as_str().and_then(|text| text.split_once("instruction_token is ")).and_then(|(_, tail)| tail.get(..64)).ok_or("fixture_instruction_token")?;
                     let calls = if step == 4 {
-                        vec![("edit", "edit_file", json!({"path":"report.txt","old_text":"Status: unverified","new_text":"Status: verified","instruction_token":token}))]
+                        let path = if writer == FixtureWriter::OutsideScope { "other.txt" } else { "report.txt" };
+                        vec![("edit", "edit_file", json!({"path":path,"old_text":"Status: unverified","new_text":"Status: verified","instruction_token":token}))]
                     } else {
                         ["ansa-candidate.diff", "approved-plan.json", "checkout/report.txt"].into_iter().zip(["diff", "plan", "report"]).map(|(path, id)| {
                             (id, "read_file", json!({"path":path,"max_bytes":8192,"offset":0,"instruction_token":token}))
@@ -926,26 +1029,53 @@ mod tests {
                 json!({"id":format!("fixture{step}"),"model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":output}}]}),
             ))
         });
-        let pilot = Pilot::authorize(
+        let pilot = Arc::new(Pilot::new(
             Secret::new("dummy".into()),
             exchange,
             Budget::open(&ledger, Some(3)).unwrap(),
-            true,
-            &stop,
-        )
-        .unwrap();
+        ));
+        pilot.preflight(true, &stop).unwrap();
         let mut report = Vec::new();
-        scenario(&pilot, &stop, &mut report).unwrap();
+        let result = scenario(&pilot, &stop, &mut report);
         assert_eq!(
             serde_json::from_slice::<Value>(&report).unwrap(),
             json!({"event":"pilot_plan_scope","status":"accepted","step_count":1,"steps":[{"access":"write","paths":["report.txt"]}]}),
         );
-        assert_eq!(pilot.requests(), Ok(12));
+        assert_eq!(
+            pilot.requests(),
+            Ok(if writer == FixtureWriter::Complete {
+                12
+            } else {
+                8
+            })
+        );
+        let mut report = Vec::new();
+        pilot.trace.write(&mut report).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        for private in [
+            "instruction_token",
+            "private-fixture-fragment",
+            "Status: unverified",
+            "Status: verified",
+            "dummy",
+        ] {
+            assert!(!report.contains(private));
+        }
+        let report: Value = serde_json::from_str(&report).unwrap();
+        let trace = report["events"].as_array().unwrap().to_vec();
+        assert!(
+            !trace.iter().any(|event| {
+                event["kind"] == "journal_error" || event["kind"] == "journal_capture_error"
+            }),
+            "{trace:?}"
+        );
+        assert_eq!(Arc::strong_count(&pilot), 1);
         drop(pilot);
-        assert!(matches!(
-            Budget::open(&ledger, None),
-            Err("pilot_already_started")
-        ));
+        assert_eq!(
+            Budget::open(&ledger, None).err(),
+            Some("pilot_already_started")
+        );
+        (result, trace)
     }
 
     #[test]
