@@ -688,7 +688,10 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     other.write_bytes(good[:start_idat] + struct.pack('>I', len(bad) - 4) + bad
                       + struct.pack('>I', zlib.crc32(bad)) + good[end_idat:])
     screen.send('Проверь повреждённый PNG\r')
-    until(screen, lambda text: 'preview_png_decode' in text and completed(root, 'Проверь повреждённый PNG'),
+    # The durable Done can precede the frame with the assistant's verdict.
+    # Wait for that frame before taking coordinates from the transcript.
+    until(screen, lambda text: 'preview_png_decode' in text and 'PNG_REJECTED' in text
+          and completed(root, 'Проверь повреждённый PNG'),
           'invalid PNG rejected visibly')
     assert 'График · other.png' not in visible(screen)
     row, col = screen.vt.location('Открыть график · chart.png')
