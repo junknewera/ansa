@@ -185,6 +185,8 @@ pub fn lock_new(directory: &File) -> io::Result<File> {
 }
 
 pub const ACTIVE_TERMINAL_SCOPE: &str = "active-terminal-scope.json";
+const WRITER_PREFIX: &str = "workspace-writer-";
+const ROOT_WRITER_PREFIX: &str = "workspace-root-writer-";
 
 pub fn workspace_records(
     registry: &Path,
@@ -197,6 +199,11 @@ pub fn workspace_records(
         return Err(io::Error::other("terminal_workspace_registry"));
     }
     let workspace = crate::fs::open_nofollow(workspace, read_flags())?;
+    let (directory, identity) = workspace_entry(registry, &workspace)?;
+    Ok((workspace, directory, identity))
+}
+
+fn workspace_entry(registry: &Path, workspace: &File) -> io::Result<(File, (u64, u64))> {
     let metadata = workspace.metadata()?;
     if !metadata.is_dir() {
         return Err(io::Error::other("terminal_workspace_identity"));
@@ -204,34 +211,248 @@ pub fn workspace_records(
     let identity = (metadata.dev(), metadata.ino());
     let path = registry.join(format!("{:x}-{:x}", identity.0, identity.1));
     crate::fs::create_private(&path)?;
-    Ok((workspace, crate::fs::private_directory(&path)?, identity))
+    Ok((crate::fs::private_directory(&path)?, identity))
 }
 
-pub fn ensure_terminal_scope_free(directory: &File) -> Result<(), &'static str> {
+fn ensure_no_writers(directory: &File, roots_only: bool) -> Result<(), &'static str> {
+    let (entries, more) = names(directory, 256).map_err(|_| "terminal_workspace_evidence")?;
+    if more
+        || entries.iter().any(|entry| {
+            let name = entry.as_encoded_bytes();
+            name.starts_with(ROOT_WRITER_PREFIX.as_bytes())
+                || !roots_only
+                    && (name.starts_with(WRITER_PREFIX.as_bytes())
+                        || name.starts_with(b"ordinary-writer-"))
+        })
+    {
+        return Err("terminal_workspace_quarantined");
+    }
     if read(directory, ACTIVE_TERMINAL_SCOPE, 8192)
         .map_err(|_| "terminal_workspace_evidence")?
         .is_some()
     {
-        Err("terminal_workspace_quarantined")
-    } else {
+        return Err("terminal_workspace_quarantined");
+    }
+    Ok(())
+}
+
+/// Directory and admission locks for one operation. Descendant workspaces keep
+/// a shared lock on eligible ancestors and an exclusive lock at each write root.
+pub struct WorkspaceWrite {
+    directory: File,
+    scopes: Vec<WriteScope>,
+    operation: Option<String>,
+}
+
+struct WriteScope {
+    record: File,
+    _lock: File,
+    _presence: Option<File>,
+    identity: (u64, u64),
+    root: bool,
+}
+
+impl WorkspaceWrite {
+    pub fn acquire(registry: &Path, workspace: &Path, target: &Path) -> Result<Self, &'static str> {
+        Self::acquire_tree(registry, workspace, target, true)
+    }
+
+    fn acquire_tree(
+        registry: &Path,
+        workspace: &Path,
+        target: &Path,
+        writer: bool,
+    ) -> Result<Self, &'static str> {
+        if !registry.is_absolute()
+            || crate::fs::normalize(registry) != registry
+            || !target.is_absolute()
+            || crate::fs::normalize(target) != target
+            || !workspace.is_absolute()
+            || crate::fs::normalize(workspace) != workspace
+        {
+            return Err("terminal_workspace_registry");
+        }
+        let mut scopes = Vec::new();
+        if !target.starts_with(workspace) && !workspace.starts_with(target) {
+            open_workspace_tree(registry, workspace, &mut scopes, writer)?;
+        }
+        let directory = open_workspace_tree(registry, target, &mut scopes, writer)?;
+        Ok(Self {
+            directory,
+            scopes,
+            operation: None,
+        })
+    }
+
+    pub fn begin(&mut self, operation: &str) -> Result<(), &'static str> {
+        if self.operation.is_some() || !valid_writer_operation(operation) {
+            return Err("terminal_workspace_evidence");
+        }
+        for (index, scope) in self.scopes.iter().enumerate() {
+            let marker = writer_marker(operation, scope.root);
+            if create(&scope.record, &marker, operation.as_bytes()).is_err() {
+                // No effect has started. Remove only publications from this attempt.
+                for previous in &self.scopes[..index] {
+                    let _ = unlink(&previous.record, &writer_marker(operation, previous.root));
+                }
+                return Err("terminal_workspace_evidence");
+            }
+        }
+        self.operation = Some(operation.to_owned());
         Ok(())
+    }
+
+    pub fn directory(&self) -> &File {
+        &self.directory
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = ((u64, u64), bool)> + '_ {
+        self.scopes.iter().map(|scope| (scope.identity, scope.root))
+    }
+
+    pub fn finish(self) -> Result<(), &'static str> {
+        let Some(operation) = self.operation else {
+            return Ok(());
+        };
+        let mut known = true;
+        for scope in &self.scopes {
+            known &= remove_writer(&scope.record, &operation, scope.root).is_ok();
+        }
+        known.then_some(()).ok_or("terminal_workspace_evidence")
     }
 }
 
-/// Hold a shared admission slot for Plan or an ordinary writing tool.
+fn valid_writer_operation(operation: &str) -> bool {
+    operation.len() == 64 && operation.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn writer_marker(operation: &str, root: bool) -> String {
+    let prefix = if root {
+        ROOT_WRITER_PREFIX
+    } else {
+        WRITER_PREFIX
+    };
+    format!("{prefix}{operation}.v1")
+}
+
+fn remove_writer(directory: &File, operation: &str, root: bool) -> io::Result<()> {
+    let marker = writer_marker(operation, root);
+    match read(directory, &marker, 64)? {
+        Some(value) if value == operation.as_bytes() => unlink(directory, &marker),
+        None => Ok(()),
+        Some(_) => Err(io::Error::other("terminal_workspace_evidence")),
+    }
+}
+
+/// Reconcile a known outcome using the original scope identities from its
+/// verified process request, even if the paths have since moved.
+pub fn reconcile_writer(
+    registry: &Path,
+    operation: &str,
+    identity: (u64, u64),
+    root: bool,
+) -> io::Result<()> {
+    if !valid_writer_operation(operation) {
+        return Err(io::Error::other("terminal_workspace_evidence"));
+    }
+    let path = registry.join(format!("{:x}-{:x}", identity.0, identity.1));
+    let directory = crate::fs::private_directory(&path)?;
+    remove_writer(&directory, operation, root)
+}
+
+fn open_workspace_tree(
+    registry: &Path,
+    target: &Path,
+    scopes: &mut Vec<WriteScope>,
+    writer: bool,
+) -> Result<File, &'static str> {
+    let mut directory = crate::fs::open_nofollow(Path::new("/"), read_flags())
+        .map_err(|_| "terminal_workspace_identity")?;
+    let mut path = std::path::PathBuf::from("/");
+    hold_scope(registry, &directory, path == target, scopes, writer)?;
+    for name in target.iter().skip(1) {
+        path.push(name);
+        directory = crate::fs::open_relative_directory(&directory, Path::new(name))
+            .map_err(|_| "terminal_workspace_identity")?;
+        hold_scope(registry, &directory, path == target, scopes, writer)?;
+    }
+    Ok(directory)
+}
+
+fn hold_scope(
+    registry: &Path,
+    directory: &File,
+    root: bool,
+    scopes: &mut Vec<WriteScope>,
+    writer: bool,
+) -> Result<(), &'static str> {
+    let (record, identity) =
+        workspace_entry(registry, directory).map_err(|_| "terminal_workspace_registry")?;
+    if let Some(index) = scopes.iter().position(|scope| scope.identity == identity) {
+        if !root || scopes[index].root {
+            return Ok(());
+        }
+        scopes.swap_remove(index);
+    }
+    let lock = if root && writer {
+        lock(&record)
+    } else {
+        lock_shared(&record)
+    }
+    .map_err(|_| "terminal_workspace_busy")?;
+    // Root readers may share the main lock. A separate admission lane
+    // keeps them mutually exclusive with writers in descendant scopes.
+    let presence = if writer != root {
+        Some(workspace_presence(&record, writer).map_err(|_| "terminal_workspace_busy")?)
+    } else {
+        None
+    };
+    ensure_no_writers(&record, !root)?;
+    scopes.push(WriteScope {
+        record,
+        _lock: lock,
+        _presence: presence,
+        identity,
+        root,
+    });
+    Ok(())
+}
+
 pub fn workspace_participant(
     registry: &Path,
     workspace: &Path,
-) -> Result<Option<(File, File)>, &'static str> {
-    if registry.starts_with(workspace) {
-        // Terminal hosts cannot reserve a registry in their own worktree.
-        return Ok(None);
-    }
-    let (workspace, directory, _) =
-        workspace_records(registry, workspace).map_err(|_| "terminal_workspace_registry")?;
-    let lock = lock_shared(&directory).map_err(|_| "terminal_workspace_busy")?;
-    ensure_terminal_scope_free(&directory)?;
-    Ok(Some((workspace, lock)))
+) -> Result<WorkspaceWrite, &'static str> {
+    WorkspaceWrite::acquire_tree(registry, workspace, workspace, false)
+}
+
+fn workspace_presence(directory: &File, writer: bool) -> io::Result<File> {
+    use rustix::fs::FlockOperation::{NonBlockingLockExclusive, NonBlockingLockShared};
+    use std::time::{Duration, Instant};
+    const PLAN: &str = "plans-here.lock";
+    const WRITERS: &str = "writers-below.lock";
+    let (own, other) = if writer {
+        (WRITERS, PLAN)
+    } else {
+        (PLAN, WRITERS)
+    };
+    let deadline = Instant::now() + Duration::from_millis(50);
+    let _gate = loop {
+        match open_named_lock(
+            directory,
+            "workspace-admission.lock",
+            OFlags::empty(),
+            NonBlockingLockExclusive,
+        ) {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result => break result?,
+        }
+    };
+    let _opposite = open_named_lock(directory, other, OFlags::empty(), NonBlockingLockExclusive)?;
+    open_named_lock(directory, own, OFlags::empty(), NonBlockingLockShared)
 }
 
 /// Release a checked mutable marker while its caller holds the owner lock.
@@ -248,9 +469,18 @@ fn open_lock(
     extra: OFlags,
     operation: rustix::fs::FlockOperation,
 ) -> io::Result<File> {
+    open_named_lock(directory, "worker.lock", extra, operation)
+}
+
+fn open_named_lock(
+    directory: &File,
+    name: &str,
+    extra: OFlags,
+    operation: rustix::fs::FlockOperation,
+) -> io::Result<File> {
     let fd = rustix::fs::openat(
         directory,
-        "worker.lock",
+        name,
         OFlags::RDWR
             | OFlags::CREATE
             | OFlags::CLOEXEC

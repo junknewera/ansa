@@ -88,7 +88,11 @@ async fn fixture_clock_collisions_and_cleanup_preserve_another_live_journal() {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    async fn plan(runtime: &Runtime, id: &str) -> ansa::frontend::protocol_v1::Snapshot {
+    async fn submit(
+        runtime: &Runtime,
+        id: &str,
+        mode: AgentMode,
+    ) -> ansa::frontend::protocol_v1::Snapshot {
         assert_eq!(
             runtime
                 .post(command(
@@ -96,7 +100,7 @@ async fn fixture_clock_collisions_and_cleanup_preserve_another_live_journal() {
                     id,
                     CommandPayload::Submit(Submit {
                         text: "inspect only".into(),
-                        mode: AgentMode::Plan,
+                        mode,
                     })
                 ))
                 .await
@@ -140,7 +144,9 @@ async fn fixture_clock_collisions_and_cleanup_preserve_another_live_journal() {
         assert!(part.is_file());
         drop(first);
         assert!(!part.exists());
-        let view = plan(&main.runtime, "old_fixture_plan").await;
+        // Reach journal append even though the colliding fixture deleted
+        // the workspace before a Plan would acquire its directory guard.
+        let view = submit(&main.runtime, "old_fixture_plan", AgentMode::Basic).await;
         assert_eq!(view.state, "paused");
         assert!(view.storage_failed);
         assert_eq!(view.diagnostic, "journal_write_conflict");
@@ -179,7 +185,7 @@ async fn fixture_clock_collisions_and_cleanup_preserve_another_live_journal() {
     drop(first);
     assert!(second.0.is_dir());
     assert_eq!(fs::read(&part).unwrap(), before);
-    let view = plan(&main.runtime, "owned_fixture_plan").await;
+    let view = submit(&main.runtime, "owned_fixture_plan", AgentMode::Plan).await;
     assert_eq!(view.state, "completed", "{}", view.diagnostic);
     assert!(!view.storage_failed, "{}", view.diagnostic);
     assert!(part.is_file());

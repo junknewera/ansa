@@ -181,7 +181,32 @@ fn workspace_claim_releases_only_after_known_durable_close() {
         ),
     )
     .unwrap();
+    let registry = fx.root.0.join("workspace_registry");
+    let workspace = fx.root.0.join("workspace");
+    let other_workspace = fx.root.0.join("other");
+    let nested = workspace.join("nested");
+    fs::create_dir(&other_workspace).unwrap();
+    fs::create_dir(&nested).unwrap();
+    let admit = || ansa_linux::local::WorkspaceWrite::acquire(&registry, &other_workspace, &nested);
+
+    let mut known_writer = admit().unwrap();
+    known_writer.begin(&"a".repeat(64)).unwrap();
+    fx.shell(
+        "while_writer",
+        fx.binding.workspace.clone(),
+        Effect::NotStarted,
+    );
+    known_writer.finish().unwrap();
     let terminal = fx.shell("first", fx.binding.workspace.clone(), Effect::Applied);
+    assert!(matches!(admit(), Err("terminal_workspace_busy")));
+    assert!(matches!(
+        ansa_linux::local::workspace_participant(&registry, &nested),
+        Err("terminal_workspace_busy"),
+    ));
+    assert!(matches!(
+        ansa_linux::local::workspace_participant(&registry, &fx.root.0),
+        Err("terminal_workspace_busy"),
+    ));
     let operation = |host: &AttachedHost, name: &str| {
         let operation = id(name);
         Intent {
@@ -214,6 +239,30 @@ fn workspace_claim_releases_only_after_known_durable_close() {
         fx.action("close", &terminal, Writer::Agent, 1, Action::Close),
         OperationStatus::Durable(Effect::Applied)
     );
+    let mut interrupted_writer = admit().unwrap();
+    interrupted_writer.begin(&"b".repeat(64)).unwrap();
+    let records = interrupted_writer.records().collect::<Vec<_>>();
+    drop(interrupted_writer);
+    assert_eq!(
+        peer.execute(Writer::Agent, operation(&peer, "after_writer_loss"), &[]),
+        Ok(OperationStatus::Durable(Effect::NotStarted))
+    );
+    assert!(matches!(
+        ansa_linux::local::workspace_participant(&registry, &workspace),
+        Err("terminal_workspace_quarantined"),
+    ));
+    // Reconcile the synthetic known result before exercising terminal-host loss.
+    for (identity, root) in records {
+        ansa_linux::local::reconcile_writer(&registry, &"b".repeat(64), identity, root).unwrap();
+    }
+    let nested_plan = ansa_linux::local::workspace_participant(&registry, &nested).unwrap();
+    let second_plan = ansa_linux::local::workspace_participant(&registry, &nested).unwrap();
+    assert_eq!(
+        peer.execute(Writer::Agent, operation(&peer, "while_nested_plan"), &[]),
+        Ok(OperationStatus::Durable(Effect::NotStarted))
+    );
+    drop(second_plan);
+    drop(nested_plan);
     assert_eq!(
         peer.execute(Writer::Agent, operation(&peer, "after_close"), &[]),
         Ok(OperationStatus::Durable(Effect::Applied))

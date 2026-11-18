@@ -39,14 +39,20 @@ fn unknown() -> Outcome {
 }
 
 impl Host {
+    #[cfg(test)]
     fn edit(&self, args: &Json, stop: &Cancel) -> Outcome {
+        self.edit_owned(args, stop, &sha256(args.dump().as_bytes()))
+    }
+
+    fn edit_owned(&self, args: &Json, stop: &Cancel, operation: &str) -> Outcome {
         if stop.cancelled() {
             return Outcome::not_started();
         }
-        self.edit_checked(args, stop).unwrap_or_else(rejection)
+        self.edit_checked(args, stop, operation)
+            .unwrap_or_else(rejection)
     }
 
-    fn edit_checked(&self, args: &Json, stop: &Cancel) -> Result<Outcome> {
+    fn edit_checked(&self, args: &Json, stop: &Cancel, operation: &str) -> Result<Outcome> {
         let text = args.text_field("path")?;
         let path = Path::new(text);
         if !path_argument(args, "path")? {
@@ -86,11 +92,12 @@ impl Host {
         {
             return Err("file_edit_limit");
         }
-        let _workspace = ansa_linux::local::workspace_participant(
+        let mut workspace = ansa_linux::local::WorkspaceWrite::acquire(
             &self.settings.directory.join("terminal-workspaces"),
             &self.settings.cwd,
+            path.parent().ok_or("file_path")?,
         )?;
-        let snapshot = ansa_linux::file_edit::Snapshot::open(&path)?;
+        let snapshot = ansa_linux::file_edit::Snapshot::open_in(&path, workspace.directory())?;
         let existed = snapshot.before().is_some();
         let before = std::str::from_utf8(snapshot.before().unwrap_or_default())
             .map_err(|_| "file_not_utf8")?;
@@ -141,7 +148,12 @@ impl Host {
         if output.len() > OUTPUT_BYTES {
             return Err("file_edit_output_limit");
         }
-        match snapshot.publish(after.as_bytes(), || stop.cancelled()) {
+        workspace.begin(operation)?;
+        let published = snapshot.publish(after.as_bytes(), || stop.cancelled());
+        if published != Err(ansa_linux::file_edit::Failure::Unknown) {
+            let _ = workspace.finish();
+        }
+        match published {
             Ok(()) => Ok(Outcome::succeeded(output)),
             Err(ansa_linux::file_edit::Failure::Cancelled) => Ok(Outcome::not_started()),
             Err(ansa_linux::file_edit::Failure::Rejected(code)) => Err(code),
@@ -169,7 +181,10 @@ pub(crate) fn register(registry: &mut Registry, host: Arc<Host>) -> Result<()> {
     }, Policy {
         requires_journal: true,
         read_only: false,
-        invoke: Some(Arc::new(move |invocation, stop| host.edit(&invocation.arguments, stop))),
+        invoke: Some(Arc::new(move |invocation, stop| match invocation.save() {
+            Ok(exact) => host.edit_owned(&invocation.arguments, stop, &sha256(exact.dump().as_bytes())),
+            Err(code) => rejection(code),
+        })),
         // An interrupted publication has no safely replayable external effect.
         // The canonical pending intent remains unknown until reconciliation.
         recover: Some(Arc::new(|_| Ok(None))),

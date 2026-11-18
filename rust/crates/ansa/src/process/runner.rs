@@ -9,7 +9,7 @@ use ansa_linux::{fs, process as linux};
 use std::{
     fs::File,
     io::{ErrorKind, Read},
-    os::unix::process::ExitStatusExt,
+    os::unix::{fs::MetadataExt, process::ExitStatusExt},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     thread::sleep,
@@ -161,7 +161,7 @@ fn output(
         body.dump().into_bytes(),
     ))
 }
-fn supervise(spec: &Json) -> Result<Outcome> {
+fn supervise(spec: &Json, bound: Option<&Json>) -> Result<Outcome> {
     linux::preflight(Path::new("/proc")).map_err(|_| "process_privileges")?;
     super::supervisor::capability_probe(
         &std::env::current_exe().map_err(|_| "process_executable")?,
@@ -177,8 +177,18 @@ fn supervise(spec: &Json) -> Result<Outcome> {
         ));
     }
     let directory = File::open(&options.cwd).map_err(|_| "process_cwd")?;
-    if !directory.metadata().map_err(|_| "process_cwd")?.is_dir() {
+    let metadata = directory.metadata().map_err(|_| "process_cwd")?;
+    if !metadata.is_dir() {
         return Err("process_cwd");
+    }
+    if let Some(bound) = bound
+        && (bound.usize_field("version")? != 1
+            || bound.usize_field("device")? as u64 != metadata.dev()
+            || bound.usize_field("inode")? as u64 != metadata.ino())
+    {
+        return Ok(Outcome::failed_known(
+            r#"{"error":"process_cwd_changed"}"#.into(),
+        ));
     }
     linux::nonblocking_stdin().map_err(|_| "process_nonblocking")?;
     let mut command = Command::new(&options.argv[0]);
@@ -249,6 +259,10 @@ fn supervise(spec: &Json) -> Result<Outcome> {
     output(status.ok(), cancelled, timed_out, out, err, 0, clean)
 }
 pub fn process_worker(job: &Path) -> Result<()> {
+    process_worker_in(job, false)
+}
+
+fn process_worker_in(job: &Path, bound_required: bool) -> Result<()> {
     linux::reset_signals().map_err(|_| "process_signal_reset")?;
     let directory = fs::private_directory(job).map_err(|_| "local_directory_permissions")?;
     let spec = v::read(&directory, "request.json")?.ok_or("process_job_request")?;
@@ -272,7 +286,11 @@ pub fn process_worker(job: &Path) -> Result<()> {
             ("request_hash", s(&sha256(spec.dump().as_bytes()))?),
         ])?,
     )?;
-    let outcome = supervise(&spec).unwrap_or_else(|_| v::unknown());
+    let bound = spec.field("workspace_binding").ok();
+    if bound_required && bound.is_none() {
+        return Err("process_cwd_binding_missing");
+    }
+    let outcome = supervise(&spec, bound).unwrap_or_else(|_| v::unknown());
     v::publish(&directory, &spec, &outcome)
 }
 /// Dispatch before Tokio, configuration, auth or any user-facing frontend.
@@ -280,9 +298,9 @@ pub fn private_entry(args: &[String]) -> Option<Result<()>> {
     if args.get(1)?.as_str() != "--process-worker" {
         return None;
     }
-    Some(if args.len() == 3 {
-        process_worker(Path::new(&args[2]))
-    } else {
-        Err("private_mode_arguments")
+    Some(match args.len() {
+        3 => process_worker(Path::new(&args[2])),
+        4 if args[3] == "--bound-directory" => process_worker_in(Path::new(&args[2]), true),
+        _ => Err("private_mode_arguments"),
     })
 }
