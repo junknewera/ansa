@@ -23,7 +23,7 @@ impl NativeItem {
 /// Persisted response envelope. Loading always reconstructs the SSE lifecycle
 /// and routes it through the same production reducer as a network response.
 pub fn save(response: &AdmittedResponse) -> Result<Json, &'static str> {
-    Json::object(vec![
+    let mut fields = vec![
         ("request", response.request().save()?),
         ("id", Json::string(response.id())?),
         ("model", Json::string(response.returned_model())?),
@@ -37,7 +37,12 @@ pub fn save(response: &AdmittedResponse) -> Result<Json, &'static str> {
                     .collect(),
             )?,
         ),
-    ])
+    ];
+    if let Some((tokens, window)) = response.context_usage() {
+        fields.push(("context_tokens", Json::parse(&tokens.to_string())?));
+        fields.push(("context_window", Json::parse(&window.to_string())?));
+    }
+    Json::object(fields)
 }
 
 pub fn load(value: &Json) -> Result<AdmittedResponse, &'static str> {
@@ -132,11 +137,23 @@ pub fn load(value: &Json) -> Result<AdmittedResponse, &'static str> {
         line: 32 * 1024 * 1024,
         ..Default::default()
     };
-    decode_synthetic(
+    let response = decode_synthetic(
         request,
         200,
         "text/event-stream",
         &[body.as_bytes()],
         limits,
-    )
+    )?;
+    if value.has("context_tokens") || value.has("context_window") {
+        let tokens = value.usize_field("context_tokens")?;
+        let window = value.usize_field("context_window")?;
+        if tokens == 0 || window < 2 {
+            return Err("saved_response_context_usage");
+        }
+        Ok(response
+            .with_token_usage(Some(tokens))
+            .with_context_window(Some(window)))
+    } else {
+        Ok(response)
+    }
 }

@@ -15,6 +15,7 @@ struct ValidatedResponse {
     model: String,
     items: Vec<NativeItem>,
     calls: Vec<FunctionCall>,
+    tokens: Option<usize>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCall {
@@ -45,6 +46,8 @@ pub struct AdmittedResponse {
     pub(crate) items: Vec<NativeItem>,
     pub(crate) calls: Vec<FunctionCall>,
     pub(crate) receipt: super::replay::AdmissionReceipt,
+    tokens: Option<usize>,
+    context_window: Option<usize>,
 }
 impl AdmittedResponse {
     pub fn request(&self) -> &Request {
@@ -61,6 +64,17 @@ impl AdmittedResponse {
     }
     pub fn calls(&self) -> &[FunctionCall] {
         &self.calls
+    }
+    pub(crate) fn context_usage(&self) -> Option<(usize, usize)> {
+        self.tokens.zip(self.context_window)
+    }
+    pub(crate) fn with_token_usage(mut self, tokens: Option<usize>) -> Self {
+        self.tokens = tokens.filter(|tokens| *tokens > 0);
+        self
+    }
+    pub(crate) fn with_context_window(mut self, window: Option<usize>) -> Self {
+        self.context_window = window.filter(|window| *window >= 2);
+        self
     }
     pub fn child_result(&self) -> Result<super::structured::ChildResult, &'static str> {
         if !self.calls.is_empty() {
@@ -318,6 +332,8 @@ impl Reducer {
             items: value.items,
             calls: value.calls,
             receipt: super::replay::receipt(&self.request)?,
+            tokens: value.tokens,
+            context_window: None,
         })
     }
     fn validate_events(
@@ -700,11 +716,17 @@ impl Reducer {
         // Completion events may arrive in a different order. Executable views
         // follow the ordered native output, as the C++ production builder does.
         calls.sort_by_key(|call| call.output_index);
+        let tokens = terminal.field("usage").ok().and_then(|usage| {
+            let input = usage.usize_field("input_tokens").ok()?;
+            let output = usage.usize_field("output_tokens").ok()?;
+            input.checked_add(output).filter(|_| input > 0)
+        });
         Ok(Some(ValidatedResponse {
             id: response_id,
             model: created_model,
             items,
             calls,
+            tokens,
         }))
     }
 }

@@ -276,7 +276,9 @@ impl Factory {
             "tasks. Decide how many helpers add value and use zero if appropriate. For a vague request, ",
             "identify concrete lines of investigation and state what would answer the request. ",
             "Prefer read-only investigation for questions. Grant write access only to the smallest necessary ",
-            "explicit project paths. Dependencies reference step IDs. For every write plan provide concrete ",
+            "explicit project paths. Use repository-relative paths such as src/lib.rs, without a ",
+            "leading slash, ./, .., or duplicates. For unscoped reads use an empty paths array. ",
+            "Dependencies reference step IDs. For every write plan provide concrete ",
             "checks as path and substring assertions against the final checkout. The user must approve the plan before execution. "
         ));
         if format == FinalFormat::OrchestrationPlanWithCommands {

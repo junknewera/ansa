@@ -15,12 +15,14 @@ use crate::{
 use serde_json::{Value, json};
 use std::{
     sync::{Mutex, TryLockError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type Result<T> = std::result::Result<T, &'static str>;
 
 pub(crate) use crate::provider::request::OPENROUTER_MODEL as MODEL;
+pub(crate) const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const ENDPOINT: &str = "fireworks/us";
 pub(crate) const PROVIDER: &str = "Fireworks";
 pub(crate) const API: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -33,7 +35,15 @@ pub(crate) struct OpenRouter {
     key: Secret,
     binding: Binding,
     exchange: Exchange,
-    strict: Mutex<bool>,
+    route: Mutex<Route>,
+}
+
+#[derive(Default)]
+struct Route {
+    catalog_retry_at: Option<Instant>,
+    catalog_verified: bool,
+    window: Option<usize>,
+    strict_verified: bool,
 }
 
 impl OpenRouter {
@@ -58,7 +68,7 @@ impl OpenRouter {
                 returned_model: MODEL.into(),
             },
             exchange,
-            strict: Mutex::new(false),
+            route: Mutex::new(Route::default()),
         })
     }
 
@@ -71,11 +81,12 @@ impl OpenRouter {
         method: &'static str,
         url: &'static str,
         body: Option<Value>,
+        timeout_ms: u64,
         stop: &Cancel,
     ) -> Result<Value> {
         stop.check()?;
         let body = body.map(|body| body.to_string()).unwrap_or_default();
-        if body.len() > 512 * 1024 {
+        if body.len() > MAX_REQUEST_BYTES {
             return Err("openrouter_request_size");
         }
         let reply = (self.exchange)(
@@ -86,7 +97,7 @@ impl OpenRouter {
                 body: Secret::new(body),
                 bearer: (url == API).then(|| self.key.clone()),
                 body_limit: 512 * 1024,
-                timeout_ms: 60_000,
+                timeout_ms,
             },
             stop,
         )?;
@@ -94,29 +105,60 @@ impl OpenRouter {
     }
 
     pub(crate) fn require_strict(&self, stop: &Cancel) -> Result<()> {
-        let mut verified = loop {
+        self.prepare_route(true, stop).map(|_| ())
+    }
+
+    fn prepare_route(&self, strict: bool, stop: &Cancel) -> Result<Option<usize>> {
+        let mut route = loop {
             stop.check()?;
-            match self.strict.try_lock() {
+            match self.route.try_lock() {
                 Ok(state) => break state,
                 Err(TryLockError::WouldBlock) => stop.wait(Duration::from_millis(20)),
                 Err(TryLockError::Poisoned(_)) => return Err("openrouter_route_state"),
             }
         };
-        if !*verified {
-            verify_catalog(&self.send("GET", CATALOG, None, stop)?)?;
-            verify_probe(&self.send("POST", API, Some(probe_body()), stop)?)?;
-            *verified = true;
+        if !route.catalog_verified
+            && (strict
+                || route
+                    .catalog_retry_at
+                    .is_none_or(|retry| Instant::now() >= retry))
+        {
+            let timeout = if strict { REQUEST_TIMEOUT_MS } else { 10_000 };
+            let catalog = self
+                .send("GET", CATALOG, None, timeout, stop)
+                .and_then(|response| {
+                    let endpoint = catalog_endpoint(&response)?;
+                    Ok(endpoint["context_length"]
+                        .as_u64()
+                        .and_then(|window| usize::try_from(window).ok())
+                        .filter(|window| *window >= 2))
+                });
+            stop.check()?;
+            match catalog {
+                Ok(window) => {
+                    route.window = window;
+                    route.catalog_verified = true;
+                }
+                Err(error) => {
+                    route.catalog_retry_at = Some(Instant::now() + Duration::from_secs(30));
+                    if strict {
+                        return Err(error);
+                    }
+                }
+            }
         }
-        Ok(())
+        if strict && !route.strict_verified {
+            verify_probe(&self.send("POST", API, Some(probe_body()), REQUEST_TIMEOUT_MS, stop)?)?;
+            route.strict_verified = true;
+        }
+        Ok(route.window)
     }
 
     pub(crate) fn generate(&self, request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
         if request.binding != self.binding || request.effort.is_some() {
             return Err("openrouter_binding");
         }
-        if request.final_format().is_some() {
-            self.require_strict(stop)?;
-        }
+        let window = self.prepare_route(request.final_format().is_some(), stop)?;
         let mut body = base_body(request, &request.epoch.instructions)?;
         if !request.tools.descriptors.is_empty() {
             body["tools"] = Value::Array(
@@ -133,9 +175,10 @@ impl OpenRouter {
         if request.final_format() == Some(FinalFormat::ChildResult)
             && !request.tools.descriptors.is_empty()
         {
-            let response = self.send("POST", API, Some(body.clone()), stop)?;
+            let response = self.send("POST", API, Some(body.clone()), REQUEST_TIMEOUT_MS, stop)?;
             if choice(&response)?["finish_reason"] == "tool_calls" {
-                return decode(request, &response);
+                return decode(request, &response)
+                    .map(|response| response.with_context_window(window));
             }
             final_choice(&response)?;
         }
@@ -145,12 +188,12 @@ impl OpenRouter {
                 body["tool_choice"] = json!("none");
             }
         }
-        let response = self.send("POST", API, Some(body), stop)?;
+        let response = self.send("POST", API, Some(body), REQUEST_TIMEOUT_MS, stop)?;
         let admitted = decode(request, &response)?;
         if request.final_format().is_some() && !admitted.calls().is_empty() {
             return Err("openrouter_final_has_tools");
         }
-        Ok(admitted)
+        Ok(admitted.with_context_window(window))
     }
 }
 
@@ -184,7 +227,12 @@ pub(crate) fn apply_final_format(request: &Request, body: &mut Value) -> Result<
     Ok(())
 }
 
+#[cfg(feature = "orchestration-pilot")]
 pub(crate) fn verify_catalog(response: &Value) -> Result<()> {
+    catalog_endpoint(response).map(|_| ())
+}
+
+fn catalog_endpoint(response: &Value) -> Result<&Value> {
     let data = response.get("data").ok_or("openrouter_catalog")?;
     if data.get("id").and_then(Value::as_str) != Some(MODEL) {
         return Err("openrouter_catalog");
@@ -213,7 +261,7 @@ pub(crate) fn verify_catalog(response: &Value) -> Result<()> {
     {
         return Err("openrouter_catalog_parameters");
     }
-    Ok(())
+    Ok(endpoint)
 }
 
 pub(crate) fn route() -> Value {
@@ -331,10 +379,13 @@ pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResp
         items.push(json!({"type":"message","id":format!("msg_{id}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}));
     } else if choice["finish_reason"] == "tool_calls" {
         let message = &choice["message"];
+        // The tool phase of a structured child can include explanatory text.
+        // Only the validated tool calls advance the turn. The final phase
+        // still requires the provider-enforced child result schema.
         if !message["content"].is_null()
-            && !message["content"]
-                .as_str()
-                .is_some_and(|text| text.trim().is_empty())
+            && !message["content"].as_str().is_some_and(|text| {
+                text.trim().is_empty() || request.final_format() == Some(FinalFormat::ChildResult)
+            })
         {
             return Err("openrouter_mixed_output");
         }
@@ -359,7 +410,14 @@ pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResp
         ("model", Json::string(MODEL)?),
         ("items", Json::parse(&Value::Array(items).to_string())?),
     ])?;
-    native::load(&envelope)
+    let usage = &response["usage"];
+    let tokens = usage["prompt_tokens"].as_u64().and_then(|input| {
+        input
+            .checked_add(usage["completion_tokens"].as_u64()?)
+            .filter(|_| input > 0)
+            .and_then(|total| usize::try_from(total).ok())
+    });
+    native::load(&envelope).map(|response| response.with_token_usage(tokens))
 }
 
 #[cfg(test)]
@@ -415,9 +473,10 @@ mod tests {
                 let call = calls.fetch_add(1, Ordering::AcqRel);
                 if call == 0 {
                     assert_eq!(request.url, CATALOG);
+                    assert_eq!(request.timeout_ms, REQUEST_TIMEOUT_MS);
                     assert!(request.bearer.is_none());
                     return Ok(reply(
-                        json!({"data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}}),
+                        json!({"data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"context_length":1000000,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}}),
                     ));
                 }
                 let body: Value = serde_json::from_str(request.body.expose()).unwrap();
@@ -432,17 +491,24 @@ mod tests {
                     }
                     2 => {
                         assert!(body.get("response_format").is_none());
-                        json!({"id":"failed_tool","model":MODEL,"provider":PROVIDER,"choices":[{"error":{"message":"fixture"},"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"type":"function","id":"one","function":{"name":"get_test_value","arguments":"{}"}}]}}]})
+                        json!({"id":"review_tool","model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"I will read the candidate.","tool_calls":[{"type":"function","id":"one","function":{"name":"get_test_value","arguments":"{}"}}]}}]})
                     }
                     3 => {
                         assert!(body.get("response_format").is_none());
-                        response("drop this unstructured response")
+                        json!({"id":"failed_tool","model":MODEL,"provider":PROVIDER,"choices":[{"error":{"message":"fixture"},"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"type":"function","id":"one","function":{"name":"get_test_value","arguments":"{}"}}]}}]})
                     }
                     4 => {
+                        assert!(body.get("response_format").is_none());
+                        response("drop this unstructured response")
+                    }
+                    5 => {
                         assert_eq!(body["tool_choice"], "none");
                         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
                         assert!(!body.to_string().contains("drop this unstructured response"));
-                        response(r#"{"status":"completed","summary":"Checked","findings":[]}"#)
+                        let mut value =
+                            response(r#"{"status":"completed","summary":"Checked","findings":[]}"#);
+                        value["usage"] = json!({"prompt_tokens":499990,"completion_tokens":10});
+                        value
                     }
                     _ => panic!("unexpected request"),
                 };
@@ -456,20 +522,21 @@ mod tests {
         .unwrap();
         let request = request(&route).with_final_format(Some(FinalFormat::ChildResult));
         let stop = Cancel::default();
+        let tool = route.generate(&request, &stop).unwrap();
+        assert_eq!(tool.calls()[0].name, "get_test_value");
+        assert_eq!(tool.items().len(), 1);
+        assert_eq!(
+            tool.items()[0].value().text_field("type"),
+            Ok("function_call")
+        );
         assert!(matches!(
             route.generate(&request, &stop),
             Err("openrouter_choice")
         ));
-        assert_eq!(
-            route
-                .generate(&request, &stop)
-                .unwrap()
-                .child_result()
-                .unwrap()
-                .summary,
-            "Checked"
-        );
-        assert_eq!(calls.load(Ordering::Acquire), 5);
+        let answer = route.generate(&request, &stop).unwrap();
+        assert_eq!(answer.child_result().unwrap().summary, "Checked");
+        assert_eq!(answer.context_usage(), Some((500000, 1000000)));
+        assert_eq!(calls.load(Ordering::Acquire), 6);
         assert_eq!(
             verify_probe(&response(r#"{"value":"wrong","value":"schema-enforced"}"#)),
             Err("openrouter_probe")
