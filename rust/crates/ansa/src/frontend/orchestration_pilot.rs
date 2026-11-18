@@ -14,10 +14,9 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
+    fs::File,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -31,25 +30,155 @@ const CATALOG: &str =
 const CALLS: u8 = 12;
 const DURATION: Duration = Duration::from_secs(600);
 
+/// This ledger belongs to a single approved pilot, including its preflight.
+/// A reservation survives transport errors and an interrupted process.
+struct Budget {
+    directory: File,
+    _lease: File,
+    used: u8,
+    model_started: bool,
+    failed: bool,
+}
+
+impl Budget {
+    fn open(path: &Path, prior: Option<u8>) -> Result<Self> {
+        use ansa_linux::{fs, local};
+        let exists = path.try_exists().map_err(|_| "pilot_budget_open")?;
+        let (directory, lease) = if exists {
+            let directory = fs::private_directory(path).map_err(|_| "pilot_budget_open")?;
+            let lease = local::lock_existing(&directory).map_err(|_| "pilot_budget_lock")?;
+            (directory, lease)
+        } else {
+            let used = prior
+                .filter(|used| *used <= CALLS)
+                .ok_or("pilot_budget_init")?;
+            let directory = fs::create_private_leaf(path).map_err(|_| "pilot_budget_create")?;
+            let lease = local::lock_new(&directory).map_err(|_| "pilot_budget_lock")?;
+            let header =
+                json!({"version":1,"model":MODEL,"endpoint":ENDPOINT,"previous_requests":used});
+            local::create(&directory, "pilot.json", header.to_string().as_bytes())
+                .map_err(|_| "pilot_budget_init")?;
+            (directory, lease)
+        };
+        let header = local::read(&directory, "pilot.json", 512)
+            .map_err(|_| "pilot_budget_read")?
+            .ok_or("pilot_budget_init")?;
+        let header = std::str::from_utf8(&header).map_err(|_| "pilot_budget_init")?;
+        let header = Json::parse(header)?;
+        let start = header.usize_field("previous_requests")?;
+        if header.usize_field("version")? != 1
+            || header.text_field("model")? != MODEL
+            || header.text_field("endpoint")? != ENDPOINT
+            || start > usize::from(CALLS)
+            || prior.is_some_and(|value| usize::from(value) != start)
+        {
+            return Err("pilot_budget_identity");
+        }
+        let (names, extra) =
+            local::names(&directory, usize::from(CALLS) + 2).map_err(|_| "pilot_budget_read")?;
+        let mut entries = Vec::new();
+        for name in names {
+            match name.to_str() {
+                Some("pilot.json" | "worker.lock") => (),
+                Some("model-started") => return Err("pilot_already_started"),
+                Some(name) => {
+                    let index = name
+                        .strip_prefix("request-")
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .ok_or("pilot_budget_incomplete")?;
+                    if name != format!("request-{index:02}") {
+                        return Err("pilot_budget_incomplete");
+                    }
+                    let entry = local::read(&directory, name, 32)
+                        .map_err(|_| "pilot_budget_read")?
+                        .ok_or("pilot_budget_incomplete")?;
+                    if entry == b"model" {
+                        return Err("pilot_already_started");
+                    }
+                    if !matches!(entry.as_slice(), b"catalog" | b"key") {
+                        return Err("pilot_budget_incomplete");
+                    }
+                    entries.push(index);
+                }
+                None => return Err("pilot_budget_incomplete"),
+            }
+        }
+        let used = start + entries.len();
+        entries.sort_unstable();
+        if extra
+            || used > usize::from(CALLS)
+            || entries
+                .iter()
+                .map(|index| usize::from(*index))
+                .ne(start..used)
+        {
+            return Err("pilot_budget_incomplete");
+        }
+        directory.sync_all().map_err(|_| "pilot_budget_sync")?;
+        Ok(Self {
+            directory,
+            _lease: lease,
+            used: used as u8,
+            model_started: false,
+            failed: false,
+        })
+    }
+
+    fn reserve(&mut self, method: &str, url: &str) -> Result<()> {
+        let label: &[u8] = match (method, url) {
+            ("GET", CATALOG) => b"catalog",
+            ("GET", KEY) => b"key",
+            ("POST", API) => b"model",
+            _ => return Err("pilot_endpoint"),
+        };
+        if self.used >= CALLS || self.failed {
+            return Err("pilot_request_budget");
+        }
+        let name = format!("request-{:02}", self.used);
+        self.failed = true;
+        if label == b"model" && !self.model_started {
+            // Preserve the one-attempt boundary even if the last request record is lost.
+            ansa_linux::local::create(&self.directory, "model-started", b"reserved")
+                .map_err(|_| "pilot_budget_publish")?;
+            self.model_started = true;
+        }
+        ansa_linux::local::create(&self.directory, &name, label)
+            .map_err(|_| "pilot_budget_publish")?;
+        self.used += 1;
+        self.failed = false;
+        Ok(())
+    }
+}
+
 pub(super) struct Pilot {
     key: Secret,
     exchange: Exchange,
-    calls: AtomicU8,
+    budget: Mutex<Budget>,
     deadline: Instant,
 }
 
 impl Pilot {
-    fn authorize(key: Secret, exchange: Exchange, stop: &Cancel) -> Result<Arc<Self>> {
+    fn authorize(
+        key: Secret,
+        exchange: Exchange,
+        budget: Budget,
+        stop: &Cancel,
+    ) -> Result<Arc<Self>> {
         let meter = Self {
             key,
             exchange,
-            calls: AtomicU8::new(0),
+            budget: Mutex::new(budget),
             deadline: Instant::now() + DURATION,
         };
         let catalog = meter.exchange("GET", CATALOG, None, stop)?;
         verify_catalog(&catalog)?;
         let credits = meter.exchange("GET", KEY, None, stop)?;
         verify_credit_limit(&credits)?;
+        // The successful scenario needs a schema probe, plan, tool+final for
+        // each child, and a parent summary.
+        if CALLS - meter.requests()? < 7 {
+            return Err("pilot_insufficient_scenario_budget");
+        }
         let challenge = json!({"type":"json_schema","json_schema":{"name":"ansa_native_schema_probe","strict":true,"schema":{
             "type":"object","properties":{"value":{"type":"string","enum":["schema-enforced"]}},
             "required":["value"],"additionalProperties":false
@@ -80,20 +209,20 @@ impl Pilot {
         body: Option<Value>,
         stop: &Cancel,
     ) -> Result<Value> {
+        stop.check()?;
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
+        if body.len() > 256 * 1024 {
+            return Err("pilot_request_size");
+        }
+        self.budget
+            .lock()
+            .map_err(|_| "pilot_budget_lock")?
+            .reserve(method, url)?;
         let timeout = self
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or("pilot_deadline")?;
         stop.check()?;
-        self.calls
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |calls| {
-                (calls < CALLS).then_some(calls + 1)
-            })
-            .map_err(|_| "pilot_request_budget")?;
-        let body = body.map(|body| body.to_string()).unwrap_or_default();
-        if body.len() > 256 * 1024 {
-            return Err("pilot_request_size");
-        }
         let reply = (self.exchange)(
             &HttpRequest {
                 method,
@@ -114,6 +243,13 @@ impl Pilot {
         }
         let strict = Json::parse_with_limits(&reply.body, 512 * 1024, 64, 131072)?;
         serde_json::from_str(&strict.dump()).map_err(|_| "pilot_json")
+    }
+
+    fn requests(&self) -> Result<u8> {
+        self.budget
+            .lock()
+            .map(|budget| budget.used)
+            .map_err(|_| "pilot_budget_lock")
     }
 
     pub(super) fn binding(&self) -> Binding {
@@ -304,6 +440,20 @@ fn decode(request: &Request, response: &Value) -> Result<AdmittedResponse> {
 /// launcher supplies the capped test key on a private pipe.
 pub fn run() -> Result<()> {
     use std::io::{IsTerminal, Read};
+    let mut arguments = std::env::args_os().skip(1);
+    let ledger = PathBuf::from(arguments.next().ok_or("pilot_budget_path")?);
+    let prior = arguments
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.parse::<u8>().ok())
+                .ok_or("pilot_budget_init")
+        })
+        .transpose()?;
+    if !ledger.is_absolute() || arguments.next().is_some() {
+        return Err("pilot_budget_path");
+    }
     if std::io::stdin().is_terminal() {
         return Err("pilot_requires_key_pipe");
     }
@@ -320,6 +470,7 @@ pub fn run() -> Result<()> {
     let pilot = Pilot::authorize(
         Secret::new(key.into()),
         Arc::new(crate::transport::client::pilot_exchange),
+        Budget::open(&ledger, prior)?,
         &stop,
     )?;
     drop(token);
@@ -339,10 +490,32 @@ pub fn run() -> Result<()> {
     watchdog.join().map_err(|_| "pilot_deadline_watchdog")?;
     println!(
         "model={MODEL} endpoint={ENDPOINT} requests={} result={}",
-        pilot.calls.load(Ordering::Acquire),
+        pilot.requests()?,
         result.err().unwrap_or("pass")
     );
     result
+}
+
+struct Sandbox(PathBuf);
+
+impl Sandbox {
+    fn create() -> Result<Self> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut bytes = [0; 16];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| "pilot_random")?;
+        let nonce: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = PathBuf::from("/tmp").join(format!("ansa-openrouter-pilot-{nonce}"));
+        ansa_linux::fs::create_private_leaf(&path).map_err(|_| "pilot_storage")?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn scenario(pilot: &Arc<Pilot>, stop: &Cancel) -> Result<()> {
@@ -354,24 +527,7 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel) -> Result<()> {
         orchestration::plan::Access,
         runtime::{AgentMode, CommandPayload, EventPayload, PostStatus, RuntimeCommand, Submit},
     };
-    use ring::rand::{SecureRandom, SystemRandom};
-    use std::path::PathBuf;
-
-    struct Sandbox(PathBuf);
-    impl Drop for Sandbox {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    let mut bytes = [0; 16];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| "pilot_random")?;
-    let nonce: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    let storage = PathBuf::from("/tmp").join(format!("ansa-openrouter-pilot-{nonce}"));
-    ansa_linux::fs::create_private_leaf(&storage).map_err(|_| "pilot_storage")?;
-    let storage = Sandbox(storage);
+    let storage = Sandbox::create()?;
     let home = storage.0.join("home");
     let cwd = storage.0.join("repo");
     ansa_linux::fs::create_private_leaf(&home).map_err(|_| "pilot_storage")?;
@@ -439,7 +595,7 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel) -> Result<()> {
         }
         Err("pilot_parent_context")
     })?;
-    let prompt = "In this synthetic repository update report.txt: replace Status: unverified with Status: verified. Use a single edit helper scoped exactly to report.txt. After the edit the coordinator will arrange an independent review. Keep the plan minimal. Do not change anything else.";
+    let prompt = "In this synthetic repository update report.txt: replace Status: unverified with Status: verified. Use one write step scoped exactly to report.txt and verify that report.txt contains Status: verified. Provide the exact old and new lines to the helper. The coordinator arranges an independent review after the edit. Leave all other lines and files unchanged.";
     let proposal = Proposal::generate(&factory, seed, prompt.into(), stop)?;
     let [step] = proposal.plan.steps() else {
         return Err("pilot_plan_scope");
@@ -508,6 +664,19 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::manager::HttpReply;
+    use crate::transport::http::Head;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    fn reply(value: Value) -> HttpReply {
+        HttpReply {
+            head: Head {
+                status: 200,
+                content_types: vec!["application/json".into()],
+            },
+            body: value.to_string(),
+        }
+    }
 
     #[test]
     fn preflight_requires_the_exact_provider_variant_and_credit_ceiling() {
@@ -536,24 +705,31 @@ mod tests {
 
     #[test]
     fn meter_never_sends_a_thirteenth_request() {
+        let root = Sandbox::create().unwrap();
+        let ledger = root.0.join("budget");
+        let mut budget = Budget::open(&ledger, Some(3)).unwrap();
+        budget.reserve("GET", KEY).unwrap();
+        assert!(matches!(
+            Budget::open(&ledger, None),
+            Err("pilot_budget_lock")
+        ));
+        drop(budget);
+        assert!(matches!(
+            Budget::open(&ledger, Some(0)),
+            Err("pilot_budget_identity")
+        ));
         let native_calls = Arc::new(AtomicU8::new(0));
         let calls = native_calls.clone();
         let meter = Pilot {
             key: Secret::new("dummy".into()),
-            calls: AtomicU8::new(0),
+            budget: Mutex::new(Budget::open(&ledger, None).unwrap()),
             deadline: Instant::now() + DURATION,
             exchange: Arc::new(move |_, _| {
                 calls.fetch_add(1, Ordering::AcqRel);
-                Ok(crate::auth::manager::HttpReply {
-                    head: crate::transport::http::Head {
-                        status: 200,
-                        content_types: vec!["application/json".into()],
-                    },
-                    body: "{}".into(),
-                })
+                Ok(reply(json!({})))
             }),
         };
-        for _ in 0..CALLS {
+        for _ in 4..CALLS {
             meter
                 .exchange("GET", KEY, None, &Cancel::default())
                 .unwrap();
@@ -562,7 +738,126 @@ mod tests {
             meter.exchange("GET", KEY, None, &Cancel::default()),
             Err("pilot_request_budget")
         );
-        assert_eq!(native_calls.load(Ordering::Acquire), CALLS);
+        assert_eq!(native_calls.load(Ordering::Acquire), CALLS - 4);
+    }
+
+    #[test]
+    fn interrupted_or_paid_attempt_cannot_reopen_for_another_model_call() {
+        let root = Sandbox::create().unwrap();
+        let ledger = root.0.join("budget");
+        let mut budget = Budget::open(&ledger, Some(3)).unwrap();
+        budget.reserve("POST", API).unwrap();
+        drop(budget);
+        assert!(matches!(
+            Budget::open(&ledger, None),
+            Err("pilot_already_started")
+        ));
+        std::fs::remove_file(ledger.join("request-03")).unwrap();
+        assert!(matches!(
+            Budget::open(&ledger, None),
+            Err("pilot_already_started")
+        ));
+
+        let ledger = root.0.join("incomplete");
+        let budget = Budget::open(&ledger, Some(0)).unwrap();
+        ansa_linux::local::create(&budget.directory, "request-00.pending", b"model").unwrap();
+        drop(budget);
+        assert!(matches!(
+            Budget::open(&ledger, None),
+            Err("pilot_budget_incomplete")
+        ));
+    }
+
+    #[test]
+    fn full_synthetic_scenario_fits_remaining_requests_after_preflight() {
+        let root = Sandbox::create().unwrap();
+        let ledger = root.0.join("budget");
+        let stop = Cancel::default();
+        let sequence = AtomicU8::new(0);
+        let exchange: Exchange = Arc::new(move |request, _| {
+            let step = sequence.fetch_add(1, Ordering::AcqRel);
+            match (step, request.method, request.url) {
+                (0, "GET", CATALOG) if request.bearer.is_none() => {
+                    return Ok(reply(json!({
+                        "data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools"]}]}
+                    })));
+                }
+                (1, "GET", KEY) if request.bearer.is_some() => {
+                    return Ok(reply(json!({"data":{"limit":1,"limit_remaining":1}})));
+                }
+                (2..=8, "POST", API) if request.bearer.is_some() => (),
+                _ => return Err("unexpected_pilot_request"),
+            }
+            let body: Value =
+                serde_json::from_str(request.body.expose()).map_err(|_| "fixture_body")?;
+            if body["model"] != MODEL || body["provider"] != route() {
+                return Err("fixture_binding");
+            }
+            let format = &body["response_format"]["json_schema"];
+            let expected_format = match step {
+                2 => "ansa_native_schema_probe",
+                3 => "ansa_orchestration_plan_v1",
+                4..=7 => "ansa_child_result_v1",
+                _ => "",
+            };
+            if step < 8 && (format["name"] != expected_format || format["strict"] != true) {
+                return Err("fixture_strict_schema");
+            }
+            let messages = body["messages"].as_array().ok_or("fixture_messages")?;
+            let output = match step {
+                2 => json!({"value":"schema-enforced"}).to_string(),
+                3 => json!({
+                    "schema_version":1,"summary":"Update the report",
+                    "steps":[{"id":"edit","task":"Replace Status: unverified with Status: verified in report.txt","access":"write","paths":["report.txt"],"depends_on":[],"acceptance":"Status: verified"}],
+                    "checks":[{"path":"report.txt","contains":"Status: verified"}],"manual_checks":[]
+                }).to_string(),
+                4 | 6 => {
+                    let token = messages[0]["content"].as_str().and_then(|text| text.split_once("instruction_token is ")).and_then(|(_, tail)| tail.get(..64)).ok_or("fixture_instruction_token")?;
+                    let calls = if step == 4 {
+                        vec![("edit", "edit_file", json!({"path":"report.txt","old_text":"Status: unverified","new_text":"Status: verified","instruction_token":token}))]
+                    } else {
+                        ["ansa-candidate.diff", "approved-plan.json", "checkout/report.txt"].into_iter().zip(["diff", "plan", "report"]).map(|(path, id)| {
+                            (id, "read_file", json!({"path":path,"max_bytes":8192,"offset":0,"instruction_token":token}))
+                        }).collect()
+                    };
+                    let calls: Vec<_> = calls.into_iter().map(|(id, name, args)| json!({"type":"function","id":id,"function":{"name":name,"arguments":args.to_string()}})).collect();
+                    return Ok(reply(json!({"id":format!("fixture{step}"),"model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":calls}}]})));
+                }
+                5 | 7 => {
+                    let tools: Vec<_> = messages.iter().filter(|message| message["role"] == "tool").collect();
+                    let expected: &[&str] = if step == 5 { &["edit"] } else { &["diff", "plan", "report"] };
+                    let evidence: &[&str] = if step == 5 { &["\"applied\":true"] } else { &["+Status: verified", "Update the report", "Report title: demo"] };
+                    if tools.len() != expected.len() || tools.iter().zip(expected.iter().zip(evidence)).any(|(message, (id, fragment))| {
+                        message["tool_call_id"].as_str() != Some(*id) || !message["content"].as_str().is_some_and(|value| value.contains(fragment))
+                    }) { return Err("fixture_tool_results"); }
+                    json!({"status":"completed","summary":"The exact report edit has been verified","findings":[]}).to_string()
+                }
+                8 => {
+                    if body.get("response_format").is_some() || !messages.last().and_then(|message| message["content"].as_str()).is_some_and(|text| text.contains("ansa-result")) {
+                        return Err("fixture_parent_handoff");
+                    }
+                    "The report update has been reviewed.".into()
+                }
+                _ => return Err("unexpected_pilot_request"),
+            };
+            Ok(reply(
+                json!({"id":format!("fixture{step}"),"model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":output}}]}),
+            ))
+        });
+        let pilot = Pilot::authorize(
+            Secret::new("dummy".into()),
+            exchange,
+            Budget::open(&ledger, Some(3)).unwrap(),
+            &stop,
+        )
+        .unwrap();
+        scenario(&pilot, &stop).unwrap();
+        assert_eq!(pilot.requests(), Ok(12));
+        drop(pilot);
+        assert!(matches!(
+            Budget::open(&ledger, None),
+            Err("pilot_already_started")
+        ));
     }
 
     #[test]
