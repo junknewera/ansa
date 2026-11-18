@@ -704,6 +704,13 @@ def native_terminal_panel(screen, root, cwd):
     session, = (root / "home/.ansa/sessions").glob("*/terminal-host-v1/terminal-v1.json")
     escape(screen)
     until(screen, lambda frame: "Терминал агента" not in frame, "Esc returned to the chat")
+    screen.send("TERMINAL_DEMO\r")
+    until(screen, lambda frame: completed(root, "TERMINAL_DEMO"), "offline terminal tool created a PTY")
+    local(screen, "/terminals")
+    until(screen, lambda frame: "Демо-терминал" in frame and "ANSA_TERMINAL_READY" in body(screen),
+          "Carbon renders live PTY output")
+    escape(screen)
+    until(screen, lambda frame: "ANSA_TERMINAL_READY" not in body(screen), "Esc returned to the chat")
     local(screen, "/exit")
     result = screen.finish()
     assert result["exit"] == 0 and result["termios_restored"]

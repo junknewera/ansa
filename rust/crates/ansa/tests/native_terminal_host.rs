@@ -654,7 +654,7 @@ fn worker_retains_output_after_program_exit_and_deadline() {
 
 #[test]
 fn detached_daemon_reconnects_to_the_same_shell_and_fences_old_writers() {
-    use ansa::terminal_host::daemon::{Client, Daemon};
+    use ansa::terminal_host::daemon::{Client, Daemon, Endpoint};
     let fx = Fixture::new();
     let directory = fx.root.0.join("daemon");
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_ansa"));
@@ -668,7 +668,7 @@ fn detached_daemon_reconnects_to_the_same_shell_and_fences_old_writers() {
     .unwrap();
     let mut agent = daemon.attach(Writer::Agent, true).unwrap();
     let old_connection = agent.connection();
-    let endpoint = daemon.endpoint().clone();
+    daemon.endpoint().remember(&fx.root.0).unwrap();
     assert!(daemon.attach(Writer::Agent, true).is_err());
     let mut reader = daemon.attach(Writer::Agent, false).unwrap();
     let terminal = fx.binding.terminal_id(&id("open"));
@@ -712,6 +712,7 @@ fn detached_daemon_reconnects_to_the_same_shell_and_fences_old_writers() {
     );
     drop(agent);
     drop(reader);
+    let endpoint = Endpoint::recall(&fx.root.0, &fx.binding).unwrap();
     let until = Instant::now() + Duration::from_secs(3);
     let mut agent = loop {
         if let Ok(client) = Client::attach(&endpoint, Writer::Agent, true) {
@@ -726,6 +727,11 @@ fn detached_daemon_reconnects_to_the_same_shell_and_fences_old_writers() {
     assert_ne!(agent.connection(), old_connection);
     let epoch = agent.attached_epoch(&terminal).unwrap();
     assert_eq!(epoch, 2);
+    let terminals = agent.terminals().unwrap();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].id, terminal);
+    assert_eq!(terminals[0].epoch, epoch);
+    assert_eq!(terminals[0].label, "Shell");
     assert_eq!(
         agent.operation(id("write")).unwrap(),
         Some(OperationStatus::Durable(Effect::Delivered {
@@ -774,9 +780,62 @@ fn detached_daemon_reconnects_to_the_same_shell_and_fences_old_writers() {
         OperationStatus::Durable(Effect::Applied)
     );
     assert!(agent.capture(terminal.clone(), epoch + 1, 0).is_err());
-    assert!(human.capture(terminal, epoch + 1, 0).is_ok());
+    let keys = b"PS1='handoff> '; printf '%s%s\\n' PRIVATE_ DAEMON; printf '\\033[2J\\033[H'; printf '%s%s\\n' PUBLIC_ DAEMON\r";
+    let input = fx.intent(
+        "human_keys",
+        &terminal,
+        Writer::Human,
+        epoch + 1,
+        Action::input(Writer::Human, keys).unwrap(),
+    );
+    assert_eq!(
+        human.execute(input, keys.to_vec()).unwrap(),
+        OperationStatus::Durable(Effect::Delivered { count: keys.len() })
+    );
+    let until = Instant::now() + Duration::from_secs(3);
+    let screen = loop {
+        let screen = human.capture(terminal.clone(), epoch + 1, 0).unwrap();
+        if screen.text.contains("PUBLIC_DAEMON") && screen.text.trim_end().ends_with("handoff>") {
+            break screen;
+        }
+        assert!(Instant::now() < until, "{screen:?}");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!screen.text.contains("PRIVATE_DAEMON"));
+    let approved = screen.approval().unwrap();
+    let handback = fx.intent(
+        "handback",
+        &terminal,
+        Writer::Human,
+        epoch + 1,
+        Action::Handback {
+            screen: approved.clone(),
+        },
+    );
+    assert_eq!(
+        human.execute(handback, Vec::new()).unwrap(),
+        OperationStatus::Durable(Effect::Applied)
+    );
+    assert!(
+        agent
+            .read(terminal.clone(), epoch + 2, approved.through - 1, 8192)
+            .is_err()
+    );
+    let public = agent
+        .capture(terminal, epoch + 2, approved.through)
+        .unwrap();
+    assert!(public.text.contains("PUBLIC_DAEMON"));
+    assert!(!public.text.contains("PRIVATE_DAEMON"));
     assert!(human.shutdown().unwrap());
     assert!(daemon.wait(Duration::from_secs(3)).unwrap());
+    let restored = Host::restore_file(
+        &directory.join("evidence"),
+        fx.binding.clone(),
+        NativeBackend::new(executable.clone(), fx.root.0.join("workspace_registry")),
+    )
+    .unwrap();
+    assert!(restored.recovery().unwrap().closure_known);
+    drop(restored);
     assert!(Client::attach(&endpoint, Writer::Agent, true).is_err());
     assert!(
         Daemon::launch(
@@ -797,8 +856,23 @@ fn detached_daemon_reconnects_to_the_same_shell_and_fences_old_writers() {
         1,
     )
     .unwrap();
+    assert!(replacement.endpoint().remember(&fx.root.0).is_err());
     assert!(Client::attach(&endpoint, Writer::Agent, true).is_err());
     assert!(replacement.wait(Duration::from_secs(3)).unwrap());
+
+    let blocked = fx.root.0.join("blocked_seal");
+    let mut bad_seal = Daemon::launch(
+        &executable,
+        &blocked,
+        &fx.root.0.join("workspace_registry"),
+        fx.binding.clone(),
+        10,
+    )
+    .unwrap();
+    fs::write(blocked.join("evidence/closed-v1.json"), b"occupied").unwrap();
+    let mut reader = bad_seal.attach(Writer::Human, true).unwrap();
+    assert!(!reader.shutdown().unwrap());
+    assert!(!bad_seal.wait(Duration::from_secs(3)).unwrap());
 }
 
 #[test]

@@ -29,6 +29,7 @@ use std::{
 const ARG: &str = "--internal-terminal-host-v1";
 const EVIDENCE: &str = "evidence";
 const ACCESS: &str = "attachment-v1.json";
+const ENDPOINT: &str = "terminal-endpoint-v1.json";
 const SOCKET: &str = "host.sock";
 const MAX_CLIENTS: usize = 4;
 const TICK: Duration = Duration::from_millis(5);
@@ -76,6 +77,7 @@ enum CommandFrame {
     Operation {
         operation: Id,
     },
+    List,
     Capture {
         terminal: Id,
         epoch: u64,
@@ -105,6 +107,9 @@ enum Reply {
     },
     Operation {
         status: Option<OperationStatus>,
+    },
+    Terminals {
+        terminals: Vec<TerminalInfo>,
     },
     Screen {
         screen: Screen,
@@ -140,6 +145,44 @@ pub struct Endpoint {
     uid: u32,
     pid: u32,
     process: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalInfo {
+    pub id: Id,
+    pub label: String,
+    pub lifecycle: Lifecycle,
+    pub writer: Writer,
+    pub epoch: u64,
+    pub visible_after: u64,
+}
+
+impl Endpoint {
+    /// Store the original process identity alongside its owning conversation.
+    /// The immutable anchor lives outside the daemon's replaceable directory.
+    pub fn remember(&self, conversation: &Path) -> io::Result<()> {
+        if self.directory.parent() != Some(conversation) {
+            return Err(io::Error::other("terminal_endpoint_directory"));
+        }
+        let owned = fs::private_directory(conversation)?;
+        local::create(
+            &owned,
+            ENDPOINT,
+            &serde_json::to_vec(self).map_err(io::Error::other)?,
+        )
+    }
+
+    pub fn recall(conversation: &Path, binding: &Binding) -> io::Result<Self> {
+        let owned = fs::private_directory(conversation)?;
+        let record = local::read(&owned, ENDPOINT, 8192)?
+            .ok_or_else(|| io::Error::other("terminal_endpoint_missing"))?;
+        let endpoint: Self = serde_json::from_slice(&record).map_err(io::Error::other)?;
+        if &endpoint.binding != binding || endpoint.directory.parent() != Some(conversation) {
+            return Err(io::Error::other("terminal_endpoint_binding"));
+        }
+        Ok(endpoint)
+    }
 }
 
 impl Daemon {
@@ -325,6 +368,13 @@ impl Client {
         }
     }
 
+    pub fn terminals(&mut self) -> io::Result<Vec<TerminalInfo>> {
+        match self.call(CommandFrame::List)? {
+            Reply::Terminals { terminals } => Ok(terminals),
+            _ => Err(io::Error::other("terminal_protocol_reply")),
+        }
+    }
+
     pub fn capture(&mut self, terminal: Id, epoch: u64, after: u64) -> io::Result<Screen> {
         match self.call(CommandFrame::Capture {
             terminal,
@@ -467,8 +517,8 @@ fn serve(path: &Path) -> io::Result<()> {
     let mut detached_at = Instant::now();
     let mut peers = Vec::<Peer>::new();
     let mut connection = 0;
-    let mut shutting_down = false;
-    while !shutting_down {
+    let mut shutdown = None;
+    while shutdown.is_none() {
         if peers.iter().any(|peer| peer.attached.is_some()) {
             detached_at = Instant::now();
         }
@@ -596,7 +646,7 @@ fn serve(path: &Path) -> io::Result<()> {
                             _ => None,
                         };
                         let ticket = peers[index].sequence;
-                        let reply = dispatch(&mut host, role, frame, ticket, &mut shutting_down);
+                        let reply = dispatch(&mut host, role, frame, ticket, &mut shutdown);
                         if let Some(terminal) = observed
                             && matches!(reply, Reply::Screen { .. } | Reply::Output { .. })
                         {
@@ -625,18 +675,13 @@ fn serve(path: &Path) -> io::Result<()> {
                 peer.sequence += 1;
                 index += 1;
             }
-            if shutting_down {
+            if shutdown.is_some() {
                 break;
             }
         }
         thread::sleep(TICK);
     }
-    let clean = host
-        .terminals()
-        .values()
-        .all(|terminal| terminal.lifecycle == Lifecycle::Closed)
-        || close_owned(&mut host);
-    if clean {
+    if shutdown.unwrap_or_else(|| close_and_seal(&mut host)) {
         Ok(())
     } else {
         Err(io::Error::other("terminal_cleanup_unknown"))
@@ -671,7 +716,7 @@ fn dispatch(
     role: Attached,
     frame: CommandFrame,
     ticket: u64,
-    shutdown: &mut bool,
+    shutdown: &mut Option<bool>,
 ) -> Reply {
     let reply = match frame {
         CommandFrame::Execute { intent, input }
@@ -682,6 +727,20 @@ fn dispatch(
         }
         CommandFrame::Operation { operation } => Ok(Reply::Operation {
             status: host.operation(&operation),
+        }),
+        CommandFrame::List => Ok(Reply::Terminals {
+            terminals: host
+                .terminals()
+                .iter()
+                .map(|(id, terminal)| TerminalInfo {
+                    id: id.clone(),
+                    label: terminal.launch.label.clone(),
+                    lifecycle: terminal.lifecycle,
+                    writer: terminal.writer,
+                    epoch: terminal.epoch,
+                    visible_after: terminal.visible_after,
+                })
+                .collect(),
         }),
         CommandFrame::Capture {
             terminal,
@@ -699,10 +758,9 @@ fn dispatch(
             .read_output(role.writer, &terminal, epoch, after, limit)
             .map(|output| Reply::Output { output, ticket }),
         CommandFrame::Shutdown if role.writer == Writer::Human && role.can_write => {
-            *shutdown = true;
-            Ok(Reply::Closed {
-                clean: close_owned(host),
-            })
+            let clean = close_and_seal(host);
+            *shutdown = Some(clean);
+            Ok(Reply::Closed { clean })
         }
         _ => Err("terminal_attachment_access"),
     };
@@ -739,6 +797,10 @@ fn renew(host: &mut NativeHost, writer: Writer) -> bool {
             &[],
         ) == Ok(OperationStatus::Durable(Effect::Applied))
     })
+}
+
+fn close_and_seal(host: &mut NativeHost) -> bool {
+    close_owned(host) && host.seal_clean().is_ok()
 }
 
 pub(super) fn close_owned(host: &mut NativeHost) -> bool {

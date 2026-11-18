@@ -19,7 +19,8 @@ pub const MAX_LIVE_TERMINALS: usize = 2;
 pub const MAX_TERMINAL_IDS: usize = 8;
 pub const MAX_TERMINAL_INPUT: usize = 128 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Lifecycle {
     Reserved,
     Live,
