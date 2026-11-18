@@ -84,7 +84,8 @@ pub(super) fn agent_task(text: &str) -> Option<&str> {
         .split_once(|ch: char| ch.is_whitespace() || ch == ':')?;
     if !matches!(
         (verb.to_lowercase().as_str(), object.to_lowercase().as_str()),
-        ("запусти" | "попроси", "субагента") | ("поручи", "субагенту")
+        ("запусти" | "попроси", "субагента" | "субагентов")
+            | ("поручи", "субагенту" | "субагентам")
     ) {
         return None;
     }

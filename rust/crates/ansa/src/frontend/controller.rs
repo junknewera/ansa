@@ -223,10 +223,13 @@ impl State {
                 | CommandPayload::GetContext
         )
         .then(|| self.read_lane.clone());
-        let new_turn = matches!(command.payload, CommandPayload::Submit(_));
+        let new_turn = matches!(
+            command.payload,
+            CommandPayload::Submit(_) | CommandPayload::Handoff(_)
+        );
         let submit = matches!(
             command.payload,
-            CommandPayload::Submit(_) | CommandPayload::Steer(_)
+            CommandPayload::Submit(_) | CommandPayload::Handoff(_) | CommandPayload::Steer(_)
         );
         if new_turn {
             self.pending = Some(command.command.clone());
@@ -791,7 +794,11 @@ impl State {
                     .as_ref()
                     .is_some_and(|p| p.kind == carbon::InspectorKind::Command);
             [
-                (self.mode == AgentMode::Plan).then_some("План"),
+                if ui.activity.is_empty() {
+                    (self.mode == AgentMode::Plan).then_some("План")
+                } else {
+                    Some(ui.activity.as_str())
+                },
                 (ui.focus == carbon::Focus::Inspector).then_some(if terminal {
                     "Терминал"
                 } else {

@@ -14,6 +14,9 @@ pub mod input;
 pub mod jsonl;
 pub mod markdown;
 pub mod offline;
+mod orchestration;
+#[cfg(feature = "orchestration-pilot")]
+pub mod orchestration_pilot;
 mod progress;
 pub mod protocol_v1;
 pub mod sessions;

@@ -880,6 +880,7 @@ pub enum InspectorKind {
     #[default]
     Plain,
     Agents,
+    Plan,
     Source,
     Diff,
     Markdown,
@@ -1331,13 +1332,14 @@ fn inspector_rows(
             rows.push(rendered);
         }
     } else {
-        for (index, text) in panel
-            .lines
-            .iter()
-            .enumerate()
-            .skip(panel.offset)
-            .take(available)
-        {
+        let wrapped;
+        let lines = if panel.kind == InspectorKind::Plan {
+            wrapped = super::cells::wrap_lines(&panel.lines, width);
+            &wrapped
+        } else {
+            &panel.lines
+        };
+        for (index, text) in lines.iter().enumerate().skip(panel.offset).take(available) {
             let safe = clipped(text, width);
             let selected = panel.selected == Some(index);
             let style = if selected {
@@ -1420,7 +1422,11 @@ pub fn layout_workspace(
         .inspector
         .as_ref()
         .is_some_and(|p| p.kind == InspectorKind::Image);
-    let side_by_side = ui.inspector.is_some() && (width >= 100 || picture && width >= 63);
+    let plan = ui
+        .inspector
+        .as_ref()
+        .is_some_and(|panel| panel.kind == InspectorKind::Plan);
+    let side_by_side = ui.inspector.is_some() && !plan && (width >= 100 || picture && width >= 63);
     let panel_width = if side_by_side {
         if picture {
             width / 2
@@ -1436,7 +1442,9 @@ pub fn layout_workspace(
         width
     };
     let stacked = ui.inspector.is_some() && !side_by_side;
-    let chat_height = if stacked {
+    let chat_height = if plan {
+        1
+    } else if stacked {
         (body_height / 3).max(1)
     } else {
         body_height

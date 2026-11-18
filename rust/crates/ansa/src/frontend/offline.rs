@@ -4,7 +4,7 @@ use crate::{
     auth::Cancel,
     context::legacy_compact::{CompactedContext, summary_request_at},
     protocol::{json::Json, legacy_json_v1::sha256},
-    provider::{native, request::Request, responses::AdmittedResponse},
+    provider::{native, request::Request, responses::AdmittedResponse, structured::FinalFormat},
 };
 fn s(v: &str) -> Json {
     Json::string(v).expect("UTF-8")
@@ -37,6 +37,9 @@ fn reasoning(suffix: &str) -> Json {
 pub fn generate(request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
     if stop.cancelled() {
         return Err("offline_cancelled");
+    }
+    if let Some(response) = orchestration_fixture(request)? {
+        return Ok(response);
     }
     if let Some(response) = terminal_fixture(request)? {
         return Ok(response);
@@ -102,6 +105,123 @@ pub fn generate(request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
         ("id", s(&id)),
         ("model", s(&request.binding.returned_model)),
         ("items", Json::array(items)?),
+    ]))
+}
+
+fn orchestration_fixture(request: &Request) -> Result<Option<AdmittedResponse>> {
+    if request.final_format().is_none()
+        && request.epoch.exact_state.text_field("purpose") != Ok("orchestration_summary")
+    {
+        return Ok(None);
+    }
+    let last = request.input.last();
+    let user = last
+        .and_then(|item| {
+            (item.text_field("role") == Ok("user"))
+                .then(|| item.text_field("content").ok())
+                .flatten()
+        })
+        .unwrap_or_default();
+    let id = sha256(request.save()?.dump().as_bytes());
+    if request.final_format() == Some(FinalFormat::ChildResult) {
+        let operation = if user.starts_with("Синтетическая правка отчёта")
+        {
+            Some(("edit_file", "report.txt"))
+        } else if user.starts_with("Независимо проверьте замороженный коммит")
+        {
+            Some(("read_file", "ansa-candidate.diff"))
+        } else {
+            None
+        };
+        if let Some((name, path)) = operation {
+            let base = if request.epoch.exact_state.has("base_state") {
+                request.epoch.exact_state.field("base_state")?
+            } else {
+                &request.epoch.exact_state
+            };
+            let token = sha256(base.field("instructions")?.dump().as_bytes());
+            let args = if name == "edit_file" {
+                serde_json::json!({"path": path, "old_text": "before fixture", "new_text": "after fixture", "instruction_token": token})
+            } else {
+                serde_json::json!({"path": path, "offset": 0, "max_bytes": 8192, "instruction_token": token})
+            };
+            let item = obj(vec![
+                ("type", s("function_call")),
+                ("id", s(&format!("item_{}", &id[..24]))),
+                ("call_id", s(&format!("orch_{name}_{}", &id[..24]))),
+                ("namespace", s("omh")),
+                ("name", s(name)),
+                ("arguments", s(&args.to_string())),
+                ("status", s("completed")),
+            ]);
+            return orchestration_response(request, &id, item).map(Some);
+        }
+    }
+    let text = match request.final_format() {
+        Some(FinalFormat::OrchestrationPlan) if user == "ORCHESTRATION_LONG_PLAN_FIXTURE" => serde_json::json!({
+            "schema_version": 1, "summary": "Проверить перенос длинного плана", "checks":[], "manual_checks":[], "steps": [
+                {"id":"long", "task":format!("{}VISIBLE_END_OF_STEP", "длинная строка ".repeat(130)), "access":"read", "paths":[], "depends_on":[], "acceptance":"Прочитать строку целиком"}
+            ]
+        }).to_string(),
+        Some(FinalFormat::OrchestrationPlan) if user == "ORCHESTRATION_WRITE_FIXTURE" => serde_json::json!({
+            "schema_version": 1, "summary": "Обновить тестовый отчёт", "checks":[{"path":"report.txt","contains":"after fixture"}], "manual_checks":[], "steps": [
+                {"id":"edit", "task":"Синтетическая правка отчёта", "access":"write", "paths":["report.txt"], "depends_on":[], "acceptance":"Тестовый отчёт содержит after fixture"}
+            ]
+        }).to_string(),
+        Some(FinalFormat::OrchestrationPlan) => serde_json::json!({
+            "schema_version": 1,
+            "summary": "Разобрать запрос и собрать подтверждения",
+            "checks": [],
+            "manual_checks": [],
+            "steps": [
+                {"id":"files","task":"Найти файлы, связанные с запросом","access":"read","paths":[],"depends_on":[],"acceptance":"Указать источники"},
+                {"id":"check","task":"Проверить, достаточно ли данных для ответа","access":"read","paths":[],"depends_on":[],"acceptance":"Указать оставшиеся вопросы"}
+            ]
+        }).to_string(),
+        Some(FinalFormat::ChildResult) => {
+            let mut success = true;
+            if let Some(last) = last.filter(|item| item.text_field("type") == Ok("function_call_output")) {
+                let output = Json::parse(last.text_field("output")?)?;
+                let call = last.text_field("call_id")?;
+                success = if call.starts_with("orch_edit_file_") {
+                    output.field("applied").and_then(Json::boolean) == Ok(true)
+                } else {
+                    call.starts_with("orch_read_file_") && output.text_field("content").is_ok_and(|diff| diff.contains("-before fixture") && diff.contains("+after fixture"))
+                };
+            }
+            serde_json::json!({"status": if success { "completed" } else { "blocked" }, "summary":"Синтетический результат проверки", "findings":[]}).to_string()
+        },
+        None if request.epoch.exact_state.text_field("purpose") == Ok("orchestration_summary") => {
+            if user.contains("verified_candidate") {
+                "Рабочая копия проверена. Ветка ansa-result готова.".to_owned()
+            } else {
+                "Сводка готова. Оба помощника завершили проверку.".to_owned()
+            }
+        }
+        None => return Ok(None),
+    };
+    let item = obj(vec![
+        ("type", s("message")),
+        ("id", s(&format!("msg_{}", &id[..24]))),
+        ("role", s("assistant")),
+        ("status", s("completed")),
+        (
+            "content",
+            Json::array(vec![obj(vec![
+                ("type", s("output_text")),
+                ("text", s(&text)),
+            ])])?,
+        ),
+    ]);
+    orchestration_response(request, &id, item).map(Some)
+}
+
+fn orchestration_response(request: &Request, id: &str, item: Json) -> Result<AdmittedResponse> {
+    native::load(&obj(vec![
+        ("request", request.save()?),
+        ("id", s(&format!("response_{}", &id[..24]))),
+        ("model", s(&request.binding.returned_model)),
+        ("items", Json::array(vec![item])?),
     ]))
 }
 

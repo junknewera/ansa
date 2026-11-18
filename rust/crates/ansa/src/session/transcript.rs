@@ -95,8 +95,13 @@ impl Transcript {
         self.tail = Some(Arc::new(block));
         self.size += 1;
     }
-    pub(crate) fn set_last(&mut self, state: &str) {
-        let Some(tail) = &self.tail else {
+    pub(crate) fn set_last(&mut self, request: &RequestId, state: &str) {
+        let Some(tail) = self.tail.as_ref().filter(|block| {
+            block
+                .entries
+                .last()
+                .is_some_and(|entry| entry.request == *request)
+        }) else {
             return;
         };
         let mut block = (**tail).clone();

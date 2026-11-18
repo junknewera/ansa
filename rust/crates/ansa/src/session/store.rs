@@ -2,7 +2,7 @@
 use super::{
     Result,
     codec_v1::{Invocation, SavedResult},
-    journal_v1::{Journal, Observer},
+    journal_v1::{DirectoryIdentity, Journal, Observer},
     need,
     state::{ForkSeed, State},
 };
@@ -32,8 +32,9 @@ impl Store {
         state: State,
         observe: Option<Observer>,
         seed: Option<&ForkSeed>,
+        existing: Option<DirectoryIdentity>,
     ) -> Result<Self> {
-        Self::open_seeded_with_replay(path, state, observe, seed, |_| Ok(()))
+        Self::open_seeded_with_replay(path, state, observe, seed, existing, |_| Ok(()))
     }
     pub fn open_with_replay(
         path: &Path,
@@ -41,23 +42,24 @@ impl Store {
         observe: Option<Observer>,
         replay: impl FnMut(&Json) -> Result<()>,
     ) -> Result<Self> {
-        Self::open_seeded_with_replay(path, state, observe, None, replay)
+        Self::open_seeded_with_replay(path, state, observe, None, None, replay)
     }
     fn open_seeded_with_replay(
         path: &Path,
         mut state: State,
         observe: Option<Observer>,
         seed: Option<&ForkSeed>,
+        existing: Option<DirectoryIdentity>,
         mut replay: impl FnMut(&Json) -> Result<()>,
     ) -> Result<Self> {
-        let mut journal = Journal::open(
-            path,
-            |event| {
-                state.apply(event)?;
-                replay(event)
-            },
-            observe,
-        )?;
+        let replay_state = |event: &Json| {
+            state.apply(event)?;
+            replay(event)
+        };
+        let mut journal = match existing {
+            Some(identity) => Journal::open_existing(path, identity, replay_state, observe)?,
+            None => Journal::open(path, replay_state, observe)?,
+        };
         let diagnostic = journal.diagnostic();
         if diagnostic.is_empty() && journal.empty() {
             let init = state.initialization_with_seed(seed)?;
@@ -82,6 +84,9 @@ impl Store {
     }
     pub fn state(&self) -> &Arc<State> {
         &self.state
+    }
+    pub(crate) fn identity(&self) -> Result<DirectoryIdentity> {
+        self.journal.identity()
     }
     pub fn diagnostic(&self) -> &'static str {
         self.diagnostic

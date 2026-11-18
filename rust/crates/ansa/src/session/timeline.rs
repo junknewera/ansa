@@ -293,7 +293,9 @@ impl Timeline {
                 self.final_text.clear();
                 self.names.clear();
                 self.purposes.clear();
-                self.append("user", event.text_field("text")?.into(), "accepted");
+                if !event.has("handoff") {
+                    self.append("user", event.text_field("text")?.into(), "accepted");
+                }
             }
             "response" => {
                 let response = codec_v1::load_response(event.field("response")?)?;

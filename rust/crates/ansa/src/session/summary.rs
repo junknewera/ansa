@@ -120,24 +120,27 @@ pub(crate) fn read(
                     kind == "init" && event.text_field("session")? == entry.id,
                     "session_missing_init",
                 )?;
-                let version = event.usize_field("version")?;
-                need(
-                    version == 1 && !event.has("fork_seed")
-                        || version == 2 && event.has("fork_seed"),
-                    "session_fork_seed",
-                )?;
                 let saved = Request::load(event.field("configuration")?)?;
                 // Replay through the production reducer before presenting a state.
                 // Inspection has no compiled read-only tool policy, so plan turns
                 // remain unavailable instead of trusting their saved advertisement.
-                let mut state = State::new(
-                    entry.id.as_str().into(),
-                    saved.clone(),
+                let structured_child = saved.final_format()
+                    == Some(crate::provider::structured::FinalFormat::ChildResult);
+                let plan_tools = if structured_child
+                    && saved.tools.descriptors.iter().all(|tool| {
+                        matches!(
+                            tool.name.as_str(),
+                            "list_directory" | "read_file" | "search_files"
+                        )
+                    }) {
+                    saved.tools.clone()
+                } else {
                     Advertisement {
                         revision: String::new(),
                         descriptors: vec![],
-                    },
-                );
+                    }
+                };
+                let mut state = State::new(entry.id.as_str().into(), saved.clone(), plan_tools);
                 state.apply(event)?;
                 canonical = Some(state);
                 summary.entry.parent = None;
@@ -157,6 +160,13 @@ pub(crate) fn read(
                 } else if saved.epoch.exact_state.has("local_console_parent") {
                     let source = saved.epoch.exact_state.text_field("local_console_parent")?;
                     need(valid_id(source), "session_fork_source")?;
+                    summary.entry.parent = Some(source.into());
+                } else if structured_child {
+                    let source = saved.epoch.exact_state.text_field("orchestration_parent")?;
+                    need(
+                        valid_id(source) && source != entry.id,
+                        "session_fork_source",
+                    )?;
                     summary.entry.parent = Some(source.into());
                 }
                 configuration = Some(saved);
@@ -195,6 +205,12 @@ pub(crate) fn read(
                     "session_active_turn",
                 )?;
                 let text = event.text_field("text")?;
+                let internal = event.has("handoff");
+                let content = if internal {
+                    super::state::handoff_content(text)
+                } else {
+                    text.to_owned()
+                };
                 need(
                     !text.is_empty()
                         && text.len() <= 16 * 1024
@@ -224,7 +240,7 @@ pub(crate) fn read(
                 need(
                     next.input.last().is_some_and(|item| {
                         item.text_field("role") == Ok("user")
-                            && item.text_field("content") == Ok(text)
+                            && item.text_field("content") == Ok(content.as_str())
                     }),
                     "session_request_conflict",
                 )?;
@@ -237,13 +253,22 @@ pub(crate) fn read(
                 response = None;
                 results.clear();
                 request_id = event.text_field("request")?.into();
-                accepted_text = text.into();
+                accepted_text = content;
                 plan = event.has("mode") && event.text_field("mode")? == "plan";
                 paused = false;
-                if summary.title.is_none() {
-                    summary.title = Some(excerpt(text, 96));
+                if !internal {
+                    if summary.title.is_none() {
+                        let title = if saved.final_format()
+                            == Some(crate::provider::structured::FinalFormat::ChildResult)
+                        {
+                            text.lines().next().unwrap_or(text)
+                        } else {
+                            text
+                        };
+                        summary.title = Some(excerpt(title, 96));
+                    }
+                    summary.preview = Some(excerpt(text, 192));
                 }
-                summary.preview = Some(excerpt(text, 192));
                 summary.status = SummaryStatus::Interrupted;
                 turn = Some(event.text_field("turn")?.into());
                 final_text = None;

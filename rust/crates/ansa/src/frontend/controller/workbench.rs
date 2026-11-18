@@ -8,10 +8,12 @@ use crate::{
         commands::{self, Completion},
         graphics,
         input::{MouseEvent, MouseKind},
+        orchestration::{self, Proposal},
         sessions::{Created, Factory, Kind},
         theme::{Catalog as ThemeCatalog, Preview as ThemePreview, Store as ThemeStore, Theme},
         workspace::{DiffStatus, EditorCommand, FileDocument, FileHost, FileListing},
     },
+    orchestration::run::RunId,
     protocol::json::Json,
     session::catalog::SessionSummary,
 };
@@ -52,8 +54,6 @@ struct Slot {
     resync: bool,
     pending_prompt: Option<String>,
     follow_accepted_submit: Option<CommandId>,
-    auto_return: bool,
-    returned: Option<RequestId>,
     admissions: Vec<(String, bool)>,
     closed: bool,
     closing: bool,
@@ -73,7 +73,6 @@ impl Slot {
         kind: Kind,
         parent: Option<String>,
         prompt: Option<String>,
-        auto_return: bool,
     ) -> Self {
         let handle = runtime.handle();
         let mut state = State::new(&handle);
@@ -103,8 +102,6 @@ impl Slot {
             resync: true,
             pending_prompt: prompt,
             follow_accepted_submit: None,
-            auto_return,
-            returned: None,
             admissions: Vec::new(),
             closed: false,
             closing: false,
@@ -550,6 +547,18 @@ enum FileValue {
     Image(graphics::Image),
 }
 enum Job {
+    OrchestrationPlan {
+        owner: String,
+        token: u64,
+        result: Result<Proposal>,
+    },
+    OrchestrationDone {
+        owner: String,
+        result: Result<orchestration::Completed>,
+    },
+    OrchestrationReceipt {
+        result: Result<()>,
+    },
     Themes {
         request: ThemeLoad,
         result: Result<ThemeCatalog>,
@@ -566,7 +575,6 @@ enum Job {
     Created {
         source: String,
         prompt: Option<String>,
-        auto_return: bool,
         foreground: bool,
         plan_only: bool,
         result: Result<Created>,
@@ -575,6 +583,7 @@ enum Job {
         owner: String,
         token: u64,
         result: Result<Vec<SessionSummary>>,
+        continuation: Option<(RunId, String)>,
     },
     CachedModels {
         result: Result<Option<Json>>,
@@ -617,12 +626,17 @@ enum ThemeLoad {
     },
 }
 enum Menu {
+    Orchestration {
+        proposal: Box<Proposal>,
+        selected: usize,
+    },
     Themes(ThemePreview),
     Loading(String),
     Sessions {
         entries: Vec<SessionSummary>,
         selected: usize,
         resume_target: Option<RequestId>,
+        continuation: Option<(RunId, String)>,
     },
     Models {
         models: Vec<(String, String, Vec<String>)>,
@@ -704,6 +718,10 @@ impl Files {
     }
 }
 enum Panel {
+    Orchestration {
+        lines: Vec<String>,
+        offset: usize,
+    },
     Files(Box<Files>),
     Agents {
         selected: usize,
@@ -762,7 +780,11 @@ struct Workbench {
     jobs: JoinSet<Job>,
     stop: Cancel,
     pending_context: BTreeMap<String, CreateIntent>,
-    pending_results: BTreeMap<String, (String, Option<RequestId>)>,
+    planning_context: Option<(CommandId, String, String, u64)>,
+    orchestration_stop: Option<(String, Cancel)>,
+    orchestration_handoffs: BTreeMap<String, String>,
+    orchestration_mode: bool,
+    refinement: Option<String>,
     menu: Option<Menu>,
     completion: Option<Completion>,
     navigation_editor: super::super::input::Editor,
@@ -870,7 +892,11 @@ impl Workbench {
             jobs: JoinSet::new(),
             stop: Cancel::default(),
             pending_context: BTreeMap::new(),
-            pending_results: BTreeMap::new(),
+            planning_context: None,
+            orchestration_stop: None,
+            orchestration_handoffs: BTreeMap::new(),
+            orchestration_mode: false,
+            refinement: None,
             menu: None,
             completion: None,
             navigation_editor: Default::default(),
@@ -912,7 +938,7 @@ impl Workbench {
             exit_deadline: None,
             terminating: false,
         };
-        value.add(Slot::new(runtime, root_id, kind, parent, None, false));
+        value.add(Slot::new(runtime, root_id, kind, parent, None));
         let store = value.theme_store.clone();
         let stop = Cancel::linked(&value.stop);
         value.jobs.spawn_blocking(move || Job::Themes {
@@ -959,6 +985,12 @@ impl Workbench {
         } else if self.menu.is_some() {
             self.disarm_exit();
             self.escape(io);
+        } else if let Some((owner, stop)) = &self.orchestration_stop
+            && owner == &slot.id
+        {
+            stop.cancel();
+            self.disarm_exit();
+            self.report(io, "Останавливаю работу помощников");
         } else if slot.interruptible() {
             self.disarm_exit();
             self.cancel_current(io);
@@ -1010,6 +1042,8 @@ impl Workbench {
         self.cancel_modal();
         self.cancel_editor_request();
         self.current = index;
+        self.orchestration_mode = false;
+        self.refinement = None;
         self.slots[index].refresh = Instant::now();
         self.slots[index].resync = true;
         self.menu = None;
@@ -1067,7 +1101,6 @@ impl Workbench {
                 result: factory.create(Kind::Main, None),
                 source,
                 prompt: None,
-                auto_return: false,
                 foreground,
                 plan_only: false,
             });
@@ -1096,7 +1129,6 @@ impl Workbench {
                 result: factory.create_console(&source),
                 source,
                 prompt,
-                auto_return: false,
                 foreground,
                 plan_only: false,
             });
@@ -1287,7 +1319,7 @@ impl Workbench {
         }
         if self.slots.iter().any(Slot::active)
             || !self.pending_context.is_empty()
-            || !self.pending_results.is_empty()
+            || self.orchestration_stop.is_some()
         {
             self.report(io, "Редактор доступен после остановки текущих задач");
             return;
@@ -1393,6 +1425,7 @@ impl Workbench {
         before != self.pending_context.len()
     }
     fn cancel_modal(&mut self) {
+        self.planning_context = None;
         if let Some(Menu::Themes(preview)) = &self.menu {
             let original = preview.original();
             self.set_theme(original);
@@ -1518,6 +1551,9 @@ impl Workbench {
         let owner = self.slots[self.current].id.clone();
         self.menu = Some(Menu::Loading("Сессии проекта".into()));
         self.jobs.spawn_blocking(move || Job::Sessions {
+            continuation: orchestration::latest_continuation(&factory, &owner)
+                .ok()
+                .flatten(),
             owner,
             token,
             result: factory.summaries(&Cancel::default()),
@@ -1609,12 +1645,127 @@ impl Workbench {
             self.report(io, "Сначала откройте родительскую сессию через /sessions");
         }
     }
-    fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
-        if let Some(task) = commands::agent_task(text) {
-            return (
-                self.create(Kind::Agent, Some(task.into()), false, io),
-                false,
+
+    fn cycle_mode(&mut self, io: &Io) {
+        let slot = &mut self.slots[self.current];
+        if !matches!(slot.kind, Kind::Main | Kind::Fork) || slot.active() {
+            return;
+        }
+        if self.orchestration_mode {
+            self.orchestration_mode = false;
+            self.refinement = None;
+            slot.state.mode = AgentMode::Basic;
+        } else if slot.state.mode == AgentMode::Plan {
+            self.orchestration_mode = true;
+            slot.state.mode = AgentMode::Basic;
+        } else {
+            slot.state.mode = AgentMode::Plan;
+        }
+        slot.state.mode_ready = true;
+        self.factory.set_editor_mode(if self.orchestration_mode {
+            AgentMode::Plan
+        } else {
+            slot.state.mode
+        });
+        let mode = if self.orchestration_mode {
+            "Оркестрация"
+        } else if slot.state.mode == AgentMode::Plan {
+            "Планирование"
+        } else {
+            "Работа"
+        };
+        self.report(io, mode);
+    }
+
+    fn start_orchestration_plan(&mut self, text: &str, io: &Io) -> bool {
+        if self.factory.orchestration_route().is_err() {
+            self.report(
+                io,
+                "Для оркестрации нужна модель с подтверждённой поддержкой строгой схемы ответа",
             );
+            return false;
+        }
+        if self.orchestration_stop.is_some() || self.slots[self.current].active() {
+            self.report(io, "Дождитесь завершения текущей задачи");
+            return false;
+        }
+        if !self.can_job(io) {
+            return false;
+        }
+        let prompt = self.refinement.as_ref().map_or_else(
+            || text.to_owned(),
+            |previous| format!("{previous}\n\nУточнение: {text}"),
+        );
+        if prompt.len() > 16 * 1024 {
+            self.report(io, "Запрос с уточнениями слишком длинный");
+            return false;
+        }
+        self.cancel_modal();
+        let token = self.modal_token;
+        let slot = &mut self.slots[self.current];
+        let command = slot.state.command(&slot.handle, CommandPayload::GetContext);
+        let id = command.command.clone();
+        if !slot
+            .state
+            .post_command(&slot.handle, command, &mut slot.replies, false)
+        {
+            self.report(io, "Дождитесь текущих запросов");
+            return false;
+        }
+        self.planning_context = Some((id, slot.id.clone(), prompt, token));
+        self.refinement = None;
+        self.menu = Some(Menu::Loading("Готовлю план".into()));
+        true
+    }
+
+    fn approve_orchestration(&mut self, proposal: Proposal, io: &Io) {
+        let slot = &self.slots[self.current];
+        if self.orchestration_stop.is_some()
+            || slot.active()
+            || slot.id != proposal.seed.source_session().0
+            || !self.can_job(io)
+        {
+            self.report(io, "Дождитесь завершения текущей задачи");
+            return;
+        }
+        let owner = self.slots[self.current].id.clone();
+        let stop = Cancel::linked(&self.stop);
+        self.orchestration_stop = Some((owner.clone(), stop.clone()));
+        let factory = self.factory.clone();
+        self.jobs.spawn_blocking(move || Job::OrchestrationDone {
+            owner,
+            result: orchestration::execute(&factory, proposal, &stop),
+        });
+        self.report(io, "Помощники выполняют план · Ctrl+C остановить");
+    }
+
+    fn resume_orchestration(&mut self, identity: RunId, io: &Io) {
+        let slot = &self.slots[self.current];
+        if self.orchestration_stop.is_some()
+            || slot.active()
+            || slot.id != identity.parent_session
+            || !self.can_job(io)
+        {
+            self.report(io, "Дождитесь завершения текущей задачи");
+            return;
+        }
+        let owner = identity.parent_session.clone();
+        let stop = Cancel::linked(&self.stop);
+        self.orchestration_stop = Some((owner.clone(), stop.clone()));
+        let factory = self.factory.clone();
+        self.jobs.spawn_blocking(move || Job::OrchestrationDone {
+            owner,
+            result: orchestration::resume(&factory, identity, &stop),
+        });
+        self.report(io, "Проверяю исходные журналы помощников");
+    }
+
+    fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
+        if !text.trim().is_empty()
+            && !text.trim_start().starts_with('/')
+            && (self.orchestration_mode || commands::agent_task(text).is_some())
+        {
+            return (self.start_orchestration_plan(text, io), false);
         }
         let (command, argument) = text
             .trim()
@@ -1645,15 +1796,8 @@ impl Workbench {
                 (true, false)
             }
             "/agent" => {
-                if argument.is_empty() {
-                    self.report(io, "Использование: /agent задача для субагента");
-                    (true, false)
-                } else {
-                    (
-                        self.create(Kind::Agent, Some(argument.into()), true, io),
-                        false,
-                    )
-                }
+                self.report(io, "Попросите основного агента подключить помощников или выберите оркестрацию клавишей Tab");
+                (true, false)
             }
             "/agents" => {
                 self.panel = Some(Panel::Agents { selected: 0 });
@@ -1719,6 +1863,19 @@ impl Workbench {
                 (true, false)
             }
             _ => {
+                if !text.starts_with('/')
+                    && self
+                        .orchestration_stop
+                        .as_ref()
+                        .is_some_and(|(owner, _)| owner == &self.slots[self.current].id)
+                {
+                    self.report(io, "Дождитесь завершения текущей задачи");
+                    return (false, false);
+                }
+                if matches!(command, "/basic" | "/plan") && argument.is_empty() {
+                    self.orchestration_mode = false;
+                    self.refinement = None;
+                }
                 let slot = &mut self.slots[self.current];
                 if slot.kind == Kind::Console && !text.starts_with('/') {
                     slot.state.report(
@@ -1771,7 +1928,6 @@ impl Workbench {
         self.jobs.spawn_blocking(move || Job::Created {
             source,
             prompt: None,
-            auto_return: false,
             foreground: true,
             plan_only: false,
             result: factory.resume(&id),
@@ -1839,6 +1995,23 @@ impl Workbench {
         let lost_context = matches!(event.payload, EventPayload::ResyncRequired { .. })
             && self.discard_contexts(id);
         if let EventPayload::ContextSnapshot { command, seed } = &event.payload
+            && self
+                .planning_context
+                .as_ref()
+                .is_some_and(|(pending, owner, _, _)| pending == command && owner == id)
+            && let Some((_, owner, prompt, token)) = self.planning_context.take()
+        {
+            let factory = self.factory.clone();
+            let seed = seed.clone();
+            let stop = Cancel::linked(&self.stop);
+            self.modal_stop = Some(stop.clone());
+            self.jobs.spawn_blocking(move || Job::OrchestrationPlan {
+                owner,
+                token,
+                result: Proposal::generate(&factory, seed, prompt, &stop),
+            });
+        }
+        if let EventPayload::ContextSnapshot { command, seed } = &event.payload
             && let Some(intent) = self.pending_context.remove(&command.0)
             && intent.source == id
         {
@@ -1847,7 +2020,6 @@ impl Workbench {
             self.jobs.spawn_blocking(move || Job::Created {
                 source: intent.source,
                 prompt: intent.prompt,
-                auto_return: intent.kind == Kind::Agent,
                 foreground: intent.foreground,
                 plan_only: intent.plan_only,
                 result: factory.create(intent.kind, Some(seed)),
@@ -1859,12 +2031,41 @@ impl Workbench {
         } = &event.payload
         {
             self.pending_context.remove(&command.0);
+            if self
+                .planning_context
+                .as_ref()
+                .is_some_and(|(pending, _, _, _)| pending == command)
+            {
+                self.cancel_modal();
+                self.menu = None;
+            }
         }
         let slot = &mut self.slots[index];
         if let EventPayload::FrontendSnapshot(snapshot) = &event.payload
             && !slot.accepts_snapshot(snapshot)
         {
             return;
+        }
+        let committed = match &event.payload {
+            EventPayload::FrontendSnapshot(snapshot)
+                if snapshot.durable && !snapshot.storage_failed =>
+            {
+                snapshot.submit.as_ref()
+            }
+            EventPayload::CommandReplayed { command, .. } if event.request.is_some() => {
+                Some(command)
+            }
+            _ => None,
+        };
+        if let Some(run) = self.orchestration_handoffs.get(id)
+            && committed.is_some_and(|command| command.0.strip_prefix("summary-") == Some(run))
+            && let Some(run) = self.orchestration_handoffs.remove(id)
+        {
+            let owner = id.to_owned();
+            let factory = self.factory.clone();
+            self.jobs.spawn_blocking(move || Job::OrchestrationReceipt {
+                result: orchestration::mark_handoff(&factory, &owner, &run),
+            });
         }
         let mut image = None;
         match &event.payload {
@@ -2003,6 +2204,137 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
+            Job::OrchestrationReceipt { result } => {
+                if let Err(code) = result {
+                    self.report(
+                        io,
+                        &format!("Не удалось сохранить отметку о передаче ({code})"),
+                    );
+                }
+            }
+            Job::OrchestrationPlan {
+                owner,
+                token,
+                result,
+            } => {
+                if self.modal_token != token
+                    || self.slots[self.current].id != owner
+                    || self.input_closed
+                {
+                    return;
+                }
+                self.modal_stop = None;
+                self.menu = None;
+                match result {
+                    Ok(proposal) => {
+                        let mut lines = vec![proposal.plan.summary().to_owned(), String::new()];
+                        if proposal
+                            .plan
+                            .steps()
+                            .iter()
+                            .any(|step| step.access == crate::orchestration::plan::Access::Write)
+                        {
+                            lines.push("После правок - проверка diff и независимое ревью. До двух исправлений в указанных путях.".into());
+                            lines.push(String::new());
+                        }
+                        for (index, step) in proposal.plan.steps().iter().enumerate() {
+                            let access = match step.access {
+                                crate::orchestration::plan::Access::Read => "Чтение",
+                                crate::orchestration::plan::Access::Write => {
+                                    "Правки в рабочей копии"
+                                }
+                            };
+                            lines.push(format!("{}. {} · {}", index + 1, step.id, access));
+                            lines.extend(step.task.lines().map(str::to_owned));
+                            if !step.paths.is_empty() {
+                                lines.extend(step.paths.iter().cloned());
+                            }
+                            if !step.depends_on.is_empty() {
+                                lines.push(format!("После шагов {}", step.depends_on.join(", ")));
+                            }
+                            lines.extend(step.acceptance.lines().map(str::to_owned));
+                            lines.push(String::new());
+                        }
+                        for check in proposal.plan.checks() {
+                            lines.push(format!("Проверка файла {}", check.path));
+                            lines.extend(check.contains.lines().map(str::to_owned));
+                        }
+                        for check in proposal.plan.manual_checks() {
+                            lines.push("Требуется дополнительная проверка".into());
+                            lines.extend(check.lines().map(str::to_owned));
+                        }
+                        self.panel = Some(Panel::Orchestration { lines, offset: 0 });
+                        self.frames.clear();
+                        self.displayed = None;
+                        self.operational_frame = None;
+                        self.last_frame = None;
+                        self.focus = Focus::Inspector;
+                        self.menu = Some(Menu::Orchestration {
+                            proposal: Box::new(proposal),
+                            selected: 0,
+                        });
+                    }
+                    Err(code) => self.report(io, &format!("Не удалось подготовить план ({code})")),
+                }
+            }
+            Job::OrchestrationDone { owner, result } => {
+                self.orchestration_stop = None;
+                let foreground = self.slots[self.current].id == owner;
+                let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner) else {
+                    return;
+                };
+                match result {
+                    Ok(completed) if !self.input_closed && !parent.active() => {
+                        if let Some(candidate) = completed.candidate
+                            && foreground
+                        {
+                            self.panel = Some(Panel::EditDiff {
+                                title: "Проверенные изменения · ansa-result".into(),
+                                rows: std::sync::Arc::new(super::super::diff::patch_rows(
+                                    &candidate.diff,
+                                )),
+                                offset: 0,
+                                column: 0,
+                            });
+                        }
+                        let mut command = parent.state.command(
+                            &parent.handle,
+                            CommandPayload::Handoff(Submit {
+                                text: completed.evidence,
+                                mode: AgentMode::Plan,
+                            }),
+                        );
+                        command.command = CommandId(format!("summary-{}", completed.id));
+                        command.turn = TurnId(format!("summary-{}", completed.id));
+                        if parent.state.post_command(
+                            &parent.handle,
+                            command,
+                            &mut parent.replies,
+                            false,
+                        ) {
+                            self.orchestration_handoffs
+                                .insert(owner.clone(), completed.id);
+                            parent.show_latest();
+                        } else {
+                            parent
+                                .state
+                                .report(io, "Результаты сохранены в журналах помощников");
+                        }
+                    }
+                    Ok(_) => parent
+                        .state
+                        .report(io, "Результаты сохранены в журналах помощников"),
+                    Err("auth_cancelled" | "run_cancelled") => {
+                        parent.state.report(io, "План остановлен")
+                    }
+                    Err("orchestration_paused") => parent
+                        .state
+                        .report(io, "Помощник приостановлен · продолжить через /sessions"),
+                    Err(code) => parent
+                        .state
+                        .report(io, &format!("План остановлен ({code})")),
+                }
+            }
             Job::TerminalScreen { token, result } => {
                 if let Some(Panel::NativeTerminal {
                     token: expected,
@@ -2104,7 +2436,6 @@ impl Workbench {
             Job::Created {
                 source,
                 prompt,
-                auto_return,
                 foreground,
                 plan_only,
                 result,
@@ -2118,14 +2449,8 @@ impl Workbench {
                         created.parent = Some(source);
                     }
                     let id = created.selected.id.clone();
-                    let mut slot = Slot::new(
-                        created.runtime,
-                        id,
-                        created.kind,
-                        created.parent,
-                        prompt,
-                        auto_return,
-                    );
+                    let mut slot =
+                        Slot::new(created.runtime, id, created.kind, created.parent, prompt);
                     if plan_only {
                         slot.state.mode = AgentMode::Plan;
                         slot.state.mode_ready = true;
@@ -2141,7 +2466,11 @@ impl Workbench {
                 }
                 Err(code) => self.report(io, &format!("Не удалось открыть сессию: {code}")),
             },
-            Job::Sessions { result, .. } => match result {
+            Job::Sessions {
+                result,
+                continuation,
+                ..
+            } => match result {
                 Ok(entries) => {
                     self.summaries = entries.clone();
                     self.menu = Some(Menu::Sessions {
@@ -2151,6 +2480,7 @@ impl Workbench {
                             .collect(),
                         selected: 0,
                         resume_target: self.resume_target(),
+                        continuation,
                     })
                 }
                 Err(code) => self.report(io, &format!("Не удалось прочитать сессии: {code}")),
@@ -2269,6 +2599,10 @@ impl Workbench {
             return;
         }
         if let Some(menu) = self.menu.take() {
+            if matches!(menu, Menu::Orchestration { .. }) {
+                self.panel = None;
+                self.focus = Focus::Chat;
+            }
             if let Menu::Efforts {
                 previous: Some((models, selected)),
                 ..
@@ -2305,7 +2639,9 @@ impl Workbench {
             self.focus = Focus::Chat;
             return;
         }
-        if !self.slots[self.current].state.follow_tail {
+        if self.slots[self.current].kind != Kind::Agent
+            && !self.slots[self.current].state.follow_tail
+        {
             self.slots[self.current].show_latest();
             return;
         }
@@ -2328,6 +2664,21 @@ impl Workbench {
         self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
         if self.focus == Focus::Inspector {
+            if let Some(Panel::Orchestration { lines, offset }) = &mut self.panel {
+                let viewport = self
+                    .displayed
+                    .as_ref()
+                    .and_then(|frame| frame.inspector_bounds());
+                let (_, _, width, height) = viewport.unwrap_or((0, 0, 80, 6));
+                let size = crate::frontend::cells::wrap_lines(lines, width.max(1)).len();
+                let step = height.saturating_sub(1).max(1);
+                *offset = if older {
+                    offset.saturating_sub(step)
+                } else {
+                    (*offset + step).min(size.saturating_sub(height.max(1)))
+                };
+                return;
+            }
             if let Some(Panel::EditDiff { rows, offset, .. }) = &mut self.panel {
                 *offset = if older {
                     offset.saturating_sub(8)
@@ -2508,6 +2859,7 @@ impl Workbench {
             }
         };
         match &mut self.menu {
+            Some(Menu::Orchestration { selected, .. }) => delta(selected, 3),
             Some(Menu::Themes(preview)) => {
                 preview.navigate(older);
                 let theme = preview.current();
@@ -2518,9 +2870,12 @@ impl Workbench {
                 entries,
                 selected,
                 resume_target,
+                continuation,
             }) => delta(
                 selected,
-                entries.len() + usize::from(resume_target.is_some()),
+                entries.len()
+                    + usize::from(resume_target.is_some())
+                    + usize::from(continuation.is_some()),
             ),
             Some(Menu::Models { models, selected }) => delta(selected, models.len()),
             Some(Menu::Efforts {
@@ -2543,6 +2898,7 @@ impl Workbench {
                 Some(Panel::Agents { selected }) => delta(selected, agent_count),
                 Some(Panel::Output { offset, .. }) => delta(offset, output_count),
                 Some(Panel::Terminal | Panel::Image { .. } | Panel::NativeTerminal { .. }) => {}
+                Some(Panel::Orchestration { .. }) => {}
                 None => {}
             },
             None => {
@@ -2569,13 +2925,45 @@ impl Workbench {
         }
         if let Some(menu) = self.menu.take() {
             match menu {
+                Menu::Orchestration { proposal, selected } => {
+                    if selected == 0
+                        && (proposal.plan.execution_ready().is_err()
+                            || !self
+                                .displayed
+                                .as_ref()
+                                .and_then(|frame| frame.inspector_bounds())
+                                .is_some_and(|(_, _, width, height)| width >= 30 && height > 0))
+                    {
+                        let text = if proposal.plan.execution_ready().is_err() {
+                            "Уточните проверку результата перед запуском"
+                        } else {
+                            "Увеличьте окно, чтобы прочитать план"
+                        };
+                        self.report(io, text);
+                        self.menu = Some(Menu::Orchestration { proposal, selected });
+                        return None;
+                    }
+                    self.panel = None;
+                    self.focus = Focus::Chat;
+                    match selected {
+                        0 => self.approve_orchestration(*proposal, io),
+                        1 => {
+                            self.refinement = Some(proposal.prompt);
+                            self.report(io, "Введите уточнение к плану");
+                        }
+                        _ => self.report(io, "План отменён"),
+                    }
+                }
                 Menu::Themes(preview) => self.commit_theme(preview.current()),
                 Menu::Loading(title) => self.menu = Some(Menu::Loading(title)),
                 Menu::Sessions {
                     entries,
                     selected,
                     resume_target,
+                    continuation,
                 } => {
+                    let native = usize::from(resume_target.is_some());
+                    let orchestration = usize::from(continuation.is_some());
                     if let Some(target) = resume_target.as_ref().filter(|_| selected == 0) {
                         if self.resume_target().as_ref() == Some(target) {
                             let slot = &mut self.slots[self.current];
@@ -2585,9 +2973,9 @@ impl Workbench {
                                 &mut slot.replies,
                             );
                         }
-                    } else if let Some(entry) =
-                        entries.get(selected - usize::from(resume_target.is_some()))
-                    {
+                    } else if let Some((id, _)) = continuation.filter(|_| selected == native) {
+                        self.resume_orchestration(id, io);
+                    } else if let Some(entry) = entries.get(selected - native - orchestration) {
                         self.resume(entry.entry.id.clone(), io);
                     }
                 }
@@ -2673,6 +3061,12 @@ impl Workbench {
         {
             if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
                 self.navigate(mouse.kind == MouseKind::WheelUp);
+            }
+            return;
+        }
+        if matches!(&self.menu, Some(Menu::Orchestration { .. })) {
+            if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
+                self.page(mouse.kind == MouseKind::WheelUp);
             }
             return;
         }
@@ -2933,6 +3327,7 @@ impl Workbench {
     fn popup(&self) -> Option<Popup> {
         let menu = self.menu.as_ref()?;
         Some(match menu {
+            Menu::Orchestration { .. } => return None,
             Menu::Themes(preview) => Popup {
                 title: "/theme".into(),
                 subtitle: "Предпросмотр темы".into(),
@@ -2963,6 +3358,7 @@ impl Workbench {
                 entries,
                 selected,
                 resume_target,
+                continuation,
             } => Popup {
                 title: "Сессии проекта".into(),
                 subtitle: "Выбрать разговор".into(),
@@ -2972,6 +3368,10 @@ impl Workbench {
                         label: "Продолжить текущий запрос".into(),
                         detail: String::new(),
                     })
+                    .chain(continuation.iter().map(|(_, title)| Choice {
+                        label: "Продолжить оркестрацию".into(),
+                        detail: title.clone(),
+                    }))
                     .chain(entries.iter().map(|e| Choice {
                         label: e.title.clone().unwrap_or_else(|| "Новый разговор".into()),
                         detail: format!(
@@ -3032,6 +3432,32 @@ impl Workbench {
     }
     fn inspector(&self) -> Option<Inspector> {
         match self.panel.as_ref()? {
+            Panel::Orchestration { lines, offset } => {
+                let selected = match &self.menu {
+                    Some(Menu::Orchestration { selected, .. }) => *selected,
+                    _ => 0,
+                };
+                let actions = ["Начать", "Уточнить", "Отмена"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        if index == selected {
+                            format!("[{label}]")
+                        } else {
+                            label.into()
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join("   ");
+                Some(Inspector {
+                    title: "План работы · PgUp/PgDn или прокрутка".into(),
+                    lines: lines.clone(),
+                    offset: *offset,
+                    footer: format!("{actions}   ·   ↑/↓ выбрать · Enter"),
+                    kind: InspectorKind::Plan,
+                    ..Inspector::default()
+                })
+            }
             Panel::Terminal => {
                 let snapshot = self.terminal.as_ref()?.snapshot();
                 Some(Inspector {
@@ -3259,7 +3685,11 @@ impl Workbench {
             effort: generation
                 .and_then(|g| g.effort.clone())
                 .unwrap_or_default(),
-            activity: String::new(),
+            activity: if self.orchestration_mode {
+                "Оркестрация".into()
+            } else {
+                String::new()
+            },
             exit_confirmation: self.exit_deadline.is_some(),
             reading: !slot.state.follow_tail,
             new_events: snapshot.map_or(0, |s| {
@@ -3575,10 +4005,6 @@ fn sync_displayed(
     }
 }
 
-fn command_id(state: &State) -> String {
-    format!("c_{}_{}", state.prefix, state.sequence)
-}
-
 fn model_choices(value: Json) -> Result<Vec<(String, String, Vec<String>)>> {
     Ok(crate::auth::dispatch::model_capabilities(&value)?
         .into_iter()
@@ -3788,30 +4214,6 @@ pub async fn run_attached(
             }
             for (id, accepted) in admissions {
                 if !accepted { work.pending_context.remove(&id); }
-                if let Some((child, request)) = work.pending_results.remove(&id)
-                    && accepted && let Some(slot) = work.slots.iter_mut().find(|slot| slot.id == child)
-                { slot.returned = request; }
-            }
-            // Authorized child results return through the parent's typed user
-            // input path once, and therefore cross the same durable boundary.
-            let mut returns = Vec::new();
-            for (index, slot) in work.slots.iter().enumerate() {
-                if work.editor.is_some() || work.pending_editor.is_some() || work.input_closed || finished { break; }
-                if slot.auto_return && let Some(view) = &slot.state.snapshot
-                    && view.state == "completed" && view.durable && !view.worker_busy
-                    && !view.text.is_empty() && view.request != slot.returned
-                    && !work.pending_results.values().any(|(child, request)| child == &slot.id && request == &view.request)
-                { returns.push(index); }
-            }
-            for index in returns {
-                let slot = &work.slots[index];
-                let Some(parent) = slot.parent.clone() else { continue; };
-                let view = slot.state.snapshot.as_ref().expect("checked completion");
-                let request = view.request.clone(); let child = slot.id.clone(); let text = format!("Результат субагента «{}»:\n{}", work.title(&slot.id), view.text);
-                if let Some(parent) = work.slots.iter_mut().find(|slot| slot.id == parent)
-                    && parent.state.snapshot.as_ref().is_some_and(|s| !s.storage_failed && s.state != "paused")
-                    && parent.state.text(&text, &parent.handle, io, &mut parent.replies).0
-                { work.pending_results.insert(command_id(&parent.state), (child, request)); }
             }
             if work.exit_deadline.is_some_and(|deadline| now >= deadline || work.slots[work.current].interruptible()) {
                 dirty |= work.disarm_exit();
@@ -3940,6 +4342,7 @@ pub async fn run_attached(
                                     Action::Complete => { if matches!(work.menu, Some(Menu::Help { .. })) { work.enter(io); } else { work.complete_command(); } }
                                     Action::Escape => work.escape(io),
                                     Action::FocusNext if work.completion.is_some() && work.menu.is_none() && work.focus == Focus::Chat => work.complete_command(),
+                                    Action::FocusNext if work.panel.is_none() && work.menu.is_none() => work.cycle_mode(io),
                                     Action::FocusNext | Action::FocusPrevious => if work.panel.is_some() { work.focus = if work.focus == Focus::Chat && work.displayed.as_ref().and_then(|frame| frame.inspector_bounds()).is_some_and(|(_, _, width, height)| width > 0 && height > 0) { Focus::Inspector } else { Focus::Chat }; },
                                     Action::Mouse(mouse) => work.mouse(mouse, io),
                                     Action::HistoryOlder | Action::HistoryNewer => work.navigate(action == Action::HistoryOlder),
@@ -4193,7 +4596,7 @@ mod tests {
     async fn history_top_waits_for_its_page_and_cancelled_jump_keeps_the_tail() {
         let runtime = super::super::super::app::offline_runtime(None, false).unwrap();
         runtime.ready().await.unwrap();
-        let mut slot = Slot::new(runtime, "offline".into(), Kind::Main, None, None, false);
+        let mut slot = Slot::new(runtime, "offline".into(), Kind::Main, None, None);
         slot.state.scroll = 2;
         slot.jump_history(true);
         assert_eq!(slot.state.scroll, 2);
@@ -4370,7 +4773,6 @@ mod tests {
             Kind::Main,
             None,
             Some("buffered task".into()),
-            false,
         );
         let handle = slot.handle.clone();
         let (sender, mut events) = mpsc::channel(32);
@@ -4568,7 +4970,7 @@ mod tests {
             call_id: "call".into(),
             name: "get_test_value".into(),
         })];
-        let mut slot = Slot::new(runtime, "offline".into(), Kind::Main, None, None, false);
+        let mut slot = Slot::new(runtime, "offline".into(), Kind::Main, None, None);
         slot.state.snapshot = Some(view);
         slot.state
             .progress

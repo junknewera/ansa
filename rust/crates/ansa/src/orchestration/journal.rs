@@ -1,4 +1,4 @@
-//! Bounded, append-only O1 records. Both stores use the same disk primitives,
+//! Bounded append-only orchestration records. The stores share disk primitives,
 //! with disjoint paths and schema headers.
 use ansa_linux::{fs, local};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -8,8 +8,8 @@ use crate::protocol::legacy_json_v1::sha256;
 
 pub(super) type Result<T> = std::result::Result<T, &'static str>;
 const HEADER: &str = "init.json";
-const MAX_RECORDS: u16 = 96;
-const MAX_BYTES: usize = 8192;
+const MAX_RECORDS: u16 = 240;
+const MAX_BYTES: usize = 160 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,10 +32,13 @@ pub(super) struct Journal {
     next: u16,
     previous: String,
     failed: bool,
+    #[cfg(test)]
     pub(super) fault: Option<Fault>,
+    #[cfg(test)]
     pub(super) after_publish: Option<Box<dyn FnOnce()>>,
 }
 
+#[cfg(test)]
 pub(super) enum Fault {
     PartialAppend,
     LostSyncAck,
@@ -103,7 +106,9 @@ impl Journal {
             next: 0,
             previous: sha256(header),
             failed: false,
+            #[cfg(test)]
             fault: None,
+            #[cfg(test)]
             after_publish: None,
         }
     }
@@ -123,7 +128,9 @@ impl Journal {
             body,
         })?;
         self.failed = true;
+        #[cfg(test)]
         let fault = self.fault.take();
+        #[cfg(test)]
         if matches!(fault, Some(Fault::PartialAppend)) {
             local::create(
                 &self.directory,
@@ -134,17 +141,20 @@ impl Journal {
             return Err("store_append");
         }
         local::create(&self.directory, &name, &bytes).map_err(|_| "store_append")?;
+        #[cfg(test)]
         if matches!(fault, Some(Fault::LostSyncAck)) {
             return Err("store_sync");
         }
         self.advance(&bytes);
         self.failed = false;
+        #[cfg(test)]
         if let Some(callback) = self.after_publish.take() {
             callback();
         }
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn directory(&self) -> &File {
         &self.directory
     }

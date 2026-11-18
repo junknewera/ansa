@@ -83,6 +83,9 @@ pub struct MessageReceiptInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandPayload {
     Submit(Submit),
+    /// Native-only synthesis input from the coordinator. Frontend wire
+    /// decoders accept ordinary Submit and never construct this variant.
+    Handoff(Submit),
     Steer(Steer),
     SetGeneration(GenerationSelection),
     GetContext,
@@ -195,12 +198,17 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
             Err("request_id")
         }
         CommandPayload::GetMessageReceipt(id) if !valid_id(&id.0) => Err("command_id"),
-        CommandPayload::Submit(submit) => {
+        CommandPayload::Submit(submit) | CommandPayload::Handoff(submit) => {
             if submit.text.is_empty() || submit.text.len() > 16 * 1024 {
                 return Err("submit_size");
             }
             if submit.mode != AgentMode::Basic && submit.mode != AgentMode::Plan {
                 return Err("submit_mode");
+            }
+            if matches!(command.payload, CommandPayload::Handoff(_))
+                && submit.mode != AgentMode::Plan
+            {
+                return Err("handoff_read_only");
             }
             Ok(())
         }

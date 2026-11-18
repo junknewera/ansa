@@ -62,6 +62,24 @@ impl AdmittedResponse {
     pub fn calls(&self) -> &[FunctionCall] {
         &self.calls
     }
+    pub fn child_result(&self) -> Result<super::structured::ChildResult, &'static str> {
+        if !self.calls.is_empty() {
+            return Err("child_result_not_final");
+        }
+        self.request
+            .final_format()
+            .ok_or("child_result_format_required")?
+            .child_result(&self.items)
+    }
+    pub fn orchestration_plan(&self) -> Result<crate::orchestration::plan::Plan, &'static str> {
+        if !self.calls.is_empty() {
+            return Err("plan_result_not_final");
+        }
+        self.request
+            .final_format()
+            .ok_or("plan_result_format_required")?
+            .plan(&self.items)
+    }
 }
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
 pub(crate) struct Reducer {
@@ -77,6 +95,11 @@ pub(crate) struct Reducer {
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
 impl Reducer {
     pub(crate) fn new(request: Request, limits: Limits, preview: Option<TextPreview>) -> Self {
+        let preview = if request.final_format().is_none() {
+            preview
+        } else {
+            None
+        };
         Self {
             request,
             events: Vec::new(),
@@ -281,6 +304,13 @@ impl Reducer {
         let value = self
             .validate_events(false)?
             .ok_or("response_premature_eof")?;
+        if let Some(format) = self.request.final_format() {
+            if value.calls.is_empty() {
+                format.validate(&value.items)?;
+            } else {
+                super::structured::reject_refusal(&value.items)?;
+            }
+        }
         Ok(AdmittedResponse {
             request: self.request.clone(),
             id: value.id,

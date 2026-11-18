@@ -2,7 +2,7 @@
 use rustix::fs::{Mode, OFlags};
 use std::{
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     os::unix::fs::MetadataExt,
     path::Path,
 };
@@ -97,6 +97,36 @@ pub fn create(directory: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
         rustix::fs::RenameFlags::NOREPLACE,
     )?;
     directory.sync_all()
+}
+
+pub fn anonymous_input(bytes: &[u8]) -> io::Result<File> {
+    let mut file = File::from(rustix::fs::memfd_create(
+        "ansa-input",
+        rustix::fs::MemfdFlags::CLOEXEC,
+    )?);
+    file.write_all(bytes)?;
+    file.rewind()?;
+    Ok(file)
+}
+
+/// Retry publication of an immutable record while holding its owner's lock.
+/// A pending file has never been visible as the final record.
+pub fn publish_recovered(directory: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let limit = bytes.len().max(4096);
+    if let Some(existing) = read(directory, name, limit)? {
+        if existing != bytes {
+            return Err(io::Error::other("local_record_conflict"));
+        }
+        sync_regular(directory, name)?;
+        return directory.sync_all();
+    }
+    let pending = format!("{name}.pending");
+    match sync_regular(directory, &pending) {
+        Ok(()) => unlink(directory, &pending)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
+    }
+    create(directory, name, bytes)
 }
 /// Sync an owned immutable output through the same anchored, nofollow boundary.
 pub fn sync_regular(directory: &File, name: &str) -> io::Result<()> {

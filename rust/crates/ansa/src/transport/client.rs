@@ -286,6 +286,35 @@ pub fn fixture_stream(
 pub fn exchange(request: &HttpRequest, stop: &Cancel) -> Result<HttpReply> {
     perform(request, stop, None, StreamAdmission::Strict)
 }
+#[cfg(feature = "orchestration-pilot")]
+pub(crate) fn pilot_exchange(request: &HttpRequest, stop: &Cancel) -> Result<HttpReply> {
+    let uri: Uri = request.url.parse().map_err(|_| "url_invalid")?;
+    if uri.scheme_str() != Some("https")
+        || uri.authority().map(|value| value.as_str()) != Some("openrouter.ai")
+        || uri.query().is_some()
+        || !matches!(
+            (request.method, uri.path()),
+            (
+                "GET",
+                "/api/v1/key" | "/api/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints"
+            ) | ("POST", "/api/v1/chat/completions")
+        )
+    {
+        return Err("pilot_endpoint");
+    }
+    perform_route(
+        request,
+        stop,
+        None,
+        uri,
+        tls()?,
+        None,
+        RoutePolicy {
+            local_only: false,
+            admission: StreamAdmission::Strict,
+        },
+    )
+}
 pub fn stream(
     value: &Json,
     bearer: &Secret,

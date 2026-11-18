@@ -263,10 +263,18 @@ impl Snapshot {
         self.policies.iter().any(|p| p.requires_journal)
     }
     pub fn read_only(&self) -> Arc<Self> {
+        self.filtered(|_, policy| policy.read_only)
+    }
+
+    pub(crate) fn named_tools(&self, names: &[&str]) -> Arc<Self> {
+        self.filtered(|definition, _| names.contains(&definition.descriptor.name.as_str()))
+    }
+
+    fn filtered(&self, include: impl Fn(&Definition, &Policy) -> bool) -> Arc<Self> {
         let mut registry = Registry::new();
         registry.owner = self.owner.clone();
         for (definition, policy) in self.definitions.iter().zip(&self.policies) {
-            if policy.read_only {
+            if include(definition, policy) {
                 registry.definitions.push(definition.clone());
                 registry.policies.push(policy.clone());
             }

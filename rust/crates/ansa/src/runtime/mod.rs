@@ -6,6 +6,7 @@ mod shutdown;
 mod work;
 pub use crate::auth::Cancel;
 pub use crate::frontend::protocol_v1::*;
+pub use crate::session::journal_v1::DirectoryIdentity;
 pub use crate::session::state::ForkSeed;
 use crate::{
     context::legacy_compact::CompactedContext,
@@ -64,6 +65,9 @@ pub struct Options {
     pub check_request: CheckRequest,
     pub select_generation: SelectGeneration,
     pub directory: Option<PathBuf>,
+    /// Require the original initialized journal when resuming a child.
+    pub existing_journal: Option<DirectoryIdentity>,
+    pub inspect_only: bool,
     pub compact: Option<Compact>,
     pub journal: Option<Observer>,
     pub keep_recent_turns: usize,
@@ -79,6 +83,8 @@ impl Default for Options {
             check_request: Arc::new(|_, _, _| Ok(())),
             select_generation: Arc::new(|_, _| Err("generation_selection_unavailable")),
             directory: None,
+            existing_journal: None,
+            inspect_only: false,
             compact: None,
             journal: None,
             keep_recent_turns: 0,
@@ -99,6 +105,66 @@ pub enum PostStatus {
     Duplicate,
     CommandIdLimit,
     CommandConflict,
+}
+
+/// Result of inspecting an exact child Submit through the native owner.
+/// It bypasses the lossy frontend event stream and is never a JSONL event.
+#[derive(Debug)]
+pub struct ChildAttempt {
+    session: SessionId,
+    incarnation: RuntimeIncarnation,
+    journal: DirectoryIdentity,
+    command: CommandId,
+    turn: TurnId,
+    mode: AgentMode,
+    text_sha256: String,
+    state: ChildAttemptState,
+}
+
+impl ChildAttempt {
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+    pub(crate) fn incarnation(&self) -> &RuntimeIncarnation {
+        &self.incarnation
+    }
+    pub fn journal(&self) -> DirectoryIdentity {
+        self.journal
+    }
+    pub fn command(&self) -> &CommandId {
+        &self.command
+    }
+    pub fn turn(&self) -> &TurnId {
+        &self.turn
+    }
+    pub fn mode(&self) -> AgentMode {
+        self.mode
+    }
+    pub fn text_sha256(&self) -> &str {
+        &self.text_sha256
+    }
+    pub fn state(&self) -> &ChildAttemptState {
+        &self.state
+    }
+    pub fn into_state(self) -> ChildAttemptState {
+        self.state
+    }
+}
+
+#[derive(Debug)]
+pub enum ChildAttemptState {
+    Missing,
+    Pending,
+    Durable {
+        request: RequestId,
+        state: String,
+        /// The exact turn and all of its workers have settled. A cancelled
+        /// journal transition by itself cannot release a writer's slot.
+        quiescent: bool,
+        resume_required: bool,
+        recovery_required: bool,
+        final_response: Option<Arc<AdmittedResponse>>,
+    },
 }
 pub use dispatch::DurableIntent;
 pub use shutdown::{Handle, Runtime};
@@ -129,6 +195,12 @@ pub(crate) fn valid_configuration(
     }
     if tools.requires_journal() && options.directory.is_none() {
         return Err("durable_tools_require_session");
+    }
+    if options.existing_journal.is_some() && options.directory.is_none() {
+        return Err("missing_journal_directory");
+    }
+    if options.inspect_only && options.existing_journal.is_none() {
+        return Err("inspection_requires_existing_journal");
     }
     if !tools.owner_matches(&session.0, options.directory.as_deref()) {
         return Err("tool_owner_binding");

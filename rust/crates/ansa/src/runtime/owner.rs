@@ -2,7 +2,7 @@
 use super::{
     dispatch::Gate,
     outbox::Outbox,
-    shutdown::{Closing, Envelope, Mailboxes},
+    shutdown::{ChildLookup, Closing, Envelope, Mailboxes},
     work::*,
     *,
 };
@@ -33,6 +33,7 @@ enum ToolTask {
 }
 pub(crate) struct Owner {
     state: Arc<State>,
+    journal_identity: Option<DirectoryIdentity>,
     tools: Arc<Tools>,
     plan_tools: Arc<Tools>,
     limits: Limits,
@@ -133,6 +134,7 @@ impl Owner {
             storage_failed: false,
             recovered_pause: false,
             recovery: None,
+            journal_identity: None,
             receipts: BTreeMap::new(),
             queued: VecDeque::new(),
             new_followups: VecDeque::new(),
@@ -298,6 +300,9 @@ impl Owner {
     }
     fn message_receipt(&self, command: &CommandId) -> Option<MessageReceiptInfo> {
         if let Some(receipt) = self.receipts.get(&command.0) {
+            if receipt.internal {
+                return None;
+            }
             let state = if self.request().as_ref() == Some(&receipt.request) {
                 self.phase.clone()
             } else {
@@ -361,6 +366,93 @@ impl Owner {
             });
         }
         None
+    }
+
+    fn child_attempt(&self, lookup: &ChildLookup) -> Result<ChildAttempt> {
+        if !self.initialized || self.starting {
+            return Err("runtime_not_ready");
+        }
+        if self.storage_failed {
+            return Err("child_journal_read_only");
+        }
+        let journal = self.journal_identity.ok_or("child_requires_journal")?;
+        let state = match self.state.submits.get(&lookup.command.0) {
+            Some(receipt) => {
+                Self::match_child_submit(receipt, lookup)?;
+                let turn = self
+                    .state
+                    .turn
+                    .as_ref()
+                    .filter(|turn| {
+                        turn.receipt.command == lookup.command
+                            && turn.receipt.request == receipt.request
+                    })
+                    .ok_or("child_attempt_not_current")?;
+                let quiescent = !self.busy()
+                    && self.pending_outcome.is_none()
+                    && self.cancelling.is_none()
+                    && self.resuming.is_none()
+                    && self.plan_workspace.is_none()
+                    && !self.owned_intent;
+                let final_response = if receipt.state == "completed" {
+                    if turn.stage != "completed" {
+                        return Err("child_completion_not_current");
+                    }
+                    Some(turn.response.clone().ok_or("child_completion_missing")?)
+                } else {
+                    None
+                };
+                ChildAttemptState::Durable {
+                    request: receipt.request.clone(),
+                    state: receipt.state.clone(),
+                    quiescent,
+                    resume_required: self.recovered_pause || turn.paused,
+                    recovery_required: self.recovery.is_some()
+                        || quiescent && self.state.unknown_operation().is_some(),
+                    final_response,
+                }
+            }
+            None => match self.receipts.get(&lookup.command.0) {
+                Some(receipt) => {
+                    Self::match_child_submit(receipt, lookup)?;
+                    ChildAttemptState::Pending
+                }
+                None if self
+                    .state
+                    .generation_commands
+                    .contains_key(&lookup.command.0)
+                    || self
+                        .state
+                        .followups
+                        .iter()
+                        .any(|item| item.command == lookup.command) =>
+                {
+                    return Err("child_submit_conflict");
+                }
+                None => ChildAttemptState::Missing,
+            },
+        };
+        Ok(ChildAttempt {
+            session: self.state.session.clone(),
+            incarnation: self.incarnation.clone(),
+            journal,
+            command: lookup.command.clone(),
+            turn: lookup.turn.clone(),
+            mode: lookup.submit.mode,
+            text_sha256: crate::protocol::legacy_json_v1::sha256(lookup.submit.text.as_bytes()),
+            state,
+        })
+    }
+
+    fn match_child_submit(receipt: &SubmitReceipt, lookup: &ChildLookup) -> Result<()> {
+        if receipt.internal
+            || receipt.turn != lookup.turn
+            || receipt.mode != lookup.submit.mode
+            || *receipt.text != lookup.submit.text
+        {
+            return Err("child_submit_conflict");
+        }
+        Ok(())
     }
     fn finish_preview(&mut self, state: &str, final_text: bool) {
         if let Some(preview) = &mut self.preview
@@ -701,6 +793,17 @@ impl Owner {
         if self.closing.mode.load(Ordering::Acquire) != 0 {
             return Ok(PostStatus::Closed);
         }
+        if self.options.inspect_only
+            && !matches!(
+                command.payload,
+                CommandPayload::GetSnapshot(_)
+                    | CommandPayload::GetTranscript(_)
+                    | CommandPayload::GetTimeline(_)
+                    | CommandPayload::GetMessageReceipt(_)
+            )
+        {
+            return Err("archive_only");
+        }
         if let Some(pending) = self.control_commands.get(&command.command.0) {
             return Ok(
                 if pending.payload == command.payload && pending.turn == command.turn {
@@ -841,7 +944,8 @@ impl Owner {
                     query: page.query,
                 }));
             }
-            CommandPayload::Submit(submitted) => {
+            CommandPayload::Submit(submitted) | CommandPayload::Handoff(submitted) => {
+                let internal = matches!(command.payload, CommandPayload::Handoff(_));
                 if self
                     .state
                     .generation_commands
@@ -859,8 +963,15 @@ impl Owner {
                     if *receipt.text != submitted.text
                         || receipt.turn != command.turn
                         || receipt.mode != submitted.mode
+                        || receipt.internal != internal
                     {
                         return Ok(PostStatus::CommandConflict);
+                    }
+                    if internal
+                        && (!self.state.submits.contains_key(&command.command.0)
+                            || self.storage_failed)
+                    {
+                        return Ok(PostStatus::QueueFull);
                     }
                     let state = if self.request().as_ref() == Some(&receipt.request) {
                         self.phase.clone()
@@ -896,6 +1007,7 @@ impl Owner {
                         text: Arc::new(submitted.text.clone()),
                         state: "queued".into(),
                         mode: submitted.mode,
+                        internal,
                     },
                 );
                 self.queued.push_back(command.clone());
@@ -984,14 +1096,16 @@ impl Owner {
             );
             return Ok(());
         }
-        if matches!(&command.payload, CommandPayload::Submit(submitted) if submitted.mode == AgentMode::Plan)
+        if matches!(&command.payload, CommandPayload::Submit(submitted) | CommandPayload::Handoff(submitted) if submitted.mode == AgentMode::Plan)
             && !self.tools.plan_ready()
         {
             self.reject_plan(&command, "terminal_workspace_busy");
             return Ok(());
         }
-        let CommandPayload::Submit(submitted) = command.payload else {
-            return Err("submit_contract");
+        let (submitted, internal) = match command.payload {
+            CommandPayload::Submit(submitted) => (submitted, false),
+            CommandPayload::Handoff(submitted) => (submitted, true),
+            _ => return Err("submit_contract"),
         };
         self.tools.begin_turn();
         let request_number = self.state.next_request + 1;
@@ -1022,18 +1136,20 @@ impl Owner {
             workers,
             Kind::Accepted,
             Box::new(move |state| {
-                let next = state.request_for(&submitted.text, submitted.mode)?;
+                let next = state.request_for_input(&submitted.text, submitted.mode, internal)?;
                 let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;
-                let compact =
-                    if inherited_incomplete_turn || state.completed_context_turns() <= keep {
-                        false
-                    } else if state.compaction_prefix().is_some() {
-                        next.input.len() >= COMPACT_ITEM_THRESHOLD
-                            || next.json()?.dump().len() >= limits.compact_bytes
-                    } else {
-                        false
-                    };
-                Json::object(vec![
+                let compact = if internal
+                    || inherited_incomplete_turn
+                    || state.completed_context_turns() <= keep
+                {
+                    false
+                } else if state.compaction_prefix().is_some() {
+                    next.input.len() >= COMPACT_ITEM_THRESHOLD
+                        || next.json()?.dump().len() >= limits.compact_bytes
+                } else {
+                    false
+                };
+                let event = Json::object(vec![
                     ("kind", Json::string("accepted")?),
                     ("command", Json::string(&receipt.command.0)?),
                     ("turn", Json::string(&receipt.turn.0)?),
@@ -1056,7 +1172,12 @@ impl Owner {
                     ),
                     ("round_limit", number(limits.tool_rounds)?),
                     ("call_limit", number(limits.tool_calls)?),
-                ])
+                ])?;
+                if internal {
+                    event.with("handoff", Json::parse("true")?)
+                } else {
+                    Ok(event)
+                }
             }),
             None,
         )?;
@@ -1129,7 +1250,9 @@ impl Owner {
         if self.starting {
             if !self.recovery_attempted {
                 self.recovery_attempted = true;
-                if let Some(invocation) = self.state.turn.as_ref().and_then(|t| t.intent.clone())
+                if !self.options.inspect_only
+                    && let Some(invocation) =
+                        self.state.turn.as_ref().and_then(|t| t.intent.clone())
                     && self
                         .tools
                         .policy(&invocation.name)
@@ -1268,7 +1391,7 @@ impl Owner {
             && self.closing.mode.load(Ordering::Acquire) != 2
             && let Some(command) = self.queued.pop_front()
         {
-            if matches!(&command.payload, CommandPayload::Submit(value) if value.mode == AgentMode::Plan)
+            if matches!(&command.payload, CommandPayload::Submit(value) | CommandPayload::Handoff(value) if value.mode == AgentMode::Plan)
                 && let Some(plan) = &workers.plan
             {
                 plan.try_send(PlanTarget::Submit(command))
@@ -1935,6 +2058,7 @@ impl Owner {
             enum Action {
                 Boot(std::result::Result<Result<Ready>, oneshot::error::RecvError>),
                 Command(Option<Envelope>),
+                Child(Option<ChildLookup>),
                 Start(Option<(Identity, Started)>),
                 Complete(Option<Completion>),
                 Preview(std::result::Result<(), watch::error::RecvError>),
@@ -1947,6 +2071,7 @@ impl Owner {
                 value=&mut boot,if !self.initialized=>Action::Boot(value),
                 value=self.done.recv()=>Action::Complete(value),
                 value=self.mail.snapshot.recv()=>Action::Command(value),
+                value=self.mail.child.recv()=>Action::Child(value),
                 value=self.mail.transcript.recv()=>Action::Command(value),
                 value=self.mail.resume.recv()=>Action::Command(value),
                 value=self.mail.submits.recv()=>Action::Command(value),
@@ -1960,6 +2085,7 @@ impl Owner {
                             return Err("session_command_limit");
                         }
                         self.state = ready.state;
+                        self.journal_identity = ready.journal_identity;
                         self.diagnostic = ready.diagnostic.into();
                         self.storage_failed = !ready.diagnostic.is_empty();
                         self.recovered_pause = ready.requires_resume;
@@ -1999,6 +2125,12 @@ impl Owner {
                 },
                 Action::Command(Some(value)) => self.admit(value),
                 Action::Command(None) => Err("runtime_mailbox_closed"),
+                Action::Child(Some(lookup)) => {
+                    let result = self.child_attempt(&lookup);
+                    let _ = lookup.reply.send(result);
+                    Ok(())
+                }
+                Action::Child(None) => Err("runtime_mailbox_closed"),
                 Action::Start(Some((identity, value))) => {
                     self.started(identity, value);
                     Ok(())

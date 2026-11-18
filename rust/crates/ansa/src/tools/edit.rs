@@ -64,13 +64,16 @@ impl Host {
             self.settings.cwd.join(path)
         };
         let path = ansa_linux::fs::normalize(&original);
+        self.check_task_path(&path, true)?;
         if self.protected_path(&path) {
             return Err("protected_file");
         }
         // Resolve for auth/session scope checks, but open the original path
         // without following any component, including its final filename.
         let parent = self.path_os(path.parent().ok_or("file_path")?)?;
-        if self.protected_path(&parent.join(path.file_name().ok_or("file_path")?)) {
+        let resolved = parent.join(path.file_name().ok_or("file_path")?);
+        self.check_task_path(&resolved, true)?;
+        if self.protected_path(&resolved) {
             return Err("protected_file");
         }
         if let Some(instructions) = self.instructions(&parent, args)? {
@@ -248,6 +251,7 @@ mod tests {
                 auth: settings.directory.join("auth"),
                 session: self.0.join("session"),
                 editor: None,
+                scope: None,
                 settings,
             }
         }
@@ -281,6 +285,47 @@ mod tests {
             )
             .unwrap()
         }
+    }
+
+    #[test]
+    fn task_scope_blocks_writes_outside_approval_and_filters_executors() {
+        let root = Root::new();
+        let mut host = root.host();
+        host.scope =
+            Some(crate::tools::files::TaskScope::new(&root.cwd(), &["file".into()]).unwrap());
+        std::fs::write(root.path(), "before").unwrap();
+        let other = root.cwd().join("file-other");
+        std::fs::write(&other, "before").unwrap();
+        let outside = root.0.join("outside");
+        std::fs::write(&outside, "before").unwrap();
+        assert!(host.path_os(&outside).is_err());
+        let stop = Cancel::default();
+        for denied in [&other, &outside] {
+            let result = host.edit(&root.args(&host, denied, "before", "after"), &stop);
+            assert_eq!(result.effects(), Effects::NotStarted);
+            assert_eq!(std::fs::read_to_string(denied).unwrap(), "before");
+        }
+        let result = host.edit(&root.args(&host, &root.path(), "before", "after"), &stop);
+        assert_eq!(result.execution(), Execution::Succeeded);
+        assert_eq!(std::fs::read_to_string(root.path()).unwrap(), "after");
+        let snapshot = crate::tools::files::local_task_tools(
+            host.settings.clone(),
+            host.epoch.clone(),
+            &host.session,
+            &host.auth,
+            &std::env::current_exe().unwrap(),
+            crate::tools::files::TaskScope::new(&root.cwd(), &[]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .advertisement()
+                .descriptors
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["list_directory", "read_file", "search_files"]
+        );
     }
     impl Drop for Root {
         fn drop(&mut self) {

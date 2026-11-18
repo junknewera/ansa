@@ -91,6 +91,7 @@ pub(crate) struct Stored {
 }
 pub(crate) struct Ready {
     pub state: Arc<State>,
+    pub journal_identity: Option<DirectoryIdentity>,
     pub diagnostic: &'static str,
     pub requires_resume: bool,
 }
@@ -293,9 +294,11 @@ impl Workers {
                                 initial,
                                 init_options.journal.clone(),
                                 init_options.fork_seed.as_ref(),
+                                init_options.existing_journal,
                             )?;
                             let ready = Ready {
                                 state: store.state().clone(),
+                                journal_identity: Some(store.identity()?),
                                 diagnostic: store.diagnostic(),
                                 requires_resume: store.requires_resume(),
                             };
@@ -309,6 +312,7 @@ impl Workers {
                                 None,
                                 Ready {
                                     state: Arc::new(state),
+                                    journal_identity: None,
                                     diagnostic: "",
                                     requires_resume: false,
                                 },
