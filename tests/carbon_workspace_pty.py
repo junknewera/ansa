@@ -922,7 +922,8 @@ def model_effort_pair(screen, root, cwd):
 def plan_agent_inherits(screen, root, cwd):
     parent, child = "PLAN_PARENT", "PLAN_AGENT"
     screen.send(parent + "\r")
-    until(screen, lambda frame: completed(root, parent) and ready(screen), "parent title committed")
+    until(screen, lambda frame: completed(root, parent) and ready(screen)
+          and "OMH_TOOL_OK:OMH_FIXED_VALUE_42" in frame, "parent reply rendered")
     local(screen, "/plan")
     until(screen, lambda frame: "План" in screen.vt.line(-2), "parent entered plan")
     screen.send("Запусти субагента: " + child + "\r")
