@@ -15,7 +15,10 @@ use crate::{
     config::{agent_epoch, load_agent_settings},
     context::summary::summarizer,
     protocol::json::Json,
-    provider::request::{Binding, Epoch, Request},
+    provider::{
+        openrouter::{MODEL as OPENROUTER_MODEL, OpenRouter},
+        request::{Binding, Epoch, Request},
+    },
     runtime::{Generate, Lease, Limits, Options as RuntimeOptions, Runtime},
     tools::{
         files::local_tools_extended,
@@ -116,6 +119,78 @@ pub fn auth_manager(path: &Path) -> Result<Arc<AuthManager>> {
         None,
         Some(Arc::new(crate::transport::client::stream)),
     )?))
+}
+
+const OPENROUTER_KEY_FILE: &str = "openrouter.key";
+
+fn openrouter_auth_path() -> Result<PathBuf> {
+    Ok(home()?.join(".ansa/openrouter"))
+}
+
+fn openrouter_client(bytes: Vec<u8>) -> Result<OpenRouter> {
+    let key = String::from_utf8(bytes).map_err(|_| "openrouter_key_invalid")?;
+    OpenRouter::new(
+        crate::auth::Secret::new(key.trim_end_matches(['\r', '\n']).to_owned()),
+        Arc::new(crate::transport::client::openrouter_exchange),
+    )
+}
+
+fn load_openrouter(path: &Path) -> Result<Arc<OpenRouter>> {
+    let directory =
+        ansa_linux::auth_store::Directory::open(path).map_err(|_| "openrouter_key_store")?;
+    let key = directory
+        .read(OPENROUTER_KEY_FILE)
+        .map_err(|_| "openrouter_key_store")?
+        .ok_or("openrouter_key_required")?;
+    Ok(Arc::new(openrouter_client(key)?))
+}
+
+fn save_openrouter(path: &Path) -> Result<i32> {
+    use std::io::Read;
+    if std::io::stdin().is_terminal() {
+        return Err("openrouter_key_requires_pipe");
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(515)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "openrouter_key_input")?;
+    if bytes.len() > 514 {
+        return Err("openrouter_key_invalid");
+    }
+    openrouter_client(bytes.clone())?;
+    let directory =
+        ansa_linux::auth_store::Directory::open(path).map_err(|_| "openrouter_key_store")?;
+    let _lease = directory
+        .try_lock()
+        .map_err(|_| "openrouter_key_store_busy")?;
+    directory
+        .save(
+            OPENROUTER_KEY_FILE,
+            &bytes,
+            &crate::auth::pkce::random_token(16)?,
+            |_, _| Ok(()),
+        )
+        .map_err(|_| "openrouter_key_store")?;
+    write_json(&object(vec![("status", s("openrouter_key_saved"))]))?;
+    Ok(0)
+}
+
+pub(super) fn openrouter_runtime(route: Arc<OpenRouter>) -> (Generate, RuntimeOptions) {
+    let generate: Generate = Arc::new(move |request, stop, _| route.generate(request, stop));
+    let options = RuntimeOptions {
+        compact: Some(summarizer(generate.clone())),
+        keep_recent_turns: 2,
+        select_generation: Arc::new(|selection, stop| {
+            stop.check()?;
+            if selection.model != OPENROUTER_MODEL || selection.effort.is_some() {
+                return Err("model_not_available");
+            }
+            Ok(())
+        }),
+        ..RuntimeOptions::default()
+    };
+    (generate, options)
 }
 pub fn pure_tools() -> Result<Arc<crate::tools::registry::Snapshot>> {
     let mut registry = Registry::new();
@@ -301,10 +376,22 @@ pub fn authorized(
     Ok((account, generate, options))
 }
 fn text(args: &[String]) -> Result<i32> {
+    text_with_openrouter(args, load_openrouter)
+}
+
+fn text_with_openrouter(
+    args: &[String],
+    load: impl FnOnce(&Path) -> Result<Arc<OpenRouter>>,
+) -> Result<i32> {
+    let default_auth = if args.iter().any(|arg| arg == "--openrouter") {
+        openrouter_auth_path()?
+    } else {
+        auth_path()?
+    };
     let parsed = Options::parse(
         args,
         std::env::current_dir().map_err(|_| "file_access_failed")?,
-        auth_path()?,
+        default_auth,
     )?;
     if parsed.native_terminals
         && (parsed.prompt.is_some()
@@ -314,12 +401,24 @@ fn text(args: &[String]) -> Result<i32> {
         return Err("native_terminal_requires_carbon");
     }
     let mut settings = load_agent_settings(&parsed.cwd, &home()?)?;
+    if parsed.openrouter
+        && [&parsed.model, &parsed.returned_model]
+            .into_iter()
+            .flatten()
+            .any(|model| model != OPENROUTER_MODEL)
+    {
+        return Err("model_not_available");
+    }
     if let Some(model) = parsed.model {
         settings.model = model.clone();
         settings.returned_model = model;
     }
     if let Some(model) = parsed.returned_model {
         settings.returned_model = model;
+    }
+    if parsed.openrouter {
+        settings.model = OPENROUTER_MODEL.into();
+        settings.returned_model = OPENROUTER_MODEL.into();
     }
     if parsed.print_config {
         write_json(&settings.effective()?)?;
@@ -335,7 +434,11 @@ fn text(args: &[String]) -> Result<i32> {
     bound.requested_model = settings.model.clone();
     bound.returned_model = settings.returned_model.clone();
     let mut workspace_auth = None;
-    let (generate, mut options) = if parsed.offline {
+    let openrouter = parsed.openrouter.then(|| load(&parsed.auth)).transpose()?;
+    let (generate, mut options) = if let Some(route) = &openrouter {
+        bound = route.binding().clone();
+        openrouter_runtime(route.clone())
+    } else if parsed.offline {
         (
             Arc::new(|request: &Request, stop: &Cancel, _| offline::generate(request, stop))
                 as Generate,
@@ -356,7 +459,12 @@ fn text(args: &[String]) -> Result<i32> {
     if parsed.resume && !parsed.session.is_empty() {
         return Err("session_selection_conflict");
     }
-    let catalog = settings.catalog(if parsed.offline { "offline" } else { "live" })?;
+    let profile = openrouter
+        .as_ref()
+        .map_or(if parsed.offline { "offline" } else { "live" }, |route| {
+            route.binding().account.as_str()
+        });
+    let catalog = settings.catalog(profile)?;
     let selected = if !parsed.session.is_empty() {
         catalog.explicit(&parsed.session)?
     } else if parsed.resume {
@@ -382,6 +490,9 @@ fn text(args: &[String]) -> Result<i32> {
         workspace_auth,
     )
     .with_native_terminals(parsed.native_terminals);
+    if let Some(route) = openrouter {
+        factory = factory.with_openrouter(route);
+    }
     if let Some(editor) = &editor {
         factory = factory.with_editor(selected.directory.clone(), editor.clone());
     }
@@ -481,6 +592,57 @@ fn text(args: &[String]) -> Result<i32> {
         &context,
     ))
 }
+
+#[cfg(feature = "frontend-test-adapter")]
+pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
+    use serde_json::{Value, json};
+    ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
+    let home = root.join("home");
+    if std::env::var_os("HOME").as_deref() != Some(home.as_os_str()) {
+        return Err("fixture_home");
+    }
+    let cwd = home.join("workspace");
+    ansa_linux::fs::private_directory(&cwd).map_err(|_| "fixture_workspace")?;
+    let cwd = cwd.to_str().ok_or("fixture_workspace")?;
+    use crate::{
+        auth::manager::HttpReply,
+        provider::openrouter::{CATALOG, ENDPOINT, PROVIDER},
+        transport::http::Head,
+    };
+    let exchange: Exchange = Arc::new(move |request, _| {
+        let content = if request.url == CATALOG {
+            json!({"data":{"id":OPENROUTER_MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}})
+        } else {
+            let request: Value =
+                serde_json::from_str(request.body.expose()).map_err(|_| "fixture_body")?;
+            let format = &request["response_format"]["json_schema"];
+            let text = match format["name"].as_str() {
+                Some("ansa_native_schema_probe") if format["strict"] == true => r#"{"value":"schema-enforced"}"#.into(),
+                Some("ansa_orchestration_plan_v2") if format["strict"] == true => json!({"schema_version":1,"summary":"OPENROUTER_CARBON_PLAN","steps":[{"id":"one","task":"Проверить вход","access":"read","paths":[],"depends_on":[],"acceptance":"Ответ получен"}],"checks":[],"manual_checks":[],"command_checks":[]}).to_string(),
+                Some("ansa_child_result_v1") if format["strict"] == true && request["tool_choice"] == "none" => r#"{"status":"completed","summary":"Синтетическая проверка пройдена","findings":[]}"#.into(),
+                None if request.get("tools").is_some() => "Готов к итоговому ответу".into(),
+                None => "OPENROUTER_CARBON_DONE".into(),
+                _ => return Err("fixture_format"),
+            };
+            json!({"id":"fixture_response","model":OPENROUTER_MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":text}}]})
+        };
+        Ok(HttpReply {
+            head: Head {
+                status: 200,
+                content_types: vec!["application/json".into()],
+            },
+            body: content.to_string(),
+        })
+    });
+    let route = Arc::new(OpenRouter::new(
+        crate::auth::Secret::new("synthetic-fixture-key-0123456789".into()),
+        exchange,
+    )?);
+    text_with_openrouter(&["--openrouter".into(), "--cwd".into(), cwd.into()], |_| {
+        Ok(route)
+    })
+}
+
 fn auth_cli(command: &str, path: &Path) -> Result<i32> {
     let manager = auth_manager(path)?;
     let cancel = Cancel::default();
@@ -630,6 +792,11 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         "--live-jsonl" => live_jsonl(&args[1..]),
+        "--openrouter-login" => match &args[1..] {
+            [] => save_openrouter(&openrouter_auth_path()?),
+            [flag, directory] if flag == "--auth-dir" => save_openrouter(Path::new(directory)),
+            _ => Err("openrouter_login_options"),
+        },
         "--login" | "--login-consent" | "--logout" | "--auth-status" | "--refresh-auth"
         | "--models" => {
             if args.len() == 1 {

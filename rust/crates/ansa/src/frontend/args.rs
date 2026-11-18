@@ -1,9 +1,10 @@
 //! Legacy command-line grammar. Help is dispatched before option parsing.
 use std::{collections::BTreeSet, path::PathBuf};
-pub const HELP: &str = "Usage: ansa [--continue | --session ID] [--cwd PATH] [--model SLUG] [PROMPT]\n       ansa --offline [PROMPT]\n       ansa --login | --auth-status | --models | --logout\n       ansa --print-config\nCommands: /status /cancel /resume /exit. Ctrl+C cancels; Ctrl+D finishes accepted work.\n";
+pub const HELP: &str = "Usage: ansa [--continue | --session ID] [--cwd PATH] [--model SLUG] [PROMPT]\n       ansa --openrouter [--continue | --session ID] [--cwd PATH]\n       ansa --openrouter-login [--auth-dir PATH] < KEY_FILE\n       ansa --offline [PROMPT]\n       ansa --login | --auth-status | --models | --logout\n       ansa --print-config\nCommands: /status /cancel /resume /exit. Ctrl+C cancels; Ctrl+D finishes accepted work.\n";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub offline: bool,
+    pub openrouter: bool,
     pub resume: bool,
     pub print_config: bool,
     pub cwd: PathBuf,
@@ -20,6 +21,7 @@ impl Options {
     pub fn parse(args: &[String], cwd: PathBuf, auth: PathBuf) -> super::Result<Self> {
         let mut value = Self {
             offline: false,
+            openrouter: false,
             resume: false,
             print_config: false,
             cwd,
@@ -48,6 +50,7 @@ impl Options {
             }
             match key.as_str() {
                 "--offline" => value.offline = true,
+                "--openrouter" => value.openrouter = true,
                 "--continue" => value.resume = true,
                 "--print-config" => value.print_config = true,
                 "--workspace-editor" => value.workspace_editor = true,
@@ -69,6 +72,9 @@ impl Options {
         }
         if value.workspace_editor && value.workspace.is_none() {
             return Err("workspace_editor_requires_endpoint");
+        }
+        if value.openrouter && value.offline {
+            return Err("provider_selection_conflict");
         }
         if value.prompt.as_deref().is_some_and(|s| {
             matches!(

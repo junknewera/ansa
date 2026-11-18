@@ -45,6 +45,9 @@ impl Request {
         input: Vec<Json>,
     ) -> Result<Self, &'static str> {
         let supported = binding.provider == "openai-siwc"
+            || binding.provider == "openrouter"
+                && binding.requested_model == super::openrouter::MODEL
+                && binding.returned_model == super::openrouter::MODEL
             || cfg!(feature = "orchestration-pilot") && binding.provider == "openrouter-test";
         if !supported
             || binding.requested_model.is_empty()

@@ -32,6 +32,10 @@ const COMMANDS: &[Command] = &[
         description: "Помощники текущего разговора",
     },
     Command {
+        name: "/pr",
+        description: "Создать черновик PR из проверенной ветки",
+    },
+    Command {
         name: "/sessions",
         description: "Открыть сохранённый разговор",
     },

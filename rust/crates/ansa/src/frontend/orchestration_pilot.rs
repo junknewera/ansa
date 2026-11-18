@@ -1,7 +1,9 @@
-//! Feature-gated, metered OpenRouter pilot. The normal CLI has no such route.
+//! Feature-gated, metered acceptance runner for the pinned OpenRouter route.
 mod trace;
 
 use super::Result;
+#[cfg(test)]
+use crate::provider::openrouter::{PROVIDER, route};
 use crate::{
     auth::{
         Cancel, Secret,
@@ -9,7 +11,7 @@ use crate::{
     },
     protocol::json::Json,
     provider::{
-        native,
+        openrouter::{self, API, CATALOG, ENDPOINT, KEY, MODEL, decode, verify_catalog},
         request::{Binding, Request},
         responses::AdmittedResponse,
         structured::FinalFormat,
@@ -24,13 +26,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const MODEL: &str = "deepseek/deepseek-v4.1-flash-1017";
-const ENDPOINT: &str = "fireworks/us";
-const PROVIDER: &str = "Fireworks";
-const API: &str = "https://openrouter.ai/api/v1/chat/completions";
-const KEY: &str = "https://openrouter.ai/api/v1/key";
-const CATALOG: &str =
-    "https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints";
 const CALLS: u8 = 12;
 const DURATION: Duration = Duration::from_secs(600);
 const REPORT: &str = "report.txt";
@@ -201,27 +196,14 @@ impl Pilot {
         if CALLS - self.requests()? < 10 {
             return Err("pilot_insufficient_scenario_budget");
         }
-        let challenge = json!({"type":"json_schema","json_schema":{"name":"ansa_native_schema_probe","strict":true,"schema":{
-            "type":"object","properties":{"value":{"type":"string","enum":["schema-enforced"]}},
-            "required":["value"],"additionalProperties":false
-        }}});
-        let value = self.exchange("schema_probe", "POST", API, Some(json!({
-            "model": MODEL, "provider": route(), "max_tokens": 256, "reasoning":{"enabled":false},
-            "messages": [{"role":"user","content":"Answer with the JSON object {\"value\":\"replace-this\"}. Never use the phrase schema-enforced."}],
-            "response_format": challenge,
-        })), stop)?;
-        let message = final_choice(&value)?;
-        let answer: Value = serde_json::from_str(
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .ok_or("pilot_probe")?,
-        )
-        .map_err(|_| "pilot_probe")?;
-        if answer != json!({"value":"schema-enforced"}) {
-            return Err("pilot_schema_enforcement");
-        }
-        Ok(())
+        let value = self.exchange(
+            "schema_probe",
+            "POST",
+            API,
+            Some(openrouter::probe_body()),
+            stop,
+        )?;
+        openrouter::verify_probe(&value)
     }
 
     fn exchange(
@@ -261,16 +243,7 @@ impl Pilot {
         );
         // The exchange exposes headers only together with a complete body.
         let status = reply.as_ref().ok().map(|reply| reply.head.status);
-        let value = reply.and_then(|reply| {
-            if reply.head.status != 200
-                || reply.head.content_types.len() != 1
-                || reply.head.content_types[0].split(';').next() != Some("application/json")
-            {
-                return Err("pilot_http");
-            }
-            let strict = Json::parse_with_limits(&reply.body, 512 * 1024, 64, 131072)?;
-            serde_json::from_str::<Value>(&strict.dump()).map_err(|_| "pilot_json")
-        });
+        let value = reply.and_then(openrouter::read_reply);
         let finish = (method == "POST")
             .then(|| value.as_ref().ok().map(trace::finish_reason))
             .flatten();
@@ -319,38 +292,6 @@ impl Pilot {
     }
 }
 
-fn verify_catalog(response: &Value) -> Result<()> {
-    let data = response.get("data").ok_or("pilot_catalog")?;
-    if data.get("id").and_then(Value::as_str) != Some(MODEL) {
-        return Err("pilot_catalog");
-    }
-    let endpoints = data
-        .get("endpoints")
-        .and_then(Value::as_array)
-        .ok_or("pilot_catalog")?;
-    let mut matches = endpoints
-        .iter()
-        .filter(|endpoint| endpoint["tag"] == ENDPOINT);
-    let endpoint = matches.next().ok_or("pilot_catalog_endpoint")?;
-    let parameters = endpoint["supported_parameters"]
-        .as_array()
-        .ok_or("pilot_catalog_parameters")?;
-    if matches.next().is_some()
-        || endpoint["provider_name"] != PROVIDER
-        || ![
-            "structured_outputs",
-            "response_format",
-            "tools",
-            "tool_choice",
-        ]
-        .iter()
-        .all(|name| parameters.iter().any(|value| value == *name))
-    {
-        return Err("pilot_catalog_parameters");
-    }
-    Ok(())
-}
-
 fn verify_credit_limit(response: &Value, allow_unlimited_key: bool) -> Result<()> {
     let data = response.get("data").ok_or("pilot_key_limit")?;
     let limit = data.get("limit").ok_or("pilot_key_limit")?;
@@ -366,10 +307,6 @@ fn verify_credit_limit(response: &Value, allow_unlimited_key: bool) -> Result<()
         return Err("pilot_key_limit");
     }
     Ok(())
-}
-
-fn route() -> Value {
-    json!({"only":[ENDPOINT],"order":[ENDPOINT],"allow_fallbacks":false,"require_parameters":true})
 }
 
 #[derive(Clone, Copy)]
@@ -495,37 +432,7 @@ fn encode(request: &Request, tool: Option<ToolStep>) -> Result<Value> {
     } else if request.final_format() == Some(FinalFormat::ChildResult) {
         instructions.push_str("\nReturn your final assessment using the tool results. If blocked, state the concrete reason in summary.");
     }
-    let mut messages = vec![json!({"role":"system","content":instructions})];
-    let mut calls = Vec::new();
-    for item in &request.input {
-        let value: Value = serde_json::from_str(&item.dump()).map_err(|_| "pilot_input")?;
-        if value["type"] == "function_call" {
-            calls.push(json!({"type":"function","id":value["call_id"],"function":{"name":value["name"],"arguments":value["arguments"]}}));
-            continue;
-        }
-        if !calls.is_empty() {
-            messages.push(json!({"role":"assistant","tool_calls":std::mem::take(&mut calls)}));
-        }
-        if value["type"] == "function_call_output" {
-            messages.push(
-                json!({"role":"tool","tool_call_id":value["call_id"],"content":value["output"]}),
-            );
-        } else if value["role"] == "user" && value["content"].is_string() {
-            messages.push(json!({"role":"user","content":value["content"]}));
-        } else if value["type"] == "message" && value["role"] == "assistant" {
-            let parts = value["content"].as_array().ok_or("pilot_input")?;
-            if parts.len() != 1 || parts[0]["type"] != "output_text" {
-                return Err("pilot_input");
-            }
-            messages.push(json!({"role":"assistant","content":parts[0]["text"]}));
-        } else {
-            return Err("pilot_input");
-        }
-    }
-    if !calls.is_empty() {
-        return Err("pilot_input");
-    }
-    let mut body = json!({"model":MODEL, "provider":route(), "messages":messages, "max_tokens":4096, "reasoning":{"enabled":false}});
+    let mut body = openrouter::base_body(request, &instructions)?;
     if request.final_format() == Some(FinalFormat::ChildResult) {
         // OpenRouter requires the definitions on continuations with tool history.
         let names: &[&str] = if trace::phase(request) == "writer" {
@@ -533,102 +440,29 @@ fn encode(request: &Request, tool: Option<ToolStep>) -> Result<Value> {
         } else {
             &["read_file"]
         };
-        body["tools"] = Value::Array(names.iter().map(|name| {
-            let descriptor = request.tools.descriptors.iter().find(|descriptor| descriptor.name == *name)
-                .ok_or("pilot_tool_not_advertised")?;
-            let schema: Value = serde_json::from_str(&descriptor.schema.dump()).map_err(|_| "pilot_tool_schema")?;
-            Ok(json!({"type":"function","function":{"name":descriptor.name,"description":descriptor.description,"parameters":schema}}))
-        }).collect::<Result<Vec<_>>>()?);
+        body["tools"] = Value::Array(
+            names
+                .iter()
+                .map(|name| {
+                    let descriptor = request
+                        .tools
+                        .descriptors
+                        .iter()
+                        .find(|descriptor| descriptor.name == *name)
+                        .ok_or("pilot_tool_not_advertised")?;
+                    openrouter::tool_value(descriptor)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
         body["tool_choice"] = tool.map_or_else(
             || json!("none"),
             |tool| json!({"type":"function","function":{"name":tool.name}}),
         );
     }
     if tool.is_none() && request.final_format().is_some() {
-        let wire: Value =
-            serde_json::from_str(&request.json()?.dump()).map_err(|_| "pilot_wire")?;
-        let format = &wire["text"]["format"];
-        body["response_format"] = json!({"type":"json_schema","json_schema":{"name":format["name"],"strict":true,"schema":format["schema"]}});
+        openrouter::apply_final_format(request, &mut body)?;
     }
     Ok(body)
-}
-
-fn choice(response: &Value) -> Result<&Value> {
-    let model = response
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or("pilot_model")?;
-    if model != MODEL {
-        return Err("pilot_model");
-    }
-    if response["provider"] != PROVIDER || !response["error"].is_null() {
-        return Err("pilot_provider");
-    }
-    let choices = response["choices"].as_array().ok_or("pilot_choice")?;
-    if choices.len() != 1
-        || choices[0]["message"]["role"] != "assistant"
-        || !choices[0]["message"]["refusal"].is_null()
-        || !choices[0]["message"]["reasoning"].is_null() && choices[0]["message"]["reasoning"] != ""
-        || !choices[0]["message"]["reasoning_details"].is_null()
-            && choices[0]["message"]["reasoning_details"] != json!([])
-    {
-        return Err("pilot_choice");
-    }
-    Ok(&choices[0])
-}
-
-fn final_choice(response: &Value) -> Result<&Value> {
-    let choice = choice(response)?;
-    let calls = &choice["message"]["tool_calls"];
-    if choice["finish_reason"] != "stop"
-        || !(calls.is_null() || calls.as_array().is_some_and(Vec::is_empty))
-    {
-        return Err("pilot_incomplete");
-    }
-    Ok(&choice["message"])
-}
-
-fn decode(request: &Request, response: &Value) -> Result<AdmittedResponse> {
-    let choice = choice(response)?;
-    let id = response["id"]
-        .as_str()
-        .filter(|id| crate::provider::contracts::valid_id(id))
-        .ok_or("pilot_identity")?;
-    let mut items = Vec::new();
-    if choice["finish_reason"] == "stop" {
-        let text = final_choice(response)?["content"]
-            .as_str()
-            .ok_or("pilot_content")?;
-        items.push(json!({"type":"message","id":format!("msg_{id}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}));
-    } else if choice["finish_reason"] == "tool_calls" {
-        let message = &choice["message"];
-        if !message["content"].is_null()
-            && !message["content"]
-                .as_str()
-                .is_some_and(|text| text.trim().is_empty())
-        {
-            return Err("pilot_mixed_output");
-        }
-        let calls = message["tool_calls"].as_array().ok_or("pilot_tool_calls")?;
-        if calls.is_empty() || calls.len() > 16 {
-            return Err("pilot_tool_calls");
-        }
-        for (index, call) in calls.iter().enumerate() {
-            if call["type"] != "function" {
-                return Err("pilot_tool_calls");
-            }
-            items.push(json!({"type":"function_call","id":format!("item_{index}_{id}"),"call_id":call["id"],"name":call["function"]["name"],"arguments":call["function"]["arguments"],"namespace":"omh","status":"completed"}));
-        }
-    } else {
-        return Err("pilot_incomplete");
-    }
-    let envelope = Json::object(vec![
-        ("request", request.save()?),
-        ("id", Json::string(id)?),
-        ("model", Json::string(MODEL)?),
-        ("items", Json::parse(&Value::Array(items).to_string())?),
-    ])?;
-    native::load(&envelope)
 }
 
 /// Run the approved scenario on a newly created synthetic repository. The
@@ -668,7 +502,7 @@ pub fn run() -> Result<()> {
     let stop = Cancel::default();
     let pilot = Arc::new(Pilot::new(
         Secret::new(key.into()),
-        Arc::new(crate::transport::client::pilot_exchange),
+        Arc::new(crate::transport::client::openrouter_exchange),
         Budget::open(&ledger, prior)?,
     ));
     drop(token);
@@ -961,10 +795,10 @@ mod tests {
             json!(["structured_outputs", "tools", "response_format"]);
         assert_eq!(
             verify_catalog(&missing_choice),
-            Err("pilot_catalog_parameters")
+            Err("openrouter_catalog_parameters")
         );
         catalog["data"]["endpoints"][0]["tag"] = json!("fireworks");
-        assert_eq!(verify_catalog(&catalog), Err("pilot_catalog_endpoint"));
+        assert_eq!(verify_catalog(&catalog), Err("openrouter_catalog_endpoint"));
         let unlimited = json!({"data":{"limit":null,"limit_remaining":null}});
         assert_eq!(
             verify_credit_limit(&unlimited, false),
@@ -1209,10 +1043,10 @@ mod tests {
         assert!(trace.iter().any(|event| event["phase"] == "writer"
             && event["kind"] == "response_admission"
             && event["accepted"] == false
-            && event["code"] == "pilot_incomplete"));
+            && event["code"] == "openrouter_incomplete"));
         assert!(trace.iter().any(|event| event["phase"] == "writer"
             && event["kind"] == "paused"
-            && event["code"] == "pilot_incomplete"));
+            && event["code"] == "openrouter_incomplete"));
         assert!(
             !trace
                 .iter()
@@ -1451,10 +1285,13 @@ mod tests {
             response["choices"][0]["message"]["content"] = content;
             assert!(matches!(
                 decode(&config, &response),
-                Err("pilot_mixed_output")
+                Err("openrouter_mixed_output")
             ));
         }
         response["choices"][0]["message"]["refusal"] = json!("refused");
-        assert!(matches!(decode(&config, &response), Err("pilot_choice")));
+        assert!(matches!(
+            decode(&config, &response),
+            Err("openrouter_choice")
+        ));
     }
 }

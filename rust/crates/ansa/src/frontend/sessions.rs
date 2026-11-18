@@ -4,7 +4,7 @@ use crate::{
     auth::{Cancel, manager::AuthManager},
     config::{AgentSettings, agent_epoch},
     protocol::json::Json,
-    provider::request::Request,
+    provider::{openrouter::OpenRouter, request::Request},
     runtime::{DirectoryIdentity, ForkSeed, Generate, Lease, Limits, Options, Runtime},
     session::{
         catalog::{CatalogEntry, Selected},
@@ -52,6 +52,7 @@ pub struct Factory {
     editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
     native_terminals: bool,
     terminal_owners: Arc<Mutex<BTreeMap<String, terminals::Owner>>>,
+    openrouter: Option<Arc<OpenRouter>>,
     #[cfg(feature = "orchestration-pilot")]
     pilot: Option<Arc<super::orchestration_pilot::Pilot>>,
 }
@@ -78,6 +79,7 @@ impl Factory {
             editor: None,
             native_terminals: false,
             terminal_owners: Arc::default(),
+            openrouter: None,
             #[cfg(feature = "orchestration-pilot")]
             pilot: None,
         }
@@ -144,8 +146,14 @@ impl Factory {
             hub.set_mode(mode);
         }
     }
-    fn profile(&self) -> &'static str {
-        if self.offline { "offline" } else { "live" }
+    fn profile(&self) -> &str {
+        if let Some(route) = &self.openrouter {
+            route.binding().account.as_str()
+        } else if self.offline {
+            "offline"
+        } else {
+            "live"
+        }
     }
     pub fn entries(&self) -> Result<Vec<CatalogEntry>> {
         self.settings.catalog(self.profile())?.entries()
@@ -185,11 +193,41 @@ impl Factory {
     }
 
     pub(super) fn orchestration_route(&self) -> Result<()> {
-        if self.offline {
+        if self.offline || self.openrouter.is_some() {
             Ok(())
         } else {
             Err("strict_orchestration_route_unavailable")
         }
+    }
+
+    pub(super) fn require_orchestration_route(&self, stop: &Cancel) -> Result<()> {
+        self.orchestration_route()?;
+        if let Some(route) = &self.openrouter {
+            route.require_strict(stop)?;
+        }
+        stop.check()
+    }
+
+    pub(super) fn with_openrouter(mut self, route: Arc<OpenRouter>) -> Self {
+        let binding = route.binding();
+        self.account = binding.account.clone();
+        self.settings.model = binding.requested_model.clone();
+        self.settings.returned_model = binding.returned_model.clone();
+        self.openrouter = Some(route);
+        self
+    }
+
+    pub(super) fn check_orchestration_context(&self, request: &Request) -> Result<()> {
+        if request.binding.account != self.account
+            || self
+                .openrouter
+                .as_ref()
+                .is_some_and(|route| route.binding() != &request.binding)
+            || self.openrouter.is_none() && request.binding.provider == "openrouter"
+        {
+            return Err("session_provider_context");
+        }
+        Ok(())
     }
 
     #[cfg(feature = "orchestration-pilot")]
@@ -203,6 +241,9 @@ impl Factory {
     }
 
     fn orchestration_generator(&self) -> Generate {
+        if let Some(route) = self.openrouter.clone() {
+            return Arc::new(move |request, stop, _| route.generate(request, stop));
+        }
         #[cfg(feature = "orchestration-pilot")]
         if let Some(pilot) = self.pilot.clone() {
             return Arc::new(move |request, stop, _| pilot.generate(request, stop));
@@ -216,11 +257,18 @@ impl Factory {
         prompt: &str,
         stop: &Cancel,
     ) -> Result<crate::orchestration::plan::Plan> {
-        self.orchestration_route()?;
+        use crate::provider::structured::FinalFormat;
         let source = seed.request()?;
-        if source.binding.account != self.account {
-            return Err("session_provider_context");
-        }
+        self.check_orchestration_context(&source)?;
+        self.require_orchestration_route(stop)?;
+        #[cfg(feature = "orchestration-pilot")]
+        let format = if self.pilot.is_some() {
+            FinalFormat::OrchestrationPlan
+        } else {
+            FinalFormat::OrchestrationPlanWithCommands
+        };
+        #[cfg(not(feature = "orchestration-pilot"))]
+        let format = FinalFormat::OrchestrationPlanWithCommands;
         let mut epoch = source.epoch;
         epoch.instructions.push_str(concat!(
             "\nYou coordinate the current user's task. Draft a proposed sequence of independent or dependent ",
@@ -228,10 +276,13 @@ impl Factory {
             "identify concrete lines of investigation and state what would answer the request. ",
             "Prefer read-only investigation for questions. Grant write access only to the smallest necessary ",
             "explicit project paths. Dependencies reference step IDs. For every write plan provide concrete ",
-            "checks as path and substring assertions against the final checkout. Put required command-based or ",
-            "other unsupported checks in manual_checks. Those must be resolved before execution. ",
-            "The user must approve the plan before execution."
+            "checks as path and substring assertions against the final checkout. The user must approve the plan before execution. "
         ));
+        if format == FinalFormat::OrchestrationPlanWithCommands {
+            epoch.instructions.push_str("List repository test commands that are needed or explicitly requested in command_checks using argv arrays. Each command starts in a fresh copy of the frozen checkout, at its root. Put checks requiring human interaction in manual_checks.");
+        } else {
+            epoch.instructions.push_str("Put required command-based or other unsupported checks in manual_checks. Those must be resolved before execution.");
+        }
         let mut input = source.input;
         input.push(Json::object(vec![
             ("role", Json::string("user")?),
@@ -241,9 +292,7 @@ impl Factory {
         let configuration =
             Request::new(source.binding, epoch, empty.advertisement().clone(), input)?
                 .with_effort(source.effort)?
-                .with_final_format(Some(
-                    crate::provider::structured::FinalFormat::OrchestrationPlan,
-                ));
+                .with_final_format(Some(format));
         (self.orchestration_generator())(&configuration, stop, Arc::new(|_| Ok(())))?
             .orchestration_plan()
     }
@@ -258,9 +307,7 @@ impl Factory {
         stop: &Cancel,
     ) -> Result<Created> {
         self.orchestration_route()?;
-        if source.binding.account != self.account {
-            return Err("session_provider_context");
-        }
+        self.check_orchestration_context(source)?;
         let mut settings = self.settings.clone();
         settings.cwd = workspace.to_owned();
         let scope = TaskScope::new(workspace, writes)?;
@@ -358,10 +405,10 @@ impl Factory {
         let configuration = configuration.ok_or("session_missing_init")?;
         if configuration.final_format()
             != Some(crate::provider::structured::FinalFormat::ChildResult)
-            || configuration.binding.account != self.account
         {
             return Err("session_provider_context");
         }
+        self.check_orchestration_context(&configuration)?;
         let provenance = &configuration.epoch.exact_state;
         let parent = provenance.text_field("orchestration_parent")?.to_owned();
         let writes = provenance
@@ -468,6 +515,11 @@ impl Factory {
         if configuration.binding.account != expected_account {
             return Err("auth_account_mismatch");
         }
+        if kind != Kind::Console
+            && (self.openrouter.is_some() || configuration.binding.provider == "openrouter")
+        {
+            self.check_orchestration_context(&configuration)?;
+        }
         // Explicitly selected history may carry another model, but cannot
         // silently restore old workspace permissions or instruction files.
         let current = agent_epoch(&self.settings)?;
@@ -563,6 +615,17 @@ impl Factory {
             .as_ref()
             .map(|r| r.binding.clone())
             .unwrap_or_else(app::binding);
+        if kind != Kind::Console
+            && let Some(route) = &self.openrouter
+        {
+            if base
+                .as_ref()
+                .is_some_and(|request| &request.binding != route.binding())
+            {
+                return Err("session_provider_context");
+            }
+            bound = route.binding().clone();
+        }
         #[cfg(feature = "orchestration-pilot")]
         if base.is_none()
             && let Some(pilot) = &self.pilot
@@ -599,6 +662,8 @@ impl Factory {
                 workspace::console_generate(&self.settings, shell)?,
                 Options::default(),
             )
+        } else if let Some(route) = &self.openrouter {
+            app::openrouter_runtime(route.clone())
         } else if self.offline {
             (
                 self.orchestration_generator(),

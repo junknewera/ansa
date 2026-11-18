@@ -85,7 +85,7 @@ pub struct ProcessRunner {
     worker: PathBuf,
 }
 impl ProcessRunner {
-    pub(super) fn has_job(&self, invocation: &Invocation) -> Result<bool> {
+    pub(crate) fn has_job(&self, invocation: &Invocation) -> Result<bool> {
         match self
             .root
             .join(sha256(invocation.operation.as_bytes()))
@@ -117,7 +117,27 @@ impl ProcessRunner {
         invocation: &Invocation,
         options: &ProcessOptions,
         stop: &Cancel,
+        workspace: Option<ansa_linux::local::WorkspaceWrite>,
+    ) -> Result<Outcome> {
+        self.run_owned(invocation, options, stop, workspace, false)
+    }
+
+    pub(crate) fn run_github(
+        &self,
+        invocation: &Invocation,
+        options: &ProcessOptions,
+        stop: &Cancel,
+    ) -> Result<Outcome> {
+        self.run_owned(invocation, options, stop, None, true)
+    }
+
+    fn run_owned(
+        &self,
+        invocation: &Invocation,
+        options: &ProcessOptions,
+        stop: &Cancel,
         mut workspace: Option<ansa_linux::local::WorkspaceWrite>,
+        github: bool,
     ) -> Result<Outcome> {
         if stop.cancelled() {
             return Ok(Outcome::from_bytes(
@@ -151,7 +171,10 @@ impl ProcessRunner {
         } else {
             None
         };
-        let spec = options.specification_with_workspace(invocation, binding)?;
+        let mut spec = options.specification_with_workspace(invocation, binding)?;
+        if github {
+            spec = spec.with("environment", s("github")?)?;
+        }
         let root = ansa_linux::fs::private_directory(&self.root)
             .map_err(|_| "local_directory_permissions")?;
         let path = self.root.join(sha256(invocation.operation.as_bytes()));

@@ -48,6 +48,7 @@ pub(crate) fn run(
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(input.map_or_else(Stdio::null, Stdio::from))
         .stdout(Stdio::piped())
