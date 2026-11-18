@@ -44,6 +44,84 @@ async fn steer(handle: &Handle, id: &str, target: &RequestId, text: &str) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn new_turn_preserves_cancelled_context_over_compaction_threshold() {
+    let root = fixture::Root::new();
+    let first = Arc::new(fixture::Gate::default());
+    let second = Arc::new(fixture::Gate::default());
+    let initial = first.clone();
+    let delivered = second.clone();
+    let observed = Arc::new(AtomicBool::new(false));
+    let seen = observed.clone();
+    let provider: Generate = Arc::new(move |request, stop, _| {
+        let last = request
+            .input
+            .last()
+            .and_then(|item| item.text_field("content").ok());
+        match last {
+            Some("D") => initial.hold(stop),
+            Some("D_UPDATE") => delivered.hold(stop),
+            Some(text) if text.len() == 14 * 1024 => {
+                assert!(has_user(request, "D") && has_user(request, "D_UPDATE"));
+                seen.store(true, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        native::load(&fixture::saved_response(request, Some("done"), 0))
+    });
+    let mut runtime = fixture::setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider,
+        Limits {
+            compact_bytes: 12 * 1024,
+            ..Limits::default()
+        },
+        Options {
+            directory: Some(root.journal()),
+            keep_recent_turns: 2,
+            compact: Some(Arc::new(ansa::frontend::offline::compact_retained)),
+            ..Options::default()
+        },
+    )
+    .await;
+    let handle = runtime.handle();
+    for id in ["A", "B", "C"] {
+        fixture::submit(&handle, id, id, id).await;
+        fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    }
+    let request = fixture::submit(&handle, "startD", "D", "turn").await;
+    first.wait();
+    steer(&handle, "updateD", &request, "D_UPDATE").await;
+    first.release();
+    second.wait();
+    fixture::post(
+        &handle,
+        "stopD",
+        CommandPayload::Cancel(request),
+        "turn",
+        PostStatus::Accepted,
+    )
+    .await;
+    fixture::until(&handle, |p| matches!(p, EventPayload::Cancelled { .. })).await;
+    second.release();
+    fixture::until(
+        &handle,
+        |p| matches!(p, EventPayload::FrontendSnapshot(s) if !s.worker_busy),
+    )
+    .await;
+    fixture::submit(&handle, "nextE", &"e".repeat(14 * 1024), "E").await;
+    fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    assert!(observed.load(Ordering::SeqCst));
+    assert_eq!(
+        fixture::snapshot(&handle, "verify_no_compact")
+            .await
+            .compactions,
+        0
+    );
+    fixture::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn provider_boundary_delivers_fifo_before_any_requested_executor() {
     let root = fixture::Root::new();
     let gate = Arc::new(fixture::Gate::default());

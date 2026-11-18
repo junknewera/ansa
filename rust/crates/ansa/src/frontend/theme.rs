@@ -115,6 +115,7 @@ impl Theme {
             (Color(232, 240, 255), p.foreground),
         ];
         let bg = [
+            (Color(29, 35, 39), p.input),
             (Color(46, 63, 88), p.selection),
             (Color(24, 58, 39), p.background.blend(p.success, 18)),
             (Color(68, 31, 36), p.background.blend(p.error, 18)),

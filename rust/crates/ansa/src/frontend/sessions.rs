@@ -286,7 +286,7 @@ impl Factory {
             (
                 Arc::new(|r, c, _| offline::generate(r, c)),
                 Options {
-                    compact: Some(Arc::new(offline::compact)),
+                    compact: Some(Arc::new(offline::compact_retained)),
                     keep_recent_turns: 2,
                     ..Options::default()
                 },

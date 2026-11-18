@@ -2,7 +2,7 @@
 use super::Result;
 use crate::{
     auth::Cancel,
-    context::legacy_compact::CompactedContext,
+    context::legacy_compact::{CompactedContext, summary_request_at},
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::{native, request::Request, responses::AdmittedResponse},
 };
@@ -101,6 +101,37 @@ pub fn generate(request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
         ("items", Json::array(items)?),
     ]))
 }
+pub fn compact_retained(
+    request: &Request,
+    prefix: usize,
+    stop: &Cancel,
+) -> Result<CompactedContext> {
+    if stop.cancelled() {
+        return Err("offline_cancelled");
+    }
+    let summary = summary_request_at(request, prefix)?;
+    let output = obj(vec![
+        ("type", s("message")),
+        ("id", s("fixture_summary_message")),
+        ("role", s("assistant")),
+        ("status", s("completed")),
+        (
+            "content",
+            Json::array(vec![obj(vec![
+                ("type", s("output_text")),
+                ("text", s("Earlier fixture turns were summarized.")),
+            ])])?,
+        ),
+    ]);
+    let response = native::load(&obj(vec![
+        ("request", summary.save()?),
+        ("id", s("fixture_summary_response")),
+        ("model", s(&summary.binding.returned_model)),
+        ("items", Json::array(vec![output])?),
+    ]))?;
+    CompactedContext::from_summary_at(request.clone(), &response, prefix)
+}
+
 pub fn compact(request: &Request, stop: &Cancel) -> Result<CompactedContext> {
     if stop.cancelled() {
         return Err("offline_cancelled");

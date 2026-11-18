@@ -1128,7 +1128,7 @@ pub async fn summary(cancelled: bool) {
     let hold = gate.clone();
     let compactions = Arc::new(AtomicUsize::new(0));
     let called = compactions.clone();
-    let compact: Compact = Arc::new(move |source, stop| {
+    let compact: Compact = Arc::new(move |source, _, stop| {
         called.fetch_add(1, Ordering::SeqCst);
         let request = summary_request(source)?;
         assert!(request.tools.descriptors.is_empty());
@@ -1211,6 +1211,104 @@ pub async fn summary(cancelled: bool) {
                 .contains("ORCHID")
         );
         assert_ne!(state.epoch.id, state.configuration.epoch.id);
+    }
+}
+
+pub async fn summary_budget() {
+    use ansa::context::legacy_compact::{CompactedContext, summary_request_at};
+
+    let root = Root::new();
+    let compactions = Arc::new(AtomicUsize::new(0));
+    let called = compactions.clone();
+    let compact: Compact = Arc::new(move |source, prefix, _| {
+        called.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(source.input[prefix].text_field("content")?, "third");
+        let request = summary_request_at(source, prefix)?;
+        let answer = native::load(&saved_response(&request, Some("Earlier goal retained"), 0))?;
+        let compacted = CompactedContext::from_summary_at(source.clone(), &answer, prefix)?;
+        assert_eq!(compacted.native().text_field("object")?, "omh.summary.v2");
+        assert_eq!(&compacted.output()?[1..], &source.input[prefix..]);
+        Ok(compacted)
+    });
+    let gate = Arc::new(Gate::default());
+    let held = gate.clone();
+    let provider: Generate = Arc::new(move |request, stop, _| {
+        if request
+            .input
+            .last()
+            .and_then(|item| item.text_field("content").ok())
+            == Some("third")
+        {
+            held.hold(stop);
+        }
+        model(request, 0)
+    });
+    let mut runtime = setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider,
+        Limits {
+            compact_bytes: 12 * 1024,
+            ..Limits::default()
+        },
+        Options {
+            directory: Some(root.journal()),
+            compact: Some(compact),
+            keep_recent_turns: 2,
+            ..Options::default()
+        },
+    )
+    .await;
+    let handle = runtime.handle();
+    for (index, text) in [
+        "first".into(),
+        "second".into(),
+        "third".into(),
+        "a".repeat(4096),
+        "b".repeat(10 * 1024),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("budget{index}");
+        let request = submit(&handle, &id, &text, &id).await;
+        if index == 2 {
+            gate.wait();
+            for (id, text) in [("steer1", "KEEP_ONE"), ("steer2", "KEEP_TWO")] {
+                post(
+                    &handle,
+                    id,
+                    CommandPayload::Steer(Steer {
+                        target: request.clone(),
+                        text: text.into(),
+                    }),
+                    "budget2",
+                    PostStatus::Accepted,
+                )
+                .await;
+            }
+            gate.release();
+        }
+        until(&handle, |p| matches!(p, EventPayload::Done)).await;
+        assert_eq!(compactions.load(Ordering::SeqCst), usize::from(index == 4));
+    }
+    finish(&mut runtime).await;
+    let registry = tools(Arc::new(AtomicUsize::new(0)), None, true);
+    let mut state = State::new(
+        "offline".into(),
+        configuration(&registry),
+        registry.read_only().advertisement().clone(),
+    );
+    let journal = Journal::open(&root.journal(), |e| state.apply(e), None).unwrap();
+    assert_eq!(journal.diagnostic(), "");
+    assert_eq!(state.compactions, 1);
+    for retained in ["third", "KEEP_ONE", "KEEP_TWO"] {
+        assert!(
+            state
+                .history
+                .iter()
+                .any(|item| item.text_field("content") == Ok(retained))
+        );
     }
 }
 

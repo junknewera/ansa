@@ -27,6 +27,10 @@ pub struct Frame {
     pub tool_actions: Vec<(usize, String)>,
     /// Chat row range and right column, all zero based and exclusive at end.
     pub chat_bounds: Option<(usize, usize, usize)>,
+    chat_rows: ChatRows,
+    suggestion_bounds: Option<(usize, usize)>,
+    pub(super) timeline_range: Option<(usize, usize)>,
+    pub(super) timeline_total: usize,
     pub inspector_content_rows: usize,
     viewport: Option<(usize, usize)>,
     cursor_row: usize,
@@ -39,6 +43,16 @@ pub struct Frame {
     inspector_bounds: Option<(usize, usize, usize, usize)>,
     terminal_rows: std::collections::BTreeSet<usize>,
     pub(super) image: Option<super::graphics::Placement>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChatRows {
+    wrapped: std::sync::Arc<[ChatRow]>,
+    first: usize,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChatRow {
+    text: String,
+    join: Option<&'static str>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRow {
@@ -530,7 +544,7 @@ fn layout_impl(
             && !entry.role.starts_with("tool_child_")
             && !entry.role.starts_with("tool_diff_");
         if !wrapped.is_empty() && (!(tool && previous_tool) || separate_tool) {
-            wrapped.push(String::new());
+            wrapped.push(ChatRow::default());
         }
         previous_tool = tool;
         if let Some(action) = &entry.action {
@@ -555,7 +569,10 @@ fn layout_impl(
             _ => None,
         } {
             for text in safe.lines() {
-                wrapped.push(diff_line(&clipped(text, cols), kind, cols, color));
+                wrapped.push(ChatRow {
+                    text: diff_line(&clipped(text, cols), kind, cols, color),
+                    join: None,
+                });
             }
             continue;
         }
@@ -570,11 +587,6 @@ fn layout_impl(
                 continue;
             }
             let mut text = text;
-            let bounded_detail;
-            if entry.role == "tool_detail" && display_cells::width(text) > cols {
-                bounded_detail = format!("{}…", clipped(text, cols.saturating_sub(1)));
-                text = &bounded_detail;
-            }
             let mut heading = false;
             if assistant && !fence && text.starts_with('#') {
                 let trimmed = text.trim_start_matches('#');
@@ -684,6 +696,9 @@ fn layout_impl(
                 for (index, ch) in chars[pos..end].iter().enumerate() {
                     if color && (ch.bold, ch.code, ch.ink) != was {
                         line.push_str(reset);
+                        if user && !queued {
+                            line.push_str(USER_MESSAGE);
+                        }
                         if ch.bold {
                             line.push_str("\x1b[1m");
                         }
@@ -713,11 +728,15 @@ fn layout_impl(
                 if color {
                     line.push_str(reset);
                 }
-                wrapped.push(line);
                 pos = end;
-                if pos < chars.len() && chars[pos].glyph.text == " " {
+                let space = pos < chars.len() && chars[pos].glyph.text == " ";
+                if space {
                     pos += 1;
                 }
+                wrapped.push(ChatRow {
+                    text: line,
+                    join: (pos < chars.len()).then_some(if space { " " } else { "" }),
+                });
                 if pos >= chars.len() {
                     break;
                 }
@@ -742,7 +761,7 @@ fn layout_impl(
         used += glyph.width;
     }
     let mut lines = vec![header];
-    lines.extend_from_slice(&wrapped[begin..end]);
+    lines.extend(wrapped[begin..end].iter().map(|line| line.text.clone()));
     let mut status_lines = status.splitn(3, '\n');
     let status = if full {
         status_lines.next().unwrap_or("")
@@ -828,6 +847,13 @@ fn layout_impl(
         inspector_bounds: None,
         terminal_rows: Default::default(),
         chat_bounds: Some((1, available + 1, cols)),
+        chat_rows: ChatRows {
+            wrapped: wrapped.into(),
+            first: begin,
+        },
+        timeline_range: None,
+        timeline_total: 0,
+        suggestion_bounds: None,
         inspector_content_rows: 0,
         viewport: full.then_some(size),
         cursor_row,
@@ -871,6 +897,7 @@ pub struct Inspector {
     pub offset: usize,
     pub footer: String,
     pub kind: InspectorKind,
+    pub agents: Vec<AgentLine>,
     pub markdown: Option<std::sync::Arc<Vec<super::markdown::Row>>>,
     pub diff: Option<std::sync::Arc<Vec<super::diff::Row>>>,
     pub diff_column: usize,
@@ -878,6 +905,12 @@ pub struct Inspector {
     pub rendered: Option<std::sync::Arc<Vec<String>>>,
     /// Zero-based column/row relative to the parsed grid.
     pub cursor: Option<(usize, usize)>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLine {
+    pub title: String,
+    pub state: String,
+    pub detail: String,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Choice {
@@ -918,6 +951,7 @@ const RED: &str = "\x1b[38;2;241;142;150m";
 const RULE: &str = "\x1b[38;2;62;74;93m";
 const DIFF_ADD: &str = "\x1b[48;2;24;58;39m";
 const DIFF_REMOVE: &str = "\x1b[48;2;68;31;36m";
+const USER_MESSAGE: &str = "\x1b[48;2;29;35;39m";
 const RESET: &str = "\x1b[0m";
 const SELECTED: &str = "\x1b[48;2;46;63;88m\x1b[38;2;232;240;255m";
 
@@ -1217,7 +1251,25 @@ fn inspector_rows(
     }
     let footer = usize::from(!panel.footer.is_empty());
     let available = height.saturating_sub(rows.len() + footer);
-    if let Some(rendered) = &panel.rendered {
+    if panel.kind == InspectorKind::Agents {
+        let stride = if available >= 4 { 2 } else { 1 };
+        let count = available / stride;
+        let first = panel
+            .selected
+            .unwrap_or_default()
+            .saturating_sub(count.saturating_sub(1));
+        for (index, agent) in panel.agents.iter().enumerate().skip(first).take(count) {
+            let label = heading(&agent.title, &agent.state, width, color);
+            rows.push(if panel.selected == Some(index) && focused {
+                styled(&padded(&plain(&label), width), SELECTED, color)
+            } else {
+                label
+            });
+            if stride == 2 {
+                rows.push(styled(&clipped(&agent.detail, width), MUTED, color));
+            }
+        }
+    } else if let Some(rendered) = &panel.rendered {
         rows.extend(
             rendered
                 .iter()
@@ -1353,9 +1405,9 @@ pub fn layout_workspace(
     };
     let mut breadcrumb = location.to_owned();
     if ui.reading {
-        breadcrumb.push_str("  /  История · прокрутка приостановлена");
+        breadcrumb.push_str(" · История");
         if ui.new_events > 0 {
-            breadcrumb.push_str(&format!(" · новых: {}", ui.new_events));
+            breadcrumb.push_str(&format!(" ↓ {}", ui.new_events));
         }
     }
     rows.push(styled(
@@ -1475,13 +1527,7 @@ pub fn layout_workspace(
     let mut cursor_column = editor_cursor;
     rows.extend(editor);
     rows.push(rule(width, color));
-    let mut metadata = ui.model.clone();
-    if !ui.effort.is_empty() {
-        if !metadata.is_empty() {
-            metadata.push_str(" · ");
-        }
-        metadata.push_str(&ui.effort);
-    }
+    let mut metadata = ui.effort.clone();
     let detail = status.lines().next().unwrap_or_default();
     let narrow = columns <= NARROW_WORKSPACE_COLUMNS;
     let terminal = ui.focus == Focus::Inspector
@@ -1601,6 +1647,10 @@ pub fn layout_workspace(
             .popup
             .is_none()
             .then_some((3, 3 + chat_height, chat_width)),
+        chat_rows: chat.chat_rows,
+        timeline_range: None,
+        timeline_total: 0,
+        suggestion_bounds,
     })
 }
 fn paint_suggestions(
@@ -1878,7 +1928,13 @@ impl Frame {
         }
         text
     }
-    fn highlight(&self, anchor: (usize, usize), focus: (usize, usize), color: bool) -> Self {
+    fn highlight(
+        &self,
+        anchor: (usize, usize),
+        focus: (usize, usize),
+        color: bool,
+        chat_only: bool,
+    ) -> Self {
         let mut frame = self.clone();
         if frame.lines.is_empty() {
             return frame;
@@ -1905,13 +1961,17 @@ impl Frame {
                         color,
                         frame.selection_style.as_deref().unwrap_or(SELECTED),
                     ),
-                    right: highlighted_segment(
-                        &pane.right,
-                        first.saturating_sub(pane.column),
-                        last.saturating_sub(pane.column),
-                        color,
-                        frame.selection_style.as_deref().unwrap_or(SELECTED),
-                    ),
+                    right: if chat_only {
+                        pane.right
+                    } else {
+                        highlighted_segment(
+                            &pane.right,
+                            first.saturating_sub(pane.column),
+                            last.saturating_sub(pane.column),
+                            color,
+                            frame.selection_style.as_deref().unwrap_or(SELECTED),
+                        )
+                    },
                 };
                 frame.lines[row] = pane.line();
                 frame.panes[row] = Some(pane);
@@ -1936,7 +1996,126 @@ pub struct Selection {
     anchor: (usize, usize),
     focus: (usize, usize),
     moved: bool,
+    chat: Option<ChatSelection>,
+    pointer: (usize, usize),
+    pub(super) scroll_pending: bool,
+    pub(super) pending_range: Option<(usize, usize)>,
 }
+
+type ChatPoint = ((usize, usize), usize, usize);
+
+#[derive(Debug, Clone)]
+struct ChatSelection {
+    anchor: ChatPoint,
+    focus: ChatPoint,
+    tail: usize,
+    pages: std::collections::BTreeMap<(usize, usize), std::sync::Arc<[ChatRow]>>,
+}
+
+impl ChatSelection {
+    fn bounds(frame: &Frame) -> Option<(usize, usize, usize)> {
+        let (top, mut bottom, width) = frame.chat_bounds?;
+        if let Some((first, _)) = frame.suggestion_bounds {
+            bottom = bottom.min(first);
+        }
+        (top < bottom && width > 0).then_some((top, bottom, width))
+    }
+    fn point(frame: &Frame, column: usize, row: usize) -> Option<ChatPoint> {
+        let page = frame.timeline_range?;
+        let (top, bottom, width) = Self::bounds(frame)?;
+        let total = frame.chat_rows.wrapped.len();
+        if total == 0 {
+            return None;
+        }
+        let line = frame.chat_rows.first + row.clamp(top, bottom.saturating_sub(1)) - top;
+        let column = if line >= total {
+            width - 1
+        } else {
+            column.min(width - 1)
+        };
+        Some((page, line.min(total - 1), column))
+    }
+
+    fn endpoints(&self) -> (ChatPoint, ChatPoint) {
+        (self.anchor.min(self.focus), self.anchor.max(self.focus))
+    }
+
+    fn highlighted(&self, frame: Frame, color: bool) -> Frame {
+        let Some((page, (top, bottom, width))) = frame.timeline_range.zip(Self::bounds(&frame))
+        else {
+            return frame;
+        };
+        let (start, end) = self.endpoints();
+        let first = frame.chat_rows.first;
+        let last = (first + bottom - top).min(frame.chat_rows.wrapped.len());
+        if page < start.0 || page > end.0 || last <= first {
+            return frame;
+        }
+        let from = if page == start.0 {
+            (start.1, start.2)
+        } else {
+            (0, 0)
+        };
+        let to = if page == end.0 {
+            (end.1, end.2)
+        } else {
+            (usize::MAX, width - 1)
+        };
+        if to.0 < first || from.0 >= last {
+            return frame;
+        }
+        let from = if from.0 < first {
+            (top, 0)
+        } else {
+            (top + from.0 - first, from.1)
+        };
+        let to = if to.0 >= last {
+            (top + last - first - 1, width - 1)
+        } else {
+            (top + to.0 - first, to.1)
+        };
+        frame.highlight(from, to, color, true)
+    }
+
+    fn text(&self) -> String {
+        let (start, end) = self.endpoints();
+        let mut text = String::new();
+        let mut join = "";
+        for (page, rows) in self.pages.range(start.0..=end.0) {
+            let first = if *page == start.0 { start.1 } else { 0 };
+            let last = if *page == end.0 {
+                end.1 + 1
+            } else {
+                rows.len()
+            };
+            for (index, row) in rows.iter().enumerate().take(last).skip(first) {
+                let from = if (*page, index) == (start.0, start.1) {
+                    start.2
+                } else {
+                    0
+                };
+                let to = if (*page, index) == (end.0, end.1) {
+                    end.2 + 1
+                } else {
+                    usize::MAX
+                };
+                text.push_str(join);
+                let selected = selected_segment(&row.text, from, to);
+                text.push_str(&selected);
+                if text.len() > super::copy::LIMIT {
+                    return text;
+                }
+                join = if index + 1 == rows.len() {
+                    "\n\n"
+                } else {
+                    row.join.unwrap_or("\n")
+                };
+            }
+        }
+        text
+    }
+}
+
 impl Selection {
     pub fn new(frame: Frame, column: usize, row: usize) -> Self {
         Self {
@@ -1944,14 +2123,145 @@ impl Selection {
             anchor: (row, column),
             focus: (row, column),
             moved: false,
+            chat: None,
+            pointer: (column, row),
+            scroll_pending: false,
+            pending_range: None,
         }
     }
+    pub(super) fn chat(frame: Frame, column: usize, row: usize) -> Option<Self> {
+        let (top, bottom, _) = ChatSelection::bounds(&frame)?;
+        if row < top
+            || row >= bottom
+            || frame.chat_rows.first + row - top >= frame.chat_rows.wrapped.len()
+        {
+            return None;
+        }
+        let point = ChatSelection::point(&frame, column, row)?;
+        let rows = frame.chat_rows.wrapped.clone();
+        let tail = frame.timeline_total;
+        let mut result = Self::new(frame, column, row);
+        result.chat = Some(ChatSelection {
+            anchor: point,
+            focus: point,
+            tail,
+            pages: [(point.0, rows)].into(),
+        });
+        Some(result)
+    }
+    pub(super) fn is_chat(&self) -> bool {
+        self.chat.is_some()
+    }
+    pub(super) fn edge(&self) -> Option<bool> {
+        if !self.moved || !self.is_chat() {
+            return None;
+        }
+        let (top, bottom, _) = self.frozen.chat_bounds?;
+        if self.pointer.1 <= top {
+            Some(true)
+        } else if self.pointer.1 + 1 >= bottom {
+            Some(false)
+        } else {
+            None
+        }
+    }
+    pub(super) fn neighbor(&self, older: bool) -> Option<(usize, usize)> {
+        let (begin, end) = self.frozen.timeline_range?;
+        self.chat.as_ref()?.pages.keys().copied().find(
+            |&(a, b)| {
+                if older { b == begin } else { a == end }
+            },
+        )
+    }
+    pub(super) fn tail(&self) -> Option<usize> {
+        self.chat.as_ref().map(|chat| chat.tail)
+    }
+    pub(super) fn can_add_page(&self) -> bool {
+        self.chat.as_ref().is_none_or(|chat| chat.pages.len() < 32)
+    }
+    pub(super) fn commit_scroll(&mut self, mut shown: Self) {
+        shown.moved |= self.moved;
+        shown.drag(self.pointer.0, self.pointer.1);
+        *self = shown;
+    }
+    pub(super) fn update(
+        &mut self,
+        mut frame: Frame,
+        scroll: usize,
+        theme: Option<&super::theme::Theme>,
+    ) {
+        if !self.scroll_pending
+            || self.pending_range.is_some() && self.pending_range == frame.timeline_range
+            || self.frozen.viewport != frame.viewport
+        {
+            return;
+        }
+        let Some(chat) = &mut self.chat else {
+            return;
+        };
+        let Some((range, _, _)) = ChatSelection::point(&frame, self.pointer.0, self.pointer.1)
+        else {
+            return;
+        };
+        if let Some(rows) = chat.pages.get(&range) {
+            let (top, bottom, width) = frame.chat_bounds.expect("chat point has bounds");
+            frame.scroll_limit = rows.len().saturating_sub(bottom - top);
+            let end = rows.len() - scroll.min(frame.scroll_limit);
+            let first = end.saturating_sub(bottom - top);
+            for index in top..bottom {
+                let text = rows
+                    .get(first + index - top)
+                    .map_or("", |row| row.text.as_str());
+                if let Some(pane) = &mut frame.panes[index] {
+                    pane.left = padded(text, width);
+                    frame.lines[index] = pane.line();
+                } else {
+                    frame.lines[index] = text.into();
+                }
+            }
+            frame.chat_rows = ChatRows {
+                wrapped: rows.clone(),
+                first,
+            };
+        } else {
+            if chat.pages.len() >= 32
+                || chat
+                    .pages
+                    .keys()
+                    .any(|&(first, end)| first < range.1 && range.0 < end)
+            {
+                return;
+            }
+            chat.pages.insert(range, frame.chat_rows.wrapped.clone());
+        }
+        self.scroll_pending = false;
+        self.pending_range = None;
+        if let Some(theme) = theme {
+            frame.apply_theme(theme);
+        }
+        self.frozen = frame;
+        self.drag(self.pointer.0, self.pointer.1);
+    }
+    pub(super) fn can_scroll(&self, size: (usize, usize)) -> bool {
+        !self.scroll_pending && self.frozen.viewport == Some(size)
+    }
+    pub(super) fn timeline_range(&self) -> Option<(usize, usize)> {
+        self.frozen.timeline_range
+    }
     pub fn drag(&mut self, column: usize, row: usize) {
+        self.pointer = (column, row);
+        if let Some(chat) = &mut self.chat
+            && let Some(point) = ChatSelection::point(&self.frozen, column, row)
+        {
+            self.moved |= point != chat.anchor;
+            chat.focus = point;
+            return;
+        }
         self.focus = (row.min(self.frozen.lines.len().saturating_sub(1)), column);
         self.moved |= self.focus != self.anchor;
     }
     pub fn frame(&self, color: bool) -> Frame {
-        self.frozen.highlight(self.anchor, self.focus, color)
+        self.frozen.highlight(self.anchor, self.focus, color, false)
     }
     /// Resize clips the frozen display without changing selection endpoints or
     /// the source bytes used by `finish`. Reflow resumes after the drag ends.
@@ -1983,11 +2293,20 @@ impl Selection {
         frame.viewport = Some(size);
         frame.cursor_row = frame.cursor_row.min(size.1.saturating_sub(1));
         frame.cursor = frame.cursor.min(size.0.saturating_sub(1));
-        frame.highlight(self.anchor, self.focus, color)
+        if let Some(chat) = &self.chat {
+            chat.highlighted(frame, color)
+        } else {
+            frame.highlight(self.anchor, self.focus, color, false)
+        }
     }
     pub fn text(&self) -> Option<String> {
         self.moved
-            .then(|| self.frozen.selected_text(self.anchor, self.focus))
+            .then(|| {
+                self.chat.as_ref().map_or_else(
+                    || self.frozen.selected_text(self.anchor, self.focus),
+                    ChatSelection::text,
+                )
+            })
             .filter(|text| !text.is_empty())
     }
     pub fn finish(&mut self, column: usize, row: usize) -> Option<String> {

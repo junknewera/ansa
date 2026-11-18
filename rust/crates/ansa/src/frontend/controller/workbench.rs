@@ -533,6 +533,8 @@ struct CreateIntent {
     source: String,
     kind: Kind,
     prompt: Option<String>,
+    foreground: bool,
+    plan_only: bool,
 }
 enum FileValue {
     Listing(FileListing),
@@ -557,6 +559,8 @@ enum Job {
         source: String,
         prompt: Option<String>,
         auto_return: bool,
+        foreground: bool,
+        plan_only: bool,
         result: Result<Created>,
     },
     Sessions {
@@ -758,6 +762,8 @@ struct Workbench {
     terminal_size: Option<(u16, u16)>,
     focus: Focus,
     selection: Option<Selection>,
+    selection_frame: Option<(u64, Selection)>,
+    next_drag_scroll: Option<Instant>,
     tool_press: Option<ToolPress>,
     frames: std::collections::VecDeque<(u64, carbon::Frame)>,
     displayed: Option<carbon::Frame>,
@@ -863,6 +869,8 @@ impl Workbench {
             terminal_size: None,
             focus: Focus::Chat,
             selection: None,
+            selection_frame: None,
+            next_drag_scroll: None,
             tool_press: None,
             frames: std::collections::VecDeque::new(),
             displayed: None,
@@ -974,10 +982,10 @@ impl Workbench {
             true
         }
     }
-    fn create(&mut self, kind: Kind, prompt: Option<String>, io: &Io) {
+    fn create(&mut self, kind: Kind, prompt: Option<String>, foreground: bool, io: &Io) -> bool {
         if self.slots.len() + self.jobs.len() + self.pending_context.len() >= MAX_SESSIONS {
             self.report(io, "Достигнут предел открытых сессий (16)");
-            return;
+            return false;
         }
         if matches!(kind, Kind::Agent | Kind::Btw)
             && self
@@ -994,10 +1002,10 @@ impl Workbench {
                 >= MAX_BACKGROUND
         {
             self.report(io, "Одновременно доступны четыре фоновых разговора");
-            return;
+            return false;
         }
         if !self.can_job(io) {
-            return;
+            return false;
         }
         if kind == Kind::Console {
             if self.slots[self.current].active() {
@@ -1005,7 +1013,7 @@ impl Workbench {
                     io,
                     "Командная панель доступна после остановки текущей задачи",
                 );
-                return;
+                return false;
             }
             if let Some(index) = self.slots.iter().position(|s| {
                 s.kind == Kind::Console
@@ -1014,7 +1022,7 @@ impl Workbench {
             }) {
                 self.switch(index);
                 self.slots[index].pending_prompt = prompt;
-                return;
+                return true;
             }
             let source = self.slots[self.current].id.clone();
             let factory = self.factory.clone();
@@ -1023,8 +1031,10 @@ impl Workbench {
                 source,
                 prompt,
                 auto_return: false,
+                foreground,
+                plan_only: false,
             });
-            return;
+            return true;
         }
         let slot = &mut self.slots[self.current];
         let command = slot.state.command(&slot.handle, CommandPayload::GetContext);
@@ -1035,7 +1045,7 @@ impl Workbench {
             .post_command(&slot.handle, command, &mut slot.replies, false)
         {
             slot.state.report(io, "Дождитесь текущих запросов");
-            return;
+            return false;
         }
         self.pending_context.insert(
             key,
@@ -1043,9 +1053,12 @@ impl Workbench {
                 source: slot.id.clone(),
                 kind,
                 prompt,
+                foreground,
+                plan_only: slot.state.mode == AgentMode::Plan,
             },
         );
         self.report(io, "Создаю сессию");
+        true
     }
     fn open_file(&mut self, path: PathBuf, io: &Io) {
         if !self.can_job(io) {
@@ -1443,6 +1456,12 @@ impl Workbench {
         }
     }
     fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
+        if let Some(task) = commands::agent_task(text) {
+            return (
+                self.create(Kind::Agent, Some(task.into()), false, io),
+                false,
+            );
+        }
         let (command, argument) = text
             .trim()
             .split_once(char::is_whitespace)
@@ -1452,6 +1471,7 @@ impl Workbench {
                 self.create(
                     Kind::Fork,
                     (!argument.is_empty()).then(|| argument.to_string()),
+                    true,
                     io,
                 );
                 (true, false)
@@ -1460,6 +1480,7 @@ impl Workbench {
                 self.create(
                     Kind::Btw,
                     (!argument.is_empty()).then(|| argument.to_string()),
+                    true,
                     io,
                 );
                 (true, false)
@@ -1467,10 +1488,13 @@ impl Workbench {
             "/agent" => {
                 if argument.is_empty() {
                     self.report(io, "Использование: /agent задача для субагента");
+                    (true, false)
                 } else {
-                    self.create(Kind::Agent, Some(argument.into()), io);
+                    (
+                        self.create(Kind::Agent, Some(argument.into()), true, io),
+                        false,
+                    )
                 }
-                (true, false)
             }
             "/agents" => {
                 self.panel = Some(Panel::Agents { selected: 0 });
@@ -1544,11 +1568,18 @@ impl Workbench {
                 if !text.starts_with('/') && !text.trim().is_empty() && slot.title.is_none() {
                     slot.title = Some(display_title(text));
                 }
-                let routed = if argument.is_empty()
+                let routed = if command == "/plan"
+                    && argument.is_empty()
+                    && slot.state.mode == AgentMode::Plan
+                    && slot.kind != Kind::Btw
+                {
+                    "/basic"
+                } else if argument.is_empty()
                     && matches!(
                         command,
                         "/basic" | "/plan" | "/status" | "/copy" | "/resume" | "/cancel" | "/exit"
-                    ) {
+                    )
+                {
                     command
                 } else {
                     text
@@ -1579,6 +1610,8 @@ impl Workbench {
             source,
             prompt: None,
             auto_return: false,
+            foreground: true,
+            plan_only: false,
             result: factory.resume(&id),
         });
     }
@@ -1653,6 +1686,8 @@ impl Workbench {
                 source: intent.source,
                 prompt: intent.prompt,
                 auto_return: intent.kind == Kind::Agent,
+                foreground: intent.foreground,
+                plan_only: intent.plan_only,
                 result: factory.create(intent.kind, Some(seed)),
             });
         }
@@ -1888,6 +1923,8 @@ impl Workbench {
                 source,
                 prompt,
                 auto_return,
+                foreground,
+                plan_only,
                 result,
             } => match result {
                 Ok(mut created) => {
@@ -1899,16 +1936,25 @@ impl Workbench {
                         created.parent = Some(source);
                     }
                     let id = created.selected.id.clone();
-                    self.add(Slot::new(
+                    let mut slot = Slot::new(
                         created.runtime,
                         id,
                         created.kind,
                         created.parent,
                         prompt,
                         auto_return,
-                    ));
+                    );
+                    if plan_only {
+                        slot.state.mode = AgentMode::Plan;
+                        slot.state.mode_ready = true;
+                    }
+                    self.add(slot);
                     if focus && !self.input_closed {
-                        self.switch(self.slots.len() - 1);
+                        if foreground {
+                            self.switch(self.slots.len() - 1);
+                        } else {
+                            self.report(io, "Субагент запущен · /agents");
+                        }
                     }
                 }
                 Err(code) => self.report(io, &format!("Не удалось открыть сессию: {code}")),
@@ -2135,8 +2181,20 @@ impl Workbench {
             }
             return;
         }
+        self.scroll_chat(older, 8, false);
+    }
+    fn scroll_chat(&mut self, older: bool, step: usize, dragging: bool) -> bool {
+        let neighbor = self
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.neighbor(older));
+        let tail = self.selection.as_ref().and_then(Selection::tail);
+        let can_page =
+            neighbor.is_some() || self.selection.as_ref().is_none_or(Selection::can_add_page);
         let slot = &mut self.slots[self.current];
         let state = &mut slot.state;
+        let original_scroll = state.scroll;
+        let mut crossing = None;
         if older {
             if state.follow_tail {
                 state.reading_total = state.snapshot.as_ref().map_or(0, |s| s.transcript_size);
@@ -2152,35 +2210,44 @@ impl Workbench {
                 };
             }
             if state.scroll >= state.scroll_limit
+                && can_page
                 && let Some(page) = &slot.timeline
                 && page.begin > 0
             {
                 slot.timeline_query = GetTranscript {
                     before: page.begin,
-                    limit: 64,
+                    limit: neighbor.map_or(64, |(begin, end)| end - begin),
                     forward: false,
                 };
+                crossing = Some((page.begin, page.end));
                 state.scroll = 0;
                 state.reading = None;
                 slot.refresh = Instant::now();
             } else {
-                state.scroll = state.scroll.saturating_add(8).min(state.scroll_limit);
+                state.scroll = state.scroll.saturating_add(step).min(state.scroll_limit);
             }
         } else if state.scroll == 0
+            && can_page
             && let Some(page) = &slot.timeline
             && page.end < page.total
+            && tail.is_none_or(|limit| page.end < limit)
         {
             slot.timeline_query = GetTranscript {
                 before: page.end,
-                limit: 64,
+                limit: neighbor.map_or_else(
+                    || tail.map_or(64, |end| (end - page.end).min(64)),
+                    |(begin, end)| end - begin,
+                ),
                 forward: true,
             };
+            crossing = Some((page.begin, page.end));
             slot.jump_top = true;
             state.reading = None;
             slot.refresh = Instant::now();
         } else {
-            state.scroll = state.scroll.saturating_sub(8);
+            state.scroll = state.scroll.saturating_sub(step);
             if state.scroll == 0
+                && !dragging
                 && slot
                     .timeline
                     .as_ref()
@@ -2195,6 +2262,41 @@ impl Workbench {
                 };
             }
         }
+        let changed = crossing.is_some() || state.scroll != original_scroll;
+        if dragging
+            && changed
+            && let Some(selection) = &mut self.selection
+        {
+            selection.scroll_pending = true;
+            selection.pending_range = crossing;
+            self.tool_press = None;
+        }
+        changed
+    }
+    fn drag_scroll(&mut self, older: bool, lines: usize, io: &Io) -> bool {
+        let range = self.slots[self.current]
+            .timeline
+            .as_ref()
+            .map(|page| (page.begin, page.end));
+        self.selection.as_ref().is_some_and(|selection| {
+            selection.is_chat()
+                && selection.can_scroll(io.size)
+                && selection.timeline_range() == range
+        }) && self.scroll_chat(older, lines, true)
+    }
+    fn tick_drag(&mut self, io: &Io, now: Instant) -> bool {
+        let Some(older) = self.selection.as_ref().and_then(Selection::edge) else {
+            self.next_drag_scroll = None;
+            return false;
+        };
+        let next = self
+            .next_drag_scroll
+            .get_or_insert(now + Duration::from_millis(240));
+        if now < *next {
+            return false;
+        }
+        *next = now + Duration::from_millis(80);
+        self.drag_scroll(older, 1, io)
     }
     fn navigate(&mut self, older: bool) {
         self.selection = None;
@@ -2328,12 +2430,13 @@ impl Workbench {
                         .listing
                         .as_ref()
                         .and_then(|l| l.entries.get(files.selected))
+                        .filter(|entry| !entry.directory)
                     {
                         self.open_file(entry.path.clone(), io);
                     }
                 }
                 Some(Panel::Agents { selected }) => {
-                    if let Some((id, _, _)) = self.agent_rows().get(*selected) {
+                    if let Some((id, _)) = self.agent_rows().get(*selected) {
                         let id = id.clone();
                         self.resume(id, io);
                     }
@@ -2405,6 +2508,15 @@ impl Workbench {
             }
         }
         if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
+            if let Some(selection) = self
+                .selection
+                .as_mut()
+                .filter(|selection| selection.is_chat())
+            {
+                selection.drag(mouse.column, mouse.row);
+                self.drag_scroll(mouse.kind == MouseKind::WheelUp, 3, io);
+                return;
+            }
             let focus = self.focus;
             self.focus = hovered;
             self.page(mouse.kind == MouseKind::WheelUp);
@@ -2416,6 +2528,8 @@ impl Workbench {
                 self.slots[self.current].cancel_history_jump();
                 self.update_displayed(io);
                 self.selection = None;
+                self.selection_frame = None;
+                self.next_drag_scroll = None;
                 self.tool_press = None;
                 // A partially painted frame has no single truthful text
                 // snapshot. Selection starts only on a completed paint.
@@ -2479,7 +2593,14 @@ impl Workbench {
                         return;
                     }
                     let slot = &mut self.slots[self.current];
-                    if in_chat {
+                    self.selection = if in_chat {
+                        Selection::chat(frame.clone(), mouse.column, mouse.row)
+                    } else if matches!(self.panel, Some(Panel::Terminal)) {
+                        Some(Selection::new(frame.clone(), mouse.column, mouse.row))
+                    } else {
+                        None
+                    };
+                    if in_chat && self.selection.is_some() {
                         let reading = slot.projected();
                         slot.state.follow_tail = false;
                         slot.state.reading_total = slot
@@ -2487,18 +2608,18 @@ impl Workbench {
                             .snapshot
                             .as_ref()
                             .map_or(0, |s| s.transcript_size);
-                        if let Some(page) = &slot.timeline {
+                        if let Some((begin, end)) = frame.timeline_range {
                             slot.timeline_query = GetTranscript {
-                                before: page.end,
-                                limit: 64,
+                                before: end,
+                                limit: end.saturating_sub(begin).max(1),
                                 forward: false,
                             };
+                            slot.refresh = Instant::now();
                         }
                         if let Some(reading) = reading {
                             slot.state.reading = Some(reading);
                         }
                     }
-                    self.selection = Some(Selection::new(frame.clone(), mouse.column, mouse.row));
                 }
             }
             MouseKind::Drag => {
@@ -2516,6 +2637,7 @@ impl Workbench {
                 }
             }
             MouseKind::Release => {
+                self.update_displayed(io);
                 if let Some((column, row, key, edit, output)) = self.tool_press.take()
                     && (column, row) == (mouse.column, mouse.row)
                 {
@@ -2747,20 +2869,9 @@ impl Workbench {
             }),
             Panel::Agents { selected } => Some(Inspector {
                 title: "Агенты разговора".into(),
-                lines: self
-                    .agent_rows()
-                    .into_iter()
-                    .map(|(_, title, generation)| {
-                        if generation.is_empty() {
-                            title
-                        } else {
-                            format!("{title} · {generation}")
-                        }
-                    })
-                    .collect(),
+                agents: self.agent_rows().into_iter().map(|(_, row)| row).collect(),
                 selected: Some(*selected),
-                offset: selected.saturating_sub(8),
-                footer: "Enter разговор · Esc назад".into(),
+                footer: "↑/↓ список · Enter разговор · Esc назад".into(),
                 kind: InspectorKind::Agents,
                 ..Inspector::default()
             }),
@@ -2874,7 +2985,7 @@ impl Workbench {
                         }),
                         selected: Some(files.selected),
                         offset: files.selected.saturating_sub(8),
-                        footer: "Enter открыть · h родитель · q терминал · Esc чат".into(),
+                        footer: "j/k список · h назад · l каталог · Enter файл · q терминал".into(),
                         ..Inspector::default()
                     })
                 }
@@ -2958,6 +3069,17 @@ impl Workbench {
         sync_displayed(&mut self.frames, &mut self.displayed, |sequence| {
             io.writer.displayed(sequence)
         });
+        if self.selection.is_none() {
+            self.selection_frame = None;
+        } else if self
+            .selection_frame
+            .as_ref()
+            .is_some_and(|(sequence, _)| io.writer.displayed(*sequence))
+            && let (Some(selection), Some((_, shown))) =
+                (&mut self.selection, self.selection_frame.take())
+        {
+            selection.commit_scroll(shown);
+        }
     }
     fn prepare_preview(&mut self, io: &Io) {
         let width = if self.input_closed || self.terminating || io.size.0 < 12 || io.size.1 < 8 {
@@ -3013,6 +3135,9 @@ impl Workbench {
     }
     fn render(&mut self, io: &Io, context: &str) {
         self.update_displayed(io);
+        if self.selection_frame.is_some() {
+            return;
+        }
         self.prepare_preview(io);
         if matches!(self.panel, Some(Panel::Terminal))
             && let Some(terminal) = &self.terminal
@@ -3031,19 +3156,38 @@ impl Workbench {
         }
         let operational =
             self.operational_frame.is_some() || self.slots[self.current].input_ready();
+        let mut selection_frame = None;
         let mut frame = if let Some(selection) = &self.selection {
-            let mut frozen = selection.frame_at(io.size, io.color);
             let mut ui = self.ui();
             ui.animate = false;
             let slot = &mut self.slots[self.current];
             let projected = slot.projected();
-            if let Some(mut live) =
-                slot.state
-                    .render_workspace(io, context, &ui, projected.as_deref())
-            {
+            let mut live = slot
+                .state
+                .render_workspace(io, context, &ui, projected.as_deref());
+            if let Some(live) = &mut live {
+                live.timeline_range = slot.timeline.as_ref().map(|page| (page.begin, page.end));
+                live.timeline_total = slot.timeline.as_ref().map_or(0, |page| page.total);
+                if selection.scroll_pending && self.selection_frame.is_none() {
+                    let mut next = selection.clone();
+                    next.update(
+                        live.clone(),
+                        slot.state.scroll,
+                        io.color.then_some(&self.theme),
+                    );
+                    if !next.scroll_pending {
+                        selection_frame = Some(next);
+                    }
+                }
                 if io.color {
                     live.apply_theme(&self.theme);
                 }
+            }
+            let mut frozen = selection_frame
+                .as_ref()
+                .unwrap_or(selection)
+                .frame_at(io.size, io.color);
+            if let Some(live) = live {
                 frozen.update_status_from(&live);
             }
             Some(frozen)
@@ -3129,6 +3273,13 @@ impl Workbench {
         {
             frame.apply_theme(&self.theme);
         }
+        if self.selection.is_none()
+            && let Some(frame) = &mut frame
+            && let Some(page) = &self.slots[self.current].timeline
+        {
+            frame.timeline_range = Some((page.begin, page.end));
+            frame.timeline_total = page.total;
+        }
         if self.menu.is_none()
             && let Some(id) = self.graphics_id
             && io.color
@@ -3159,12 +3310,16 @@ impl Workbench {
                 return self.render(io, context);
             }
             slot.state.scroll = slot.state.scroll.min(frame.scroll_limit);
+            slot.state.scroll_limit = frame.scroll_limit;
         }
         if let Some(frame) = frame
             && self.last_frame.as_ref() != Some(&frame)
             && io.writer.idle()
         {
             let sequence = io.writer.frame(frame.clone());
+            if let Some(selection) = selection_frame {
+                self.selection_frame = Some((sequence, selection));
+            }
             if operational && self.operational_frame.is_none() {
                 self.operational_frame = Some(sequence);
             }
@@ -3368,6 +3523,7 @@ pub async fn run_attached(
                 }
             }
             let now = Instant::now();
+            dirty |= work.tick_drag(io, now);
             work.flush_terminal_input(io);
             if let Some(terminal) = &work.terminal {
                 let snapshot = terminal.snapshot();
@@ -3482,6 +3638,12 @@ pub async fn run_attached(
                                         if byte == b':' && files.document.is_some() { files.jump = Some(String::new()); continue; }
                                         if byte == b'g' { files.preview_end = false; files.offset = 0; if files.document.is_none() { files.selected = 0; } continue; }
                                         if byte == b'G' { if files.document.is_none() { files.selected = files.listing.as_ref().map_or(0, |listing| listing.entries.len().saturating_sub(1)); } else { files.preview_end = files.tab == 2 && files.preview_rows().is_none(); let visible = if files.preview_end { 1 } else { file_visible }; files.offset = files.last_line().saturating_sub(visible - 1); } continue; }
+                                    }
+                                    if byte == b'l' && files.document.is_none() {
+                                        if let Some(path) = files.listing.as_ref().and_then(|listing| listing.entries.get(files.selected)).filter(|entry| entry.directory).map(|entry| entry.path.clone()) {
+                                            work.open_file(path, io);
+                                        }
+                                        continue;
                                     }
                                     if let Some(tab) = match byte { b's' => Some(0), b'd' => Some(1), b'p' => Some(2), _ => None } { files.preview_end = false; files.tab = tab; files.offset = 0; continue; }
                                     if byte == b'h' { let parent = files.document.as_ref().and_then(|d| d.path.parent()).or_else(|| files.listing.as_ref().and_then(|l| l.path.parent())).map(Path::to_path_buf); if let Some(parent) = parent { work.open_file(parent, io); } continue; }

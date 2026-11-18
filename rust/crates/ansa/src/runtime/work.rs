@@ -93,7 +93,6 @@ pub(crate) struct Ready {
     pub state: Arc<State>,
     pub diagnostic: &'static str,
     pub requires_resume: bool,
-    pub profile_bytes: usize,
 }
 pub(crate) enum ProviderTask {
     Generate,
@@ -256,7 +255,7 @@ impl Workers {
                 .name("ansa-journal".into())
                 .spawn(move || {
                     let initialized = guarded(|| {
-                        let profile_bytes = initial.configuration.json()?.dump().len();
+                        initial.configuration.json()?;
                         if let Some(path) = &init_options.directory {
                             let store = Store::open_with_seed(
                                 path,
@@ -268,7 +267,6 @@ impl Workers {
                                 state: store.state().clone(),
                                 diagnostic: store.diagnostic(),
                                 requires_resume: store.requires_resume(),
-                                profile_bytes,
                             };
                             Ok((Some(store), ready))
                         } else {
@@ -282,7 +280,6 @@ impl Workers {
                                     state: Arc::new(state),
                                     diagnostic: "",
                                     requires_resume: false,
-                                    profile_bytes,
                                 },
                             ))
                         }
@@ -411,14 +408,28 @@ impl Workers {
                                         job.state.history.clone(),
                                     )?
                                     .with_effort(current.next.effort.clone())?;
+                                    let prefix = match job.state.compaction_prefix() {
+                                        Some(prefix) => prefix,
+                                        None => {
+                                            crate::context::legacy_compact::summary_prefix_size(
+                                                &request,
+                                            )?
+                                        }
+                                    };
                                     let value = provider_options
                                         .compact
                                         .as_ref()
                                         .ok_or("compaction_unavailable")?(
-                                        &request, &job.stop
+                                        &request, prefix, &job.stop,
                                     )?;
                                     if value.request().save()? != request.save()? {
                                         return Err("compaction_request_mismatch");
+                                    }
+                                    if value
+                                        .summary_prefix()?
+                                        .is_some_and(|retained| retained != prefix)
+                                    {
+                                        return Err("compaction_boundary_mismatch");
                                     }
                                     if value.output()?.len() + 1
                                         >= crate::session::state::COMPACT_ITEM_THRESHOLD

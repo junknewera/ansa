@@ -28,10 +28,6 @@ pub const COMMANDS: &[Command] = &[
         description: "Файлы, diff и терминал проекта",
     },
     Command {
-        name: "/agent",
-        description: "Поручить задачу субагенту",
-    },
-    Command {
         name: "/agents",
         description: "Помощники текущего разговора",
     },
@@ -48,20 +44,8 @@ pub const COMMANDS: &[Command] = &[
         description: "Побочный разговор с доступом только для чтения",
     },
     Command {
-        name: "/send",
-        description: "Передать результат родительскому агенту",
-    },
-    Command {
-        name: "/basic",
-        description: "Работа с изменением файлов и запуском команд",
-    },
-    Command {
         name: "/plan",
-        description: "Анализ проекта без изменения файлов",
-    },
-    Command {
-        name: "/status",
-        description: "Состояние текущей задачи",
+        description: "Переключить режим планирования",
     },
     Command {
         name: "/copy",
@@ -80,6 +64,21 @@ pub const COMMANDS: &[Command] = &[
         description: "Завершить ANSA",
     },
 ];
+
+pub(super) fn agent_task(text: &str) -> Option<&str> {
+    let (verb, rest) = text.trim().split_once(char::is_whitespace)?;
+    let (object, task) = rest
+        .trim_start()
+        .split_once(|ch: char| ch.is_whitespace() || ch == ':')?;
+    if !matches!(
+        (verb.to_lowercase().as_str(), object.to_lowercase().as_str()),
+        ("запусти" | "попроси", "субагента") | ("поручи", "субагенту")
+    ) {
+        return None;
+    }
+    let task = task.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ':');
+    (!task.trim().is_empty()).then_some(task.trim_end())
+}
 
 #[derive(Clone)]
 pub struct Completion {

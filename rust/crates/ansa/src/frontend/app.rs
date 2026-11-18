@@ -13,7 +13,7 @@ use crate::{
         manager::{AuthManager, Clock, Exchange},
     },
     config::{agent_epoch, load_agent_settings},
-    context::legacy_compact::{CompactedContext, summary_request},
+    context::summary::summarizer,
     protocol::json::Json,
     provider::request::{Binding, Epoch, Request},
     runtime::{Generate, Lease, Limits, Options as RuntimeOptions, Runtime},
@@ -167,7 +167,7 @@ pub fn offline_runtime(directory: Option<PathBuf>, delayed: bool) -> Result<Runt
         Limits::default(),
         RuntimeOptions {
             directory,
-            compact: Some(Arc::new(offline::compact)),
+            compact: Some(Arc::new(offline::compact_retained)),
             keep_recent_turns: 2,
             ..RuntimeOptions::default()
         },
@@ -293,11 +293,7 @@ pub fn authorized(
                 stop,
             })
         }),
-        compact: Some(Arc::new(move |request, cancel| {
-            let response =
-                compact_generate(&summary_request(request)?, cancel, Arc::new(|_| Ok(())))?;
-            CompactedContext::from_summary(request.clone(), &response)
-        })),
+        compact: Some(summarizer(compact_generate)),
         keep_recent_turns: 2,
         streaming: true,
         ..RuntimeOptions::default()
@@ -331,7 +327,7 @@ fn text(args: &[String]) -> Result<i32> {
             Arc::new(|request: &Request, stop: &Cancel, _| offline::generate(request, stop))
                 as Generate,
             RuntimeOptions {
-                compact: Some(Arc::new(offline::compact)),
+                compact: Some(Arc::new(offline::compact_retained)),
                 keep_recent_turns: 2,
                 ..RuntimeOptions::default()
             },
