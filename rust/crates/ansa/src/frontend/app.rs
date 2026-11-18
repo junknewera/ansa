@@ -323,19 +323,23 @@ pub fn authorized(
     let generate_auth = auth.clone();
     let lease_auth = auth;
     let generate: Generate = Arc::new(move |request, cancel, preview| {
-        let session = provider
-            .lock()
-            .map_err(|_| "auth_state")?
-            .session()
-            .to_owned();
-        generate_auth.generate(
-            request.clone(),
-            cancel,
-            &session,
-            Some(Box::new(move |text| {
-                let _ = preview(text);
-            })),
-        )
+        let (session, window) = {
+            let provider = provider.lock().map_err(|_| "auth_state")?;
+            (
+                provider.session().to_owned(),
+                provider.context_window(request),
+            )
+        };
+        generate_auth
+            .generate(
+                request.clone(),
+                cancel,
+                &session,
+                Some(Box::new(move |text| {
+                    let _ = preview(text);
+                })),
+            )
+            .map(|response| response.with_context_window(window))
     });
     let compact_generate = generate.clone();
     let options = RuntimeOptions {

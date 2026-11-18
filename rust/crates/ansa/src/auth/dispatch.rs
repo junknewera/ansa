@@ -13,6 +13,7 @@ pub struct ModelCapability {
     pub model: String,
     pub display_name: String,
     pub efforts: Vec<String>,
+    pub context_window: Option<usize>,
 }
 /// Only explicit catalog metadata authorizes effort values. Slugs and the
 /// illustrative UI levels are never a capability oracle.
@@ -65,6 +66,9 @@ fn catalog_models(catalog: &Json, selected: Option<&str>) -> Result<Vec<ModelCap
                 slug.into()
             },
             efforts,
+            context_window: ["context_window", "max_context_window"]
+                .into_iter()
+                .find_map(|field| model.usize_field(field).ok().filter(|window| *window >= 2)),
         });
         if selected.is_some() {
             break;
@@ -130,6 +134,12 @@ impl Authorization {
     }
     pub fn session(&self) -> &str {
         &self.session
+    }
+    pub(crate) fn context_window(&self, request: &Request) -> Option<usize> {
+        self.models
+            .iter()
+            .find(|model| model.model == request.binding.requested_model)
+            .and_then(|model| model.context_window)
     }
     pub fn check_generation(
         &mut self,

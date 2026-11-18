@@ -122,6 +122,69 @@ async fn new_turn_preserves_cancelled_context_over_compaction_threshold() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn autocompact_reaches_half_window_even_after_reopen() {
+    let root = fixture::Root::new();
+    let large = "a".repeat(14 * 1024);
+    let expected = large.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let provider: Generate = Arc::new(move |request, _, _| {
+        let last = request.input.last().unwrap().text_field("content")?;
+        match last {
+            "D" => assert!(has_user(request, &expected)),
+            "E" => {
+                assert!(!has_user(request, &expected));
+                assert!(has_user(request, "C") && has_user(request, "D"));
+            }
+            _ => {}
+        }
+        observed.fetch_add(1, Ordering::SeqCst);
+        let tokens = if last == "D" { "499999" } else { "499998" };
+        native::load(
+            &fixture::saved_response(request, Some("done"), 0)
+                .with("context_tokens", Json::parse(tokens)?)?
+                .with("context_window", Json::parse("1000000")?)?,
+        )
+    });
+    let start = || {
+        fixture::setup(
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            provider.clone(),
+            Limits {
+                compact_bytes: 12 * 1024,
+                ..Limits::default()
+            },
+            Options {
+                directory: Some(root.journal()),
+                keep_recent_turns: 2,
+                compact: Some(Arc::new(ansa::frontend::offline::compact_retained)),
+                ..Options::default()
+            },
+        )
+    };
+    let mut runtime = start().await;
+    let handle = runtime.handle();
+    for (id, text) in [("A", large.as_str()), ("B", "B"), ("C", "C"), ("D", "D")] {
+        fixture::submit(&handle, id, text, id).await;
+        fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    }
+    assert_eq!(
+        fixture::snapshot(&handle, "below_half").await.compactions,
+        0
+    );
+    fixture::finish(&mut runtime).await;
+
+    let mut runtime = start().await;
+    let handle = runtime.handle();
+    fixture::submit(&handle, "E", "E", "E").await;
+    fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    assert_eq!(fixture::snapshot(&handle, "at_half").await.compactions, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    fixture::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn provider_boundary_delivers_fifo_before_any_requested_executor() {
     let root = fixture::Root::new();
     let gate = Arc::new(fixture::Gate::default());
@@ -1270,11 +1333,13 @@ async fn seeded_init_is_atomic_at_fsync_ack_loss_and_rejects_incomplete_v2() {
 
 #[test]
 fn capabilities_require_explicit_catalog_metadata_and_legacy_effort_is_absent() {
-    let catalog = Json::parse(r#"{"models":[{"slug":"gpt-6.1-sol","visibility":"list","display_name":"One"},{"slug":"second","visibility":"list","supported_reasoning_levels":[{"effort":"proven"},"also_proven"]},{"slug":"hidden","visibility":"hide"}]}"#).unwrap();
+    let catalog = Json::parse(r#"{"models":[{"slug":"gpt-6.1-sol","visibility":"list","display_name":"One","context_window":1000000,"max_context_window":2000000},{"slug":"second","visibility":"list","context_window":null,"max_context_window":120000,"supported_reasoning_levels":[{"effort":"proven"},"also_proven"]},{"slug":"hidden","visibility":"hide"}]}"#).unwrap();
     let values = ansa::auth::dispatch::model_capabilities(&catalog).unwrap();
     assert_eq!(values.len(), 2);
     assert!(values[0].efforts.is_empty());
+    assert_eq!(values[0].context_window, Some(1000000));
     assert_eq!(values[1].efforts, vec!["proven", "also_proven"]);
+    assert_eq!(values[1].context_window, Some(120000));
     let tools = fixture::tools(Arc::new(AtomicUsize::new(0)), None, false);
     let request = fixture::configuration(&tools);
     assert!(!request.save().unwrap().has("effort"));

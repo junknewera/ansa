@@ -1144,8 +1144,16 @@ impl Owner {
                 {
                     false
                 } else if state.compaction_prefix().is_some() {
-                    next.input.len() >= COMPACT_ITEM_THRESHOLD
-                        || next.json()?.dump().len() >= limits.compact_bytes
+                    if next.input.len() >= COMPACT_ITEM_THRESHOLD {
+                        true
+                    } else if let Some(compact) = state.context_at_half(&next, &submitted.text) {
+                        compact
+                            || next.binding.provider == "openrouter"
+                                && next.json()?.dump().len()
+                                    >= crate::openrouter::MAX_REQUEST_BYTES * 3 / 4
+                    } else {
+                        next.json()?.dump().len() >= limits.compact_bytes
+                    }
                 } else {
                     false
                 };
