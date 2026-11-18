@@ -374,10 +374,13 @@ pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResp
         items.push(json!({"type":"message","id":format!("msg_{id}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}));
     } else if choice["finish_reason"] == "tool_calls" {
         let message = &choice["message"];
+        // The tool phase of a structured child can include explanatory text.
+        // Only the validated tool calls advance the turn. The final phase
+        // still requires the provider-enforced child result schema.
         if !message["content"].is_null()
-            && !message["content"]
-                .as_str()
-                .is_some_and(|text| text.trim().is_empty())
+            && !message["content"].as_str().is_some_and(|text| {
+                text.trim().is_empty() || request.final_format() == Some(FinalFormat::ChildResult)
+            })
         {
             return Err("openrouter_mixed_output");
         }
@@ -482,13 +485,17 @@ mod tests {
                     }
                     2 => {
                         assert!(body.get("response_format").is_none());
-                        json!({"id":"failed_tool","model":MODEL,"provider":PROVIDER,"choices":[{"error":{"message":"fixture"},"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"type":"function","id":"one","function":{"name":"get_test_value","arguments":"{}"}}]}}]})
+                        json!({"id":"review_tool","model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"I will read the candidate.","tool_calls":[{"type":"function","id":"one","function":{"name":"get_test_value","arguments":"{}"}}]}}]})
                     }
                     3 => {
                         assert!(body.get("response_format").is_none());
-                        response("drop this unstructured response")
+                        json!({"id":"failed_tool","model":MODEL,"provider":PROVIDER,"choices":[{"error":{"message":"fixture"},"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"type":"function","id":"one","function":{"name":"get_test_value","arguments":"{}"}}]}}]})
                     }
                     4 => {
+                        assert!(body.get("response_format").is_none());
+                        response("drop this unstructured response")
+                    }
+                    5 => {
                         assert_eq!(body["tool_choice"], "none");
                         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
                         assert!(!body.to_string().contains("drop this unstructured response"));
@@ -509,6 +516,13 @@ mod tests {
         .unwrap();
         let request = request(&route).with_final_format(Some(FinalFormat::ChildResult));
         let stop = Cancel::default();
+        let tool = route.generate(&request, &stop).unwrap();
+        assert_eq!(tool.calls()[0].name, "get_test_value");
+        assert_eq!(tool.items().len(), 1);
+        assert_eq!(
+            tool.items()[0].value().text_field("type"),
+            Ok("function_call")
+        );
         assert!(matches!(
             route.generate(&request, &stop),
             Err("openrouter_choice")
@@ -516,7 +530,7 @@ mod tests {
         let answer = route.generate(&request, &stop).unwrap();
         assert_eq!(answer.child_result().unwrap().summary, "Checked");
         assert_eq!(answer.context_usage(), Some((500000, 1000000)));
-        assert_eq!(calls.load(Ordering::Acquire), 5);
+        assert_eq!(calls.load(Ordering::Acquire), 6);
         assert_eq!(
             verify_probe(&response(r#"{"value":"wrong","value":"schema-enforced"}"#)),
             Err("openrouter_probe")
