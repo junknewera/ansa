@@ -698,7 +698,9 @@ def outer_eof_cleans_terminal(screen, root, cwd):
 
 
 def native_terminal_panel(screen, root, cwd):
-    local(screen, "/terminals")
+    screen.send("/term")
+    until(screen, lambda frame: "/terminals" in body(screen), "native terminal command completion")
+    screen.send(b"\t\r")
     until(screen, lambda frame: "Терминал агента" in frame and "Агент ещё не открыл терминал" in frame,
           "managed terminal panel in the normal Carbon entry point")
     session, = (root / "home/.ansa/sessions").glob("*/terminal-host-v1/terminal-v1.json")

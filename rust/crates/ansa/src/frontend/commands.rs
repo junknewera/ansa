@@ -6,7 +6,7 @@ pub struct Command {
     pub name: &'static str,
     pub description: &'static str,
 }
-pub const COMMANDS: &[Command] = &[
+const COMMANDS: &[Command] = &[
     Command {
         name: "/model",
         description: "Выбрать модель и уровень рассуждения",
@@ -26,10 +26,6 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "/files",
         description: "Файлы, diff и терминал проекта",
-    },
-    Command {
-        name: "/terminals",
-        description: "Посмотреть терминал агента",
     },
     Command {
         name: "/agents",
@@ -71,7 +67,15 @@ pub const COMMANDS: &[Command] = &[
         name: "/exit",
         description: "Завершить ANSA",
     },
+    Command {
+        name: "/terminals",
+        description: "Посмотреть терминал агента",
+    },
 ];
+
+pub fn available(native_terminals: bool) -> &'static [Command] {
+    &COMMANDS[..COMMANDS.len() - usize::from(!native_terminals)]
+}
 
 pub(super) fn agent_task(text: &str) -> Option<&str> {
     let (verb, rest) = text.trim().split_once(char::is_whitespace)?;
@@ -106,6 +110,10 @@ impl Completion {
             })
     }
     pub fn at(editor: &Editor) -> Option<Self> {
+        Self::at_with_commands(editor, available(false))
+    }
+
+    pub(crate) fn at_with_commands(editor: &Editor, commands: &[Command]) -> Option<Self> {
         if editor.pasting() || editor.overflow {
             return None;
         }
@@ -124,7 +132,7 @@ impl Completion {
         let end = text[editor.cursor..]
             .find(char::is_whitespace)
             .map_or(text.len(), |offset| editor.cursor + offset);
-        let matches: Vec<_> = COMMANDS
+        let matches: Vec<_> = commands
             .iter()
             .enumerate()
             .filter_map(|(i, command)| command.name.starts_with(query).then_some(i))
@@ -176,10 +184,14 @@ impl Completion {
     }
 }
 pub fn help(selected: usize) -> Popup {
+    help_with_commands(selected, available(false))
+}
+
+pub(crate) fn help_with_commands(selected: usize, commands: &[Command]) -> Popup {
     Popup {
         title: "Команды ANSA".into(),
         subtitle: "Ctrl+J новая строка · Ctrl+C очистить ввод или остановить шаг".into(),
-        items: COMMANDS
+        items: commands
             .iter()
             .map(|command| Choice {
                 label: command.name.into(),
@@ -234,5 +246,8 @@ mod tests {
         assert!(completion.apply(&mut input));
         assert_eq!(input.text().unwrap(), "/effort");
         assert!(!COMMANDS.iter().any(|command| command.name == "/run"));
+        let input = editor("/term");
+        assert!(Completion::at(&input).is_none());
+        assert!(Completion::at_with_commands(&input, available(true)).is_some());
     }
 }

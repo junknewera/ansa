@@ -21,6 +21,13 @@ impl Workbench {
             &mut self.slots[self.current].state.editor
         }
     }
+    pub(super) fn available_commands(&self) -> &'static [commands::Command] {
+        commands::available(
+            self.factory
+                .terminal_owner(&self.slots[self.current].id)
+                .is_some(),
+        )
+    }
     pub(super) fn refresh_completion(&mut self) {
         if self.menu.is_some()
             || self.focus != Focus::Chat
@@ -39,7 +46,7 @@ impl Workbench {
             return;
         }
         self.completion_closed = None;
-        let mut next = Completion::at(editor);
+        let mut next = Completion::at_with_commands(editor, self.available_commands());
         if let (Some(old), Some(next)) = (&self.completion, &mut next)
             && old.begin == next.begin
             && old.query == next.query

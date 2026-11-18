@@ -636,6 +636,7 @@ enum Menu {
     },
     Help {
         selected: usize,
+        entries: &'static [commands::Command],
     },
 }
 type PreviewRows = std::sync::Arc<Vec<super::super::markdown::Row>>;
@@ -1707,7 +1708,10 @@ impl Workbench {
                 (true, false)
             }
             "/help" | "/" | "?" => {
-                self.menu = Some(Menu::Help { selected: 0 });
+                self.menu = Some(Menu::Help {
+                    selected: 0,
+                    entries: self.available_commands(),
+                });
                 (true, false)
             }
             "/basic" if self.slots[self.current].kind == Kind::Btw => {
@@ -2522,7 +2526,7 @@ impl Workbench {
             Some(Menu::Efforts {
                 values, selected, ..
             }) => delta(selected, values.len()),
-            Some(Menu::Help { selected }) => delta(selected, commands::COMMANDS.len()),
+            Some(Menu::Help { selected, entries }) => delta(selected, entries.len()),
             None if self.focus == Focus::Inspector => match &mut self.panel {
                 Some(Panel::EditDiff { rows, offset, .. }) => delta(offset, rows.len()),
                 Some(Panel::Files(files)) if files.document.is_none() => delta(
@@ -2600,8 +2604,8 @@ impl Workbench {
                         self.apply_generation(model, effort.clone(), io);
                     }
                 }
-                Menu::Help { selected } => {
-                    if let Some(command) = commands::COMMANDS.get(selected) {
+                Menu::Help { selected, entries } => {
+                    if let Some(command) = entries.get(selected) {
                         let slot = &mut self.slots[self.current];
                         let end = slot.state.editor.bytes.len();
                         slot.state.editor.replace(0, end, command.name.as_bytes());
@@ -3023,7 +3027,7 @@ impl Workbench {
                 }
                 .into(),
             },
-            Menu::Help { selected } => commands::help(*selected),
+            Menu::Help { selected, entries } => commands::help_with_commands(*selected, entries),
         })
     }
     fn inspector(&self) -> Option<Inspector> {
@@ -3884,7 +3888,7 @@ pub async fn run_attached(
                                     if byte >= 32 && byte != 127 { continue; }
                                 }
                                 if work.focus == Focus::Chat && work.menu.is_none() && byte == b'?' && work.slots[work.current].state.editor.bytes.is_empty() {
-                                    work.menu = Some(Menu::Help { selected: 0 }); work.completion = None; continue;
+                                    work.menu = Some(Menu::Help { selected: 0, entries: work.available_commands() }); work.completion = None; continue;
                                 }
                                 if work.menu.is_some() && !matches!(byte, 27 | b'\r' | b'\n' | 9) { continue; }
                             }
