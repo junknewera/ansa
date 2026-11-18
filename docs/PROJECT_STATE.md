@@ -13,14 +13,19 @@
 shell, чтение после выхода, передачу видимого экрана, замену пути сокета,
 устаревший ввод после переподключения и завершение потомков.
 
-На [`bef3353`](https://github.com/junknewera/ansa/commit/bef33530ea1e73b82e787e5acd7b3c5cee3f6065)
-на X13s/NixOS/aarch64 прошли 43/43 этапа. Cargo и Nix Release - по 357 тестов
-и 9 doctests, AddressSanitizer - 357/357. Логи в
-`~/Workspace/pet/ansa-baselines/native-terminal-host-vlYqrX/final-bef3353/`.
+На [`32aa2be`](https://github.com/junknewera/ansa/commit/32aa2be5727dcd5eb836b8813857d793f80c875c)
+на X13s/NixOS/aarch64 прошли 43/43 этапа. Cargo и Nix Release - по 358 тестов
+и 9 doctests, AddressSanitizer - 358/358. В обоих профилях прошли
+24 сценария Carbon и 5 графических сценариев. Один клик по PNG не сработал
+в первом прогоне Release. Повтор на том же коммите и с теми же бинарниками
+прошёл. Оба прогона сохранены в
+`~/Workspace/pet/ansa-baselines/native-terminal-host-vlYqrX/final-32aa2be/`.
 
-В Carbon есть предпросмотр `--offline --native-terminals` и панель
-`/terminals [имя]`. После чистого выхода история терминала открывается
-по подтверждённой записи о завершении.
+В Carbon `--offline --native-terminals` включает панель `/terminals [имя]`.
+`TERMINAL_DEMO` запускает PTY через обычный путь вызова инструментов.
+После чистого выхода история терминала открывается по подтверждённой записи
+о завершении. Отдельный тест проверяет повторное подключение к тому же shell
+по сохранённому адресу и передачу только одобренного экрана.
 
 Plan и пишущие операции проверяют пересечение каталогов по открытым
 дескрипторам. Два Plan могут читать один проект. `run_command` сверяет
