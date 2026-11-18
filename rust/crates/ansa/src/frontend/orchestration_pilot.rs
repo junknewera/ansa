@@ -3,15 +3,15 @@ mod trace;
 
 use super::Result;
 #[cfg(test)]
-use crate::provider::openrouter::{PROVIDER, route};
+use crate::openrouter::{PROVIDER, route};
 use crate::{
     auth::{
         Cancel, Secret,
         manager::{Exchange, HttpRequest},
     },
+    openrouter::{self, API, CATALOG, ENDPOINT, KEY, MODEL, decode, verify_catalog},
     protocol::json::Json,
     provider::{
-        openrouter::{self, API, CATALOG, ENDPOINT, KEY, MODEL, decode, verify_catalog},
         request::{Binding, Request},
         responses::AdmittedResponse,
         structured::FinalFormat,

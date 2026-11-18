@@ -14,11 +14,9 @@ use crate::{
     },
     config::{agent_epoch, load_agent_settings},
     context::summary::summarizer,
+    openrouter::{MODEL as OPENROUTER_MODEL, OpenRouter},
     protocol::json::Json,
-    provider::{
-        openrouter::{MODEL as OPENROUTER_MODEL, OpenRouter},
-        request::{Binding, Epoch, Request},
-    },
+    provider::request::{Binding, Epoch, Request},
     runtime::{Generate, Lease, Limits, Options as RuntimeOptions, Runtime},
     tools::{
         files::local_tools_extended,
@@ -606,7 +604,7 @@ pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
     let cwd = cwd.to_str().ok_or("fixture_workspace")?;
     use crate::{
         auth::manager::HttpReply,
-        provider::openrouter::{CATALOG, ENDPOINT, PROVIDER},
+        openrouter::{CATALOG, ENDPOINT, PROVIDER},
         transport::http::Head,
     };
     let exchange: Exchange = Arc::new(move |request, _| {

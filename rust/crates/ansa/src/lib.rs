@@ -6,6 +6,8 @@ pub mod auth;
 pub mod config;
 pub mod context;
 pub mod frontend;
+#[path = "provider/openrouter.rs"]
+mod openrouter;
 pub mod orchestration;
 pub mod process;
 pub mod protocol;

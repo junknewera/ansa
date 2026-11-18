@@ -1,6 +1,9 @@
 //! Immutable provider binding, context epoch, and advertised tool snapshot.
 use super::structured::FinalFormat;
 use crate::protocol::json::Json;
+
+pub(crate) const OPENROUTER_MODEL: &str = "deepseek/deepseek-v4.1-flash-1017";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
     pub provider: String,
@@ -46,8 +49,8 @@ impl Request {
     ) -> Result<Self, &'static str> {
         let supported = binding.provider == "openai-siwc"
             || binding.provider == "openrouter"
-                && binding.requested_model == super::openrouter::MODEL
-                && binding.returned_model == super::openrouter::MODEL
+                && binding.requested_model == OPENROUTER_MODEL
+                && binding.returned_model == OPENROUTER_MODEL
             || cfg!(feature = "orchestration-pilot") && binding.provider == "openrouter-test";
         if !supported
             || binding.requested_model.is_empty()

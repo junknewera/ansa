@@ -20,7 +20,7 @@ use std::{
 
 type Result<T> = std::result::Result<T, &'static str>;
 
-pub(crate) const MODEL: &str = "deepseek/deepseek-v4.1-flash-1017";
+pub(crate) use crate::provider::request::OPENROUTER_MODEL as MODEL;
 pub(crate) const ENDPOINT: &str = "fireworks/us";
 pub(crate) const PROVIDER: &str = "Fireworks";
 pub(crate) const API: &str = "https://openrouter.ai/api/v1/chat/completions";

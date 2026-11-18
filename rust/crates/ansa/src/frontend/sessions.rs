@@ -3,8 +3,9 @@ use super::{Result, app, offline, workspace};
 use crate::{
     auth::{Cancel, manager::AuthManager},
     config::{AgentSettings, agent_epoch},
+    openrouter::OpenRouter,
     protocol::json::Json,
-    provider::{openrouter::OpenRouter, request::Request},
+    provider::request::Request,
     runtime::{DirectoryIdentity, ForkSeed, Generate, Lease, Limits, Options, Runtime},
     session::{
         catalog::{CatalogEntry, Selected},
