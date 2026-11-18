@@ -306,9 +306,6 @@ fn text(args: &[String]) -> Result<i32> {
         std::env::current_dir().map_err(|_| "file_access_failed")?,
         auth_path()?,
     )?;
-    if parsed.native_terminals && !parsed.offline {
-        return Err("native_terminal_offline_preview");
-    }
     if parsed.native_terminals
         && (parsed.prompt.is_some()
             || !std::io::stdin().is_terminal()
@@ -330,7 +327,7 @@ fn text(args: &[String]) -> Result<i32> {
     }
     if parsed.native_terminals && settings.directory.starts_with(&settings.cwd) {
         eprintln!(
-            "Рабочая папка содержит каталог данных ansa. Для предпросмотра терминалов укажи папку проекта через --cwd."
+            "Рабочая папка содержит каталог данных ansa. Для постоянного терминала укажи папку проекта через --cwd."
         );
         return Ok(2);
     }
@@ -355,7 +352,7 @@ fn text(args: &[String]) -> Result<i32> {
         bound.account = account;
         (generate, options)
     };
-    let epoch = agent_epoch(&settings)?;
+    let mut epoch = agent_epoch(&settings)?;
     if parsed.resume && !parsed.session.is_empty() {
         return Err("session_selection_conflict");
     }
@@ -391,6 +388,9 @@ fn text(args: &[String]) -> Result<i32> {
     let terminal = (parsed.native_terminals && !parsed.resume && parsed.session.is_empty())
         .then(|| factory.open_terminal_owner(&selected, false))
         .transpose()?;
+    if terminal.is_some() {
+        crate::terminal_host::tools::add_agent_instructions(&mut epoch);
+    }
     let tools = local_tools_extended(
         settings.clone(),
         epoch.clone(),

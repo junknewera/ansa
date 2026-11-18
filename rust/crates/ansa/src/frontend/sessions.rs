@@ -274,6 +274,9 @@ impl Factory {
                     .any(|descriptor| descriptor.name == "terminal_create")
             },
         );
+        if wants_terminals && !self.offline && !self.native_terminals {
+            return Err("native_terminal_opt_in_required");
+        }
         let terminal = wants_terminals
             .then(|| self.open_terminal_owner(&selected, restored.is_some()))
             .transpose()?;
@@ -324,6 +327,9 @@ impl Factory {
             .as_ref()
             .map(|r| r.epoch.clone())
             .unwrap_or(initial_epoch);
+        if base.is_none() && terminal.is_some() {
+            terminals::add_agent_instructions(&mut epoch);
+        }
         let mut bound = base
             .as_ref()
             .map(|r| r.binding.clone())

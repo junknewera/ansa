@@ -4,8 +4,10 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import termios
@@ -736,7 +738,65 @@ def native_terminal_panel(screen, root, cwd):
     local(resumed, "/exit")
     resumed.result = resumed.finish()
     assert resumed.result["exit"] == 0 and resumed.result["termios_restored"]
+    live_terminal_opt_in(screen, root, cwd)
     return "normal"
+
+
+def live_terminal_opt_in(screen, root, cwd):
+    home = root / "live-home"
+    auth = home / ".ansa/auth"
+    auth.mkdir(parents=True, mode=0o700)
+    (home / ".ansa").chmod(0o700)
+    identity = dict(version=1, host_id="synthetic-host", client_id="synthetic-client",
+                    subject="synthetic-subject")
+    credentials = dict(identity, scope="openid profile email offline_access resource.invoke chatgpt.tokens.use.direct",
+                       session="synthetic-session", expires_at=4102444800, earliest_refresh_at=0,
+                       refresh_pending=False, access_token="synthetic-access", refresh_token="synthetic-refresh",
+                       nonce="synthetic-nonce")
+    for filename, value in (("registration.json", identity), ("credentials.json", credentials)):
+        path = auth / filename
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        proxy = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        env = {key: proxy for key in ("http_proxy", "HTTP_PROXY", "https_proxy",
+                                     "HTTPS_PROXY", "all_proxy", "ALL_PROXY")}
+        env.update(no_proxy="", NO_PROXY="")
+        options = ["--cwd", str(cwd), "--auth-dir", str(auth)]
+        catalog = home / ".ansa/sessions"
+
+        def launch(label, arguments):
+            child = Pty(screen.child.args[0], root, home, cwd, "", True, size=(100, 32),
+                        argv=[*options, *arguments], extra_env=env)
+            child.vt = Terminal(100, 32)
+            screen.additional_screens.append((label, child))
+            return child
+
+        for enabled in (False, True):
+            before = set(catalog.iterdir()) if catalog.exists() else set()
+            child = launch(f"live-startup-{enabled}", ["--native-terminals"] if enabled else [])
+            until(child, lambda _: ready(child), "ordinary Carbon startup with synthetic auth")
+            local(child, "/exit")
+            child.result = child.finish()
+            assert child.result["exit"] == 0 and child.result["termios_restored"]
+            session, = set(catalog.iterdir()) - before
+            init, = session_cases.decode({p.name: p.read_bytes() for p in session.glob("part-*.log")})
+            assert init["kind"] == "init", "idle Carbon submitted work"
+            config = init["configuration"]
+            terminal_tools = {tool["name"] for tool in config["tools"]["descriptors"]
+                              if tool["name"].startswith("terminal_")}
+            assert ("terminal_create" in terminal_tools) if enabled else not terminal_tools
+            instructions = config["epoch"]["instructions"]
+            assert ("Call terminal_list first" in instructions) == enabled
+            if enabled:
+                assert "lifetime_seconds=1800 and idle_seconds=300" in instructions
+        child = launch("live-restore-without-opt-in", ["--session", session.name])
+        child.result = child.finish()
+        assert child.result["exit"] == 1 and b"native_terminal_opt_in_required" in child.raw
+        assert not select.select([listener], [], [], 0)[0], "provider connection during startup"
 
 
 def completion_and_help(screen, root, cwd):

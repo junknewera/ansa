@@ -10,7 +10,10 @@ use crate::{
     terminal_host::{
         FileJournal, Host, Lifecycle, OperationStatus,
         native::{MAX_READ, NativeBackend},
-        protocol::{Action, Binding, Effect, Id, Intent, Launch, MAX_INPUT, Size, Writer, sha256},
+        protocol::{
+            Action, Binding, Effect, Id, Intent, Launch, MAX_IDLE_SECONDS, MAX_INPUT,
+            MAX_LIFETIME_SECONDS, Size, Writer, sha256,
+        },
     },
     tools::{
         invocation::Invocation,
@@ -26,6 +29,27 @@ use std::{
 
 type Result<T> = std::result::Result<T, &'static str>;
 pub(crate) type Owner = Arc<Mutex<Host<FileJournal, NativeBackend>>>;
+
+pub(crate) fn add_agent_instructions(epoch: &mut crate::provider::request::Epoch) {
+    epoch.instructions = epoch.instructions.replacen(
+        "Tools are non-interactive; ",
+        "Use run_command for non-interactive commands when available. ",
+        1,
+    );
+    epoch.instructions.push_str(concat!(
+        "\n\nWhen the managed terminal tools are advertised, use them for shell environments, interactive ",
+        "programs, and connections that should stay open between messages. Call terminal_list first and reuse ",
+        "a suitable live terminal in this conversation. Use its current terminal ID and writer epoch. ",
+        "Run commands for that workflow in the same terminal, including after a follow-up from the user. ",
+        "A terminal_input receipt confirms byte delivery. Check the output to tell when the command finishes. ",
+        "Keep the terminal open across replies while the workflow needs that environment. Close it when the ",
+        "workflow is finished or the user asks to close it. Close an exited terminal before opening its ",
+        "replacement. Handle terminal operations through tools while the user stays in the conversation."
+    ));
+    epoch.instructions.push_str(&format!(
+        " For a shell kept across replies, use lifetime_seconds={MAX_LIFETIME_SECONDS} and idle_seconds={MAX_IDLE_SECONDS}. Both must be positive and idle_seconds may not exceed lifetime_seconds."
+    ));
+}
 
 pub(crate) fn open_for(
     settings: &crate::config::AgentSettings,

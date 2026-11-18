@@ -157,9 +157,7 @@ fn explanation(code: &str) -> &'static str {
         "terminal_workspace_quarantined" => "Сначала проверьте результат работы терминала",
         "terminal_worker_lost" => "Связь с терминалом потеряна",
         "native_terminal_requires_carbon" => "--native-terminals доступен в интерактивном Carbon",
-        "native_terminal_offline_preview" => {
-            "Предварительный режим терминалов запускается с --offline"
-        }
+        "native_terminal_opt_in_required" => "Открой этот разговор с --native-terminals",
         "cli_output_stalled" => "Приём вывода остановился; сообщение передано не полностью",
         "cli_output_interrupted" => "Передача вывода прервана пользователем",
         "cli_output" => "Не удалось завершить передачу вывода",

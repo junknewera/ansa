@@ -986,6 +986,23 @@ fn runtime_publishes_session_intent_before_compiled_terminal_calls() {
             move |request: &Request, _: &ansa::runtime::Cancel, _: ansa::runtime::PreviewSink| {
                 let index = step.fetch_add(1, Ordering::SeqCst);
                 let call = |index: usize, name: &str, arguments: Value| json!({"type":"function_call","id":format!("item_{index}"),"call_id":format!("call_{index}"),"namespace":"omh","name":name,"arguments":arguments.to_string(),"status":"completed"});
+                let message = |id: &str, text: &str| json!({"type":"message","id":id,"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]});
+                let receipt = || -> Result<Value, &'static str> {
+                    serde_json::from_str(request.input.last().unwrap().text_field("output")?)
+                        .map_err(|_| "terminal_fixture_receipt")
+                };
+                let wait_for = |name: &str| {
+                    let until = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        if let Ok(text) = fs::read_to_string(workspace.join(name))
+                            && !text.is_empty()
+                        {
+                            break text;
+                        }
+                        assert!(Instant::now() < until, "missing PTY result {name}");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                };
                 let items = match index {
                     0 => {
                         let launch = call(
@@ -1006,36 +1023,51 @@ fn runtime_publishes_session_intent_before_compiled_terminal_calls() {
                             vec![launch]
                         }
                     }
-                    1 => {
-                        let receipt: Value = serde_json::from_str(
-                            request.input.last().unwrap().text_field("output")?,
-                        )
-                        .unwrap();
-                        vec![call(
-                            1,
-                            "terminal_input",
-                            json!({"terminal":receipt["terminal"],"epoch":1,"encoding":"utf8","data":"printf fixture > marker\r"}),
-                        )]
-                    }
+                    1 => vec![call(
+                        1,
+                        "terminal_input",
+                        json!({"terminal":receipt()?["terminal"],"epoch":1,"encoding":"utf8","data":"mkdir -p saved; cd saved; export ANSA_FIXTURE=retained; printf '%s' \"$$\" > ../first_pid\r"}),
+                    )],
                     2 => {
-                        let receipt: Value = serde_json::from_str(
-                            request.input.last().unwrap().text_field("output")?,
-                        )
-                        .unwrap();
-                        let until = Instant::now() + Duration::from_secs(2);
-                        while !workspace.join("marker").exists() {
-                            assert!(Instant::now() < until, "tool wrote no PTY input");
-                            thread::sleep(Duration::from_millis(5));
-                        }
+                        wait_for("first_pid");
+                        vec![message("environment_ready", "Окружение готово")]
+                    }
+                    3 => {
+                        assert_eq!(
+                            request.input.last().unwrap().text_field("content")?,
+                            "Используй это окружение"
+                        );
+                        vec![call(3, "terminal_list", json!({}))]
+                    }
+                    4 => {
+                        let listing = receipt()?;
+                        let entries = listing["terminals"].as_array().unwrap();
+                        assert_eq!(entries.len(), 1);
+                        let terminal = &entries[0];
+                        assert_eq!(terminal["state"], "live");
                         vec![call(
-                            2,
-                            "terminal_close",
-                            json!({"terminal":receipt["terminal"],"epoch":1}),
+                            4,
+                            "terminal_input",
+                            json!({"terminal":terminal["terminal"],"epoch":terminal["epoch"],"encoding":"utf8","data":"printf '%s:%s:%s' \"$ANSA_FIXTURE\" \"$PWD\" \"$$\" > ../continued\r"}),
                         )]
                     }
-                    3 => vec![
-                        json!({"type":"message","id":"finished","role":"assistant","status":"completed","content":[{"type":"output_text","text":"PTY_FINISHED"}]}),
-                    ],
+                    5 => {
+                        assert_eq!(
+                            wait_for("continued"),
+                            format!(
+                                "retained:{}:{}",
+                                workspace.join("saved").display(),
+                                wait_for("first_pid")
+                            )
+                        );
+                        let receipt = receipt()?;
+                        vec![call(
+                            5,
+                            "terminal_close",
+                            json!({"terminal":receipt["terminal"],"epoch":receipt["epoch"]}),
+                        )]
+                    }
+                    6 => vec![message("finished", "PTY_FINISHED")],
                     _ => return Err("terminal_fixture_unexpected_generation"),
                 };
                 native::load(&Json::object(vec![
@@ -1097,34 +1129,42 @@ fn runtime_publishes_session_intent_before_compiled_terminal_calls() {
                 .unwrap();
                 let handle = runtime.handle();
                 handle.ready().await.unwrap();
-                handle
-                    .post(RuntimeCommand {
-                        schema_version: 1,
-                        session: handle.session().clone(),
-                        incarnation: handle.incarnation().clone(),
-                        command: "submit".into(),
-                        turn: "turn".into(),
-                        payload: CommandPayload::Submit(Submit {
-                            text: "Terminal fixture".into(),
-                            mode: AgentMode::Basic,
-                        }),
+                for (id, text) in [
+                    ("prepare", "Подготовь окружение"),
+                    ("reuse", "Используй это окружение"),
+                ]
+                .into_iter()
+                .take(if invalid_batch { 1 } else { 2 })
+                {
+                    handle
+                        .post(RuntimeCommand {
+                            schema_version: 1,
+                            session: handle.session().clone(),
+                            incarnation: handle.incarnation().clone(),
+                            command: id.into(),
+                            turn: id.into(),
+                            payload: CommandPayload::Submit(Submit {
+                                text: text.into(),
+                                mode: AgentMode::Basic,
+                            }),
+                        })
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(6), async {
+                        loop {
+                            match handle.next_event().await.expect("runtime event").payload {
+                                EventPayload::Done if !invalid_batch => break,
+                                EventPayload::FrontendSnapshot(s) if s.state == "paused" => {
+                                    assert!(invalid_batch, "unexpected pause {}", s.diagnostic);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
                     })
                     .await
                     .unwrap();
-                tokio::time::timeout(Duration::from_secs(6), async {
-                    while let Some(event) = handle.next_event().await {
-                        match event.payload {
-                            EventPayload::Done if !invalid_batch => break,
-                            EventPayload::FrontendSnapshot(s) if s.state == "paused" => {
-                                assert!(invalid_batch, "unexpected pause {}", s.diagnostic);
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                })
-                .await
-                .unwrap();
+                }
                 runtime.shutdown().await.unwrap();
             });
         assert_eq!(observed_intent.load(Ordering::SeqCst), !invalid_batch);
