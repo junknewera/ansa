@@ -201,6 +201,14 @@ impl Slot {
                     )
             })
     }
+    fn interruptible(&self) -> bool {
+        self.active()
+            || self
+                .state
+                .snapshot
+                .as_ref()
+                .is_some_and(|view| view.state == "paused")
+    }
     fn input_ready(&self) -> bool {
         self.ready
             && !self.ready_refresh
@@ -610,6 +618,7 @@ enum Menu {
     Sessions {
         entries: Vec<SessionSummary>,
         selected: usize,
+        resume_target: Option<RequestId>,
     },
     Models {
         models: Vec<(String, String, Vec<String>)>,
@@ -779,6 +788,7 @@ struct Workbench {
     editor_wait: Option<EditorWait>,
     modal_token: u64,
     modal_stop: Option<Cancel>,
+    exit_deadline: Option<Instant>,
     input_closed: bool,
     terminating: bool,
 }
@@ -887,6 +897,7 @@ impl Workbench {
             modal_token: 0,
             modal_stop: None,
             input_closed: false,
+            exit_deadline: None,
             terminating: false,
         };
         value.add(Slot::new(runtime, root_id, kind, parent, None, false));
@@ -917,6 +928,35 @@ impl Workbench {
     }
     fn report(&mut self, io: &Io, message: &str) {
         self.slots[self.current].state.report(io, message);
+    }
+    fn disarm_exit(&mut self) -> bool {
+        self.exit_deadline.take().is_some()
+    }
+    fn interrupt(&mut self, io: &Io, now: Instant) -> bool {
+        let slot = &mut self.slots[self.current];
+        if !slot.state.editor.bytes.is_empty()
+            || slot.state.editor.overflow
+            || slot.state.editor.pasting()
+            || slot.state.editor.escape_pending()
+        {
+            slot.state.editor.clear();
+            slot.state.input_history.reset();
+            self.completion = None;
+            self.completion_closed = None;
+            self.disarm_exit();
+        } else if self.menu.is_some() {
+            self.disarm_exit();
+            self.escape(io);
+        } else if slot.interruptible() {
+            self.disarm_exit();
+            self.cancel_current(io);
+        } else if self.exit_deadline.is_some_and(|deadline| now < deadline) {
+            self.disarm_exit();
+            return true;
+        } else {
+            self.exit_deadline = Some(now + Duration::from_secs(2));
+        }
+        false
     }
     fn cancel_current(&mut self, io: &Io) {
         let index = self.current;
@@ -954,6 +994,7 @@ impl Workbench {
         }
     }
     fn switch(&mut self, index: usize) {
+        self.disarm_exit();
         self.cancel_modal();
         self.cancel_editor_request();
         self.current = index;
@@ -1006,6 +1047,19 @@ impl Workbench {
         }
         if !self.can_job(io) {
             return false;
+        }
+        if kind == Kind::Main {
+            let source = self.slots[self.current].id.clone();
+            let factory = self.factory.clone();
+            self.jobs.spawn_blocking(move || Job::Created {
+                result: factory.create(Kind::Main, None),
+                source,
+                prompt: None,
+                auto_return: false,
+                foreground,
+                plan_only: false,
+            });
+            return true;
         }
         if kind == Kind::Console {
             if self.slots[self.current].active() {
@@ -1377,6 +1431,14 @@ impl Workbench {
             result: factory.summaries(&Cancel::default()),
         });
     }
+    fn resume_target(&self) -> Option<RequestId> {
+        self.slots[self.current]
+            .state
+            .snapshot
+            .as_ref()
+            .filter(|view| view.resume_available)
+            .and_then(|view| view.request.clone())
+    }
     fn open_models(&mut self, effort: bool, io: &Io) {
         if self.slots[self.current].kind == Kind::Console {
             self.report(io, "У командной панели нет модели");
@@ -1467,6 +1529,7 @@ impl Workbench {
             .split_once(char::is_whitespace)
             .map_or((text.trim(), ""), |(c, a)| (c, a.trim()));
         match command {
+            "/new" if argument.is_empty() => (self.create(Kind::Main, None, true, io), false),
             "/fork" => {
                 self.create(
                     Kind::Fork,
@@ -1508,7 +1571,7 @@ impl Workbench {
                 }
                 (true, false)
             }
-            "/sessions" => {
+            "/sessions" | "/resume" => {
                 if argument.is_empty() {
                     self.open_sessions(io);
                 } else {
@@ -1577,7 +1640,7 @@ impl Workbench {
                 } else if argument.is_empty()
                     && matches!(
                         command,
-                        "/basic" | "/plan" | "/status" | "/copy" | "/resume" | "/cancel" | "/exit"
+                        "/basic" | "/plan" | "/status" | "/copy" | "/cancel" | "/exit"
                     )
                 {
                     command
@@ -1968,6 +2031,7 @@ impl Workbench {
                             .filter(|s| matches!(s.entry.kind.as_str(), "main" | "fork"))
                             .collect(),
                         selected: 0,
+                        resume_target: self.resume_target(),
                     })
                 }
                 Err(code) => self.report(io, &format!("Не удалось прочитать сессии: {code}")),
@@ -2331,7 +2395,14 @@ impl Workbench {
                 self.set_theme(theme);
             }
             Some(Menu::Loading(_)) => {}
-            Some(Menu::Sessions { entries, selected }) => delta(selected, entries.len()),
+            Some(Menu::Sessions {
+                entries,
+                selected,
+                resume_target,
+            }) => delta(
+                selected,
+                entries.len() + usize::from(resume_target.is_some()),
+            ),
             Some(Menu::Models { models, selected }) => delta(selected, models.len()),
             Some(Menu::Efforts {
                 values, selected, ..
@@ -2369,7 +2440,11 @@ impl Workbench {
         }
     }
     fn enter(&mut self, io: &Io) -> Option<String> {
-        if self.completion.is_some() && self.menu.is_none() && self.focus == Focus::Chat {
+        if let Some(completion) = &self.completion
+            && self.menu.is_none()
+            && self.focus == Focus::Chat
+            && !completion.exact_command(&self.slots[self.current].state.editor)
+        {
             self.complete_command();
             return None;
         }
@@ -2377,8 +2452,23 @@ impl Workbench {
             match menu {
                 Menu::Themes(preview) => self.commit_theme(preview.current()),
                 Menu::Loading(title) => self.menu = Some(Menu::Loading(title)),
-                Menu::Sessions { entries, selected } => {
-                    if let Some(entry) = entries.get(selected) {
+                Menu::Sessions {
+                    entries,
+                    selected,
+                    resume_target,
+                } => {
+                    if let Some(target) = resume_target.as_ref().filter(|_| selected == 0) {
+                        if self.resume_target().as_ref() == Some(target) {
+                            let slot = &mut self.slots[self.current];
+                            slot.state.post(
+                                &slot.handle,
+                                CommandPayload::Resume(target.clone()),
+                                &mut slot.replies,
+                            );
+                        }
+                    } else if let Some(entry) =
+                        entries.get(selected - usize::from(resume_target.is_some()))
+                    {
                         self.resume(entry.entry.id.clone(), io);
                     }
                 }
@@ -2750,12 +2840,20 @@ impl Workbench {
                 footer: "Esc отменить".into(),
                 ..Popup::default()
             },
-            Menu::Sessions { entries, selected } => Popup {
+            Menu::Sessions {
+                entries,
+                selected,
+                resume_target,
+            } => Popup {
                 title: "Сессии проекта".into(),
                 subtitle: "Выбрать разговор".into(),
-                items: entries
+                items: resume_target
                     .iter()
-                    .map(|e| Choice {
+                    .map(|_| Choice {
+                        label: "Продолжить текущий запрос".into(),
+                        detail: String::new(),
+                    })
+                    .chain(entries.iter().map(|e| Choice {
                         label: e.title.clone().unwrap_or_else(|| "Новый разговор".into()),
                         detail: format!(
                             "{} · {}{}",
@@ -2769,7 +2867,7 @@ impl Workbench {
                                 .as_ref()
                                 .map_or(String::new(), |preview| format!(" · {preview}"))
                         ),
-                    })
+                    }))
                     .collect(),
                 selected: *selected,
                 footer: "Enter открыть · Esc назад".into(),
@@ -3004,7 +3102,11 @@ impl Workbench {
             if !seen.insert(id.clone()) {
                 break;
             }
-            breadcrumb.push(self.title(&id));
+            if let Some(title) = self.known_title(&id) {
+                breadcrumb.push(title);
+            } else if id == slot.id && slot.kind == Kind::Fork {
+                breadcrumb.push("Ветка".into());
+            }
             if let Some(ancestor) = self.slots.iter().find(|s| s.id == id) {
                 current = ancestor.parent.clone();
             } else if let Some(ancestor) =
@@ -3019,11 +3121,7 @@ impl Workbench {
         let snapshot = slot.state.snapshot.as_ref();
         let generation = snapshot.map(|s| &s.generation);
         Workspace {
-            breadcrumb: if breadcrumb.is_empty() {
-                self.title(&self.root_id)
-            } else {
-                breadcrumb.join(" / ")
-            },
+            breadcrumb: breadcrumb.join(" / "),
             model: if slot.kind == Kind::Console {
                 "Локальная консоль".into()
             } else {
@@ -3033,6 +3131,7 @@ impl Workbench {
                 .and_then(|g| g.effort.clone())
                 .unwrap_or_default(),
             activity: String::new(),
+            exit_confirmation: self.exit_deadline.is_some(),
             reading: !slot.state.follow_tail,
             new_events: snapshot.map_or(0, |s| {
                 s.transcript_size.saturating_sub(slot.state.reading_total)
@@ -3044,7 +3143,7 @@ impl Workbench {
                 .completion
                 .as_ref()
                 .filter(|_| self.menu.is_none() && self.focus == Focus::Chat)
-                .map(Completion::popup),
+                .map(|completion| completion.popup(completion.exact_command(&slot.state.editor))),
             animate: self.animation_enabled(),
             animation_frame: Self::animation_frame(),
         }
@@ -3463,7 +3562,10 @@ pub async fn run_attached(
                         if work.terminal_focused() { work.terminal_bytes(&[3], io); }
                         else if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); finished = true; work.terminating = true; terminating_since.get_or_insert(Instant::now()); } }
                         else if work.pending_editor.is_some() || work.editor_preparing { work.cancel_editor_request(); }
-                        else { work.cancel_current(io); }
+                        else if !finished {
+                            if work.input_closed { work.cancel_current(io); }
+                            else { finished |= work.interrupt(io, Instant::now()); }
+                        }
                     }
                     SIGTSTP => {
                         if work.terminal_focused() { work.terminal_bytes(&[26], io); }
@@ -3581,6 +3683,9 @@ pub async fn run_attached(
                     && parent.state.text(&text, &parent.handle, io, &mut parent.replies).0
                 { work.pending_results.insert(command_id(&parent.state), (child, request)); }
             }
+            if work.exit_deadline.is_some_and(|deadline| now >= deadline || work.slots[work.current].interruptible()) {
+                dirty |= work.disarm_exit();
+            }
             if work.input_editor().escape_pending() {
                 let at = escape_at.get_or_insert(now);
                 if now.duration_since(*at) >= Duration::from_millis(35) {
@@ -3604,6 +3709,7 @@ pub async fn run_attached(
                             continue;
                         }
                         for (position, &byte) in bytes[..count].iter().enumerate() {
+                            work.disarm_exit();
                             // Modal/read-only navigation never edits a draft.
                             if byte.is_ascii() && !work.input_editor().escape_pending() && !work.input_editor().pasting() {
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());
@@ -3703,6 +3809,7 @@ pub async fn run_attached(
                                     }
                                     Action::Complete => { if matches!(work.menu, Some(Menu::Help { .. })) { work.enter(io); } else { work.complete_command(); } }
                                     Action::Escape => work.escape(io),
+                                    Action::FocusNext if work.completion.is_some() && work.menu.is_none() && work.focus == Focus::Chat => work.complete_command(),
                                     Action::FocusNext | Action::FocusPrevious => if work.panel.is_some() { work.focus = if work.focus == Focus::Chat && work.displayed.as_ref().and_then(|frame| frame.inspector_bounds()).is_some_and(|(_, _, width, height)| width > 0 && height > 0) { Focus::Inspector } else { Focus::Chat }; },
                                     Action::Mouse(mouse) => work.mouse(mouse, io),
                                     Action::HistoryOlder | Action::HistoryNewer => work.navigate(action == Action::HistoryOlder),

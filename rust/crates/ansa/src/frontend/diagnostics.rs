@@ -88,7 +88,7 @@ mod tests {
             v.recovery_operation = recovery.map(Into::into);
             let status = format!(
                 "basic\n{}\n{}",
-                pause_notice(&v),
+                pause_notice(&v, false),
                 status_notice(&v, "/resume недоступен")
             );
             for cols in [20, 80] {
@@ -159,7 +159,7 @@ fn explanation(code: &str) -> &'static str {
         _ => "Ошибка выполнения",
     }
 }
-pub(crate) fn pause_notice(view: &Snapshot) -> String {
+pub(crate) fn pause_notice(view: &Snapshot, workspace: bool) -> String {
     if view.storage_failed {
         return format!("{}: Ошибка хранения сессии", safe_code(&view.diagnostic));
     }
@@ -171,7 +171,8 @@ pub(crate) fn pause_notice(view: &Snapshot) -> String {
     }
     let code = safe_code(&view.diagnostic);
     if view.resume_available && view.request.is_some() {
-        format!("{code} · /resume · Ctrl+C · {}", explanation(code))
+        let command = if workspace { "/sessions" } else { "/resume" };
+        format!("{code} · {command} · Ctrl+C · {}", explanation(code))
     } else {
         format!("{code}: {}", explanation(code))
     }
