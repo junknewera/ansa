@@ -160,10 +160,32 @@ pub fn replace_ui(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()
     directory.sync_all()
 }
 pub fn lock(directory: &File) -> io::Result<File> {
+    open_lock(directory, OFlags::empty())
+}
+
+pub fn lock_new(directory: &File) -> io::Result<File> {
+    open_lock(directory, OFlags::EXCL)
+}
+
+/// Release a checked mutable marker while its caller holds the owner lock.
+pub fn unlink(directory: &File, name: &str) -> io::Result<()> {
+    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") || name.contains('\0') {
+        return Err(io::Error::other("local_file_name"));
+    }
+    rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty())?;
+    directory.sync_all()
+}
+
+fn open_lock(directory: &File, extra: OFlags) -> io::Result<File> {
     let fd = rustix::fs::openat(
         directory,
         "worker.lock",
-        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        OFlags::RDWR
+            | OFlags::CREATE
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | extra,
         Mode::RUSR | Mode::WUSR,
     )?;
     let file = File::from(fd);

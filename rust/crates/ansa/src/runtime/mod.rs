@@ -127,5 +127,8 @@ pub(crate) fn valid_configuration(
     if tools.requires_journal() && options.directory.is_none() {
         return Err("durable_tools_require_session");
     }
+    if !tools.owner_matches(&session.0, options.directory.as_deref()) {
+        return Err("tool_owner_binding");
+    }
     Ok(())
 }

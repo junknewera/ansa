@@ -6,7 +6,10 @@ use crate::{
         request::{Advertisement, Descriptor},
     },
 };
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 pub type Validator = Arc<dyn Fn(&Json) -> bool + Send + Sync>;
 pub type Executor = Arc<dyn Fn(&Json) -> Outcome + Send + Sync>;
 pub type ContextExecutor =
@@ -82,6 +85,15 @@ pub struct Definition {
 pub struct Registry {
     definitions: Vec<Definition>,
     policies: Vec<Policy>,
+    owner: Option<BoundOwner>,
+}
+#[derive(Clone)]
+struct BoundOwner {
+    session: String,
+    directory: PathBuf,
+    signal_cancel: Arc<dyn Fn() + Send + Sync>,
+    plan_ready: Arc<dyn Fn() -> bool + Send + Sync>,
+    begin_turn: Arc<dyn Fn() + Send + Sync>,
 }
 /// Snapshot provenance stays immutable even if an Arc is uniquely owned.
 /// ```compile_fail,E0616
@@ -94,6 +106,7 @@ pub struct Snapshot {
     pub(crate) definitions: Vec<Definition>,
     advertisement: Advertisement,
     policies: Vec<Policy>,
+    owner: Option<BoundOwner>,
 }
 impl Default for Registry {
     fn default() -> Self {
@@ -106,7 +119,33 @@ impl Registry {
         Self {
             definitions: vec![],
             policies: vec![],
+            owner: None,
         }
+    }
+
+    pub(crate) fn bind_owner(
+        &mut self,
+        session: &str,
+        directory: &Path,
+        signal_cancel: Arc<dyn Fn() + Send + Sync>,
+        plan_ready: Arc<dyn Fn() -> bool + Send + Sync>,
+        begin_turn: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), &'static str> {
+        if !crate::provider::contracts::valid_id(session)
+            || !directory.is_absolute()
+            || ansa_linux::fs::normalize(directory) != directory
+            || self.owner.is_some()
+        {
+            return Err("tool_owner_binding");
+        }
+        self.owner = Some(BoundOwner {
+            session: session.to_owned(),
+            directory: directory.to_path_buf(),
+            signal_cancel,
+            plan_ready,
+            begin_turn,
+        });
+        Ok(())
     }
     pub fn register(&mut self, d: Definition) -> Result<(), &'static str> {
         self.register_with_policy(d, Policy::default())
@@ -184,6 +223,7 @@ impl Registry {
         Arc::new(Snapshot {
             definitions: self.definitions.clone(),
             policies: self.policies.clone(),
+            owner: self.owner.clone(),
             advertisement: Advertisement {
                 revision,
                 descriptors,
@@ -200,6 +240,7 @@ impl Snapshot {
             return None;
         }
         let mut registry = Registry::new();
+        registry.owner = self.owner.clone();
         for descriptor in &saved.descriptors {
             let index = self
                 .definitions
@@ -223,6 +264,7 @@ impl Snapshot {
     }
     pub fn read_only(&self) -> Arc<Self> {
         let mut registry = Registry::new();
+        registry.owner = self.owner.clone();
         for (definition, policy) in self.definitions.iter().zip(&self.policies) {
             if policy.read_only {
                 registry.definitions.push(definition.clone());
@@ -239,6 +281,28 @@ impl Snapshot {
     }
     pub fn advertisement(&self) -> &Advertisement {
         &self.advertisement
+    }
+
+    pub(crate) fn owner_matches(&self, session: &str, directory: Option<&Path>) -> bool {
+        self.owner.as_ref().is_none_or(|owner| {
+            owner.session == session && Some(owner.directory.as_path()) == directory
+        })
+    }
+
+    pub(crate) fn signal_cancel(&self) {
+        if let Some(owner) = &self.owner {
+            (owner.signal_cancel)();
+        }
+    }
+
+    pub(crate) fn plan_ready(&self) -> bool {
+        self.owner.as_ref().is_none_or(|owner| (owner.plan_ready)())
+    }
+
+    pub(crate) fn begin_turn(&self) {
+        if let Some(owner) = &self.owner {
+            (owner.begin_turn)();
+        }
     }
 
     pub(crate) fn definitions_match_advertisement(&self) -> bool {

@@ -1,6 +1,14 @@
 pub use rustix::process::{Pid, Signal};
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
+
+pub fn peer_credentials(socket: &std::os::unix::net::UnixStream) -> io::Result<(u32, u32)> {
+    let credentials = rustix::net::sockopt::socket_peercred(socket)?;
+    Ok((
+        credentials.uid.as_raw(),
+        credentials.pid.as_raw_nonzero().get() as u32,
+    ))
+}
 
 /// Abrupt termination at a synthetic durable crash boundary, without running
 /// atexit/sanitizer exit handlers. Normal runtime shutdown must join its owned
@@ -155,18 +163,55 @@ pub fn preflight(proc_root: &Path) -> io::Result<()> {
 }
 
 pub fn children(proc_root: &Path) -> io::Result<Vec<Pid>> {
+    read_children(proc_root, 4096, 4096)
+}
+
+pub fn children_with_limit(proc_root: &Path, limit: usize) -> io::Result<Vec<Pid>> {
+    if !(1..=4096).contains(&limit) {
+        return Err(io::Error::other("children_limit"));
+    }
+    read_children(proc_root, limit * 8, limit)
+}
+
+fn read_children(proc_root: &Path, byte_limit: usize, limit: usize) -> io::Result<Vec<Pid>> {
     let id = std::process::id().to_string();
-    let bytes = std::fs::read(proc_root.join(&id).join("task").join(&id).join("children"))?;
-    if bytes.len() > 4096 {
+    let mut bytes = Vec::new();
+    std::fs::File::open(proc_root.join(&id).join("task").join(&id).join("children"))?
+        .take((byte_limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > byte_limit {
         return Err(io::Error::other("children_limit"));
     }
     let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
-    text.split_whitespace()
+    let pids = text
+        .split_whitespace()
+        .take(limit + 1)
         .map(|part| {
             let value: u32 = part.parse().map_err(io::Error::other)?;
             Pid::from_raw(value as i32).ok_or_else(|| io::Error::other("child_pid"))
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()?;
+    if pids.len() > limit {
+        return Err(io::Error::other("children_limit"));
+    }
+    Ok(pids)
+}
+
+/// Tighten the inherited process ceiling for this fresh, unprivileged helper
+/// and the programs it starts. Linux accounts this limit per real UID.
+pub fn limit_processes(cap: u64) -> io::Result<()> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let prior = getrlimit(Resource::Nproc);
+    let maximum = prior.maximum.map_or(cap, |limit| cap.min(limit));
+    let current = prior.current.map_or(maximum, |limit| maximum.min(limit));
+    setrlimit(
+        Resource::Nproc,
+        Rlimit {
+            current: Some(current),
+            maximum: Some(maximum),
+        },
+    )?;
+    Ok(())
 }
 
 pub fn subreaper() -> io::Result<()> {

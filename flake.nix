@@ -23,7 +23,7 @@
           cargoLock.lockFile = ./rust/Cargo.lock;
           strictDeps = true;
           nativeBuildInputs = [ pkgs.python3 pkgs.makeWrapper ];
-          nativeCheckInputs = [ pkgs.gitMinimal pkgs.zsh ];
+          nativeCheckInputs = [ pkgs.gitMinimal pkgs.zsh pkgs.util-linux ];
           cargoBuildFlags = [ "--workspace" ];
           cargoTestFlags = [ "--workspace" ];
           doCheck = true;

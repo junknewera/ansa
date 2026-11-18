@@ -23,7 +23,7 @@ use std::{
     cell::Cell,
     fs::File,
     io::{self, Read},
-    os::unix::process::CommandExt,
+    os::{fd::AsRawFd, unix::process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
@@ -48,7 +48,16 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    pub fn spawn(mut command: Command, rows: u16, cols: u16) -> io::Result<Self> {
+    pub fn spawn(command: Command, rows: u16, cols: u16) -> io::Result<Self> {
+        Self::spawn_in(command, rows, cols, None)
+    }
+
+    pub fn spawn_in(
+        mut command: Command,
+        rows: u16,
+        cols: u16,
+        directory: Option<&File>,
+    ) -> io::Result<Self> {
         require_waitable_sigchld()?;
         if rows == 0 || cols == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "pty_size"));
@@ -72,6 +81,7 @@ impl PtySession {
         command.stdout(Stdio::from(File::from(slave.try_clone()?)));
         command.stderr(Stdio::from(File::from(slave)));
         let parent = std::process::id() as libc::pid_t;
+        let directory = directory.map(AsRawFd::as_raw_fd);
         // SAFETY: initialized plain C data are prepared before fork. The child
         // callback captures only these values and integers. It calls only
         // async-signal-safe syscalls, does not allocate, lock, invoke handlers
@@ -79,6 +89,7 @@ impl PtySession {
         // descriptors 0..2 by Command. TIOCSCTTY therefore targets our slave,
         // never the outer tty. Error construction uses only errno integers.
         // UID/capability/NNP/close_range protections match managed::spawn.
+        // A borrowed directory FD remains open until synchronous spawn returns.
         let (mut action, mut empty): (libc::sigaction, libc::sigset_t) =
             unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
         unsafe {
@@ -107,6 +118,11 @@ impl PtySession {
                     return Err(io::Error::from_raw_os_error(libc::ESRCH));
                 }
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(directory) = directory
+                    && libc::fchdir(directory) != 0
+                {
                     return Err(io::Error::last_os_error());
                 }
                 let header = [0x2008_0522_u32, 0];
@@ -165,6 +181,21 @@ impl PtySession {
         Ok(())
     }
 
+    /// Ask the kernel to signal the slave's current foreground process group.
+    /// Success reports ioctl admission, not the termination of a foreground job.
+    pub fn interrupt_foreground(&self) -> io::Result<()> {
+        if self.wait_owned()? {
+            return Err(io::Error::other("pty_shell_exited"));
+        }
+        rustix::termios::tcgetpgrp(&self.master)?;
+        // SAFETY: this is an owned PTY master. TIOCSIG takes a scalar signal,
+        // not a pointer, and resolves the foreground group through this PTY.
+        if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn foreground_is_shell(&self) -> bool {
         self.wait_owned().is_ok()
             && rustix::termios::tcgetpgrp(&self.master).ok() == Some(self.leader)
@@ -182,6 +213,10 @@ impl PtySession {
             return Ok(true);
         }
         self.wait_owned()
+    }
+
+    pub fn exit_status(&self) -> Option<ExitStatus> {
+        self.reaped
     }
     fn wait_owned(&self) -> io::Result<bool> {
         if self.ownership_unknown.get() {

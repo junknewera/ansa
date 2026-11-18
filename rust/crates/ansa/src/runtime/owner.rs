@@ -448,6 +448,7 @@ impl Owner {
         };
         self.gate.cancel();
         self.turn_stop.cancel();
+        self.tools.signal_cancel();
         self.finish_preview("discarded", false);
         if self.phase != "cancelled" {
             self.phase = "paused".into();
@@ -651,6 +652,7 @@ impl Owner {
         self.gate.cancel();
         self.drain_started();
         self.turn_stop.cancel();
+        self.tools.signal_cancel();
         self.finish_preview("discarded", false);
         self.cancelling = Some(command);
         self.phase = "cancelled".into();
@@ -971,9 +973,16 @@ impl Owner {
             );
             return Ok(());
         }
+        if matches!(&command.payload, CommandPayload::Submit(submitted) if submitted.mode == AgentMode::Plan)
+            && !self.tools.plan_ready()
+        {
+            self.reject(&command, "terminal_workspace_busy");
+            return Ok(());
+        }
         let CommandPayload::Submit(submitted) = command.payload else {
             return Err("submit_contract");
         };
+        self.tools.begin_turn();
         let request_number = self.state.next_request + 1;
         let request = RequestId(format!("request_{request_number}"));
         let run = format!("{}_{}", self.incarnation.0, request.0);
