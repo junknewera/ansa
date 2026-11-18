@@ -162,6 +162,7 @@ impl Pilot {
         key: Secret,
         exchange: Exchange,
         budget: Budget,
+        allow_unlimited_key: bool,
         stop: &Cancel,
     ) -> Result<Arc<Self>> {
         let meter = Self {
@@ -173,7 +174,7 @@ impl Pilot {
         let catalog = meter.exchange("GET", CATALOG, None, stop)?;
         verify_catalog(&catalog)?;
         let credits = meter.exchange("GET", KEY, None, stop)?;
-        verify_credit_limit(&credits)?;
+        verify_credit_limit(&credits, allow_unlimited_key)?;
         // The successful scenario needs a schema probe, plan, tool+final for
         // each child, and a parent summary.
         if CALLS - meter.requests()? < 7 {
@@ -298,12 +299,13 @@ fn verify_catalog(response: &Value) -> Result<()> {
     Ok(())
 }
 
-fn verify_credit_limit(response: &Value) -> Result<()> {
+fn verify_credit_limit(response: &Value, allow_unlimited_key: bool) -> Result<()> {
     let data = response.get("data").ok_or("pilot_key_limit")?;
-    let cap = data
-        .get("limit")
-        .and_then(Value::as_f64)
-        .ok_or("pilot_key_limit")?;
+    let limit = data.get("limit").ok_or("pilot_key_limit")?;
+    if allow_unlimited_key && limit.is_null() {
+        return Ok(());
+    }
+    let cap = limit.as_f64().ok_or("pilot_key_limit")?;
     let balance = data
         .get("limit_remaining")
         .and_then(Value::as_f64)
@@ -437,10 +439,14 @@ fn decode(request: &Request, response: &Value) -> Result<AdmittedResponse> {
 }
 
 /// Run the approved scenario on a newly created synthetic repository. The
-/// launcher supplies the capped test key on a private pipe.
+/// launcher supplies the test key on a private pipe. An unlimited key requires
+/// explicit opt-in for this run.
 pub fn run() -> Result<()> {
     use std::io::{IsTerminal, Read};
-    let mut arguments = std::env::args_os().skip(1);
+    let mut arguments = std::env::args_os().skip(1).peekable();
+    let allow_unlimited_key = arguments
+        .next_if(|argument| argument == "--allow-unlimited-key")
+        .is_some();
     let ledger = PathBuf::from(arguments.next().ok_or("pilot_budget_path")?);
     let prior = arguments
         .next()
@@ -471,6 +477,7 @@ pub fn run() -> Result<()> {
         Secret::new(key.into()),
         Arc::new(crate::transport::client::pilot_exchange),
         Budget::open(&ledger, prior)?,
+        allow_unlimited_key,
         &stop,
     )?;
     drop(token);
@@ -684,20 +691,32 @@ mod tests {
         assert_eq!(verify_catalog(&catalog), Ok(()));
         catalog["data"]["endpoints"][0]["tag"] = json!("fireworks");
         assert_eq!(verify_catalog(&catalog), Err("pilot_catalog_endpoint"));
-        for credit in [json!(null), json!(1.01), json!(0)] {
-            assert!(
-                verify_credit_limit(&json!({"data":{"limit":credit,"limit_remaining":1}})).is_err()
-            );
+        let unlimited = json!({"data":{"limit":null,"limit_remaining":null}});
+        assert_eq!(
+            verify_credit_limit(&unlimited, false),
+            Err("pilot_key_limit")
+        );
+        assert_eq!(verify_credit_limit(&unlimited, true), Ok(()));
+        for invalid in [json!(1.01), json!(0), json!("unlimited")] {
+            let credits = json!({"data":{"limit":invalid,"limit_remaining":1}});
+            assert_eq!(verify_credit_limit(&credits, false), Err("pilot_key_limit"));
+            assert_eq!(verify_credit_limit(&credits, true), Err("pilot_key_limit"));
         }
         assert_eq!(
+            verify_credit_limit(&json!({"data":{}}), true),
+            Err("pilot_key_limit")
+        );
+        assert_eq!(
             verify_credit_limit(
-                &json!({"data":{"limit":1,"limit_remaining":0.75,"limit_reset":null}})
+                &json!({"data":{"limit":1,"limit_remaining":0.75,"limit_reset":null}}),
+                false,
             ),
             Ok(())
         );
         assert!(
             verify_credit_limit(
-                &json!({"data":{"limit":1,"limit_remaining":0.75,"limit_reset":"daily"}})
+                &json!({"data":{"limit":1,"limit_remaining":0.75,"limit_reset":"daily"}}),
+                false,
             )
             .is_err()
         );
@@ -783,7 +802,7 @@ mod tests {
                     })));
                 }
                 (1, "GET", KEY) if request.bearer.is_some() => {
-                    return Ok(reply(json!({"data":{"limit":1,"limit_remaining":1}})));
+                    return Ok(reply(json!({"data":{"limit":null,"limit_remaining":null}})));
                 }
                 (2..=8, "POST", API) if request.bearer.is_some() => (),
                 _ => return Err("unexpected_pilot_request"),
@@ -848,6 +867,7 @@ mod tests {
             Secret::new("dummy".into()),
             exchange,
             Budget::open(&ledger, Some(3)).unwrap(),
+            true,
             &stop,
         )
         .unwrap();
