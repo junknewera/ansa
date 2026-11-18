@@ -10,6 +10,7 @@ use crate::provider::replay::Effects;
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq)]
+        #[cfg_attr(test, derive(serde::Serialize, serde::Deserialize), serde(transparent))]
         pub struct $name(pub String);
         impl From<&str> for $name {
             fn from(value: &str) -> Self {

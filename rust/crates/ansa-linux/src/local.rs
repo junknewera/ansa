@@ -163,6 +163,15 @@ pub fn replace_ui(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()
 pub fn lock(directory: &File) -> io::Result<File> {
     open_lock(
         directory,
+        OFlags::CREATE,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+}
+
+/// Reacquire an already initialized store without creating any lock file.
+pub fn lock_existing(directory: &File) -> io::Result<File> {
+    open_lock(
+        directory,
         OFlags::empty(),
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
@@ -171,7 +180,7 @@ pub fn lock(directory: &File) -> io::Result<File> {
 pub fn lock_shared(directory: &File) -> io::Result<File> {
     open_lock(
         directory,
-        OFlags::empty(),
+        OFlags::CREATE,
         rustix::fs::FlockOperation::NonBlockingLockShared,
     )
 }
@@ -179,7 +188,7 @@ pub fn lock_shared(directory: &File) -> io::Result<File> {
 pub fn lock_new(directory: &File) -> io::Result<File> {
     open_lock(
         directory,
-        OFlags::EXCL,
+        OFlags::CREATE | OFlags::EXCL,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
 }
@@ -440,7 +449,7 @@ fn workspace_presence(directory: &File, writer: bool) -> io::Result<File> {
         match open_named_lock(
             directory,
             "workspace-admission.lock",
-            OFlags::empty(),
+            OFlags::CREATE,
             NonBlockingLockExclusive,
         ) {
             Err(error)
@@ -451,8 +460,8 @@ fn workspace_presence(directory: &File, writer: bool) -> io::Result<File> {
             result => break result?,
         }
     };
-    let _opposite = open_named_lock(directory, other, OFlags::empty(), NonBlockingLockExclusive)?;
-    open_named_lock(directory, own, OFlags::empty(), NonBlockingLockShared)
+    let _opposite = open_named_lock(directory, other, OFlags::CREATE, NonBlockingLockExclusive)?;
+    open_named_lock(directory, own, OFlags::CREATE, NonBlockingLockShared)
 }
 
 /// Release a checked mutable marker while its caller holds the owner lock.
@@ -481,12 +490,7 @@ fn open_named_lock(
     let fd = rustix::fs::openat(
         directory,
         name,
-        OFlags::RDWR
-            | OFlags::CREATE
-            | OFlags::CLOEXEC
-            | OFlags::NOFOLLOW
-            | OFlags::NONBLOCK
-            | extra,
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | extra,
         Mode::RUSR | Mode::WUSR,
     )?;
     let file = File::from(fd);

@@ -14,3 +14,7 @@ pub mod session;
 pub mod terminal_host;
 pub mod tools;
 pub mod transport;
+
+// O1 exercises orchestration offline before it is wired to native sessions.
+#[cfg(test)]
+mod orchestration;
