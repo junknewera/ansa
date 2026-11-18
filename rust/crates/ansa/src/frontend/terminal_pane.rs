@@ -543,7 +543,7 @@ fn attributes(cell: &vt100::Cell) -> String {
 
 /// All terminal strings are discarded before reaching the VT parser. Only our
 /// exact prompt marker is consumed; even an unterminated OSC/DCS stays bounded.
-struct EscapeFilter {
+pub(crate) struct EscapeFilter {
     state: FilterState,
     osc: Vec<u8>,
     escape: Vec<u8>,
@@ -559,7 +559,7 @@ enum FilterState {
     String { osc: bool, escaped: bool },
 }
 impl EscapeFilter {
-    fn new(marker: Vec<u8>) -> Self {
+    pub(crate) fn new(marker: Vec<u8>) -> Self {
         Self {
             state: FilterState::Ground,
             osc: Vec::new(),
@@ -569,7 +569,11 @@ impl EscapeFilter {
             prompt: None,
         }
     }
-    fn process(&mut self, bytes: &[u8], parser: &mut vt100::Parser<Replies>) {
+    pub(crate) fn process(
+        &mut self,
+        bytes: &[u8],
+        parser: &mut vt100::Parser<impl vt100::Callbacks>,
+    ) {
         for &byte in bytes {
             match self.state {
                 FilterState::Ground if byte == 0x1b => self.start_escape(),

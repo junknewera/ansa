@@ -14,8 +14,12 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    if let Some(result) = ansa::process::runner::private_entry(&args) {
-        return if result.is_ok() {
+    if let Some(ok) = ansa::terminal_host::native::private_entry(&args)
+        .map(|result| result.is_ok())
+        .or_else(|| ansa::terminal_host::daemon::private_entry(&args).map(|result| result.is_ok()))
+        .or_else(|| ansa::process::runner::private_entry(&args).map(|result| result.is_ok()))
+    {
+        return if ok {
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::from(125)

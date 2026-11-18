@@ -14,6 +14,7 @@ pub struct Options {
     pub prompt: Option<String>,
     pub workspace: Option<PathBuf>,
     pub workspace_editor: bool,
+    pub native_terminals: bool,
 }
 impl Options {
     pub fn parse(args: &[String], cwd: PathBuf, auth: PathBuf) -> super::Result<Self> {
@@ -29,6 +30,7 @@ impl Options {
             prompt: None,
             workspace: None,
             workspace_editor: false,
+            native_terminals: false,
         };
         let mut seen = BTreeSet::new();
         let mut index = 0;
@@ -49,6 +51,7 @@ impl Options {
                 "--continue" => value.resume = true,
                 "--print-config" => value.print_config = true,
                 "--workspace-editor" => value.workspace_editor = true,
+                "--native-terminals" => value.native_terminals = true,
                 _ => {
                     let next = args.get(index).ok_or("cli_option_value")?;
                     index += 1;

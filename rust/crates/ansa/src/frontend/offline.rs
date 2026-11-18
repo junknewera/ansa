@@ -38,6 +38,9 @@ pub fn generate(request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
     if stop.cancelled() {
         return Err("offline_cancelled");
     }
+    if let Some(response) = terminal_fixture(request)? {
+        return Ok(response);
+    }
     let last = request.input.last();
     let (id, items) = if !last
         .is_some_and(|v| v.has("type") && v.text_field("type") == Ok("function_call_output"))
@@ -100,6 +103,87 @@ pub fn generate(request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
         ("model", s(&request.binding.returned_model)),
         ("items", Json::array(items)?),
     ]))
+}
+
+fn terminal_fixture(request: &Request) -> Result<Option<AdmittedResponse>> {
+    if !request
+        .tools
+        .descriptors
+        .iter()
+        .any(|tool| tool.name == "terminal_create")
+    {
+        return Ok(None);
+    }
+    let Some(last) = request.input.last() else {
+        return Ok(None);
+    };
+    let (id, item) = if last.text_field("role") == Ok("user")
+        && last.text_field("content") == Ok("TERMINAL_DEMO")
+    {
+        let hash = sha256(Json::array(request.input.clone())?.dump().as_bytes());
+        let suffix = &hash[..16];
+        let arguments = serde_json::json!({
+            "label": "Демо-терминал",
+            "cwd": ".",
+            "argv": ["sh", "-c", "printf 'ANSA_%s\\n' TERMINAL_READY; exec sh -i"],
+            "rows": 24,
+            "columns": 80,
+            "lifetime_seconds": 60,
+            "idle_seconds": 45,
+        });
+        (
+            format!("fixture_terminal_open_{suffix}"),
+            obj(vec![
+                ("type", s("function_call")),
+                ("id", s(&format!("fixture_terminal_item_{suffix}"))),
+                ("call_id", s(&format!("fixture_terminal_call_{suffix}"))),
+                ("namespace", s("omh")),
+                ("name", s("terminal_create")),
+                ("arguments", s(&arguments.to_string())),
+                ("status", s("completed")),
+            ]),
+        )
+    } else if last.text_field("type") == Ok("function_call_output")
+        && let Some(suffix) = last
+            .text_field("call_id")?
+            .strip_prefix("fixture_terminal_call_")
+    {
+        let output = Json::parse(last.text_field("output")?)?;
+        if output
+            .field("receipt")?
+            .field("effect")?
+            .text_field("state")?
+            != "applied"
+        {
+            return Err("fixture_terminal_create");
+        }
+        let part = obj(vec![
+            ("type", s("output_text")),
+            (
+                "text",
+                s("Демо-терминал открыт. Экран доступен через /terminals."),
+            ),
+        ]);
+        (
+            format!("fixture_terminal_done_{suffix}"),
+            obj(vec![
+                ("type", s("message")),
+                ("id", s(&format!("fixture_terminal_message_{suffix}"))),
+                ("role", s("assistant")),
+                ("status", s("completed")),
+                ("content", Json::array(vec![part])?),
+            ]),
+        )
+    } else {
+        return Ok(None);
+    };
+    native::load(&obj(vec![
+        ("request", request.save()?),
+        ("id", s(&id)),
+        ("model", s(&request.binding.returned_model)),
+        ("items", Json::array(vec![item])?),
+    ]))
+    .map(Some)
 }
 pub fn compact_retained(
     request: &Request,

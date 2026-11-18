@@ -153,7 +153,15 @@ pub(crate) struct AuthJob {
     pub stop: Cancel,
     pub task: AuthTask,
 }
+pub(crate) enum PlanTarget {
+    Submit(RuntimeCommand),
+    Resume(CommandId),
+}
 pub(crate) enum Completion {
+    Plan {
+        target: PlanTarget,
+        result: Result<Box<dyn Send>>,
+    },
     Stored(Stored),
     Provider {
         identity: Identity,
@@ -179,6 +187,7 @@ pub(crate) struct Workers {
     pub tool: Option<blocking::SyncSender<ToolJob>>,
     pub auth: Option<blocking::SyncSender<AuthJob>>,
     pub release: Option<blocking::SyncSender<Identity>>,
+    pub plan: Option<blocking::SyncSender<PlanTarget>>,
     joins: Vec<JoinHandle<()>>,
 }
 fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -244,8 +253,30 @@ impl Workers {
             tool: None,
             auth: None,
             release: None,
+            plan: None,
             joins: vec![],
         };
+        if let Some(check) = options.plan_guard.clone() {
+            let (sender, receiver) = blocking::sync_channel::<PlanTarget>(1);
+            workers.plan = Some(sender);
+            let output = done.clone();
+            workers.joins.push(
+                thread::Builder::new()
+                    .name("ansa-plan-workspace".into())
+                    .spawn(move || {
+                        while let Ok(target) = receiver.recv() {
+                            let result = guarded(|| check());
+                            if output
+                                .blocking_send(Completion::Plan { target, result })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .map_err(|_| "plan_worker")?,
+            );
+        }
         let (sender, receiver) = blocking::sync_channel::<StoreJob>(1);
         workers.store = Some(sender);
         let channel = done.clone();
@@ -666,6 +697,7 @@ impl Drop for Workers {
         self.tool.take();
         self.auth.take();
         self.release.take();
+        self.plan.take();
         for join in self.joins.drain(..) {
             let _ = join.join();
         }

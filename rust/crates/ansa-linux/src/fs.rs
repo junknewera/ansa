@@ -90,6 +90,25 @@ pub fn regular_single(file: &File) -> io::Result<bool> {
     let meta = file.metadata()?;
     Ok(meta.is_file() && meta.nlink() == 1)
 }
+
+/// Traverse workspace-relative directories from a pinned descriptor.
+pub fn open_relative_directory(directory: &File, path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    let mut current = directory.try_clone()?;
+    for part in path.components() {
+        let Component::Normal(name) = part else {
+            return Err(io::Error::other("workspace_relative_path"));
+        };
+        current = rustix::fs::openat(
+            &current,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into();
+    }
+    Ok(current)
+}
 pub fn create_private(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     if !path.is_absolute() {
@@ -115,6 +134,31 @@ pub fn create_private(path: &Path) -> io::Result<()> {
     )?
     .sync_all()?;
     private_directory(path).map(|_| ())
+}
+
+/// Reserve a new private leaf. An existing directory is never a fresh store.
+pub fn create_private_leaf(path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    if !path.is_absolute() || normalize(path) != path {
+        return Err(io::Error::other("absolute_normalized_path_required"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("directory_parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("directory_name"))?;
+    let directory = open_nofollow(parent, OFlags::RDONLY | OFlags::DIRECTORY)?;
+    rustix::fs::mkdirat(&directory, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+    let child = rustix::fs::openat(
+        &directory,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let child = checked_private_directory(child.into())?;
+    directory.sync_all()?;
+    Ok(child)
 }
 /// Bytewise replacement agrees with legacy v1, including incomplete UTF-8 tails.
 pub fn utf8_text(bytes: &[u8]) -> String {
@@ -169,7 +213,10 @@ pub fn private_directory(path: &Path) -> io::Result<File> {
             _ => return Err(io::Error::other("private_directory_component")),
         }
     }
-    let file = File::from(fd);
+    checked_private_directory(File::from(fd))
+}
+
+fn checked_private_directory(file: File) -> io::Result<File> {
     let meta = file.metadata()?;
     if meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
         return Err(io::Error::other("private_directory_permissions"));

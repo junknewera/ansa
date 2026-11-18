@@ -107,6 +107,19 @@ impl Snapshot {
             OFlags::RDONLY | OFlags::DIRECTORY,
         )
         .map_err(|_| "file_access_failed")?;
+        Self::open_named(directory, name)
+    }
+
+    pub fn open_in(path: &Path, directory: &File) -> Result<Self, &'static str> {
+        if !path.is_absolute() || crate::fs::protected_path(path) {
+            return Err("protected_file");
+        }
+        let name = path.file_name().ok_or("file_path")?.to_os_string();
+        let directory = directory.try_clone().map_err(|_| "file_access_failed")?;
+        Self::open_named(directory, name)
+    }
+
+    fn open_named(directory: File, name: OsString) -> Result<Self, &'static str> {
         let existing = read_current(&directory, &name)?;
         Ok(Self {
             directory,

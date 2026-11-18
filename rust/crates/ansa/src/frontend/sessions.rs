@@ -10,9 +10,14 @@ use crate::{
         catalog::{CatalogEntry, Selected},
         journal_v1::Journal,
     },
-    tools::files::local_tools_with_editor,
+    terminal_host::tools as terminals,
+    tools::files::local_tools_extended,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 const CONSOLE_ACCOUNT: &str = "ansa-local-console";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +50,8 @@ pub struct Factory {
     account: String,
     auth: Option<Arc<AuthManager>>,
     editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
+    native_terminals: bool,
+    terminal_owners: Arc<Mutex<BTreeMap<String, terminals::Owner>>>,
 }
 pub struct Created {
     pub runtime: Runtime,
@@ -67,7 +74,58 @@ impl Factory {
             account,
             auth,
             editor: None,
+            native_terminals: false,
+            terminal_owners: Arc::default(),
         }
+    }
+    pub fn with_native_terminals(mut self, enabled: bool) -> Self {
+        self.native_terminals = enabled;
+        self
+    }
+
+    pub(crate) fn open_terminal_owner(
+        &self,
+        selected: &Selected,
+        restoring: bool,
+    ) -> Result<terminals::Owner> {
+        terminals::open_for(&self.settings, &selected.id, &selected.directory, restoring)
+    }
+
+    pub(crate) fn retain_terminal_owner(
+        &self,
+        id: &str,
+        owner: Option<terminals::Owner>,
+    ) -> Result<()> {
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        self.terminal_owners
+            .lock()
+            .map_err(|_| "terminal_owner_unavailable")?
+            .insert(id.to_owned(), owner);
+        Ok(())
+    }
+
+    pub(crate) fn terminal_owner(&self, id: &str) -> Option<terminals::Owner> {
+        self.terminal_owners.lock().ok()?.get(id).cloned()
+    }
+
+    pub(crate) fn has_terminal_owners(&self) -> bool {
+        self.terminal_owners
+            .lock()
+            .map_or(true, |owners| !owners.is_empty())
+    }
+
+    pub(crate) fn close_terminals(&self) -> bool {
+        let owners = match self.terminal_owners.lock() {
+            Ok(mut owners) => std::mem::take(&mut *owners),
+            Err(_) => return false,
+        };
+        let mut known = true;
+        for owner in owners.into_values() {
+            known &= terminals::close(&owner);
+        }
+        known
     }
     pub fn with_editor(
         mut self,
@@ -206,7 +264,23 @@ impl Factory {
         {
             return Err("session_configuration_mismatch");
         }
-        let tools = local_tools_with_editor(
+        let wants_terminals = source_configuration.as_ref().map_or(
+            self.native_terminals && kind == Kind::Main,
+            |source| {
+                source
+                    .tools
+                    .descriptors
+                    .iter()
+                    .any(|descriptor| descriptor.name == "terminal_create")
+            },
+        );
+        if wants_terminals && !self.offline && !self.native_terminals {
+            return Err("native_terminal_opt_in_required");
+        }
+        let terminal = wants_terminals
+            .then(|| self.open_terminal_owner(&selected, restored.is_some()))
+            .transpose()?;
+        let tools = local_tools_extended(
             self.settings.clone(),
             initial_epoch.clone(),
             &selected.directory,
@@ -216,6 +290,11 @@ impl Factory {
                 .as_ref()
                 .filter(|(directory, _)| directory == &selected.directory)
                 .map(|(_, hub)| hub.clone()),
+            |registry| {
+                terminal.clone().map_or(Ok(()), |owner| {
+                    terminals::register(registry, owner, &selected.directory)
+                })
+            },
         )?;
         // Resume/fork retains the exact saved tool catalogue. Adding a compiled
         // tool only affects new sessions; saved descriptors cannot install code.
@@ -248,6 +327,9 @@ impl Factory {
             .as_ref()
             .map(|r| r.epoch.clone())
             .unwrap_or(initial_epoch);
+        if base.is_none() && terminal.is_some() {
+            terminals::add_agent_instructions(&mut epoch);
+        }
         let mut bound = base
             .as_ref()
             .map(|r| r.binding.clone())
@@ -302,6 +384,7 @@ impl Factory {
             (generate, options)
         };
         options.directory = Some(selected.directory.clone());
+        options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&self.settings));
         options.fork_seed = seed;
         if self.offline && kind != Kind::Console {
             let model = bound.requested_model.clone();
@@ -329,6 +412,7 @@ impl Factory {
             },
             options,
         )?;
+        self.retain_terminal_owner(&selected.id, terminal)?;
         Ok(Created {
             runtime,
             selected,

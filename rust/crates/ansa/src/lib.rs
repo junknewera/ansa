@@ -11,5 +11,6 @@ pub mod protocol;
 pub mod provider;
 pub mod runtime;
 pub mod session;
+pub mod terminal_host;
 pub mod tools;
 pub mod transport;

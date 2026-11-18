@@ -4,8 +4,10 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import termios
@@ -697,6 +699,106 @@ def outer_eof_cleans_terminal(screen, root, cwd):
     return "normal"
 
 
+def native_terminal_panel(screen, root, cwd):
+    home = root / "home"
+    catalog = home / ".ansa/sessions"
+    before = set(catalog.iterdir())
+    rejected = Pty(screen.child.args[0], root, home, home, "", True,
+                   argv=["--offline", "--native-terminals"])
+    rejected.vt = Terminal(80, 24)
+    screen.additional_screens = [("home-rejected", rejected)]
+    rejected.result = rejected.finish()
+    assert rejected.result["exit"] == 2 and rejected.result["termios_restored"]
+    assert "укажи папку проекта через --cwd".encode() in rejected.raw
+    assert set(catalog.iterdir()) == before, "invalid workspace created a session"
+    screen.send("/term")
+    until(screen, lambda frame: "/terminals" in body(screen), "native terminal command completion")
+    screen.send(b"\t\r")
+    until(screen, lambda frame: "Терминал агента" in frame and "Агент ещё не открыл терминал" in frame,
+          "managed terminal panel in the normal Carbon entry point")
+    session, = (root / "home/.ansa/sessions").glob("*/terminal-host-v1/terminal-v1.json")
+    escape(screen)
+    until(screen, lambda frame: "Терминал агента" not in frame, "Esc returned to the chat")
+    screen.send("TERMINAL_DEMO\r")
+    until(screen, lambda frame: completed(root, "TERMINAL_DEMO"), "offline terminal tool created a PTY")
+    local(screen, "/terminals")
+    until(screen, lambda frame: "Демо-терминал" in frame and "ANSA_TERMINAL_READY" in body(screen),
+          "Carbon renders live PTY output")
+    escape(screen)
+    until(screen, lambda frame: "ANSA_TERMINAL_READY" not in body(screen), "Esc returned to the chat")
+    local(screen, "/exit")
+    result = screen.finish()
+    assert result["exit"] == 0 and result["termios_restored"]
+    assert session.with_name("closed-v1.json").is_file(), "clean host closed with a durable seal"
+    resumed = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--session", session.parents[1].name])
+    screen.additional_screens.append(("resumed", resumed))
+    local(resumed, "/plan")
+    resumed.send("SEALED_PLAN\r")
+    until(resumed, lambda frame: completed(root, "SEALED_PLAN"), "Plan admitted after a clean restart")
+    local(resumed, "/exit")
+    resumed.result = resumed.finish()
+    assert resumed.result["exit"] == 0 and resumed.result["termios_restored"]
+    live_terminal_opt_in(screen, root, cwd)
+    return "normal"
+
+
+def live_terminal_opt_in(screen, root, cwd):
+    home = root / "live-home"
+    auth = home / ".ansa/auth"
+    auth.mkdir(parents=True, mode=0o700)
+    (home / ".ansa").chmod(0o700)
+    identity = dict(version=1, host_id="synthetic-host", client_id="synthetic-client",
+                    subject="synthetic-subject")
+    credentials = dict(identity, scope="openid profile email offline_access resource.invoke chatgpt.tokens.use.direct",
+                       session="synthetic-session", expires_at=4102444800, earliest_refresh_at=0,
+                       refresh_pending=False, access_token="synthetic-access", refresh_token="synthetic-refresh",
+                       nonce="synthetic-nonce")
+    for filename, value in (("registration.json", identity), ("credentials.json", credentials)):
+        path = auth / filename
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        proxy = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        env = {key: proxy for key in ("http_proxy", "HTTP_PROXY", "https_proxy",
+                                     "HTTPS_PROXY", "all_proxy", "ALL_PROXY")}
+        env.update(no_proxy="", NO_PROXY="")
+        options = ["--cwd", str(cwd), "--auth-dir", str(auth)]
+        catalog = home / ".ansa/sessions"
+
+        def launch(label, arguments):
+            child = Pty(screen.child.args[0], root, home, cwd, "", True, size=(100, 32),
+                        argv=[*options, *arguments], extra_env=env)
+            child.vt = Terminal(100, 32)
+            screen.additional_screens.append((label, child))
+            return child
+
+        for enabled in (False, True):
+            before = set(catalog.iterdir()) if catalog.exists() else set()
+            child = launch(f"live-startup-{enabled}", ["--native-terminals"] if enabled else [])
+            until(child, lambda _: ready(child), "ordinary Carbon startup with synthetic auth")
+            local(child, "/exit")
+            child.result = child.finish()
+            assert child.result["exit"] == 0 and child.result["termios_restored"]
+            session, = set(catalog.iterdir()) - before
+            init, = session_cases.decode({p.name: p.read_bytes() for p in session.glob("part-*.log")})
+            assert init["kind"] == "init", "idle Carbon submitted work"
+            config = init["configuration"]
+            terminal_tools = {tool["name"] for tool in config["tools"]["descriptors"]
+                              if tool["name"].startswith("terminal_")}
+            assert ("terminal_create" in terminal_tools) if enabled else not terminal_tools
+            instructions = config["epoch"]["instructions"]
+            assert ("Call terminal_list first" in instructions) == enabled
+            if enabled:
+                assert "lifetime_seconds=1800 and idle_seconds=300" in instructions
+        child = launch("live-restore-without-opt-in", ["--session", session.name])
+        child.result = child.finish()
+        assert child.result["exit"] == 1 and b"native_terminal_opt_in_required" in child.raw
+        assert not select.select([listener], [], [], 0)[0], "provider connection during startup"
+
+
 def completion_and_help(screen, root, cwd):
     before = journals(root)
     screen.send("/mo")
@@ -888,6 +990,7 @@ def main():
              ("inline-tool-details", inline_tool_details),
              ("slash-completion-help", completion_and_help),
              ("new-resume-interrupt", new_resume_and_exit),
+             ("native-terminal-panel", native_terminal_panel),
              ("model-effort-pair", model_effort_pair),
              ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),
@@ -922,7 +1025,8 @@ def main():
                 editor.write_text('#!/bin/sh\nkill -STOP $$\nprintf resumed > after-stop\n')
             editor.chmod(0o700)
             editor_path = cwd / "does-not-exist" if name == "editor-missing" else editor
-            screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)})
+            extra = ["--native-terminals"] if name == "native-terminal-panel" else []
+            screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)}, argv_extra=extra)
             try:
                 normal = case(screen, root, cwd) == "normal"
                 result = screen.finish(None if normal else signal.SIGTERM)

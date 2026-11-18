@@ -566,6 +566,40 @@ pub fn evidence() {
     )
     .unwrap();
     assert!(runner.recover(&id).is_err());
+
+    use std::os::unix::fs::MetadataExt;
+    let cwd = root.0.join("bound-cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    let identity = std::fs::metadata(&cwd).unwrap();
+    std::fs::rename(&cwd, root.0.join("original-cwd")).unwrap();
+    std::fs::create_dir(&cwd).unwrap();
+    let job = root.0.join("bound-job");
+    ansa_linux::fs::create_private_leaf(&job).unwrap();
+    let record = ansa_linux::fs::private_directory(&job).unwrap();
+    let id = invocation("changed_cwd");
+    let options = ProcessOptions {
+        cwd: cwd.clone(),
+        ..self::options(&root, "printf effect > marker")
+    };
+    let mut spec: serde_json::Value =
+        serde_json::from_str(&options.specification(&id).unwrap().dump()).unwrap();
+    spec["workspace_binding"] = serde_json::json!({
+        "version": 1, "device": identity.dev(), "inode": identity.ino(), "scopes": [],
+    });
+    ansa_linux::local::create(&record, "request.json", spec.to_string().as_bytes()).unwrap();
+    assert!(
+        std::process::Command::new(worker())
+            .arg("--process-worker")
+            .arg(&job)
+            .arg("--bound-directory")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = std::fs::read_to_string(job.join("result.json")).unwrap();
+    assert!(result.contains("process_cwd_changed"));
+    assert!(!cwd.join("marker").exists());
+    assert!(!root.0.join("original-cwd/marker").exists());
 }
 
 pub fn runtime_loop(cancel: bool) {

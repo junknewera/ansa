@@ -65,6 +65,8 @@ pub(crate) struct Owner {
     pending_receipt: Option<SubmitReceipt>,
     cancelling: Option<CommandId>,
     resuming: Option<CommandId>,
+    plan_admission_pending: bool,
+    plan_workspace: Option<Box<dyn Send>>,
     generation: u64,
     resume_epoch: u64,
     preview_sequence: u64,
@@ -143,6 +145,8 @@ impl Owner {
             pending_receipt: None,
             cancelling: None,
             resuming: None,
+            plan_admission_pending: false,
+            plan_workspace: None,
             generation: 0,
             resume_epoch: 0,
             preview_sequence: 0,
@@ -208,6 +212,7 @@ impl Owner {
             || self.provider.is_some()
             || self.tool.is_some()
             || self.auth.is_some()
+            || self.plan_admission_pending
     }
     fn can_cancel(&self) -> bool {
         self.request().is_some()
@@ -410,6 +415,12 @@ impl Owner {
             None,
         );
     }
+
+    fn reject_plan(&mut self, command: &RuntimeCommand, code: &str) {
+        // This Submit was queued but never reached the durable admission.
+        self.receipts.remove(&command.command.0);
+        self.reject(command, code);
+    }
     fn fail(&mut self, code: &'static str) {
         if let Some(stop) = &self.selection_stop {
             stop.cancel();
@@ -448,6 +459,7 @@ impl Owner {
         };
         self.gate.cancel();
         self.turn_stop.cancel();
+        self.tools.signal_cancel();
         self.finish_preview("discarded", false);
         if self.phase != "cancelled" {
             self.phase = "paused".into();
@@ -651,6 +663,7 @@ impl Owner {
         self.gate.cancel();
         self.drain_started();
         self.turn_stop.cancel();
+        self.tools.signal_cancel();
         self.finish_preview("discarded", false);
         self.cancelling = Some(command);
         self.phase = "cancelled".into();
@@ -923,7 +936,7 @@ impl Owner {
                 {
                     return Ok(PostStatus::StaleTarget);
                 }
-                if self.resuming.is_some() {
+                if self.resuming.is_some() || self.plan_admission_pending {
                     return Ok(PostStatus::QueueFull);
                 }
                 if self.storage_failed || self.recovery.is_some() {
@@ -971,9 +984,16 @@ impl Owner {
             );
             return Ok(());
         }
+        if matches!(&command.payload, CommandPayload::Submit(submitted) if submitted.mode == AgentMode::Plan)
+            && !self.tools.plan_ready()
+        {
+            self.reject_plan(&command, "terminal_workspace_busy");
+            return Ok(());
+        }
         let CommandPayload::Submit(submitted) = command.payload else {
             return Err("submit_contract");
         };
+        self.tools.begin_turn();
         let request_number = self.state.next_request + 1;
         let request = RequestId(format!("request_{request_number}"));
         let run = format!("{}_{}", self.incarnation.0, request.0);
@@ -1173,6 +1193,27 @@ impl Owner {
             if self.phase != "paused" || self.recovery.is_some() {
                 return Ok(());
             }
+            let plan_mode = self
+                .state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.receipt.mode == AgentMode::Plan);
+            if plan_mode && !self.tools.plan_ready() {
+                self.emit(EventPayload::RuntimeError {
+                    command: Some(command),
+                    diagnostic: "terminal_workspace_busy".into(),
+                });
+                return Ok(());
+            }
+            if plan_mode
+                && self.plan_workspace.is_none()
+                && let Some(plan) = &workers.plan
+            {
+                plan.try_send(PlanTarget::Resume(command))
+                    .map_err(|_| "plan_worker_queue")?;
+                self.plan_admission_pending = true;
+                return Ok(());
+            }
             self.resuming = Some(command.clone());
             return self.record(
                 workers,
@@ -1227,6 +1268,14 @@ impl Owner {
             && self.closing.mode.load(Ordering::Acquire) != 2
             && let Some(command) = self.queued.pop_front()
         {
+            if matches!(&command.payload, CommandPayload::Submit(value) if value.mode == AgentMode::Plan)
+                && let Some(plan) = &workers.plan
+            {
+                plan.try_send(PlanTarget::Submit(command))
+                    .map_err(|_| "plan_worker_queue")?;
+                self.plan_admission_pending = true;
+                return Ok(());
+            }
             return self.submit(workers, command);
         }
         if !self.can_act() {
@@ -1398,6 +1447,7 @@ impl Owner {
                 }
             }
             Kind::Done => {
+                self.plan_workspace = None;
                 self.phase = "completed".into();
                 self.finish_preview("committed", true);
                 if let Some(response) = self.state.turn.as_ref().and_then(|t| t.response.as_ref()) {
@@ -1429,6 +1479,7 @@ impl Owner {
                 self.snapshot(None);
             }
             Kind::Cancel => {
+                self.plan_workspace = None;
                 self.phase = "cancelled".into();
                 if let Some(command) = self.cancelling.take() {
                     self.emit(EventPayload::Cancelled { command });
@@ -1466,6 +1517,7 @@ impl Owner {
             && matches!(
                 &done,
                 Completion::Provider { .. }
+                    | Completion::Plan { .. }
                     | Completion::Auth {
                         task: AuthTask::BeforeIntent | AuthTask::SelectGeneration,
                         ..
@@ -1486,6 +1538,49 @@ impl Owner {
             self.drain_started();
         }
         match done {
+            Completion::Plan { target, result } => {
+                self.plan_admission_pending = false;
+                if self.shutting_down
+                    || self.storage_failed
+                    || self.closing.mode.load(Ordering::Acquire) == 2
+                {
+                    return Ok(());
+                }
+                match (target, result) {
+                    (PlanTarget::Submit(command), Ok(lease)) => {
+                        if self.tools.plan_ready() {
+                            self.plan_workspace = Some(lease);
+                            self.submit(workers, command)?;
+                        } else {
+                            self.reject_plan(&command, "terminal_workspace_busy");
+                        }
+                    }
+                    (PlanTarget::Submit(command), Err(code)) => self.reject_plan(&command, code),
+                    (PlanTarget::Resume(command), Ok(lease))
+                        if self.phase == "paused"
+                            && self.recovery.is_none()
+                            && self.tools.plan_ready() =>
+                    {
+                        self.plan_workspace = Some(lease);
+                        self.resuming = Some(command);
+                    }
+                    (PlanTarget::Resume(command), Err(code)) => {
+                        self.emit(EventPayload::RuntimeError {
+                            command: Some(command),
+                            diagnostic: code.into(),
+                        })
+                    }
+                    (PlanTarget::Resume(command), Ok(_))
+                        if self.phase == "paused" && self.recovery.is_none() =>
+                    {
+                        self.emit(EventPayload::RuntimeError {
+                            command: Some(command),
+                            diagnostic: "terminal_workspace_busy".into(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
             Completion::Stored(value) => self.stored(value)?,
             Completion::Provider { identity, result } => {
                 if self.provider.as_ref() != Some(&identity) {

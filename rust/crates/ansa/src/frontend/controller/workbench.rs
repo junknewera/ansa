@@ -592,6 +592,10 @@ enum Job {
         token: u64,
         result: Result<FileValue>,
     },
+    TerminalScreen {
+        token: u64,
+        result: Result<carbon::OutputView>,
+    },
     Preview {
         token: u64,
         width: usize,
@@ -632,6 +636,7 @@ enum Menu {
     },
     Help {
         selected: usize,
+        entries: &'static [commands::Command],
     },
 }
 type PreviewRows = std::sync::Arc<Vec<super::super::markdown::Row>>;
@@ -704,6 +709,13 @@ enum Panel {
         selected: usize,
     },
     Terminal,
+    NativeTerminal {
+        token: u64,
+        name: String,
+        view: Option<carbon::OutputView>,
+        pending: bool,
+        next: Instant,
+    },
     Image {
         token: u64,
         name: String,
@@ -1169,6 +1181,86 @@ impl Workbench {
             Job::File { token, result }
         });
     }
+
+    fn inspect_terminal(&mut self, name: &str, io: &Io) {
+        if self
+            .factory
+            .terminal_owner(&self.slots[self.current].id)
+            .is_none()
+        {
+            self.report(io, "Откройте новый разговор с --native-terminals");
+            return;
+        }
+        self.file_token = self.file_token.wrapping_add(1);
+        self.panel = Some(Panel::NativeTerminal {
+            token: self.file_token,
+            name: name.to_owned(),
+            view: None,
+            pending: false,
+            next: Instant::now(),
+        });
+        self.focus = Focus::Inspector;
+        self.selection = None;
+        self.refresh_terminal_screen(Instant::now());
+    }
+
+    fn refresh_terminal_screen(&mut self, now: Instant) {
+        if self.input_closed || self.terminating || self.jobs.len() >= 6 {
+            return;
+        }
+        let Some(Panel::NativeTerminal {
+            token,
+            name,
+            pending,
+            next,
+            ..
+        }) = &mut self.panel
+        else {
+            return;
+        };
+        if *pending || now < *next {
+            return;
+        }
+        let Some(owner) = self.factory.terminal_owner(&self.slots[self.current].id) else {
+            return;
+        };
+        *pending = true;
+        *next = now + Duration::from_millis(300);
+        let token = *token;
+        let name = name.clone();
+        self.jobs.spawn_blocking(move || {
+            use crate::terminal_host::{Lifecycle, protocol::Writer};
+            let result = (|| {
+                let mut host = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
+                let (id, terminal) = host
+                    .terminals()
+                    .iter()
+                    .find(|(id, terminal)| {
+                        terminal.lifecycle == Lifecycle::Live
+                            && (name.is_empty()
+                                || name == id.as_str()
+                                || name == terminal.launch.label)
+                    })
+                    .ok_or("terminal_not_open")?;
+                let (id, epoch) = (id.clone(), terminal.epoch);
+                let mut title = terminal.launch.label.clone();
+                let screen = host.capture(Writer::Human, &id, epoch, 0)?;
+                if let Some(exit) = &screen.exit {
+                    title.push_str(if exit.cleanup_known {
+                        " · завершён"
+                    } else {
+                        " · остановка не подтверждена"
+                    });
+                }
+                let mut text = screen.text;
+                if screen.truncated {
+                    text.push_str("\nЭкран сокращён");
+                }
+                Ok(carbon::OutputView { title, text })
+            })();
+            Job::TerminalScreen { token, result }
+        });
+    }
     fn copy_image_path(&mut self, io: &Io) {
         let Some(Panel::Image {
             view: Some(image), ..
@@ -1529,6 +1621,10 @@ impl Workbench {
             .split_once(char::is_whitespace)
             .map_or((text.trim(), ""), |(c, a)| (c, a.trim()));
         match command {
+            "/terminals" => {
+                self.inspect_terminal(argument, io);
+                (true, false)
+            }
             "/new" if argument.is_empty() => (self.create(Kind::Main, None, true, io), false),
             "/fork" => {
                 self.create(
@@ -1612,7 +1708,10 @@ impl Workbench {
                 (true, false)
             }
             "/help" | "/" | "?" => {
-                self.menu = Some(Menu::Help { selected: 0 });
+                self.menu = Some(Menu::Help {
+                    selected: 0,
+                    entries: self.available_commands(),
+                });
                 (true, false)
             }
             "/basic" if self.slots[self.current].kind == Kind::Btw => {
@@ -1904,6 +2003,26 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
+            Job::TerminalScreen { token, result } => {
+                if let Some(Panel::NativeTerminal {
+                    token: expected,
+                    view,
+                    pending,
+                    ..
+                }) = &mut self.panel
+                    && *expected == token
+                {
+                    *pending = false;
+                    *view = Some(result.unwrap_or_else(|error| carbon::OutputView {
+                        title: "Терминал агента".into(),
+                        text: if error == "terminal_not_open" {
+                            "Агент ещё не открыл терминал".into()
+                        } else {
+                            diagnostics::error(error)
+                        },
+                    }));
+                }
+            }
             Job::Themes { request, result } => match result {
                 Ok(catalog) => {
                     if !self.theme_initialized {
@@ -2407,7 +2526,7 @@ impl Workbench {
             Some(Menu::Efforts {
                 values, selected, ..
             }) => delta(selected, values.len()),
-            Some(Menu::Help { selected }) => delta(selected, commands::COMMANDS.len()),
+            Some(Menu::Help { selected, entries }) => delta(selected, entries.len()),
             None if self.focus == Focus::Inspector => match &mut self.panel {
                 Some(Panel::EditDiff { rows, offset, .. }) => delta(offset, rows.len()),
                 Some(Panel::Files(files)) if files.document.is_none() => delta(
@@ -2423,7 +2542,7 @@ impl Workbench {
                 }
                 Some(Panel::Agents { selected }) => delta(selected, agent_count),
                 Some(Panel::Output { offset, .. }) => delta(offset, output_count),
-                Some(Panel::Terminal | Panel::Image { .. }) => {}
+                Some(Panel::Terminal | Panel::Image { .. } | Panel::NativeTerminal { .. }) => {}
                 None => {}
             },
             None => {
@@ -2485,8 +2604,8 @@ impl Workbench {
                         self.apply_generation(model, effort.clone(), io);
                     }
                 }
-                Menu::Help { selected } => {
-                    if let Some(command) = commands::COMMANDS.get(selected) {
+                Menu::Help { selected, entries } => {
+                    if let Some(command) = entries.get(selected) {
                         let slot = &mut self.slots[self.current];
                         let end = slot.state.editor.bytes.len();
                         slot.state.editor.replace(0, end, command.name.as_bytes());
@@ -2908,7 +3027,7 @@ impl Workbench {
                 }
                 .into(),
             },
-            Menu::Help { selected } => commands::help(*selected),
+            Menu::Help { selected, entries } => commands::help_with_commands(*selected, entries),
         })
     }
     fn inspector(&self) -> Option<Inspector> {
@@ -2949,6 +3068,16 @@ impl Workbench {
                 lines: self.output_lines(&view.text),
                 offset: *offset,
                 footer: "j/k строки · PgUp/PgDn страницы · g/G начало/конец · Esc назад".into(),
+                ..Inspector::default()
+            }),
+            Panel::NativeTerminal { view, .. } => Some(Inspector {
+                title: view
+                    .as_ref()
+                    .map_or_else(|| "Терминал агента".into(), |view| view.title.clone()),
+                lines: view.as_ref().map_or_else(Vec::new, |view| {
+                    view.text.lines().map(str::to_owned).collect()
+                }),
+                footer: "Esc чат".into(),
                 ..Inspector::default()
             }),
             Panel::EditDiff {
@@ -3626,6 +3755,7 @@ pub async fn run_attached(
             }
             let now = Instant::now();
             dirty |= work.tick_drag(io, now);
+            work.refresh_terminal_screen(now);
             work.flush_terminal_input(io);
             if let Some(terminal) = &work.terminal {
                 let snapshot = terminal.snapshot();
@@ -3758,7 +3888,7 @@ pub async fn run_attached(
                                     if byte >= 32 && byte != 127 { continue; }
                                 }
                                 if work.focus == Focus::Chat && work.menu.is_none() && byte == b'?' && work.slots[work.current].state.editor.bytes.is_empty() {
-                                    work.menu = Some(Menu::Help { selected: 0 }); work.completion = None; continue;
+                                    work.menu = Some(Menu::Help { selected: 0, entries: work.available_commands() }); work.completion = None; continue;
                                 }
                                 if work.menu.is_some() && !matches!(byte, 27 | b'\r' | b'\n' | 9) { continue; }
                             }
@@ -3930,6 +4060,15 @@ pub async fn run_attached(
     while let Some(result) = work.pumps.join_next().await {
         if result.is_err() {
             failure.get_or_insert("workspace_event_task");
+        }
+    }
+    if work.factory.has_terminal_owners() {
+        let terminal_factory = work.factory.clone();
+        if !tokio::task::spawn_blocking(move || terminal_factory.close_terminals())
+            .await
+            .unwrap_or(false)
+        {
+            failure.get_or_insert("terminal_cleanup_unknown");
         }
     }
     if let Err(code) = io.stop_reporting() {
