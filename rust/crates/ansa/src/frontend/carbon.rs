@@ -931,6 +931,7 @@ pub struct Workspace {
     pub model: String,
     pub effort: String,
     pub activity: String,
+    pub exit_confirmation: bool,
     pub reading: bool,
     pub new_events: usize,
     pub focus: Focus,
@@ -953,6 +954,7 @@ const DIFF_ADD: &str = "\x1b[48;2;24;58;39m";
 const DIFF_REMOVE: &str = "\x1b[48;2;68;31;36m";
 const USER_MESSAGE: &str = "\x1b[48;2;29;35;39m";
 const RESET: &str = "\x1b[0m";
+const EXIT_HINT: &str = "Ctrl+C ещё раз для выхода";
 const SELECTED: &str = "\x1b[48;2;46;63;88m\x1b[38;2;232;240;255m";
 
 fn tool_ink(role: &str) -> &'static str {
@@ -1386,26 +1388,24 @@ pub fn layout_workspace(
 ) -> Option<Frame> {
     let (columns, height) = size;
     if columns < 12 || height < 8 {
+        let status = if ui.exit_confirmation {
+            EXIT_HINT
+        } else {
+            status
+        };
         return layout_full(history, input, cursor, status, scroll, context, size, color);
     }
     let width = columns - 1;
     let (editor, editor_cursor_row, editor_cursor) =
         editor_rows(input, cursor, width, (height / 4).clamp(1, 4), color);
     let body_height = height.saturating_sub(7 + editor.len()).max(1);
-    let mut rows = vec![heading(
-        &format!("ANSA  {context}"),
-        &ui.model,
-        width,
-        color,
-    )];
-    let location = if ui.breadcrumb.is_empty() {
-        "main"
-    } else {
-        &ui.breadcrumb
-    };
-    let mut breadcrumb = location.to_owned();
+    let mut rows = vec![heading("ANSA", "", width, color)];
+    let mut breadcrumb = ui.breadcrumb.clone();
     if ui.reading {
-        breadcrumb.push_str(" · История");
+        if !breadcrumb.is_empty() {
+            breadcrumb.push_str(" · ");
+        }
+        breadcrumb.push_str("История");
         if ui.new_events > 0 {
             breadcrumb.push_str(&format!(" ↓ {}", ui.new_events));
         }
@@ -1527,8 +1527,16 @@ pub fn layout_workspace(
     let mut cursor_column = editor_cursor;
     rows.extend(editor);
     rows.push(rule(width, color));
-    let mut metadata = ui.effort.clone();
     let detail = status.lines().next().unwrap_or_default();
+    let project = std::path::Path::new(context)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(context);
+    let metadata = [detail, ui.model.as_str(), ui.effort.as_str(), project]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
     let narrow = columns <= NARROW_WORKSPACE_COLUMNS;
     let terminal = ui.focus == Focus::Inspector
         && ui.popup.is_none()
@@ -1542,17 +1550,7 @@ pub fn layout_workspace(
         (false, false) => "/ команды · Tab фокус · ? помощь",
         (false, true) => "? помощь",
     };
-    if narrow && !detail.is_empty() {
-        // Give the active mode, focus and lifecycle status the available
-        // cells before the model. The model is also shown in the header.
-        rows.push(heading(detail, hint, width, color));
-    } else {
-        if !detail.is_empty() && !metadata.is_empty() {
-            metadata.push_str(" · ");
-        }
-        metadata.push_str(detail);
-        rows.push(heading(&metadata, hint, width, color));
-    }
+    rows.push(heading(&metadata, hint, width, color));
     // Diagnostics are separate from frozen transcript rows.
     let notice = status.lines().nth(1).unwrap_or_default();
     let notice = if notice.is_empty() {
@@ -1563,6 +1561,9 @@ pub fn layout_workspace(
     rows.push(styled(&clipped(notice, width), MUTED, color));
     rows.resize(height, String::new());
     rows.truncate(height);
+    if ui.exit_confirmation {
+        rows[height - 1] = styled(&clipped(EXIT_HINT, width), MUTED, color);
+    }
     if let Some(popup) = &ui.popup {
         paint_popup(&mut rows, popup, width, color);
     }

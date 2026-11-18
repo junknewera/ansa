@@ -59,6 +59,10 @@ impl Workbench {
         self.completion_closed = Some((editor.bytes.clone(), editor.cursor));
     }
     pub(super) fn title(&self, id: &str) -> String {
+        self.known_title(id)
+            .unwrap_or_else(|| "Новый разговор".into())
+    }
+    pub(super) fn known_title(&self, id: &str) -> Option<String> {
         self.slots
             .iter()
             .find(|slot| slot.id == id)
@@ -69,7 +73,6 @@ impl Workbench {
                     .find(|summary| summary.entry.id == id)
                     .and_then(|summary| summary.title.clone())
             })
-            .unwrap_or_else(|| "Новый разговор".into())
     }
     pub(super) fn conversation_root(&self) -> String {
         let mut id = self.slots[self.current].id.clone();

@@ -1,4 +1,4 @@
-//! Text completion only. Choosing a suggestion never dispatches a command.
+//! Command discovery and completion for the chat composer.
 use super::carbon::{Choice, Popup};
 use super::input::Editor;
 
@@ -36,6 +36,10 @@ pub const COMMANDS: &[Command] = &[
         description: "Открыть сохранённый разговор",
     },
     Command {
+        name: "/new",
+        description: "Начать новый разговор",
+    },
+    Command {
         name: "/fork",
         description: "Продолжить разговор отдельной веткой",
     },
@@ -53,7 +57,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/resume",
-        description: "Продолжить приостановленную задачу",
+        description: "Открыть список сессий",
     },
     Command {
         name: "/help",
@@ -89,6 +93,14 @@ pub struct Completion {
     matches: Vec<usize>,
 }
 impl Completion {
+    pub fn exact_command(&self, editor: &Editor) -> bool {
+        self.end == editor.cursor
+            && self.matches.get(self.selected).is_some_and(|&index| {
+                editor
+                    .text()
+                    .is_ok_and(|text| COMMANDS[index].name == text.trim())
+            })
+    }
     pub fn at(editor: &Editor) -> Option<Self> {
         if editor.pasting() || editor.overflow {
             return None;
@@ -137,7 +149,7 @@ impl Completion {
         };
         editor.replace(self.begin, self.end, command.name.as_bytes())
     }
-    pub fn popup(&self) -> Popup {
+    pub fn popup(&self, exact_command: bool) -> Popup {
         Popup {
             title: "Команды".into(),
             subtitle: String::new(),
@@ -150,14 +162,19 @@ impl Completion {
                 })
                 .collect(),
             selected: self.selected,
-            footer: "↑/↓ выбрать · Enter/→ вставить · Esc закрыть".into(),
+            footer: if exact_command {
+                "Enter выполнить · Tab/→ дописать · Esc закрыть"
+            } else {
+                "↑/↓ выбрать · Enter/Tab/→ дописать · Esc закрыть"
+            }
+            .into(),
         }
     }
 }
 pub fn help(selected: usize) -> Popup {
     Popup {
         title: "Команды ANSA".into(),
-        subtitle: "Enter вставить команду · Ctrl+J новая строка · Ctrl+C остановить шаг".into(),
+        subtitle: "Ctrl+J новая строка · Ctrl+C очистить ввод или остановить шаг".into(),
         items: COMMANDS
             .iter()
             .map(|command| Choice {

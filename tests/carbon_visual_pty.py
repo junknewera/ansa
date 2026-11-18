@@ -205,8 +205,7 @@ def local(screen, command):
     assert command.startswith('/') and '\n' not in command and '\r' not in command
     # Bare commands first insert their completion, then submit it; arguments
     # supply the token delimiter. The workspace suite checks each Enter alone.
-    command = command.rstrip()
-    screen.send(command + ('\r' if any(char.isspace() for char in command) else '\r\r'))
+    screen.send(command.rstrip() + '\r')
 
 
 def mouse(screen, button, column, row, release=False):
@@ -242,7 +241,8 @@ def start(binary, root, home, cwd, screens, label, adapter=False, size=(112, 40)
     screen.finished = None
     screen.snapshots = {}
     screens.append(screen)
-    until(screen, lambda text: 'ANSA' in text and 'готов' in screen.vt.line(-2), 'first color workspace')
+    until(screen, lambda text: 'ANSA' in text and 'gpt-6.1-sol' in screen.vt.line(-2)
+          and screen.vt.line(-4).startswith('›'), 'first color workspace')
     return screen
 
 
@@ -253,11 +253,11 @@ def snapshot(screen, label):
     screen.snapshots[label] = json.loads(json.dumps(screen.snapshots[label]))
 
 
-def finish(screen):
+def finish(screen, shutdown=signal.SIGTERM):
     snapshot(screen, 'final')
-    result = screen.finish(signal.SIGTERM)
+    result = screen.finish(shutdown)
     screen.finished = {key: value for key, value in result.items() if key != 'stdout_hex'}
-    assert result['exit'] == 143 and result['termios_restored'] and result['flags_restored'], result
+    assert result['exit'] == (143 if shutdown is not None else 0) and result['termios_restored'] and result['flags_restored'], result
     screen.close()
     screen.closed = True
 
@@ -283,7 +283,7 @@ def native_background(screen, *labels):
 def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     screen = start(binary, root, home, cwd, screens, 'lifecycle')
     screen.send('VISUAL_TASK\r')
-    until(screen, lambda text: completed(root, 'VISUAL_TASK') and 'get_test_value' in text and 'OMH_TOOL_OK:OMH_FIXED_VALUE_42' in text and 'готов' in screen.vt.line(-2), 'committed colored tool and final text')
+    until(screen, lambda text: completed(root, 'VISUAL_TASK') and 'get_test_value' in text and 'OMH_TOOL_OK:OMH_FIXED_VALUE_42' in text, 'committed colored tool and final text')
     headers = [screen.vt.line(row) for row in range(3, screen.vt.rows - 5) if 'get_test_value' in screen.vt.line(row)]
     assert len(headers) == 1 and '▸' in headers[0] and 'готово' in headers[0], headers
     target_fg = screen.vt.attribute('get_test_value')[0]
@@ -523,6 +523,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         quiet_hold.touch()
         quiet = start(adapter, quiet_root, quiet_home, quiet_cwd, screens, 'edit-reduced-motion',
                       adapter=True, size=(96, 40), extra_env={'ANSA_NO_ANIMATION': '1'})
+        eof_interrupted = False
         try:
             quiet.send('EDIT_REDUCED_MOTION_TASK\r')
 
@@ -547,9 +548,13 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
             quiet_elapsed = time.monotonic() - quiet_began
             quiet_delta_bytes = len(quiet.raw) - quiet_since
             snapshot(quiet, 'reduced-motion-idle')
+            quiet.send(b'\x04')
+            quiet.drain(.04)
+            quiet.child.send_signal(signal.SIGINT)
+            eof_interrupted = True
         finally:
             try:
-                finish(quiet)
+                finish(quiet, None if eof_interrupted else signal.SIGTERM)
             finally:
                 quiet_hold.unlink(missing_ok=True)
         assert not (quiet_root / 'generated').exists(), 'cancelled held generation replied'
@@ -572,23 +577,32 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         paused.send('FAILED_TURN\r')
         until(paused, lambda text: 'terminal_item_count' in text and 'пауза' in paused.vt.line(-2),
               'provider failure paused the request')
-        assert '/resume' in paused.vt.line(-1) and 'Ctrl+C' in paused.vt.line(-1)
+        assert '/sessions' in paused.vt.line(-1) and 'Ctrl+C' in paused.vt.line(-1)
         paused.send('NEXT_TURN Ж\r')
         until(paused, lambda text: paused.vt.line(-4) == '› NEXT_TURN Ж', 'paused draft preserved')
         assert sum(row['kind'] == 'accepted' for row in records(failed_root)) == 1
         snapshot(paused, 'paused')
+        paused.child.send_signal(signal.SIGINT)
+        until(paused, lambda text: paused.vt.line(-4) == '›' and 'пауза' in paused.vt.line(-2),
+              'Ctrl+C cleared the draft and retained the paused request')
+        local(paused, '/resume')
+        until(paused, lambda text: 'Сессии проекта' in text and 'Продолжить текущий запрос' in text,
+              'resume opened the saved sessions picker')
+        paused.send(b'\r')
+        until(paused, lambda text: (failed_root / 'generated').stat().st_size == 2
+              and sum(row['kind'] == 'pause' for row in records(failed_root)) >= 2
+              and 'пауза' in paused.vt.line(-2), 'picker resumed the same request')
         rejection.unlink()
         paused.child.send_signal(signal.SIGINT)
         until(paused, lambda text: 'отменено' in paused.vt.line(-2), 'Ctrl+C cancelled the paused request')
-        assert paused.vt.line(-4) == '› NEXT_TURN Ж'
-        paused.send(b'\r')
+        paused.send('NEXT_TURN Ж\r')
         until(paused, lambda text: completed(failed_root, 'NEXT_TURN Ж') and 'EDIT_DONE' in text,
-              'preserved draft sent after cancellation')
+              'new message sent after cancellation')
         assert sum(row['kind'] == 'accepted' and row['text'] == 'NEXT_TURN Ж'
                    for row in records(failed_root)) == 1
         finish(paused)
     return {'added': 1, 'removed': 1, 'effective_add_bg': added, 'effective_remove_bg': removed,
-            'paused_draft_sent_after_cancel': True,
+            'paused_draft_cleared_and_picker_resumed': True,
             'idle_animation': {'row': next(iter(observed))[0], 'spinner_frames': len(observed),
                                'elapsed': idle_elapsed, 'delta_bytes': len(idle_delta)},
             'reduced_motion': quiet_evidence}

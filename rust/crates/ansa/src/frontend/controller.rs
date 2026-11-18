@@ -797,7 +797,8 @@ impl State {
                 } else {
                     "Панель"
                 }),
-                (!view.worker_busy).then_some(phase),
+                (!view.worker_busy && !matches!(view.state.as_str(), "idle" | "completed"))
+                    .then_some(phase),
             ]
             .into_iter()
             .flatten()
@@ -839,7 +840,7 @@ impl State {
         // A live notice has a reserved row outside the frozen conversation.
         // Keep the code first so even a narrow terminal shows the failure.
         let notice = if diagnostics::needs_attention(view) {
-            diagnostics::pause_notice(view)
+            diagnostics::pause_notice(view, ui.is_some())
         } else {
             String::new()
         };
@@ -848,7 +849,7 @@ impl State {
         status.push('\n');
         let detail = if self.explicit_status {
             format!("ansa: {} tools={}", view.state, view.completed_tools)
-        } else if self.status.is_empty() && diagnostics::needs_attention(view) {
+        } else if ui.is_none() && self.status.is_empty() && diagnostics::needs_attention(view) {
             if view.resume_available && !view.storage_failed && view.recovery_operation.is_none() {
                 "/resume - продолжить; /cancel - отменить запрос".into()
             } else {

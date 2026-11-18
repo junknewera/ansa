@@ -109,7 +109,7 @@ def footer_phase(terminal, phase):
 def workspace_ready(screen):
     """Production Workbench, deliberately distinct from the legacy fixtures."""
     until(screen, lambda: screen.vt.line(0).startswith('ANSA')
-          and re.search(r'(?<!\S)готов(?=\s|$)', screen.vt.line(-2)) is not None,
+          and 'gpt-6.1-sol' in screen.vt.line(-2) and screen.vt.line(-4).startswith('›'),
           'production workspace ready')
 
 

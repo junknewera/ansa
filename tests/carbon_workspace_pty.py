@@ -90,18 +90,12 @@ def completed(root, message):
 
 
 def ready(screen):
-    return "готов" in screen.vt.line(-2)
+    return "gpt-6.1-sol" in screen.vt.line(-2) and screen.vt.line(-4).startswith("›")
 
 
 def local(screen, command):
-    """Use completion's insert-then-submit flow for exact bare commands.
-
-    An argument supplies the ordinary token delimiter and closes completion.
-    Dedicated completion cases check each Enter separately.
-    """
     assert command.startswith("/") and "\n" not in command and "\r" not in command
-    command = command.rstrip()
-    screen.send(command + ("\r" if any(char.isspace() for char in command) else "\r\r"))
+    screen.send(command.rstrip() + "\r")
 
 
 def reading(screen):
@@ -190,7 +184,9 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     until(screen, lambda frame: ready(screen) and "CHILD_HISTORY_TASK" in screen.vt.line(1),
           "completed child frame before Ctrl+C")
     screen.send(b"\x03")
-    until(screen, lambda frame: "Нет активного шага" in frame, "child handled Ctrl+C")
+    until(screen, lambda frame: screen.vt.line(-4) == "›", "Ctrl+C cleared the child draft")
+    screen.send("CHILD_DRAFT Ж")
+    until(screen, lambda frame: screen.vt.line(-4) == "› CHILD_DRAFT Ж", "new child draft")
     mouse(screen, 64, 2, 5)
     until(screen, lambda frame: reading(screen), "child mouse reading")
     screen.send(b"\x1bg")
@@ -356,7 +352,7 @@ def input_and_copy(screen, root, cwd):
 
 
 def mouse_copy(screen, root, cwd):
-    model = screen.vt.line(0).split()[-1]
+    model = "gpt-6.1-sol"
     screen.send("MOUSE_COPY Ж界😀\r")
     until(screen, lambda frame: completed(root, "MOUSE_COPY Ж界😀") and ready(screen), "mouse-copy conversation content")
     paint_quiet(screen)
@@ -370,12 +366,13 @@ def mouse_copy(screen, root, cwd):
     screen.resize(80, 20)
     screen.vt = Terminal(80, 20)
     screen.wait(b"\x1b[7mMOUSE_COPY", before_resize)
-    until(screen, lambda frame: ready(screen) and "Сообщение агенту" not in screen.vt.line(-2), "compact status after resize")
+    until(screen, lambda frame: model in screen.vt.line(-2) and "Сообщение агенту" not in screen.vt.line(-2), "compact status after resize")
     mouse(screen, 0, 2 + len("MOUSE_COPY") - 1, row, release=True)
     text = copied(screen, at)
     assert text == "MOUSE_COPY" and "\x1b" not in text, repr(text)
     assert journals(root) == before, "selection or resize changed the canonical conversation"
-    until(screen, lambda frame: screen.vt.line(0).split().count(model) == 1, "one model in the narrow live header")
+    until(screen, lambda frame: screen.vt.line(-2).split().count(model) == 1 and model not in screen.vt.line(0),
+          "one model in the narrow footer")
     for _ in range(2):
         paint_quiet(screen)
         row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> MOUSE_COPY"))
@@ -438,7 +435,7 @@ def branches(screen, root, cwd):
     screen.send("parent-marker\r")
     until(screen, lambda frame: "OMH_TOOL_OK:OMH_FIXED_VALUE_42" in frame, "parent completion")
     local(screen, "/fork")
-    until(screen, lambda frame: "Новый разговор" in screen.vt.line(1), "fork conversation")
+    until(screen, lambda frame: "Ветка" in screen.vt.line(1), "fork conversation")
     assert "parent-marker" in visible(screen)
     screen.send("child-marker\r")
     until(screen, lambda frame: "child-marker" in screen.vt.line(1) and completed(root, "child-marker") and ready(screen), "fork completion")
@@ -541,8 +538,8 @@ def editor_case(screen, root, cwd, cancel):
         resumed = len(screen.raw)
         screen.send(b"save\r")
     screen.wait(b"\x1b[?1002h", since=resumed)
+    screen.wait(b"\x1b[?1049l\x1b[?25h\x1b[0m", since=resumed)
     until(screen, lambda frame: "ANSA" in frame and "только чтение" in frame, "editor terminal restored")
-    assert b"\x1b[?1049l\x1b[?25h\x1b[0m" in screen.raw[resumed:], "editor reset not delivered"
     assert not screen.vt.alternate and screen.vt.cursor_visible and not screen.vt.sgr, "editor screen modes not restored"
     if not cancel:
         until(screen, lambda frame: "edited" in frame, "edited file reloaded")
@@ -703,12 +700,12 @@ def outer_eof_cleans_terminal(screen, root, cwd):
 def completion_and_help(screen, root, cwd):
     before = journals(root)
     screen.send("/mo")
-    until(screen, lambda frame: "/model" in body(screen) and "Enter/→ вставить" in frame, "slash prefix suggestions")
-    screen.send(b"\r")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Для следующих сообщений" not in frame, "first Enter inserts without dispatch")
+    until(screen, lambda frame: "/model" in body(screen) and "Tab/→ дописать" in frame, "slash prefix suggestions")
+    screen.send(b"\t")
+    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Для следующих сообщений" not in frame, "Tab completes without dispatch")
     assert journals(root) == before
     screen.send(b"\r")
-    until(screen, lambda frame: "Для следующих сообщений" in frame, "second Enter opens the selected command")
+    until(screen, lambda frame: "Для следующих сообщений" in frame, "Enter opens the completed command")
     escape(screen)
     until(screen, lambda frame: "Для следующих сообщений" not in frame, "model menu closed before typing another prefix")
     screen.send("/")
@@ -717,10 +714,15 @@ def completion_and_help(screen, root, cwd):
     until(screen, lambda frame: screen.vt.line(-4) == "› /effort" and "По умолчанию" not in frame, "arrows choose and Right inserts only")
     assert journals(root) == before
     screen.send(b"\x15")
+    screen.send(b"/exit" + b"\x1b[D" * 4 + b"\r")
+    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Для следующих сообщений" not in frame,
+          "Enter at a partial token inserts the selected command")
+    assert journals(root) == before
+    screen.send(b"\x15")
     screen.send("Проверь /mo потом")
     screen.send(b"\x1b[D" * len(" потом"))
-    until(screen, lambda frame: "/model" in body(screen) and "Enter/→ вставить" in frame, "completion at a middle word boundary")
-    screen.send(b"\x1b[C")
+    until(screen, lambda frame: "/model" in body(screen) and "Tab/→ дописать" in frame, "completion at a middle word boundary")
+    screen.send(b"\t")
     until(screen, lambda frame: screen.vt.line(-4) == "› Проверь /model потом", "middle completion preserves prefix and suffix")
     assert journals(root) == before
     screen.send(b"\x05\x15")
@@ -729,7 +731,7 @@ def completion_and_help(screen, root, cwd):
     command_rows = [match for row in range(screen.vt.rows)
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
-    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions", "/fork", "/btw", "/plan", "/copy", "/resume", "/help", "/exit"}
+    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions", "/new", "/fork", "/btw", "/plan", "/copy", "/resume", "/help", "/exit"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert "/run" not in visible(screen), "removed /run remains advertised"
@@ -749,6 +751,45 @@ def completion_and_help(screen, root, cwd):
     until(screen, lambda frame: "План" not in screen.vt.line(-2) and screen.vt.line(-4) == "›", "/plan returns to work")
     assert journals(root) == before, "whitespace in local commands dispatched canonical user turns"
     screen.send("/exit \r")
+    return "normal"
+
+
+def new_resume_and_exit(screen, root, cwd):
+    assert screen.vt.line(0) == "ANSA" and screen.vt.line(1) == ""
+    assert "готов" not in screen.vt.line(-2) and cwd.name in screen.vt.line(-2)
+    screen.send("PREVIOUS_SESSION\r")
+    until(screen, lambda frame: completed(root, "PREVIOUS_SESSION") and "OMH_TOOL_OK" in frame,
+          "previous session committed")
+    previous, = [path for path in (root / "home/.ansa/sessions").iterdir() if path.is_dir()]
+    local(screen, "/new")
+    until(screen, lambda frame: ready(screen) and "PREVIOUS_SESSION" not in frame
+          and sum(row["kind"] == "init" for row in records(root)) == 2, "new conversation with an empty transcript")
+    assert sum(row["kind"] == "accepted" for row in records(root)) == 1
+    local(screen, "/resume")
+    until(screen, lambda frame: "Сессии проекта" in frame and "PREVIOUS_SESSION" in popup_text(screen),
+          "resume opened saved sessions on an idle chat")
+    assert "resume_not_available" not in visible(screen)
+    escape(screen)
+    until(screen, lambda frame: "Сессии проекта" not in frame, "session picker closed")
+    local(screen, f"/resume {previous.name}")
+    until(screen, lambda frame: "PREVIOUS_SESSION" in screen.vt.line(1), "resume with an ID reopened that conversation")
+    screen.send("Черновик Ж界")
+    until(screen, lambda frame: screen.vt.line(-4) == "› Черновик Ж界", "draft before interrupt")
+    screen.send(b"\x03")
+    until(screen, lambda frame: screen.vt.line(-4) == "›", "interrupt clears the draft")
+    assert "ещё раз для выхода" not in visible(screen)
+    local(screen, "/status")
+    until(screen, lambda frame: "ansa: completed" in frame, "explicit status before exit")
+    screen.send(b"\x03")
+    until(screen, lambda frame: "Ctrl+C ещё раз для выхода" in screen.vt.line(-1), "first empty interrupt confirms exit")
+    screen.send("x")
+    until(screen, lambda frame: screen.vt.line(-4) == "› x" and "ещё раз для выхода" not in frame,
+          "typing disarms exit")
+    screen.send(b"\x03")
+    until(screen, lambda frame: screen.vt.line(-4) == "›", "draft cleared after disarming")
+    screen.send(b"\x03")
+    until(screen, lambda frame: "Ctrl+C ещё раз для выхода" in screen.vt.line(-1), "exit armed again")
+    screen.send(b"\x03")
     return "normal"
 
 
@@ -846,6 +887,7 @@ def main():
              ("markdown-source-preview", markdown_source_preview),
              ("inline-tool-details", inline_tool_details),
              ("slash-completion-help", completion_and_help),
+             ("new-resume-interrupt", new_resume_and_exit),
              ("model-effort-pair", model_effort_pair),
              ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),

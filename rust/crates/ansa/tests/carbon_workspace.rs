@@ -632,6 +632,9 @@ fn workspace_shows_real_data_and_adapts_inspector_to_narrow_screen() {
     let text = wide.plain_lines().join("\n");
     assert!(text.contains("ANSA") && text.contains("CHAT_MARKER") && text.contains("src/retry.rs"));
     assert!(text.contains("Source") && text.contains("Diff") && text.contains("fixture-model"));
+    assert_eq!(wide.plain_lines()[0].trim(), "ANSA");
+    let footer = &wide.plain_lines()[30];
+    assert!(footer.contains("fixture-model") && footer.contains("project"));
     assert!(!text.contains("context 18%") && !text.contains("Ctrl+F") && !text.contains("PgUp"));
     assert_eq!(wide.lines.len(), 32);
     assert!(
@@ -757,6 +760,20 @@ fn multiline_input_retains_cursor_row_and_status_ticks_leave_chat_untouched() {
 }
 #[test]
 fn tiny_workspace_keeps_multiline_draft_in_physical_cells() {
+    for height in [7, 8] {
+        let ui = Workspace {
+            exit_confirmation: true,
+            ..Workspace::default()
+        };
+        let exit =
+            carbon::layout_workspace(&[], b"", 0, "", 0, "project", (80, height), false, &ui)
+                .unwrap();
+        assert!(
+            exit.plain_lines()
+                .iter()
+                .any(|row| row.contains("Ctrl+C ещё раз для выхода"))
+        );
+    }
     let input = "first\nЖ界😀\nlast".as_bytes();
     let saved = input.to_vec();
     let frame = carbon::layout_workspace(
