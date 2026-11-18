@@ -7,7 +7,8 @@ use crate::{
         contracts::valid_id,
         replay::{Effects, Execution},
         request::Request,
-        structured::FinalFormat,
+        responses::AdmittedResponse,
+        structured::{ChildStatus, FinalFormat},
     },
     session::{
         codec_v1::{SavedResult, load_response},
@@ -128,6 +129,38 @@ pub(super) fn finish_reason(value: &Value) -> &'static str {
         Some(_) => "other",
         None => "missing",
     }
+}
+
+pub(super) fn blocked_reason(response: &AdmittedResponse) -> Option<&'static str> {
+    let result = response.child_result().ok()?;
+    if result.status != ChildStatus::Blocked {
+        return None;
+    }
+    // Only categories leave the synthetic workspace, even if the provider
+    // includes a tool argument or instruction token in its explanation.
+    let summary = result.summary.to_ascii_lowercase();
+    Some(
+        if summary.contains("instruction_token") || summary.contains("instructions_required") {
+            "instructions"
+        } else if summary.contains("permission")
+            || summary.contains("scope")
+            || summary.contains("read-only")
+        {
+            "permission_or_scope"
+        } else if summary.contains("tool")
+            || summary.contains("edit_file")
+            || summary.contains("read_file")
+        {
+            "tool_unavailable"
+        } else if summary.contains("evidence")
+            || summary.contains("missing")
+            || summary.contains("verify")
+        {
+            "missing_evidence"
+        } else {
+            "unspecified"
+        },
+    )
 }
 
 fn journal_event(event: &Json) -> Result<Option<Value>> {

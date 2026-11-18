@@ -12,6 +12,7 @@ use crate::{
         native,
         request::{Binding, Request},
         responses::AdmittedResponse,
+        structured::FinalFormat,
     },
 };
 use serde_json::{Value, json};
@@ -32,15 +33,32 @@ const CATALOG: &str =
     "https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints";
 const CALLS: u8 = 12;
 const DURATION: Duration = Duration::from_secs(600);
+const REPORT: &str = "report.txt";
+const FULL_READ_BYTES: usize = 8192;
+const REVIEW_FILES: [&str; 3] = [
+    "approved-plan.json",
+    "ansa-candidate.diff",
+    "checkout/report.txt",
+];
 
 /// This ledger belongs to a single approved pilot, including its preflight.
 /// A reservation survives transport errors and an interrupted process.
 struct Budget {
     directory: File,
-    _lease: File,
+    _lease: BudgetLease,
     used: u8,
     model_started: bool,
     failed: bool,
+}
+
+struct BudgetLease(File);
+
+impl Drop for BudgetLease {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly hold a duplicate CLOEXEC descriptor.
+        // Unlock explicitly after the last ledger action instead of waiting for exec.
+        let _ = self.0.unlock();
+    }
 }
 
 impl Budget {
@@ -49,14 +67,15 @@ impl Budget {
         let exists = path.try_exists().map_err(|_| "pilot_budget_open")?;
         let (directory, lease) = if exists {
             let directory = fs::private_directory(path).map_err(|_| "pilot_budget_open")?;
-            let lease = local::lock_existing(&directory).map_err(|_| "pilot_budget_lock")?;
+            let lease =
+                BudgetLease(local::lock_existing(&directory).map_err(|_| "pilot_budget_lock")?);
             (directory, lease)
         } else {
             let used = prior
                 .filter(|used| *used <= CALLS)
                 .ok_or("pilot_budget_init")?;
             let directory = fs::create_private_leaf(path).map_err(|_| "pilot_budget_create")?;
-            let lease = local::lock_new(&directory).map_err(|_| "pilot_budget_lock")?;
+            let lease = BudgetLease(local::lock_new(&directory).map_err(|_| "pilot_budget_lock")?);
             let header =
                 json!({"version":1,"model":MODEL,"endpoint":ENDPOINT,"previous_requests":used});
             local::create(&directory, "pilot.json", header.to_string().as_bytes())
@@ -177,9 +196,9 @@ impl Pilot {
         verify_catalog(&catalog)?;
         let credits = self.exchange("key", "GET", KEY, None, stop)?;
         verify_credit_limit(&credits, allow_unlimited_key)?;
-        // The successful scenario needs a schema probe, plan, tool+final for
-        // each child, and a parent summary.
-        if CALLS - self.requests()? < 7 {
+        // Probe, plan, writer read/edit/final, three reviewer reads and final,
+        // and the parent summary.
+        if CALLS - self.requests()? < 10 {
             return Err("pilot_insufficient_scenario_budget");
         }
         let challenge = json!({"type":"json_schema","json_schema":{"name":"ansa_native_schema_probe","strict":true,"schema":{
@@ -279,11 +298,23 @@ impl Pilot {
         if request.binding != self.binding() {
             return Err("pilot_binding");
         }
-        let body = encode(request)?;
+        fixture_settings(&request.epoch.exact_state)?;
+        let tool = next_tool(request)?;
+        let body = encode(request, tool)?;
         let phase = trace::phase(request);
         let response = self.exchange(phase, "POST", API, Some(body), stop)?;
-        let admitted = decode(request, &response);
-        self.trace.add(json!({"kind":"response_admission","phase":phase,"accepted":admitted.is_ok(),"code":admitted.as_ref().err()}))?;
+        let decoded = decode(request, &response);
+        let blocked_reason = decoded.as_ref().ok().and_then(trace::blocked_reason);
+        let admitted = decoded.and_then(|response| match (tool, response.calls()) {
+            (Some(tool), [call]) if call.name == tool.name => {
+                validate_tool_arguments(request, tool, &call.arguments)?;
+                Ok(response)
+            }
+            (None, []) => Ok(response),
+            (Some(_), _) => Err("pilot_required_tool"),
+            (None, _) => Err("pilot_final_has_tools"),
+        });
+        self.trace.add(json!({"kind":"response_admission","phase":phase,"required_tool":tool.map(|tool| tool.name),"accepted":admitted.is_ok(),"code":admitted.as_ref().err(),"blocked_reason":blocked_reason}))?;
         admitted
     }
 }
@@ -306,9 +337,14 @@ fn verify_catalog(response: &Value) -> Result<()> {
         .ok_or("pilot_catalog_parameters")?;
     if matches.next().is_some()
         || endpoint["provider_name"] != PROVIDER
-        || !["structured_outputs", "response_format", "tools"]
-            .iter()
-            .all(|name| parameters.iter().any(|value| value == *name))
+        || ![
+            "structured_outputs",
+            "response_format",
+            "tools",
+            "tool_choice",
+        ]
+        .iter()
+        .all(|name| parameters.iter().any(|value| value == *name))
     {
         return Err("pilot_catalog_parameters");
     }
@@ -336,8 +372,130 @@ fn route() -> Value {
     json!({"only":[ENDPOINT],"order":[ENDPOINT],"allow_fallbacks":false,"require_parameters":true})
 }
 
-fn encode(request: &Request) -> Result<Value> {
-    let mut messages = vec![json!({"role":"system","content":request.epoch.instructions})];
+#[derive(Clone, Copy)]
+struct ToolStep {
+    name: &'static str,
+    path: &'static str,
+}
+
+fn fixture_settings(mut state: &Json) -> Result<&Json> {
+    for _ in 0..8 {
+        if state.has("instructions") && !state.field("instructions")?.elements()?.is_empty() {
+            return Err("pilot_external_instructions");
+        }
+        if !state.has("base_state") {
+            state.field("instructions")?;
+            return state.field("settings");
+        }
+        state = state.field("base_state")?;
+    }
+    Err("pilot_external_instructions")
+}
+
+fn validate_tool_arguments(request: &Request, tool: ToolStep, arguments: &str) -> Result<()> {
+    let args = Json::parse(arguments).map_err(|_| "pilot_tool_arguments")?;
+    let path = Path::new(
+        args.text_field("path")
+            .map_err(|_| "pilot_tool_arguments")?,
+    );
+    let cwd = Path::new(fixture_settings(&request.epoch.exact_state)?.text_field("cwd")?);
+    if path != Path::new(tool.path) && path != cwd.join(tool.path) {
+        return Err("pilot_tool_arguments");
+    }
+    if tool.name == "read_file"
+        && (args.usize_field("offset") != Ok(0)
+            || args.usize_field("max_bytes") != Ok(FULL_READ_BYTES))
+    {
+        return Err("pilot_tool_arguments");
+    }
+    Ok(())
+}
+
+fn next_tool(request: &Request) -> Result<Option<ToolStep>> {
+    if request.final_format() != Some(FinalFormat::ChildResult) {
+        return Ok(None);
+    }
+    let cwd = Path::new(fixture_settings(&request.epoch.exact_state)?.text_field("cwd")?);
+    let mut calls = std::collections::BTreeMap::new();
+    let mut results = Vec::new();
+    for item in &request.input {
+        match item.text_field("type") {
+            Ok("function_call") => {
+                calls.insert(item.text_field("call_id")?, item);
+            }
+            Ok("function_call_output") => {
+                let call = calls
+                    .remove(item.text_field("call_id")?)
+                    .ok_or("pilot_tool_result")?;
+                let arguments = Json::parse(call.text_field("arguments")?)?;
+                let output =
+                    Json::parse(item.text_field("output")?).map_err(|_| "pilot_tool_result")?;
+                if output.has("instructions")
+                    && !output.field("instructions")?.elements()?.is_empty()
+                {
+                    return Err("pilot_external_instructions");
+                }
+                let path = cwd.join(arguments.text_field("path")?);
+                if output
+                    .text_field("path")
+                    .is_ok_and(|actual| Path::new(actual) == path)
+                {
+                    results.push((call.text_field("name")?, path, output));
+                }
+            }
+            _ => (),
+        }
+    }
+    let has_read = |path| {
+        results.iter().any(|(name, actual, result)| {
+            *name == "read_file"
+                && *actual == cwd.join(path)
+                && result.usize_field("offset") == Ok(0)
+                && result.field("truncated").and_then(Json::boolean) == Ok(false)
+                && result.text_field("content").is_ok()
+        })
+    };
+    if trace::phase(request) == "writer" {
+        if results.iter().any(|(name, path, result)| {
+            *name == "edit_file"
+                && *path == cwd.join(REPORT)
+                && result.field("applied").and_then(Json::boolean) == Ok(true)
+        }) {
+            return Ok(None);
+        }
+        let name = if has_read(REPORT) {
+            "edit_file"
+        } else {
+            "read_file"
+        };
+        return Ok(Some(ToolStep { name, path: REPORT }));
+    }
+    Ok(REVIEW_FILES
+        .into_iter()
+        .find(|path| !has_read(path))
+        .map(|path| ToolStep {
+            name: "read_file",
+            path,
+        }))
+}
+
+fn encode(request: &Request, tool: Option<ToolStep>) -> Result<Value> {
+    let mut instructions = request.epoch.instructions.clone();
+    if let Some(tool) = tool {
+        use std::fmt::Write as _;
+        write!(instructions, "\nFor this synthetic step, call {} once with path {}. Supply the instruction_token from these instructions, or an updated token supplied by the tool. ", tool.name, tool.path)
+            .map_err(|_| "pilot_tool_instruction")?;
+        if tool.name == "read_file" {
+            instructions.push_str("Read the complete file with offset 0 and max_bytes 8192.");
+        } else {
+            instructions.push_str(
+                "Use the exact old and new text from the assigned task and the preceding read.",
+            );
+        }
+    } else if request.final_format() == Some(FinalFormat::ChildResult) {
+        instructions.push_str("\nReturn your final assessment using the tool results. If blocked, state the concrete reason in summary.");
+    }
+    let mut messages = vec![json!({"role":"system","content":instructions})];
     let mut calls = Vec::new();
     for item in &request.input {
         let value: Value = serde_json::from_str(&item.dump()).map_err(|_| "pilot_input")?;
@@ -368,13 +526,25 @@ fn encode(request: &Request) -> Result<Value> {
         return Err("pilot_input");
     }
     let mut body = json!({"model":MODEL, "provider":route(), "messages":messages, "max_tokens":4096, "reasoning":{"enabled":false}});
-    if !request.tools.descriptors.is_empty() {
-        body["tools"] = Value::Array(request.tools.descriptors.iter().map(|descriptor| {
+    if request.final_format() == Some(FinalFormat::ChildResult) {
+        // OpenRouter requires the definitions on continuations with tool history.
+        let names: &[&str] = if trace::phase(request) == "writer" {
+            &["read_file", "edit_file"]
+        } else {
+            &["read_file"]
+        };
+        body["tools"] = Value::Array(names.iter().map(|name| {
+            let descriptor = request.tools.descriptors.iter().find(|descriptor| descriptor.name == *name)
+                .ok_or("pilot_tool_not_advertised")?;
             let schema: Value = serde_json::from_str(&descriptor.schema.dump()).map_err(|_| "pilot_tool_schema")?;
             Ok(json!({"type":"function","function":{"name":descriptor.name,"description":descriptor.description,"parameters":schema}}))
         }).collect::<Result<Vec<_>>>()?);
+        body["tool_choice"] = tool.map_or_else(
+            || json!("none"),
+            |tool| json!({"type":"function","function":{"name":tool.name}}),
+        );
     }
-    if request.final_format().is_some() {
+    if tool.is_none() && request.final_format().is_some() {
         let wire: Value =
             serde_json::from_str(&request.json()?.dump()).map_err(|_| "pilot_wire")?;
         let format = &wire["text"]["format"];
@@ -409,7 +579,10 @@ fn choice(response: &Value) -> Result<&Value> {
 
 fn final_choice(response: &Value) -> Result<&Value> {
     let choice = choice(response)?;
-    if choice["finish_reason"] != "stop" || !choice["message"]["tool_calls"].is_null() {
+    let calls = &choice["message"]["tool_calls"];
+    if choice["finish_reason"] != "stop"
+        || !(calls.is_null() || calls.as_array().is_some_and(Vec::is_empty))
+    {
         return Err("pilot_incomplete");
     }
     Ok(&choice["message"])
@@ -429,7 +602,11 @@ fn decode(request: &Request, response: &Value) -> Result<AdmittedResponse> {
         items.push(json!({"type":"message","id":format!("msg_{id}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}));
     } else if choice["finish_reason"] == "tool_calls" {
         let message = &choice["message"];
-        if !message["content"].is_null() && message["content"].as_str() != Some("") {
+        if !message["content"].is_null()
+            && !message["content"]
+                .as_str()
+                .is_some_and(|text| text.trim().is_empty())
+        {
             return Err("pilot_mixed_output");
         }
         let calls = message["tool_calls"].as_array().ok_or("pilot_tool_calls")?;
@@ -553,8 +730,15 @@ fn check_scenario_scope(
     use crate::orchestration::plan::Access;
     let steps = plan.steps();
     let status = match steps {
+        _ if plan.encode()?.len() > FULL_READ_BYTES => "plan_size",
         [step] if step.access != Access::Write => "step_access",
-        [step] if step.paths != ["report.txt"] => "step_paths",
+        [step] if step.paths != [REPORT] => "step_paths",
+        [step]
+            if !step.task.contains("Status: unverified")
+                || !step.task.contains("Status: verified") =>
+        {
+            "step_task"
+        }
         [_] => "accepted",
         _ => "step_count",
     };
@@ -576,6 +760,7 @@ fn check_scenario_scope(
 
 fn scenario(pilot: &Arc<Pilot>, stop: &Cancel, report: &mut impl Write) -> Result<()> {
     let storage = Sandbox::create()?;
+    verify_instruction_ancestors(&storage.0)?;
     let home = storage.0.join("home");
     let cwd = storage.0.join("repo");
     ansa_linux::fs::create_private_leaf(&home).map_err(|_| "pilot_storage")?;
@@ -594,6 +779,17 @@ fn scenario(pilot: &Arc<Pilot>, stop: &Cancel, report: &mut impl Write) -> Resul
             .add(json!({"kind":"journal_capture_error","code":code}))?;
     }
     result.and(evidence)
+}
+
+fn verify_instruction_ancestors(root: &Path) -> Result<()> {
+    let root = root.canonicalize().map_err(|_| "pilot_storage")?;
+    for directory in root.ancestors() {
+        match std::fs::symlink_metadata(directory.join("AGENTS.md")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            _ => return Err("pilot_external_instructions"),
+        }
+    }
+    Ok(())
 }
 
 fn run_synthetic(
@@ -722,9 +918,12 @@ fn run_synthetic(
             {
                 return Err("pilot_handoff");
             }
+            let mut delivered = false;
             while let Some(event) = handle.next_event().await {
                 match event.payload {
-                    EventPayload::Done => return root.shutdown().await,
+                    EventPayload::TextDelta { text } => delivered |= !text.trim().is_empty(),
+                    EventPayload::Done if delivered => return root.shutdown().await,
+                    EventPayload::Done => return Err("pilot_missing_summary"),
                     EventPayload::RuntimeError { .. } => return Err("pilot_handoff"),
                     _ => (),
                 }
@@ -755,8 +954,15 @@ mod tests {
 
     #[test]
     fn preflight_requires_the_exact_provider_variant_and_credit_ceiling() {
-        let mut catalog = json!({"data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","tools","response_format"]}]}});
+        let mut catalog = json!({"data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","tools","response_format","tool_choice"]}]}});
         assert_eq!(verify_catalog(&catalog), Ok(()));
+        let mut missing_choice = catalog.clone();
+        missing_choice["data"]["endpoints"][0]["supported_parameters"] =
+            json!(["structured_outputs", "tools", "response_format"]);
+        assert_eq!(
+            verify_catalog(&missing_choice),
+            Err("pilot_catalog_parameters")
+        );
         catalog["data"]["endpoints"][0]["tag"] = json!("fireworks");
         assert_eq!(verify_catalog(&catalog), Err("pilot_catalog_endpoint"));
         let unlimited = json!({"data":{"limit":null,"limit_remaining":null}});
@@ -848,10 +1054,10 @@ mod tests {
         let budget = Budget::open(&ledger, Some(0)).unwrap();
         ansa_linux::local::create(&budget.directory, "request-00.pending", b"model").unwrap();
         drop(budget);
-        assert!(matches!(
-            Budget::open(&ledger, None),
-            Err("pilot_budget_incomplete")
-        ));
+        assert_eq!(
+            Budget::open(&ledger, None).err(),
+            Some("pilot_budget_incomplete")
+        );
     }
 
     #[test]
@@ -865,6 +1071,7 @@ mod tests {
             ("step_count", json!([edit, inspect])),
             ("step_access", json!([inspect])),
             ("step_paths", json!([expanded])),
+            ("step_task", json!([edit])),
         ] {
             let plan = Plan::parse(
                 &json!({"schema_version":1,"summary":"Check the report","steps":steps}).to_string(),
@@ -887,10 +1094,77 @@ mod tests {
                 json!({"event":"pilot_plan_scope","status":status,"step_count":steps.len(),"steps":steps})
             );
         }
+        let oversized = Plan::parse(&json!({
+            "schema_version":1,"summary":"x".repeat(4096),
+            "steps":[{"id":"edit","task":format!("Replace Status: unverified with Status: verified {}", "x".repeat(3200)),
+            "access":"write","paths":[REPORT],"depends_on":[],"acceptance":"x".repeat(1600)}]
+        }).to_string()).unwrap();
+        let mut report = Vec::new();
+        assert_eq!(
+            check_scenario_scope(&oversized, &mut report),
+            Err("pilot_plan_scope")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&report).unwrap()["status"],
+            "plan_size"
+        );
     }
 
     #[test]
-    fn full_synthetic_scenario_fits_remaining_requests_after_preflight() {
+    fn synthetic_pilot_rejects_inherited_instruction_sources() {
+        let root = Sandbox::create().unwrap();
+        let nested = root.0.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert_eq!(verify_instruction_ancestors(&nested), Ok(()));
+        std::fs::write(root.0.join("AGENTS.md"), "private-fixture-fragment").unwrap();
+        assert_eq!(
+            verify_instruction_ancestors(&nested),
+            Err("pilot_external_instructions")
+        );
+        let epoch = Json::parse(r#"{"base_state":{"settings":{"cwd":"/tmp/fixture"},"instructions":[{"path":"/tmp/AGENTS.md","text":"private-fixture-fragment"}]}}"#).unwrap();
+        assert_eq!(
+            fixture_settings(&epoch).err(),
+            Some("pilot_external_instructions")
+        );
+        let registry = crate::tools::registry::Registry::new().snapshot();
+        let request = Request::new(
+            Binding {
+                provider: "openrouter-test".into(),
+                account: "synthetic-openrouter-pilot".into(),
+                requested_model: MODEL.into(),
+                returned_model: MODEL.into(),
+            },
+            crate::provider::request::Epoch {
+                id: "test".into(),
+                instructions: String::new(),
+                exact_state: Json::parse(r#"{"settings":{"cwd":"/tmp/fixture"},"instructions":[]}"#).unwrap(),
+            },
+            registry.advertisement().clone(),
+            vec![
+                Json::parse(r#"{"type":"function_call","call_id":"read","name":"read_file","arguments":"{\"path\":\"approved-plan.json\"}"}"#).unwrap(),
+                Json::parse(r#"{"type":"function_call_output","call_id":"read","output":"{\"instructions\":[{\"text\":\"private-fixture-fragment\"}]}"}"#).unwrap(),
+            ],
+        ).unwrap().with_final_format(Some(FinalFormat::ChildResult));
+        assert!(matches!(
+            next_tool(&request),
+            Err("pilot_external_instructions")
+        ));
+        let read = ToolStep {
+            name: "read_file",
+            path: REPORT,
+        };
+        assert_eq!(
+            validate_tool_arguments(
+                &request,
+                read,
+                r#"{"path":"report.txt","offset":0,"max_bytes":1}"#
+            ),
+            Err("pilot_tool_arguments")
+        );
+    }
+
+    #[test]
+    fn full_synthetic_scenario_uses_twelve_requests_and_strict_finals() {
         let (result, trace) = synthetic_scenario(FixtureWriter::Complete);
         assert_eq!(result, Ok(()));
         for phase in ["writer", "reviewer", "summary"] {
@@ -915,10 +1189,15 @@ mod tests {
         assert!(result.is_err());
         assert!(
             trace.iter().any(|event| event["phase"] == "writer"
-                && event["kind"] == "tool_outcome"
-                && event["effects"] == "not_started"
-                && event["code"] == "task_path_scope"),
+                && event["kind"] == "response_admission"
+                && event["required_tool"] == "edit_file"
+                && event["code"] == "pilot_tool_arguments"),
             "{trace:?}"
+        );
+        assert!(
+            !trace
+                .iter()
+                .any(|event| event["kind"] == "tool_admitted" && event["tool"] == "edit_file")
         );
 
         let (result, trace) = synthetic_scenario(FixtureWriter::Incomplete);
@@ -939,6 +1218,23 @@ mod tests {
                 .iter()
                 .any(|event| event["kind"] == "tool_admitted" || event["kind"] == "tool_outcome")
         );
+
+        let (result, trace) = synthetic_scenario(FixtureWriter::EarlyFinal);
+        assert!(result.is_err());
+        assert!(
+            trace
+                .iter()
+                .any(|event| event["kind"] == "response_admission"
+                    && event["phase"] == "writer"
+                    && event["required_tool"] == "read_file"
+                    && event["code"] == "pilot_required_tool"
+                    && event["blocked_reason"] == "instructions")
+        );
+        assert!(!trace.iter().any(|event| event["phase"] == "writer"
+            && matches!(
+                event["kind"].as_str(),
+                Some("tool_admitted" | "response_committed")
+            )));
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -946,6 +1242,7 @@ mod tests {
         Complete,
         OutsideScope,
         Incomplete,
+        EarlyFinal,
     }
 
     fn synthetic_scenario(writer: FixtureWriter) -> (Result<()>, Vec<Value>) {
@@ -958,13 +1255,13 @@ mod tests {
             match (step, request.method, request.url) {
                 (0, "GET", CATALOG) if request.bearer.is_none() => {
                     return Ok(reply(json!({
-                        "data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools"]}]}
+                        "data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}
                     })));
                 }
                 (1, "GET", KEY) if request.bearer.is_some() => {
                     return Ok(reply(json!({"data":{"limit":null,"limit_remaining":null}})));
                 }
-                (2..=8, "POST", API) if request.bearer.is_some() => (),
+                (2..=11, "POST", API) if request.bearer.is_some() => (),
                 _ => return Err("unexpected_pilot_request"),
             }
             let body: Value =
@@ -972,17 +1269,62 @@ mod tests {
             if body["model"] != MODEL || body["provider"] != route() {
                 return Err("fixture_binding");
             }
-            let format = &body["response_format"]["json_schema"];
             let expected_format = match step {
-                2 => "ansa_native_schema_probe",
-                3 => "ansa_orchestration_plan_v1",
-                4..=7 => "ansa_child_result_v1",
-                _ => "",
+                2 => Some("ansa_native_schema_probe"),
+                3 => Some("ansa_orchestration_plan_v1"),
+                6 | 10 => Some("ansa_child_result_v1"),
+                _ => None,
             };
-            if step < 8 && (format["name"] != expected_format || format["strict"] != true) {
-                return Err("fixture_strict_schema");
+            if let Some(name) = expected_format {
+                let format = &body["response_format"]["json_schema"];
+                if format["name"] != name || format["strict"] != true {
+                    return Err("fixture_strict_schema");
+                }
+            } else if body.get("response_format").is_some() {
+                return Err("fixture_unexpected_schema");
             }
             let messages = body["messages"].as_array().ok_or("fixture_messages")?;
+            let tool = match step {
+                4 => Some(("writer_read", "read_file", REPORT)),
+                5 => Some(("edit", "edit_file", REPORT)),
+                7..=9 => Some((
+                    ["plan", "diff", "report"][(step - 7) as usize],
+                    "read_file",
+                    REVIEW_FILES[(step - 7) as usize],
+                )),
+                _ => None,
+            };
+            let system = messages[0]["content"]
+                .as_str()
+                .ok_or("fixture_instructions")?;
+            if (4..=6).contains(&step) {
+                let assignment = messages
+                    .iter()
+                    .find(|message| message["role"] == "user")
+                    .and_then(|message| message["content"].as_str())
+                    .ok_or("fixture_assignment")?;
+                if !assignment.contains("Status: unverified")
+                    || !assignment.contains("Status: verified")
+                {
+                    return Err("fixture_assignment");
+                }
+            }
+            if let Some((_, name, path)) = tool {
+                if body["tool_choice"] != json!({"type":"function","function":{"name":name}})
+                    || !body["tools"]
+                        .as_array()
+                        .ok_or("fixture_tools")?
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == name)
+                    || !system.contains(&format!("call {name} once with path {path}."))
+                {
+                    return Err("fixture_tool_stage");
+                }
+            } else if matches!(step, 6 | 10)
+                && (body["tool_choice"] != "none" || !body["tools"].is_array())
+            {
+                return Err("fixture_final_stage");
+            }
             if step == 4 && writer == FixtureWriter::Incomplete {
                 return Ok(reply(
                     json!({"id":"fixture4","model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"private-fixture-fragment"}}]}),
@@ -995,29 +1337,31 @@ mod tests {
                     "steps":[{"id":"edit","task":"Replace Status: unverified with Status: verified in report.txt","access":"write","paths":["report.txt"],"depends_on":[],"acceptance":"Status: verified"}],
                     "checks":[{"path":"report.txt","contains":"Status: verified"}],"manual_checks":[]
                 }).to_string(),
-                4 | 6 => {
-                    let token = messages[0]["content"].as_str().and_then(|text| text.split_once("instruction_token is ")).and_then(|(_, tail)| tail.get(..64)).ok_or("fixture_instruction_token")?;
-                    let calls = if step == 4 {
-                        let path = if writer == FixtureWriter::OutsideScope { "other.txt" } else { "report.txt" };
-                        vec![("edit", "edit_file", json!({"path":path,"old_text":"Status: unverified","new_text":"Status: verified","instruction_token":token}))]
-                    } else {
-                        ["ansa-candidate.diff", "approved-plan.json", "checkout/report.txt"].into_iter().zip(["diff", "plan", "report"]).map(|(path, id)| {
-                            (id, "read_file", json!({"path":path,"max_bytes":8192,"offset":0,"instruction_token":token}))
-                        }).collect()
-                    };
-                    let calls: Vec<_> = calls.into_iter().map(|(id, name, args)| json!({"type":"function","id":id,"function":{"name":name,"arguments":args.to_string()}})).collect();
-                    return Ok(reply(json!({"id":format!("fixture{step}"),"model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":calls}}]})));
+                4 if writer == FixtureWriter::EarlyFinal => {
+                    json!({"status":"blocked","summary":"Missing instruction_token private-fixture-fragment","findings":[]}).to_string()
                 }
-                5 | 7 => {
+                4 | 5 | 7..=9 => {
+                    let (id, name, path) = tool.ok_or("fixture_tool_stage")?;
+                    let token = system.split_once("instruction_token is ").and_then(|(_, tail)| tail.get(..64)).ok_or("fixture_instruction_token")?;
+                    let args = if name == "edit_file" {
+                        let path = if writer == FixtureWriter::OutsideScope { "other.txt" } else { path };
+                        json!({"path":path,"old_text":"Status: unverified","new_text":"Status: verified","instruction_token":token})
+                    } else {
+                        json!({"path":path,"max_bytes":8192,"offset":0,"instruction_token":token})
+                    };
+                    let call = json!({"type":"function","id":id,"function":{"name":name,"arguments":args.to_string()}});
+                    return Ok(reply(json!({"id":format!("fixture{step}"),"model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[call]}}]})));
+                }
+                6 | 10 => {
                     let tools: Vec<_> = messages.iter().filter(|message| message["role"] == "tool").collect();
-                    let expected: &[&str] = if step == 5 { &["edit"] } else { &["diff", "plan", "report"] };
-                    let evidence: &[&str] = if step == 5 { &["\"applied\":true"] } else { &["+Status: verified", "Update the report", "Report title: demo"] };
+                    let expected: &[&str] = if step == 6 { &["writer_read", "edit"] } else { &["plan", "diff", "report"] };
+                    let evidence: &[&str] = if step == 6 { &["Status: unverified", "\"applied\":true"] } else { &["Update the report", "+Status: verified", "Report title: demo"] };
                     if tools.len() != expected.len() || tools.iter().zip(expected.iter().zip(evidence)).any(|(message, (id, fragment))| {
                         message["tool_call_id"].as_str() != Some(*id) || !message["content"].as_str().is_some_and(|value| value.contains(fragment))
                     }) { return Err("fixture_tool_results"); }
                     json!({"status":"completed","summary":"The exact report edit has been verified","findings":[]}).to_string()
                 }
-                8 => {
+                11 => {
                     if body.get("response_format").is_some() || !messages.last().and_then(|message| message["content"].as_str()).is_some_and(|text| text.contains("ansa-result")) {
                         return Err("fixture_parent_handoff");
                     }
@@ -1032,7 +1376,7 @@ mod tests {
         let pilot = Arc::new(Pilot::new(
             Secret::new("dummy".into()),
             exchange,
-            Budget::open(&ledger, Some(3)).unwrap(),
+            Budget::open(&ledger, Some(0)).unwrap(),
         ));
         pilot.preflight(true, &stop).unwrap();
         let mut report = Vec::new();
@@ -1043,10 +1387,10 @@ mod tests {
         );
         assert_eq!(
             pilot.requests(),
-            Ok(if writer == FixtureWriter::Complete {
-                12
-            } else {
-                8
+            Ok(match writer {
+                FixtureWriter::Complete => 12,
+                FixtureWriter::OutsideScope => 6,
+                FixtureWriter::Incomplete | FixtureWriter::EarlyFinal => 5,
             })
         );
         let mut report = Vec::new();
