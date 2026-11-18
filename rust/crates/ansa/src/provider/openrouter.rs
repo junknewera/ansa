@@ -22,6 +22,7 @@ type Result<T> = std::result::Result<T, &'static str>;
 
 pub(crate) use crate::provider::request::OPENROUTER_MODEL as MODEL;
 pub(crate) const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const ENDPOINT: &str = "fireworks/us";
 pub(crate) const PROVIDER: &str = "Fireworks";
 pub(crate) const API: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -80,6 +81,7 @@ impl OpenRouter {
         method: &'static str,
         url: &'static str,
         body: Option<Value>,
+        timeout_ms: u64,
         stop: &Cancel,
     ) -> Result<Value> {
         stop.check()?;
@@ -95,7 +97,7 @@ impl OpenRouter {
                 body: Secret::new(body),
                 bearer: (url == API).then(|| self.key.clone()),
                 body_limit: 512 * 1024,
-                timeout_ms: if url == CATALOG { 10_000 } else { 60_000 },
+                timeout_ms,
             },
             stop,
         )?;
@@ -121,13 +123,16 @@ impl OpenRouter {
                     .catalog_retry_at
                     .is_none_or(|retry| Instant::now() >= retry))
         {
-            let catalog = self.send("GET", CATALOG, None, stop).and_then(|response| {
-                let endpoint = catalog_endpoint(&response)?;
-                Ok(endpoint["context_length"]
-                    .as_u64()
-                    .and_then(|window| usize::try_from(window).ok())
-                    .filter(|window| *window >= 2))
-            });
+            let timeout = if strict { REQUEST_TIMEOUT_MS } else { 10_000 };
+            let catalog = self
+                .send("GET", CATALOG, None, timeout, stop)
+                .and_then(|response| {
+                    let endpoint = catalog_endpoint(&response)?;
+                    Ok(endpoint["context_length"]
+                        .as_u64()
+                        .and_then(|window| usize::try_from(window).ok())
+                        .filter(|window| *window >= 2))
+                });
             stop.check()?;
             match catalog {
                 Ok(window) => {
@@ -143,7 +148,7 @@ impl OpenRouter {
             }
         }
         if strict && !route.strict_verified {
-            verify_probe(&self.send("POST", API, Some(probe_body()), stop)?)?;
+            verify_probe(&self.send("POST", API, Some(probe_body()), REQUEST_TIMEOUT_MS, stop)?)?;
             route.strict_verified = true;
         }
         Ok(route.window)
@@ -170,7 +175,7 @@ impl OpenRouter {
         if request.final_format() == Some(FinalFormat::ChildResult)
             && !request.tools.descriptors.is_empty()
         {
-            let response = self.send("POST", API, Some(body.clone()), stop)?;
+            let response = self.send("POST", API, Some(body.clone()), REQUEST_TIMEOUT_MS, stop)?;
             if choice(&response)?["finish_reason"] == "tool_calls" {
                 return decode(request, &response)
                     .map(|response| response.with_context_window(window));
@@ -183,7 +188,7 @@ impl OpenRouter {
                 body["tool_choice"] = json!("none");
             }
         }
-        let response = self.send("POST", API, Some(body), stop)?;
+        let response = self.send("POST", API, Some(body), REQUEST_TIMEOUT_MS, stop)?;
         let admitted = decode(request, &response)?;
         if request.final_format().is_some() && !admitted.calls().is_empty() {
             return Err("openrouter_final_has_tools");
@@ -468,6 +473,7 @@ mod tests {
                 let call = calls.fetch_add(1, Ordering::AcqRel);
                 if call == 0 {
                     assert_eq!(request.url, CATALOG);
+                    assert_eq!(request.timeout_ms, REQUEST_TIMEOUT_MS);
                     assert!(request.bearer.is_none());
                     return Ok(reply(
                         json!({"data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"context_length":1000000,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}}),
