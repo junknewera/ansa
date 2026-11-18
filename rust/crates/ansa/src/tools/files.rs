@@ -78,6 +78,7 @@ impl Host {
             || path.starts_with(&self.auth)
             || path.starts_with(&self.session)
             || path.starts_with(self.settings.directory.join("auth"))
+            || path.starts_with(self.settings.directory.join("openrouter"))
             || path.starts_with(self.settings.directory.join("sessions"))
             || path.starts_with(self.settings.directory.join("terminal-workspaces"))
             || self.scope.is_some() && path.components().any(|part| part.as_os_str() == ".git")

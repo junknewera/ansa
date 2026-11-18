@@ -379,12 +379,27 @@ impl Worktree {
         stop: &Cancel,
     ) -> Result<PathBuf> {
         let storage = self.path.parent().ok_or("worktree_storage")?;
-        let path = storage.join(format!("verification-{number}"));
-        if path.exists()
-            && !path.join("ansa-candidate.diff").exists()
-            && !storage.join(format!("review-{number}")).exists()
-        {
-            let retained = storage.join(format!("interrupted-verification-{number}"));
+        self.frozen_view_named(
+            frozen,
+            &format!("verification-{number}"),
+            plan,
+            storage.join(format!("review-{number}")).exists(),
+            stop,
+        )
+    }
+
+    pub(crate) fn frozen_view_named(
+        &self,
+        frozen: &Frozen,
+        name: &str,
+        plan: &str,
+        referenced: bool,
+        stop: &Cancel,
+    ) -> Result<PathBuf> {
+        let storage = self.path.parent().ok_or("worktree_storage")?;
+        let path = storage.join(name);
+        if path.exists() && !path.join("ansa-candidate.diff").exists() && !referenced {
+            let retained = storage.join(format!("interrupted-{name}"));
             if retained.exists() {
                 return Err("candidate_view_incomplete");
             }

@@ -286,8 +286,7 @@ pub fn fixture_stream(
 pub fn exchange(request: &HttpRequest, stop: &Cancel) -> Result<HttpReply> {
     perform(request, stop, None, StreamAdmission::Strict)
 }
-#[cfg(feature = "orchestration-pilot")]
-pub(crate) fn pilot_exchange(request: &HttpRequest, stop: &Cancel) -> Result<HttpReply> {
+pub(crate) fn openrouter_exchange(request: &HttpRequest, stop: &Cancel) -> Result<HttpReply> {
     let uri: Uri = request.url.parse().map_err(|_| "url_invalid")?;
     if uri.scheme_str() != Some("https")
         || uri.authority().map(|value| value.as_str()) != Some("openrouter.ai")
@@ -300,7 +299,7 @@ pub(crate) fn pilot_exchange(request: &HttpRequest, stop: &Cancel) -> Result<Htt
             ) | ("POST", "/api/v1/chat/completions")
         )
     {
-        return Err("pilot_endpoint");
+        return Err("openrouter_endpoint");
     }
     perform_route(
         request,

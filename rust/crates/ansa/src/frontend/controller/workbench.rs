@@ -559,6 +559,10 @@ enum Job {
     OrchestrationReceipt {
         result: Result<()>,
     },
+    DraftPullRequest {
+        owner: String,
+        result: Result<String>,
+    },
     Themes {
         request: ThemeLoad,
         result: Result<ThemeCatalog>,
@@ -990,7 +994,7 @@ impl Workbench {
         {
             stop.cancel();
             self.disarm_exit();
-            self.report(io, "Останавливаю работу помощников");
+            self.report(io, "Останавливаю текущую задачу");
         } else if slot.interruptible() {
             self.disarm_exit();
             self.cancel_current(io);
@@ -1819,6 +1823,25 @@ impl Workbench {
                 }
                 (true, false)
             }
+            "/pr" => {
+                if argument.is_empty() {
+                    self.report(io, "Укажите базовую ветку, например /pr main");
+                } else if self.orchestration_stop.is_some() || self.slots[self.current].active() {
+                    self.report(io, "Дождитесь завершения текущей задачи");
+                } else if self.can_job(io) {
+                    let owner = self.slots[self.current].id.clone();
+                    let factory = self.factory.clone();
+                    let base = argument.to_owned();
+                    let stop = Cancel::linked(&self.stop);
+                    self.orchestration_stop = Some((owner.clone(), stop.clone()));
+                    self.jobs.spawn_blocking(move || Job::DraftPullRequest {
+                        result: super::super::publish::draft(&factory, &owner, &base, &stop),
+                        owner,
+                    });
+                    self.report(io, "Готовлю черновик PR · Ctrl+C остановить");
+                }
+                (true, false)
+            }
             "/files" | "/open" => {
                 self.open_file(
                     if argument.is_empty() {
@@ -2204,6 +2227,20 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
+            Job::DraftPullRequest { owner, result } => {
+                self.orchestration_stop = None;
+                let message = match result {
+                    Ok(url) => format!("Черновик PR · {url}"),
+                    Err("draft_release_missing") => "В разговоре пока нет проверенной ветки".into(),
+                    Err("draft_snapshot_private_changes") => "В исходном снимке есть локальные изменения. Для публикации нужен кандидат, проверенный на чистой базе".into(),
+                    Err("draft_base_changed") => "Базовая ветка на GitHub отличается от проверенной версии".into(),
+                    Err("draft_requires_network") => "Черновик PR доступен в сетевом режиме ansa".into(),
+                    Err(code) => format!("Не удалось создать черновик PR ({code})"),
+                };
+                if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
+                    slot.state.report(io, &message);
+                }
+            }
             Job::OrchestrationReceipt { result } => {
                 if let Err(code) = result {
                     self.report(
@@ -2228,6 +2265,10 @@ impl Workbench {
                 match result {
                     Ok(proposal) => {
                         let mut lines = vec![proposal.plan.summary().to_owned(), String::new()];
+                        for check in proposal.plan.command_checks() {
+                            let argv = serde_json::json!(check.argv);
+                            lines.push(format!("Команда в копии проекта с вашими правами {argv}"));
+                        }
                         if proposal
                             .plan
                             .steps()

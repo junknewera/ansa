@@ -19,6 +19,7 @@ mod orchestration;
 pub mod orchestration_pilot;
 mod progress;
 pub mod protocol_v1;
+mod publish;
 pub mod sessions;
 pub mod terminal;
 pub mod terminal_input;

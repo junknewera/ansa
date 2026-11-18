@@ -10,6 +10,7 @@ const MAX_FINDINGS: usize = 8;
 pub enum FinalFormat {
     ChildResult,
     OrchestrationPlan,
+    OrchestrationPlanWithCommands,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,7 @@ impl FinalFormat {
         match self {
             Self::ChildResult => "ansa_child_result_v1",
             Self::OrchestrationPlan => "ansa_orchestration_plan_v1",
+            Self::OrchestrationPlanWithCommands => "ansa_orchestration_plan_v2",
         }
     }
 
@@ -55,6 +57,7 @@ impl FinalFormat {
         match name {
             "ansa_child_result_v1" => Ok(Self::ChildResult),
             "ansa_orchestration_plan_v1" => Ok(Self::OrchestrationPlan),
+            "ansa_orchestration_plan_v2" => Ok(Self::OrchestrationPlanWithCommands),
             _ => Err("unknown_final_format"),
         }
     }
@@ -64,9 +67,24 @@ impl FinalFormat {
             Self::ChildResult => Json::parse(
                 r#"{"type":"object","properties":{"status":{"type":"string","enum":["completed","changes_requested","blocked"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}}},"required":["status","summary","findings"],"additionalProperties":false}"#,
             )?,
-            Self::OrchestrationPlan => Json::parse(
+            Self::OrchestrationPlan | Self::OrchestrationPlanWithCommands => Json::parse(
                 r#"{"type":"object","properties":{"schema_version":{"type":"integer","enum":[1]},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"task":{"type":"string"},"access":{"type":"string","enum":["read","write"]},"paths":{"type":"array","items":{"type":"string"}},"depends_on":{"type":"array","items":{"type":"string"}},"acceptance":{"type":"string"}},"required":["id","task","access","paths","depends_on","acceptance"],"additionalProperties":false}},"checks":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"contains":{"type":"string"}},"required":["path","contains"],"additionalProperties":false}},"manual_checks":{"type":"array","items":{"type":"string"}}},"required":["schema_version","summary","steps","checks","manual_checks"],"additionalProperties":false}"#,
             )?,
+        };
+        let schema = if self == Self::OrchestrationPlanWithCommands {
+            let command_checks = Json::parse(
+                r#"{"type":"array","items":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}}},"required":["argv"],"additionalProperties":false}}"#,
+            )?;
+            let properties = schema
+                .field("properties")?
+                .with("command_checks", command_checks)?;
+            let mut required = schema.field("required")?.elements()?.to_vec();
+            required.push(Json::string("command_checks")?);
+            schema
+                .with("properties", properties)?
+                .with("required", Json::array(required)?)?
+        } else {
+            schema
         };
         Json::object(vec![
             ("type", Json::string("json_schema")?),
@@ -79,7 +97,9 @@ impl FinalFormat {
     pub(super) fn validate(self, items: &[NativeItem]) -> Result<()> {
         match self {
             Self::ChildResult => self.child_result(items).map(|_| ()),
-            Self::OrchestrationPlan => self.plan(items).map(|_| ()),
+            Self::OrchestrationPlan | Self::OrchestrationPlanWithCommands => {
+                self.plan(items).map(|_| ())
+            }
         }
     }
 
@@ -94,13 +114,21 @@ impl FinalFormat {
     }
 
     pub(super) fn plan(self, items: &[NativeItem]) -> Result<crate::orchestration::plan::Plan> {
-        if self != Self::OrchestrationPlan {
+        if !matches!(
+            self,
+            Self::OrchestrationPlan | Self::OrchestrationPlanWithCommands
+        ) {
             return Err("plan_result_format_required");
         }
         let text = terminal_text(items, 64 * 1024)?;
         let value = Json::parse(text)?;
         value.field("checks")?.elements()?;
         value.field("manual_checks")?.elements()?;
+        if self == Self::OrchestrationPlanWithCommands {
+            value.field("command_checks")?.elements()?;
+        } else if value.has("command_checks") {
+            return Err("plan_schema_version");
+        }
         crate::orchestration::plan::Plan::parse(text)
     }
 }

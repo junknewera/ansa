@@ -59,6 +59,8 @@ struct Proposal {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     checks: Vec<Check>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    command_checks: Vec<CommandCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     manual_checks: Vec<String>,
 }
 
@@ -67,6 +69,12 @@ struct Proposal {
 pub(crate) struct Check {
     pub path: String,
     pub contains: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CommandCheck {
+    pub argv: Vec<String>,
 }
 
 /// Immutable, validated description of the tasks offered to the user.
@@ -89,6 +97,7 @@ impl Plan {
         if proposal.schema_version != 1
             || proposal.steps.len() > PLAN_STEPS
             || proposal.checks.len() > 16
+            || proposal.command_checks.len() > 8
             || proposal.manual_checks.len() > 8
             || !valid_text(&proposal.summary, 4096)
         {
@@ -102,6 +111,16 @@ impl Plan {
                 .manual_checks
                 .iter()
                 .any(|check| !valid_text(check, 2048))
+            || proposal.command_checks.iter().any(|check| {
+                check.argv.is_empty()
+                    || check.argv.len() > 64
+                    || check.argv[0].trim().is_empty()
+                    || check
+                        .argv
+                        .iter()
+                        .any(|arg| arg.chars().any(char::is_control))
+                    || check.argv.iter().map(String::len).sum::<usize>() > 4096
+            })
         {
             return Err("plan_check_scope");
         }
@@ -135,7 +154,8 @@ impl Plan {
                 }
             }
         }
-        if !proposal.checks.is_empty() && writes.is_empty() {
+        if (!proposal.checks.is_empty() || !proposal.command_checks.is_empty()) && writes.is_empty()
+        {
             return Err("plan_check_scope");
         }
         for step in &proposal.steps {
@@ -179,6 +199,10 @@ impl Plan {
         &self.0.checks
     }
 
+    pub(crate) fn command_checks(&self) -> &[CommandCheck] {
+        &self.0.command_checks
+    }
+
     pub(crate) fn manual_checks(&self) -> &[String] {
         &self.0.manual_checks
     }
@@ -187,7 +211,9 @@ impl Plan {
         if !self.manual_checks().is_empty() {
             return Err("orchestration_manual_checks_required");
         }
-        if self.0.steps.iter().any(|step| step.access == Access::Write) && self.checks().is_empty()
+        if self.0.steps.iter().any(|step| step.access == Access::Write)
+            && self.checks().is_empty()
+            && self.command_checks().is_empty()
         {
             return Err("orchestration_missing_checks");
         }
@@ -324,6 +350,7 @@ mod tests {
                 summary: "Find out why the report sometimes comes back empty".into(),
                 steps,
                 checks: Vec::new(),
+                command_checks: Vec::new(),
                 manual_checks: Vec::new(),
             })
             .unwrap(),

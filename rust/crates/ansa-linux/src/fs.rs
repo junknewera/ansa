@@ -50,6 +50,8 @@ pub fn protected_path(path: &Path) -> bool {
         let name = part.as_os_str().as_encoded_bytes();
         name == b".env"
             || name.starts_with(b".env.")
+            || name == b"openrouter.key"
+            || name.starts_with(b"openrouter.key.pending-")
             || matches!(name, b".codex" | b".claude" | b".gemini")
     })
 }

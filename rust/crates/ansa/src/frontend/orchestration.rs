@@ -4,7 +4,7 @@ use crate::{
     orchestration::{
         plan::{Access, Plan, Step},
         run::{DispatchBudget, Run, RunContext, RunId},
-        worktree::Worktree,
+        worktree::{Frozen, Worktree},
     },
     protocol::json::Json,
     provider::request::Request,
@@ -12,6 +12,10 @@ use crate::{
     runtime::{
         Cancel, ChildAttempt, ChildAttemptState, CommandPayload, ForkSeed, PostStatus, Runtime,
         RuntimeCommand,
+    },
+    tools::{
+        command::{ProcessOptions, ProcessRunner},
+        invocation::Invocation,
     },
 };
 use ansa_linux::{fs, local};
@@ -112,9 +116,9 @@ pub(super) struct Candidate {
 }
 
 pub(super) fn execute(factory: &Factory, proposal: Proposal, stop: &Cancel) -> Result<Completed> {
-    factory.orchestration_route()?;
+    factory.check_orchestration_context(&proposal.seed.request()?)?;
     proposal.plan.execution_ready()?;
-    stop.check()?;
+    factory.require_orchestration_route(stop)?;
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -224,7 +228,15 @@ async fn schedule(
                 run.observe(id, &receipt)?;
                 if !run.active().any(|active_id| active_id == id) {
                     active.swap_remove(index).runtime.shutdown().await?;
-                } else if matches!(receipt.state(), ChildAttemptState::Durable { quiescent: true, resume_required: true, recovery_required: false, .. }) {
+                } else if matches!(
+                    receipt.state(),
+                    ChildAttemptState::Durable {
+                        quiescent: true,
+                        resume_required: true,
+                        recovery_required: false,
+                        ..
+                    }
+                ) {
                     paused += 1;
                 }
             }
@@ -252,15 +264,27 @@ async fn schedule(
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         let release = if let Some((worktree, _lease)) = &candidate {
-            if run.plan().steps().iter().any(|step| !run.result(&step.id).is_some_and(|result| result.status == ChildStatus::Completed)) {
+            if run.plan().steps().iter().any(|step| {
+                !run.result(&step.id)
+                    .is_some_and(|result| result.status == ChildStatus::Completed)
+            }) {
                 return Err("orchestration_candidate_incomplete");
             }
             Some(review_candidate(factory, &run, worktree, &source, stop).await?)
-        } else { None };
+        } else {
+            None
+        };
         let mut summary = evidence(&run, &prompt)?;
         if let Some(candidate) = &release {
-            let mut object: serde_json::Value = serde_json::from_str(&summary).map_err(|_| "orchestration_summary")?;
-            object["verified_candidate"] = serde_json::json!({ "commit": candidate.commit, "workspace": candidate.workspace, "branch": "ansa-result", "verification": "git diff --check, approved assertions and independent review" });
+            let mut object: serde_json::Value =
+                serde_json::from_str(&summary).map_err(|_| "orchestration_summary")?;
+            object["verified_candidate"] = serde_json::json!({
+                "commit": candidate.commit,
+                "workspace": candidate.workspace,
+                "branch": "ansa-result",
+                "verification": "git diff --check, approved checks and independent review",
+                "command_checks_passed": run.plan().command_checks().len(),
+            });
             summary = object.to_string();
         }
         Ok(Completed {
@@ -327,8 +351,14 @@ async fn review_candidate(
     for attempt in 0..=2 {
         stop.check()?;
         let candidate = worktree.candidate(attempt, &scope, stop)?;
-        let review_path = worktree.frozen_view(&candidate, attempt, &run.plan().encode()?, stop)?;
-        let failed = Worktree::failed_checks(&review_path, run.plan().checks(), stop)?;
+        let mut failed = run_command_checks(factory, run, worktree, &candidate, attempt, stop)?;
+        let plan = run.plan().encode()?;
+        let review_path = worktree.frozen_view(&candidate, attempt, &plan, stop)?;
+        failed.extend(Worktree::failed_checks(
+            &review_path,
+            run.plan().checks(),
+            stop,
+        )?);
         let reviewer = Step {
             id: format!("review-{attempt}"),
             task: format!("Независимо проверьте замороженный коммит {}. Прочитайте approved-plan.json, ansa-candidate.diff и нужные файлы из checkout/. Оцените корректность, полноту и риски по критериям каждого шага.", candidate.commit()),
@@ -349,7 +379,9 @@ async fn review_candidate(
         )
         .await?;
         if verdict.status == ChildStatus::Completed && failed.is_empty() {
+            worktree.frozen_view(&candidate, attempt, &plan, stop)?;
             worktree.local_branch(&candidate, stop)?;
+            super::publish::record_release(storage, worktree, &candidate)?;
             return Ok(Candidate {
                 commit: candidate.commit().into(),
                 workspace: worktree.path().to_owned(),
@@ -385,6 +417,92 @@ async fn review_candidate(
         }
     }
     Err("orchestration_review_unresolved")
+}
+
+fn run_command_checks(
+    factory: &Factory,
+    run: &Run,
+    worktree: &Worktree,
+    candidate: &Frozen,
+    attempt: u8,
+    stop: &Cancel,
+) -> Result<Vec<String>> {
+    let checks = run.plan().command_checks();
+    if checks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let storage = worktree.path().parent().ok_or("worktree_storage")?;
+    let runner = ProcessRunner::new(
+        &storage.join("check-jobs"),
+        &std::env::current_exe().map_err(|_| "process_executable")?,
+    )?;
+    let plan = run.plan().encode()?;
+    let timeout_ms = factory.settings.process_timeout_ms.clamp(1, 300_000);
+    let mut failures = Vec::new();
+    for (index, check) in checks.iter().enumerate() {
+        stop.check()?;
+        let name = format!("check-{attempt}-{index}");
+        let path = storage.join(&name);
+        let arguments = Json::parse(
+            &serde_json::json!({"candidate":candidate.commit(),"argv":check.argv}).to_string(),
+        )?;
+        let invocation = Invocation {
+            operation: crate::protocol::legacy_json_v1::sha256(
+                format!("{}\n{name}\n{}", run.identity().run, arguments.dump()).as_bytes(),
+            ),
+            call: name.clone(),
+            name: "candidate_check".into(),
+            revision: "ansa_candidate_check_v1".into(),
+            arguments,
+        };
+        let existing = runner.has_job(&invocation)?;
+        if !existing {
+            if now()?.saturating_add((timeout_ms as u64).div_ceil(1000)) > run.deadline() {
+                return Err("orchestration_deadline");
+            }
+            worktree.frozen_view_named(candidate, &name, &plan, false, stop)?;
+            if now()?.saturating_add((timeout_ms as u64).div_ceil(1000)) > run.deadline() {
+                return Err("orchestration_deadline");
+            }
+        }
+        let outcome = runner.run(
+            &invocation,
+            &ProcessOptions {
+                cwd: path.join("checkout"),
+                argv: check.argv.clone(),
+                timeout_ms,
+                output_bytes: 8192,
+            },
+            stop,
+        )?;
+        if outcome.effects() == crate::provider::replay::Effects::Unknown {
+            return Err("orchestration_check_effect_unknown");
+        }
+        stop.check()?;
+        if !existing {
+            std::fs::remove_dir_all(&path).map_err(|_| "orchestration_check_cleanup")?;
+        }
+        let output =
+            std::str::from_utf8(outcome.output()).map_err(|_| "orchestration_check_result")?;
+        let output = Json::parse(output)?;
+        if output.field("cancelled").and_then(Json::boolean) == Ok(true) {
+            return Err("orchestration_check_cancelled");
+        }
+        if outcome.execution() != crate::provider::replay::Execution::Succeeded
+            || output.usize_field("exit_code") != Ok(0)
+            || output.field("timed_out").and_then(Json::boolean) != Ok(false)
+            || output.field("cleanup_complete").and_then(Json::boolean) != Ok(true)
+        {
+            failures.push(format!(
+                "Проверка {} завершилась ошибкой ({})",
+                check.argv[0],
+                output
+                    .field("exit_code")
+                    .map_or_else(|_| "запуск".into(), Json::dump)
+            ));
+        }
+    }
+    Ok(failures)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -657,6 +775,9 @@ async fn resume_owned(factory: &Factory, identity: RunId, stop: &Cancel) -> Resu
     if !continuable(&run, now()?) {
         return Err("orchestration_continuation_unavailable");
     }
+    let context = run.context().ok_or("orchestration_context")?;
+    factory.check_orchestration_context(&Request::load(&Json::parse(&context.configuration)?)?)?;
+    factory.require_orchestration_route(stop)?;
     let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
     let active = restore_active(factory, &mut run, stop).await?;
     schedule(factory, run, candidate, active, stop).await
@@ -752,7 +873,7 @@ async fn restore_active(factory: &Factory, run: &mut Run, stop: &Cancel) -> Resu
     Ok(active)
 }
 
-fn run_root(factory: &Factory, parent: &str) -> PathBuf {
+pub(super) fn run_root(factory: &Factory, parent: &str) -> PathBuf {
     factory
         .settings
         .directory

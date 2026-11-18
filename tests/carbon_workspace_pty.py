@@ -850,7 +850,8 @@ def completion_and_help(screen, root, cwd):
     command_rows = [match for row in range(screen.vt.rows)
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
-    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions", "/new", "/fork", "/btw", "/plan", "/copy", "/resume", "/help", "/exit"}
+    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions",
+                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert "/run" not in visible(screen), "removed /run remains advertised"
@@ -868,6 +869,9 @@ def completion_and_help(screen, root, cwd):
     until(screen, lambda frame: "План" in screen.vt.line(-2) and screen.vt.line(-4) == "›", "trailing-space /plan routed locally")
     screen.send("/plan \r")
     until(screen, lambda frame: "План" not in screen.vt.line(-2) and screen.vt.line(-4) == "›", "/plan returns to work")
+    local(screen, "/pr main")
+    until(screen, lambda frame: "Черновик PR доступен в сетевом режиме ansa" in frame,
+          "/pr stays local and refuses publishing offline")
     assert journals(root) == before, "whitespace in local commands dispatched canonical user turns"
     screen.send("/exit \r")
     return "normal"
@@ -1017,16 +1021,21 @@ def orchestration_candidate(screen, root, cwd):
     git("init", "-q")
     report = cwd / "report.txt"
     report.write_text("committed version\n")
-    git("add", "report.txt")
+    check_marker = root / "check-ran"
+    check = cwd / "check.sh"
+    check.write_text(f'#!/bin/sh\nset -eu\ngrep -qx "after fixture" report.txt\nprintf x >> "{check_marker}"\n')
+    check.chmod(0o700)
+    git("add", "report.txt", "check.sh")
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "fixture")
     report.write_text("before fixture\n")
     before = git("status", "--short")
     screen.send(b"\t\t")
     until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "writer plan mode")
-    screen.send("ORCHESTRATION_WRITE_FIXTURE\r")
+    screen.send("ORCHESTRATION_COMMAND_FIXTURE\r")
     until(screen, lambda frame: "Независимое ревью" in frame or "независимое ревью" in frame,
           "plan discloses verification and fixes")
     assert not (home := root / "home/.ansa/orchestration").exists()
+    assert "./check.sh" in visible(screen) and not check_marker.exists()
     screen.send(b"\r")
     until(screen, lambda frame: "ansa-result готова" in frame and "Проверенные изменения" in frame,
           "reviewed isolated candidate and diff", timeout=15)
@@ -1035,6 +1044,7 @@ def orchestration_candidate(screen, root, cwd):
     assert report.read_text() == "before fixture\n"
     assert git("show", ":report.txt") == "committed version\n"
     assert git("status", "--short") == before
+    assert check_marker.read_text() == "x"
     results = [event for event in records(root) if event["kind"] == "outcome"]
     assert len(results) == 2, "edit and independent diff review should each use a native tool"
     run = checkout.parent
@@ -1059,9 +1069,24 @@ def orchestration_candidate(screen, root, cwd):
     until(restarted, lambda frame: "Проверенные изменения" in frame, "reconciled exact original candidate", timeout=15)
     until(restarted, lambda frame: (run / "summary-admitted").is_file(), "restored durable handoff receipt")
     assert git("rev-parse", "ansa-result", path=checkout) == frozen
+    assert check_marker.read_text() == "x", "recovery ran the completed command again"
     assert journals(root) == before_journals, "reconciliation executed a second tool or repeated the handoff"
     restarted.result = restarted.finish(signal.SIGTERM)
     assert restarted.result["exit"] == 143 and restarted.result["termios_restored"], restarted.result
+    return "normal"
+
+
+def openrouter_orchestration(screen, root, cwd):
+    until(screen, lambda frame: "deepseek/deepseek-v4.1-flash-1017" in frame
+          and screen.vt.line(-4).startswith("›"), "pinned OpenRouter model")
+    screen.send(b"\t\t")
+    until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "OpenRouter plan mode")
+    screen.send("summarize fixture\r")
+    until(screen, lambda frame: "OPENROUTER_CARBON_PLAN" in frame and "Начать" in frame, "validated strict plan")
+    assert not (root / "home/.ansa/orchestration").exists()
+    screen.send(b"\r")
+    until(screen, lambda frame: "OPENROUTER_CARBON_DONE" in frame, "coordinator summary", timeout=15)
+    local(screen, "/exit")
     return "normal"
 
 
@@ -1087,7 +1112,8 @@ def main():
              ("editor-cancel", lambda *a: editor_case(*a, True)),
              ("editor-early-exit", editor_early_exit),
              ("editor-stopped", lambda *a: editor_early_exit(*a, True)),
-             ("editor-missing", editor_missing), ("normal-exit", normal_exit)]
+             ("editor-missing", editor_missing), ("normal-exit", normal_exit),
+             ("openrouter-orchestration", openrouter_orchestration)]
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -1096,6 +1122,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     if args.selected_cases:
         cases = [(name, case) for name, case in cases if name in args.selected_cases]
+    else:
+        cases = [(name, case) for name, case in cases if name != "openrouter-orchestration"]
     results = []
     for name, case in cases:
         started = time.monotonic()
@@ -1112,7 +1140,14 @@ def main():
             editor.chmod(0o700)
             editor_path = cwd / "does-not-exist" if name == "editor-missing" else editor
             extra = ["--native-terminals"] if name == "native-terminal-panel" else []
-            screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)}, argv_extra=extra)
+            if name == "openrouter-orchestration":
+                home.chmod(0o700)
+                cwd.chmod(0o700)
+                screen = Pty(str(args.binary.resolve()), root, home, cwd, "", True, size=(100, 32),
+                             argv=["--frontend-fixture", str(root), "openrouter-carbon"])
+                screen.vt = Terminal(100, 32)
+            else:
+                screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)}, argv_extra=extra)
             try:
                 normal = case(screen, root, cwd) == "normal"
                 result = screen.finish(None if normal else signal.SIGTERM)
