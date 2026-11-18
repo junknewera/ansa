@@ -18,12 +18,12 @@ use crate::{
     provider::request::{Binding, Epoch, Request},
     runtime::{Generate, Lease, Limits, Options as RuntimeOptions, Runtime},
     tools::{
-        files::local_tools_with_editor,
+        files::local_tools_extended,
         registry::{Definition, Outcome, Policy, Registry},
     },
 };
 use std::{
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -306,6 +306,16 @@ fn text(args: &[String]) -> Result<i32> {
         std::env::current_dir().map_err(|_| "file_access_failed")?,
         auth_path()?,
     )?;
+    if parsed.native_terminals && !parsed.offline {
+        return Err("native_terminal_offline_preview");
+    }
+    if parsed.native_terminals
+        && (parsed.prompt.is_some()
+            || !std::io::stdin().is_terminal()
+            || !std::io::stdout().is_terminal())
+    {
+        return Err("native_terminal_requires_carbon");
+    }
     let mut settings = load_agent_settings(&parsed.cwd, &home()?)?;
     if let Some(model) = parsed.model {
         settings.model = model.clone();
@@ -361,16 +371,36 @@ fn text(args: &[String]) -> Result<i32> {
             ],
         )
     });
-    let tools = local_tools_with_editor(
+    let mut factory = super::sessions::Factory::new(
+        settings.clone(),
+        parsed.auth.clone(),
+        parsed.offline,
+        bound.account.clone(),
+        workspace_auth,
+    )
+    .with_native_terminals(parsed.native_terminals);
+    if let Some(editor) = &editor {
+        factory = factory.with_editor(selected.directory.clone(), editor.clone());
+    }
+    let terminal = (parsed.native_terminals && !parsed.resume && parsed.session.is_empty())
+        .then(|| factory.open_terminal_owner(&selected, false))
+        .transpose()?;
+    let tools = local_tools_extended(
         settings.clone(),
         epoch.clone(),
         &selected.directory,
         &parsed.auth,
         &std::env::current_exe().map_err(|_| "process_executable")?,
         editor.clone(),
+        |registry| {
+            terminal.clone().map_or(Ok(()), |owner| {
+                crate::terminal_host::tools::register(registry, owner, &selected.directory)
+            })
+        },
     )?;
     let configuration = Request::new(bound, epoch, tools.advertisement().clone(), vec![])?;
     options.directory = Some(selected.directory.clone());
+    options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&settings));
     if parsed.offline {
         let model = settings.model.clone();
         options.select_generation = Arc::new(move |selection, _| {
@@ -380,16 +410,6 @@ fn text(args: &[String]) -> Result<i32> {
                 Err("model_not_available")
             }
         });
-    }
-    let mut factory = super::sessions::Factory::new(
-        settings.clone(),
-        parsed.auth.clone(),
-        parsed.offline,
-        configuration.binding.account.clone(),
-        workspace_auth,
-    );
-    if let Some(editor) = &editor {
-        factory = factory.with_editor(selected.directory.clone(), editor.clone());
     }
     // Signals must be blocked before starting owner and output threads.
     let mut io = Io::open(parsed.prompt.is_none())?;
@@ -415,6 +435,7 @@ fn text(args: &[String]) -> Result<i32> {
             None,
         )
     };
+    factory.retain_terminal_owner(&selected.id, terminal)?;
     io.status(&format!(
         "ansa session {} (full access, sudo disabled)\n",
         selected.id

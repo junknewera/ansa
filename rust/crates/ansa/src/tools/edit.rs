@@ -86,6 +86,10 @@ impl Host {
         {
             return Err("file_edit_limit");
         }
+        let _workspace = ansa_linux::local::workspace_participant(
+            &self.settings.directory.join("terminal-workspaces"),
+            &self.settings.cwd,
+        )?;
         let snapshot = ansa_linux::file_edit::Snapshot::open(&path)?;
         let existed = snapshot.before().is_some();
         let before = std::str::from_utf8(snapshot.before().unwrap_or_default())

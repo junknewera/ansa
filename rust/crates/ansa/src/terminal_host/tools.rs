@@ -10,7 +10,7 @@ use crate::{
     terminal_host::{
         FileJournal, Host, Lifecycle, OperationStatus,
         native::{MAX_READ, NativeBackend},
-        protocol::{Action, Effect, Id, Intent, Launch, MAX_INPUT, Size, Writer},
+        protocol::{Action, Binding, Effect, Id, Intent, Launch, MAX_INPUT, Size, Writer, sha256},
     },
     tools::{
         invocation::Invocation,
@@ -25,7 +25,42 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, &'static str>;
-type Owner = Arc<Mutex<Host<FileJournal, NativeBackend>>>;
+pub(crate) type Owner = Arc<Mutex<Host<FileJournal, NativeBackend>>>;
+
+pub(crate) fn open_for(
+    settings: &crate::config::AgentSettings,
+    session: &str,
+    directory: &Path,
+    restoring: bool,
+) -> Result<Owner> {
+    let session = Id::try_from(session.to_owned())?;
+    let binding = Binding {
+        host: Id::try_from(format!("attached_{}", sha256(session.as_str().as_bytes())))?,
+        workspace: crate::config::path_text(&settings.cwd)?.to_owned(),
+        scope: session.clone(),
+        session,
+    };
+    let backend = NativeBackend::new(
+        std::env::current_exe().map_err(|_| "process_executable")?,
+        settings.directory.join("terminal-workspaces"),
+    );
+    let path = directory.join("terminal-host-v1");
+    let host = if restoring {
+        Host::restore_file(&path, binding, backend)?
+    } else {
+        Host::create_file(&path, binding, backend)?
+    };
+    Ok(Arc::new(Mutex::new(host)))
+}
+
+pub(crate) fn close(owner: &Owner) -> bool {
+    owner.lock().is_ok_and(|mut host| {
+        if let Some(recovered) = host.recovery() {
+            return recovered.closure_known;
+        }
+        super::daemon::close_owned(&mut host) && host.seal_clean().is_ok()
+    })
+}
 
 #[derive(Clone, Copy)]
 enum Tool {

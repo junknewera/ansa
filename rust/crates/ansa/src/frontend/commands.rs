@@ -28,6 +28,10 @@ pub const COMMANDS: &[Command] = &[
         description: "Файлы, diff и терминал проекта",
     },
     Command {
+        name: "/terminals",
+        description: "Посмотреть терминал агента",
+    },
+    Command {
         name: "/agents",
         description: "Помощники текущего разговора",
     },

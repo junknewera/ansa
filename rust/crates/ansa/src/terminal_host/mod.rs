@@ -8,7 +8,7 @@ pub mod native;
 pub mod protocol;
 pub mod tools;
 mod wire;
-mod workspace;
+pub(crate) mod workspace;
 
 pub use evidence::{FileJournal, Journal, Record, Tail};
 use evidence::{MAX_OPERATIONS, NORMAL_OPERATIONS};
@@ -49,6 +49,7 @@ pub enum OperationStatus {
 pub struct Recovery {
     pub verified_records: usize,
     pub tail: Tail,
+    pub closure_known: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,7 +107,21 @@ impl<B: Backend> Host<FileJournal, B> {
             backend,
             restored.records,
             restored.tail,
+            restored.sealed,
         )
+    }
+
+    pub(crate) fn seal_clean(&mut self) -> Result<(), &'static str> {
+        if self.storage_failed
+            || self.quarantined
+            || self
+                .terminals
+                .values()
+                .any(|terminal| terminal.lifecycle != Lifecycle::Closed)
+        {
+            return Err("terminal_cleanup_unknown");
+        }
+        self.journal.seal()
     }
 }
 
@@ -134,6 +149,7 @@ impl<J: Journal, B: Backend> Host<J, B> {
         backend: B,
         records: Vec<Record>,
         tail: Tail,
+        sealed: bool,
     ) -> Result<Self, &'static str> {
         if records.len() > MAX_OPERATIONS * 2 {
             return Err("terminal_store_limit");
@@ -143,6 +159,7 @@ impl<J: Journal, B: Backend> Host<J, B> {
         let mut recovery = Recovery {
             verified_records: 0,
             tail,
+            closure_known: false,
         };
         for record in records {
             let valid = match record {
@@ -175,6 +192,14 @@ impl<J: Journal, B: Backend> Host<J, B> {
             }
             recovery.verified_records += 1;
         }
+        recovery.closure_known = sealed
+            && recovery.tail == Tail::End
+            && pending.is_none()
+            && !host.quarantined
+            && host
+                .terminals
+                .values()
+                .all(|terminal| terminal.lifecycle == Lifecycle::Closed);
         for terminal in host
             .terminals
             .values_mut()
@@ -187,8 +212,10 @@ impl<J: Journal, B: Backend> Host<J, B> {
         host.storage_failed = pending.is_some();
         // A truncated tail can be a valid prefix, so replay cannot prove
         // quiescence. Only the original live host may mutate this incarnation.
-        host.quarantined = true;
-        host.backend.quarantine();
+        host.quarantined = !recovery.closure_known;
+        if host.quarantined {
+            host.backend.quarantine();
+        }
         host.recovery = Some(recovery);
         Ok(host)
     }

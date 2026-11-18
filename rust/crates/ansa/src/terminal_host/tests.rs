@@ -270,8 +270,15 @@ fn publication_faults_and_restart_preserve_known_facts_without_resending() {
         );
         let records = fixture.0.borrow().records.clone();
         let fresh = Fixture::default();
-        let mut recovered =
-            Host::restore(binding(), fresh.clone(), fresh.clone(), records, Tail::End).unwrap();
+        let mut recovered = Host::restore(
+            binding(),
+            fresh.clone(),
+            fresh.clone(),
+            records,
+            Tail::End,
+            false,
+        )
+        .unwrap();
         assert_eq!(recovered.terminals()[&terminal].lifecycle, Lifecycle::Lost);
         assert_eq!(
             recovered.operation(&id("open1")),
@@ -408,7 +415,8 @@ fn bound_file_evidence_rejects_concurrent_or_corrupt_open() {
         restored.recovery(),
         Some(Recovery {
             verified_records: 4,
-            tail: Tail::Unpublished
+            tail: Tail::Unpublished,
+            closure_known: false,
         })
     );
     assert!(restored.quarantined());
@@ -422,7 +430,8 @@ fn bound_file_evidence_rejects_concurrent_or_corrupt_open() {
         restored.recovery(),
         Some(Recovery {
             verified_records: 3,
-            tail: Tail::Damaged
+            tail: Tail::Damaged,
+            closure_known: false,
         })
     );
     assert_eq!(
@@ -441,7 +450,8 @@ fn bound_file_evidence_rejects_concurrent_or_corrupt_open() {
         gap.recovery(),
         Some(Recovery {
             verified_records: 0,
-            tail: Tail::Damaged
+            tail: Tail::Damaged,
+            closure_known: false,
         })
     );
     drop(gap);

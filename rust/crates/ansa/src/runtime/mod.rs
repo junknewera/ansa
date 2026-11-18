@@ -23,6 +23,7 @@ pub type CheckDispatch = Arc<dyn Fn(u64, &Cancel) -> Result<()> + Send + Sync>;
 pub type CheckRequest = Arc<dyn Fn(&Request, u64, &Cancel) -> Result<()> + Send + Sync>;
 pub type SelectGeneration = Arc<dyn Fn(&GenerationSelection, &Cancel) -> Result<()> + Send + Sync>;
 pub type ToolGuard = Arc<dyn Fn(&Cancel) -> Result<Lease> + Send + Sync>;
+pub type PlanGuard = Arc<dyn Fn() -> Result<Box<dyn Send>> + Send + Sync>;
 /// Ownership is retained and dropped on the auth worker, never on the reactor.
 pub struct Lease {
     pub ownership: Box<dyn Send>,
@@ -68,6 +69,7 @@ pub struct Options {
     pub keep_recent_turns: usize,
     pub check_dispatch: CheckDispatch,
     pub tool_guard: ToolGuard,
+    pub plan_guard: Option<PlanGuard>,
     pub streaming: bool,
 }
 impl Default for Options {
@@ -82,6 +84,7 @@ impl Default for Options {
             keep_recent_turns: 0,
             check_dispatch: Arc::new(|_, _| Ok(())),
             tool_guard: Arc::new(|_| Ok(Lease::default())),
+            plan_guard: None,
             streaming: false,
         }
     }

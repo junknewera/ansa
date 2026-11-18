@@ -194,6 +194,10 @@ impl Host {
         if timeout_ms == 0 || timeout_ms > self.settings.process_timeout_ms {
             return Err("process_timeout_limit");
         }
+        let _workspace = ansa_linux::local::workspace_participant(
+            &self.settings.directory.join("terminal-workspaces"),
+            &self.settings.cwd,
+        )?;
         self.processes.run(
             invocation,
             &ProcessOptions {
@@ -275,6 +279,18 @@ pub fn local_tools_with_editor(
     auth: &Path,
     worker: &Path,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+) -> Result<Arc<Snapshot>> {
+    local_tools_extended(settings, epoch, session, auth, worker, editor, |_| Ok(()))
+}
+
+pub fn local_tools_extended(
+    settings: AgentSettings,
+    epoch: Epoch,
+    session: &Path,
+    auth: &Path,
+    worker: &Path,
+    editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    extend: impl FnOnce(&mut Registry) -> Result<()>,
 ) -> Result<Arc<Snapshot>> {
     let host = Arc::new(Host {
         processes: ProcessRunner::new(&session.join("operations"), worker)?,
@@ -422,8 +438,9 @@ pub fn local_tools_with_editor(
         (||->Result<bool>{if !path_argument(args,"cwd")?||args.usize_field("timeout_ms")?==0||args.usize_field("timeout_ms")?>maximum{return Ok(false);}
             let argv=args.field("argv")?.elements()?;if argv.is_empty()||argv.len()>64||argv[0].text()?.is_empty(){return Ok(false);}let mut bytes=0;for arg in argv {let arg=arg.text()?;if arg.contains('\0')||arg.len()>16384-bytes{return Ok(false);}bytes+=arg.len();}Ok(true)})().unwrap_or(false)
     }),executor:Arc::new(|_|Outcome::failed_unknown())},Policy {requires_journal:true,invoke:Some(Arc::new(move |invocation,stop|match run.run(invocation,stop) {
-        Ok(value)=>value,Err(code) if matches!(code,"process_timeout_limit"|"protected_file"|"file_path"|"instruction_size_limit"|"process_cwd_unavailable")=>error(code),Err(_)=>Outcome::failed_unknown()
+        Ok(value)=>value,Err(code) if matches!(code,"process_timeout_limit"|"protected_file"|"file_path"|"instruction_size_limit"|"process_cwd_unavailable"|"terminal_workspace_busy"|"terminal_workspace_quarantined"|"terminal_workspace_registry"|"terminal_workspace_evidence")=>error(code),Err(_)=>Outcome::failed_unknown()
     })),recover:Some(Arc::new(move |invocation|recovery.processes.recover(invocation))),..Policy::default()})?;
     registry.register_with_policy(Definition {descriptor:Descriptor{name:"get_test_value".into(),description:"Return a fixed test JSON value without side effects".into(),revision:"1".into(),schema:Json::parse(r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#)?},validator:Arc::new(|_|true),executor:Arc::new(|_|Outcome::succeeded(r#"{"ok":true,"value":"OMH_FIXED_VALUE_42"}"#.into()))},Policy {read_only:true,..Policy::default()})?;
+    extend(&mut registry)?;
     Ok(registry.snapshot())
 }

@@ -12,6 +12,7 @@ const MAX_RECORDS: usize = MAX_OPERATIONS * 2;
 // escaping quotes and backslashes. Leave room for the typed envelope as well.
 const MAX_RECORD_BYTES: usize = 16 * 1024;
 const HEADER: &str = "terminal-v1.json";
+const SEALED: &str = "closed-v1.json";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
@@ -35,6 +36,15 @@ pub(super) struct Restored {
     pub journal: FileJournal,
     pub records: Vec<Record>,
     pub tail: Tail,
+    pub sealed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Seal {
+    version: u16,
+    count: usize,
+    last: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,7 +109,7 @@ impl FileJournal {
         let (names, more) = local::names(&directory, 256).map_err(|_| "terminal_store")?;
         let names: Vec<_> = names
             .into_iter()
-            .filter(|name| name != "worker.lock" && name != HEADER)
+            .filter(|name| name != "worker.lock" && name != HEADER && name != SEALED)
             .collect();
         let mut records = Vec::new();
         let mut tail = Tail::End;
@@ -131,6 +141,23 @@ impl FileJournal {
                 Tail::Damaged
             };
         }
+        let sealed = match local::read(&directory, SEALED, MAX_RECORD_BYTES) {
+            Ok(None) => false,
+            Ok(Some(bytes))
+                if tail == Tail::End
+                    && decode::<Seal>(&bytes).is_ok_and(|seal| {
+                        seal.version == VERSION
+                            && seal.count == records.len()
+                            && seal.last == previous
+                    }) =>
+            {
+                true
+            }
+            _ => {
+                tail = Tail::Damaged;
+                false
+            }
+        };
         // An earlier owner may have stopped between rename and directory
         // fsync. Establish durability before reporting a visible receipt.
         directory.sync_all().map_err(|_| "terminal_store_sync")?;
@@ -144,7 +171,21 @@ impl FileJournal {
             },
             records,
             tail,
+            sealed,
         })
+    }
+
+    pub(super) fn seal(&mut self) -> Result<(), &'static str> {
+        if self.failed {
+            return Err("terminal_store_unavailable");
+        }
+        let data = encode(&Seal {
+            version: VERSION,
+            count: self.sequence,
+            last: self.previous.clone(),
+        })?;
+        self.failed = true;
+        local::create(&self.directory, SEALED, &data).map_err(|_| "terminal_store_publish")
     }
 
     fn lock(path: &Path) -> Result<(File, File), &'static str> {

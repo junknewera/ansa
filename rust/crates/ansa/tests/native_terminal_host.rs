@@ -229,6 +229,158 @@ fn workspace_claim_releases_only_after_known_durable_close() {
 }
 
 #[test]
+fn plan_admission_holds_the_workspace_across_generation() {
+    use ansa::{
+        frontend::{
+            app::{binding, pure_tools},
+            offline,
+        },
+        protocol::json::Json,
+        provider::request::{Epoch, Request},
+        runtime::{
+            AgentMode, CommandPayload, EventPayload, Limits, Options, Runtime, RuntimeCommand,
+            Submit,
+        },
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let mut fixture = Fixture::new();
+    let terminal = fixture.shell(
+        "initial",
+        fixture.binding.workspace.clone(),
+        Effect::Applied,
+    );
+    let registry = fixture.root.0.join("workspace_registry");
+    let workspace = fixture.root.0.join("workspace");
+    let tools = pure_tools().unwrap();
+    let configuration = Request::new(
+        binding(),
+        Epoch {
+            id: "fixture".into(),
+            instructions: "test".into(),
+            exact_state: Json::parse("{}").unwrap(),
+        },
+        tools.advertisement().clone(),
+        vec![],
+    )
+    .unwrap();
+    let options = Options {
+        plan_guard: Some(Arc::new(move || {
+            Ok(Box::new(ansa_linux::local::workspace_participant(
+                &registry, &workspace,
+            )?))
+        })),
+        ..Options::default()
+    };
+    let enabled = Arc::new(AtomicBool::new(false));
+    let generating = Arc::new(AtomicBool::new(false));
+    let finish_probe = Arc::new(AtomicBool::new(false));
+    let allowed = enabled.clone();
+    let started = generating.clone();
+    let continue_model = finish_probe.clone();
+    let generate = Arc::new(
+        move |request: &Request, stop: &ansa::runtime::Cancel, _: ansa::runtime::PreviewSink| {
+            assert!(
+                allowed.load(Ordering::SeqCst),
+                "Plan reached the provider before workspace admission"
+            );
+            started.store(true, Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(3);
+            while !continue_model.load(Ordering::SeqCst) {
+                if Instant::now() >= until {
+                    return Err("fixture_plan_timeout");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            offline::generate(request, stop)
+        },
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut runtime = Runtime::new(
+                "plan_fixture".into(),
+                configuration,
+                tools,
+                generate,
+                Limits::default(),
+                options,
+            )
+            .unwrap();
+            let handle = runtime.handle();
+            handle.ready().await.unwrap();
+            let submit = |id: &str| RuntimeCommand {
+                schema_version: 1,
+                session: handle.session().clone(),
+                incarnation: handle.incarnation().clone(),
+                command: id.into(),
+                turn: id.into(),
+                payload: CommandPayload::Submit(Submit {
+                    text: "Inspect scope".into(),
+                    mode: AgentMode::Plan,
+                }),
+            };
+            handle.post(submit("blocked")).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    match handle.next_event().await.unwrap().payload {
+                        EventPayload::RuntimeError { diagnostic, .. }
+                            if diagnostic == "terminal_workspace_busy" =>
+                        {
+                            break;
+                        }
+                        EventPayload::CommandAccepted { .. } => {
+                            panic!("Plan was accepted while a terminal held its workspace")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!generating.load(Ordering::SeqCst));
+            assert_eq!(
+                fixture.action("close", &terminal, Writer::Agent, 1, Action::Close),
+                OperationStatus::Durable(Effect::Applied)
+            );
+            enabled.store(true, Ordering::SeqCst);
+            handle.post(submit("blocked")).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while !generating.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            fixture.shell(
+                "overlap_plan",
+                fixture.binding.workspace.clone(),
+                Effect::NotStarted,
+            );
+            finish_probe.store(true, Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while !matches!(
+                    handle.next_event().await.unwrap().payload,
+                    EventPayload::Done
+                ) {}
+            })
+            .await
+            .unwrap();
+            runtime.shutdown().await.unwrap();
+        });
+    let terminal = fixture.shell(
+        "after_plan",
+        fixture.binding.workspace.clone(),
+        Effect::Applied,
+    );
+    assert_eq!(
+        fixture.action("finish", &terminal, Writer::Agent, 1, Action::Close),
+        OperationStatus::Durable(Effect::Applied)
+    );
+}
+
+#[test]
 fn worker_preserves_tty_state_and_transfers_only_an_approved_screen() {
     let mut fx = Fixture::new();
     let terminal = fx.shell("launch", fx.binding.workspace.clone(), Effect::Applied);

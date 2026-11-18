@@ -741,7 +741,7 @@ fn renew(host: &mut NativeHost, writer: Writer) -> bool {
     })
 }
 
-fn close_owned(host: &mut NativeHost) -> bool {
+pub(super) fn close_owned(host: &mut NativeHost) -> bool {
     let open: Vec<_> = host
         .terminals()
         .iter()

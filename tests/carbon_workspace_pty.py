@@ -697,6 +697,28 @@ def outer_eof_cleans_terminal(screen, root, cwd):
     return "normal"
 
 
+def native_terminal_panel(screen, root, cwd):
+    local(screen, "/terminals")
+    until(screen, lambda frame: "Терминал агента" in frame and "Агент ещё не открыл терминал" in frame,
+          "managed terminal panel in the normal Carbon entry point")
+    session, = (root / "home/.ansa/sessions").glob("*/terminal-host-v1/terminal-v1.json")
+    escape(screen)
+    until(screen, lambda frame: "Терминал агента" not in frame, "Esc returned to the chat")
+    local(screen, "/exit")
+    result = screen.finish()
+    assert result["exit"] == 0 and result["termios_restored"]
+    assert session.with_name("closed-v1.json").is_file(), "clean host closed with a durable seal"
+    resumed = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--session", session.parents[1].name])
+    screen.additional_screens = [("resumed", resumed)]
+    local(resumed, "/plan")
+    resumed.send("SEALED_PLAN\r")
+    until(resumed, lambda frame: completed(root, "SEALED_PLAN"), "Plan admitted after a clean restart")
+    local(resumed, "/exit")
+    resumed.result = resumed.finish()
+    assert resumed.result["exit"] == 0 and resumed.result["termios_restored"]
+    return "normal"
+
+
 def completion_and_help(screen, root, cwd):
     before = journals(root)
     screen.send("/mo")
@@ -888,6 +910,7 @@ def main():
              ("inline-tool-details", inline_tool_details),
              ("slash-completion-help", completion_and_help),
              ("new-resume-interrupt", new_resume_and_exit),
+             ("native-terminal-panel", native_terminal_panel),
              ("model-effort-pair", model_effort_pair),
              ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),
@@ -922,7 +945,8 @@ def main():
                 editor.write_text('#!/bin/sh\nkill -STOP $$\nprintf resumed > after-stop\n')
             editor.chmod(0o700)
             editor_path = cwd / "does-not-exist" if name == "editor-missing" else editor
-            screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)})
+            extra = ["--native-terminals"] if name == "native-terminal-panel" else []
+            screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)}, argv_extra=extra)
             try:
                 normal = case(screen, root, cwd) == "normal"
                 result = screen.finish(None if normal else signal.SIGTERM)

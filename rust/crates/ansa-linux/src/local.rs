@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::unix::fs::MetadataExt,
+    path::Path,
 };
 pub type ReadFlags = OFlags;
 pub fn read_flags() -> OFlags {
@@ -160,11 +161,77 @@ pub fn replace_ui(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()
     directory.sync_all()
 }
 pub fn lock(directory: &File) -> io::Result<File> {
-    open_lock(directory, OFlags::empty())
+    open_lock(
+        directory,
+        OFlags::empty(),
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+}
+
+pub fn lock_shared(directory: &File) -> io::Result<File> {
+    open_lock(
+        directory,
+        OFlags::empty(),
+        rustix::fs::FlockOperation::NonBlockingLockShared,
+    )
 }
 
 pub fn lock_new(directory: &File) -> io::Result<File> {
-    open_lock(directory, OFlags::EXCL)
+    open_lock(
+        directory,
+        OFlags::EXCL,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+}
+
+pub const ACTIVE_TERMINAL_SCOPE: &str = "active-terminal-scope.json";
+
+pub fn workspace_records(
+    registry: &Path,
+    workspace: &Path,
+) -> io::Result<(File, File, (u64, u64))> {
+    if registry.starts_with(workspace)
+        || !registry.is_absolute()
+        || crate::fs::normalize(registry) != registry
+    {
+        return Err(io::Error::other("terminal_workspace_registry"));
+    }
+    let workspace = crate::fs::open_nofollow(workspace, read_flags())?;
+    let metadata = workspace.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::other("terminal_workspace_identity"));
+    }
+    let identity = (metadata.dev(), metadata.ino());
+    let path = registry.join(format!("{:x}-{:x}", identity.0, identity.1));
+    crate::fs::create_private(&path)?;
+    Ok((workspace, crate::fs::private_directory(&path)?, identity))
+}
+
+pub fn ensure_terminal_scope_free(directory: &File) -> Result<(), &'static str> {
+    if read(directory, ACTIVE_TERMINAL_SCOPE, 8192)
+        .map_err(|_| "terminal_workspace_evidence")?
+        .is_some()
+    {
+        Err("terminal_workspace_quarantined")
+    } else {
+        Ok(())
+    }
+}
+
+/// Hold a shared admission slot for Plan or an ordinary writing tool.
+pub fn workspace_participant(
+    registry: &Path,
+    workspace: &Path,
+) -> Result<Option<(File, File)>, &'static str> {
+    if registry.starts_with(workspace) {
+        // Terminal hosts cannot reserve a registry in their own worktree.
+        return Ok(None);
+    }
+    let (workspace, directory, _) =
+        workspace_records(registry, workspace).map_err(|_| "terminal_workspace_registry")?;
+    let lock = lock_shared(&directory).map_err(|_| "terminal_workspace_busy")?;
+    ensure_terminal_scope_free(&directory)?;
+    Ok(Some((workspace, lock)))
 }
 
 /// Release a checked mutable marker while its caller holds the owner lock.
@@ -176,7 +243,11 @@ pub fn unlink(directory: &File, name: &str) -> io::Result<()> {
     directory.sync_all()
 }
 
-fn open_lock(directory: &File, extra: OFlags) -> io::Result<File> {
+fn open_lock(
+    directory: &File,
+    extra: OFlags,
+    operation: rustix::fs::FlockOperation,
+) -> io::Result<File> {
     let fd = rustix::fs::openat(
         directory,
         "worker.lock",
@@ -197,7 +268,7 @@ fn open_lock(directory: &File, extra: OFlags) -> io::Result<File> {
     {
         return Err(io::Error::other("process_job_lock"));
     }
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    rustix::fs::flock(&file, operation)?;
     Ok(file)
 }
 

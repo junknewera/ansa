@@ -1,8 +1,16 @@
 use super::protocol::{Binding, VERSION};
-use ansa_linux::{fs, local};
-use std::{fs::File, os::unix::fs::MetadataExt, path::Path};
+use ansa_linux::local::{self, ACTIVE_TERMINAL_SCOPE as MARKER};
+use std::{fs::File, path::Path, sync::Arc};
 
-const MARKER: &str = "active-terminal-scope.json";
+pub(crate) fn plan_guard(settings: &crate::config::AgentSettings) -> crate::runtime::PlanGuard {
+    let workspace = settings.cwd.clone();
+    let registry = settings.directory.join("terminal-workspaces");
+    Arc::new(move || {
+        Ok(Box::new(local::workspace_participant(
+            &registry, &workspace,
+        )?))
+    })
+}
 
 /// An advisory writer lease for the files covered by one canonical workspace.
 /// A crashed host leaves its marker for explicit reconciliation even after
@@ -17,31 +25,11 @@ pub(super) struct Claim {
 
 impl Claim {
     pub(super) fn acquire(registry: &Path, binding: &Binding) -> Result<Self, &'static str> {
-        if registry.starts_with(&binding.workspace)
-            || !registry.is_absolute()
-            || fs::normalize(registry) != registry
-        {
-            return Err("terminal_workspace_registry");
-        }
-        let workspace = fs::open_nofollow(Path::new(&binding.workspace), local::read_flags())
-            .map_err(|_| "terminal_workspace_identity")?;
-        let metadata = workspace
-            .metadata()
-            .map_err(|_| "terminal_workspace_identity")?;
-        if !metadata.is_dir() {
-            return Err("terminal_workspace_identity");
-        }
-        let identity = (metadata.dev(), metadata.ino());
-        let path = registry.join(format!("{:x}-{:x}", identity.0, identity.1));
-        fs::create_private(&path).map_err(|_| "terminal_workspace_registry")?;
-        let directory = fs::private_directory(&path).map_err(|_| "terminal_workspace_registry")?;
+        let (workspace, directory, identity) =
+            local::workspace_records(registry, Path::new(&binding.workspace))
+                .map_err(|_| "terminal_workspace_registry")?;
         let lock = local::lock(&directory).map_err(|_| "terminal_workspace_busy")?;
-        if local::read(&directory, MARKER, 8192)
-            .map_err(|_| "terminal_workspace_evidence")?
-            .is_some()
-        {
-            return Err("terminal_workspace_quarantined");
-        }
+        local::ensure_terminal_scope_free(&directory)?;
         let marker = serde_json::to_vec(&serde_json::json!({"version":VERSION,"binding":binding}))
             .map_err(|_| "terminal_workspace_evidence")?;
         local::create(&directory, MARKER, &marker).map_err(|_| "terminal_workspace_evidence")?;
