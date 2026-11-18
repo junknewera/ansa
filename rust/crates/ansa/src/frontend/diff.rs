@@ -67,6 +67,77 @@ pub struct EditView {
     pub diff: Diff,
 }
 
+pub(super) fn patch_rows(text: &str) -> Vec<Row> {
+    let mut old = 0;
+    let mut new = 0;
+    text.lines()
+        .map(|line| {
+            if let Some(ranges) = line
+                .strip_prefix("@@ -")
+                .and_then(|rest| rest.split_once(" +"))
+            {
+                old = ranges
+                    .0
+                    .split(',')
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                new = ranges
+                    .1
+                    .split([',', ' '])
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                return Row {
+                    kind: Kind::Hunk,
+                    old: None,
+                    new: None,
+                    text: line.into(),
+                };
+            }
+            if line.starts_with("diff --git ")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+                || line.starts_with("index ")
+            {
+                return Row {
+                    kind: Kind::Notice,
+                    old: None,
+                    new: None,
+                    text: line.into(),
+                };
+            }
+            let (kind, before, after) = if line.starts_with('-') && old > 0 {
+                let number = old;
+                old += 1;
+                (Kind::Remove, Some(number), None)
+            } else if line.starts_with('+') && new > 0 {
+                let number = new;
+                new += 1;
+                (Kind::Add, None, Some(number))
+            } else if line.starts_with(' ') && old > 0 && new > 0 {
+                let numbers = (old, new);
+                old += 1;
+                new += 1;
+                (Kind::Context, Some(numbers.0), Some(numbers.1))
+            } else {
+                return Row {
+                    kind: Kind::Notice,
+                    old: None,
+                    new: None,
+                    text: line.into(),
+                };
+            };
+            Row {
+                kind,
+                old: before,
+                new: after,
+                text: line[1..].into(),
+            }
+        })
+        .collect()
+}
+
 fn frontier(layer: &[isize], distance: usize, diagonal: isize) -> isize {
     let at = diagonal + distance as isize;
     if at < 0 {

@@ -65,6 +65,18 @@ impl SavedResult {
     }
 }
 pub fn response_text(response: &AdmittedResponse) -> Result<String> {
+    if response.calls().is_empty()
+        && response.request().final_format()
+            == Some(crate::provider::structured::FinalFormat::ChildResult)
+    {
+        let result = response.child_result()?;
+        let mut text = result.summary;
+        for finding in result.findings {
+            text.push_str("\n- ");
+            text.push_str(&finding);
+        }
+        return Ok(text);
+    }
     let mut text = String::new();
     for item in response.items() {
         let item = item.value();

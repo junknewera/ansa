@@ -39,7 +39,39 @@ pub(crate) struct Host {
     pub auth: PathBuf,
     pub session: PathBuf,
     pub editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    pub(super) scope: Option<TaskScope>,
 }
+
+pub struct TaskScope {
+    root: PathBuf,
+    writes: Vec<PathBuf>,
+}
+
+impl TaskScope {
+    pub fn new(root: &Path, writes: &[String]) -> Result<Self> {
+        let directory = ansa_linux::fs::open_nofollow(root, ansa_linux::local::read_flags())
+            .map_err(|_| "task_workspace")?;
+        if !directory.metadata().map_err(|_| "task_workspace")?.is_dir() || writes.len() > 32 {
+            return Err("task_workspace");
+        }
+        let root = ansa_linux::fs::normalize(root);
+        let mut paths = Vec::with_capacity(writes.len());
+        for path in writes {
+            let path = Path::new(path);
+            if path.as_os_str().is_empty() || path.components().any(|component| {
+                !matches!(component, std::path::Component::Normal(value) if value != ".git")
+            }) || ansa_linux::fs::protected_path(path) {
+                return Err("task_write_scope");
+            }
+            paths.push(root.join(path));
+        }
+        Ok(Self {
+            root,
+            writes: paths,
+        })
+    }
+}
+
 impl Host {
     pub(crate) fn protected_path(&self, path: &Path) -> bool {
         ansa_linux::fs::protected_path(path)
@@ -48,6 +80,16 @@ impl Host {
             || path.starts_with(self.settings.directory.join("auth"))
             || path.starts_with(self.settings.directory.join("sessions"))
             || path.starts_with(self.settings.directory.join("terminal-workspaces"))
+            || self.scope.is_some() && path.components().any(|part| part.as_os_str() == ".git")
+    }
+    pub(super) fn check_task_path(&self, path: &Path, writing: bool) -> Result<()> {
+        if let Some(scope) = &self.scope
+            && (!path.starts_with(&scope.root)
+                || writing && !scope.writes.iter().any(|allowed| path.starts_with(allowed)))
+        {
+            return Err("task_path_scope");
+        }
+        Ok(())
     }
     pub fn path(&self, text: &str) -> Result<PathBuf> {
         self.path_os(Path::new(text))
@@ -65,10 +107,12 @@ impl Host {
         if self.protected_path(&input) {
             return Err("protected_file");
         }
+        self.check_task_path(&ansa_linux::fs::normalize(&input), false)?;
         let resolved = input.canonicalize().map_err(|_| "file_access_failed")?;
         if self.protected_path(&resolved) {
             return Err("protected_file");
         }
+        self.check_task_path(&resolved, false)?;
         Ok(resolved)
     }
     pub fn instructions(&self, directory: &Path, args: &Json) -> Result<Option<Outcome>> {
@@ -292,14 +336,55 @@ pub fn local_tools_extended(
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
     extend: impl FnOnce(&mut Registry) -> Result<()>,
 ) -> Result<Arc<Snapshot>> {
-    let host = Arc::new(Host {
+    register_local_tools(
+        Arc::new(local_host(settings, epoch, session, auth, worker, editor)?),
+        extend,
+    )
+}
+
+pub fn local_task_tools(
+    settings: AgentSettings,
+    epoch: Epoch,
+    session: &Path,
+    auth: &Path,
+    worker: &Path,
+    scope: TaskScope,
+) -> Result<Arc<Snapshot>> {
+    if !settings.cwd.starts_with(&scope.root) {
+        return Err("task_workspace");
+    }
+    let mut names = vec!["list_directory", "read_file", "search_files"];
+    if !scope.writes.is_empty() {
+        names.push("edit_file");
+    }
+    let mut host = local_host(settings, epoch, session, auth, worker, None)?;
+    host.scope = Some(scope);
+    Ok(register_local_tools(Arc::new(host), |_| Ok(()))?.named_tools(&names))
+}
+
+fn local_host(
+    settings: AgentSettings,
+    epoch: Epoch,
+    session: &Path,
+    auth: &Path,
+    worker: &Path,
+    editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+) -> Result<Host> {
+    Ok(Host {
         processes: ProcessRunner::new(&session.join("operations"), worker)?,
         auth: ansa_linux::fs::weakly_canonical(auth).map_err(|_| "file_access_failed")?,
         session: ansa_linux::fs::weakly_canonical(session).map_err(|_| "file_access_failed")?,
         settings,
         epoch,
         editor,
-    });
+        scope: None,
+    })
+}
+
+fn register_local_tools(
+    host: Arc<Host>,
+    extend: impl FnOnce(&mut Registry) -> Result<()>,
+) -> Result<Arc<Snapshot>> {
     let mut registry = Registry::new();
     type Action = fn(&Host, &Json, &Cancel) -> Result<Outcome>;
     for (name, description, properties, action) in [

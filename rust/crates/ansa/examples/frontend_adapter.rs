@@ -48,7 +48,7 @@ fn hex(raw: &str) -> Result<Vec<u8>> {
         })
         .collect()
 }
-fn command(c: &RuntimeCommand) -> Json {
+fn command(c: &RuntimeCommand) -> Result<Json> {
     let mut f = vec![
         ("schema_version", n(1)),
         ("session", s(&c.session.0)),
@@ -57,6 +57,7 @@ fn command(c: &RuntimeCommand) -> Json {
         ("command_id", s(&c.command.0)),
     ];
     match &c.payload {
+        CommandPayload::Handoff(_) => return Err("internal_command"),
         CommandPayload::Submit(v) => f.extend([
             ("type", s("submit")),
             ("text", s(&v.text)),
@@ -95,7 +96,7 @@ fn command(c: &RuntimeCommand) -> Json {
             ("forward", b(v.forward)),
         ]),
     }
-    obj(f)
+    Ok(obj(f))
 }
 fn run(row: &Json) -> Result<Json> {
     let root = Path::new(row.text_field("root")?);
@@ -114,7 +115,7 @@ fn run(row: &Json) -> Result<Json> {
                     code
                 }
             })?;
-            Ok(self::command(&command))
+            self::command(&command)
         }
         "args" => {
             let home = root.join("home");

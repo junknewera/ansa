@@ -1,4 +1,5 @@
 //! Immutable provider binding, context epoch, and advertised tool snapshot.
+use super::structured::FinalFormat;
 use crate::protocol::json::Json;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
@@ -33,6 +34,7 @@ pub struct Request {
     pub input: Vec<Json>,
     /// Omitted for legacy requests, preserving their exact serialized bytes.
     pub effort: Option<String>,
+    final_format: Option<FinalFormat>,
 }
 impl Request {
     pub const MAX_ITEMS: usize = 4096;
@@ -42,7 +44,9 @@ impl Request {
         tools: Advertisement,
         input: Vec<Json>,
     ) -> Result<Self, &'static str> {
-        if binding.provider != "openai-siwc"
+        let supported = binding.provider == "openai-siwc"
+            || cfg!(feature = "orchestration-pilot") && binding.provider == "openrouter-test";
+        if !supported
             || binding.requested_model.is_empty()
             || binding.requested_model.len() > 256
             || binding.account.is_empty()
@@ -72,6 +76,7 @@ impl Request {
             tools,
             input,
             effort: None,
+            final_format: None,
         })
     }
     pub fn with_effort(mut self, effort: Option<String>) -> Result<Self, &'static str> {
@@ -85,10 +90,21 @@ impl Request {
         Ok(self)
     }
     pub fn with_input(self, input: Vec<Json>) -> Result<Self, &'static str> {
-        Self::new(self.binding, self.epoch, self.tools, input)?.with_effort(self.effort)
+        Ok(Self::new(self.binding, self.epoch, self.tools, input)?
+            .with_effort(self.effort)?
+            .with_final_format(self.final_format))
     }
     pub fn with_input_bounds(self) -> Result<Self, &'static str> {
-        Self::new(self.binding, self.epoch, self.tools, self.input)?.with_effort(self.effort)
+        Ok(Self::new(self.binding, self.epoch, self.tools, self.input)?
+            .with_effort(self.effort)?
+            .with_final_format(self.final_format))
+    }
+    pub fn with_final_format(mut self, format: Option<FinalFormat>) -> Self {
+        self.final_format = format;
+        self
+    }
+    pub fn final_format(&self) -> Option<FinalFormat> {
+        self.final_format
     }
     pub fn json(&self) -> Result<Json, &'static str> {
         let functions = self
@@ -115,7 +131,7 @@ impl Request {
                 ("tools", Json::array(functions)?),
             ])?])?
         };
-        let value = Json::object(vec![
+        let mut value = Json::object(vec![
             ("model", Json::string(&self.binding.requested_model)?),
             ("store", Json::parse("false")?),
             ("stream", Json::parse("true")?),
@@ -127,6 +143,9 @@ impl Request {
                 Json::array(vec![Json::string("reasoning.encrypted_content")?])?,
             ),
         ])?;
+        if let Some(format) = self.final_format {
+            value = value.with("text", Json::object(vec![("format", format.format()?)])?)?;
+        }
         if let Some(effort) = &self.effort {
             value.with(
                 "reasoning",
@@ -207,12 +226,15 @@ impl Request {
             ("revision", Json::string(&self.tools.revision)?),
             ("descriptors", Json::array(descriptors)?),
         ])?;
-        let value = Json::object(vec![
+        let mut value = Json::object(vec![
             ("binding", binding),
             ("epoch", epoch),
             ("tools", tools),
             ("input", Json::array(self.input.clone())?),
         ])?;
+        if let Some(format) = self.final_format {
+            value = value.with("final_format", Json::string(format.name())?)?;
+        }
         if let Some(effort) = &self.effort {
             value.with("effort", Json::string(effort)?)
         } else {
@@ -232,7 +254,7 @@ impl Request {
                 schema: d.field("schema")?.clone(),
             })
         }
-        Self::new(
+        let request = Self::new(
             Binding {
                 provider: b.text_field("provider")?.to_owned(),
                 account: b.text_field("account")?.to_owned(),
@@ -254,7 +276,13 @@ impl Request {
             Some(value.text_field("effort")?.into())
         } else {
             None
-        })
+        })?;
+        let format = if value.has("final_format") {
+            Some(FinalFormat::parse(value.text_field("final_format")?)?)
+        } else {
+            None
+        };
+        Ok(request.with_final_format(format))
     }
 }
 fn t_placeholder_input(value: &Json) -> Result<Vec<Json>, &'static str> {

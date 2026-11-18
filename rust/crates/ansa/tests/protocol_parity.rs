@@ -16,7 +16,7 @@ pub mod provider;
 #[path = "../src/tools/mod.rs"]
 #[allow(dead_code)] // Source copy intentionally exercises M2 without the M5 owner.
 pub mod tools;
-pub use ansa::auth;
+pub use ansa::{auth, orchestration};
 #[path = "../src/config/mod.rs"]
 #[allow(dead_code)]
 pub mod config;

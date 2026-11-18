@@ -1,0 +1,411 @@
+//! Validate proposed tasks before the user can approve dispatch.
+use crate::provider::contracts::{AgentMode, Submit, valid_id};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+
+type Result<T> = std::result::Result<T, &'static str>;
+
+const PLAN_BYTES: usize = 64 * 1024;
+const PLAN_STEPS: usize = 16;
+const ACTIVE_CHILDREN: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    pub id: String,
+    pub task: String,
+    pub access: Access,
+    pub paths: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub acceptance: String,
+}
+
+impl Step {
+    pub fn assignment(&self) -> Submit {
+        let scope = if self.paths.is_empty() {
+            "весь проект".to_owned()
+        } else {
+            self.paths.join(", ")
+        };
+        Submit {
+            text: format!(
+                "{}\n\nШаг {}\nОбласть — {}\nРезультат — {}",
+                self.task, self.id, scope, self.acceptance
+            ),
+            mode: match self.access {
+                Access::Read => AgentMode::Plan,
+                Access::Write => AgentMode::Basic,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Proposal {
+    schema_version: u8,
+    summary: String,
+    steps: Vec<Step>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    checks: Vec<Check>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    manual_checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Check {
+    pub path: String,
+    pub contains: String,
+}
+
+/// Immutable, validated description of the tasks offered to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan(Proposal);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl Plan {
+    pub fn parse(input: &str) -> Result<Self> {
+        if input.len() > PLAN_BYTES {
+            return Err("plan_size");
+        }
+        let proposal: Proposal = serde_json::from_str(input).map_err(|_| "plan_schema")?;
+        if proposal.schema_version != 1
+            || proposal.steps.len() > PLAN_STEPS
+            || proposal.checks.len() > 16
+            || proposal.manual_checks.len() > 8
+            || !valid_text(&proposal.summary, 4096)
+        {
+            return Err("plan_limits");
+        }
+        if proposal
+            .checks
+            .iter()
+            .any(|check| !valid_path(&check.path) || !valid_text(&check.contains, 2048))
+            || proposal
+                .manual_checks
+                .iter()
+                .any(|check| !valid_text(check, 2048))
+        {
+            return Err("plan_check_scope");
+        }
+        let mut ids = BTreeSet::new();
+        let mut writes = BTreeSet::new();
+        for step in &proposal.steps {
+            if !valid_id(&step.id) || !ids.insert(step.id.as_str()) {
+                return Err("plan_step_identity");
+            }
+            if !valid_text(&step.task, 4096) || !valid_text(&step.acceptance, 2048) {
+                return Err("plan_step_description");
+            }
+            if step.paths.len() > 32 || step.access == Access::Write && step.paths.is_empty() {
+                return Err("plan_step_scope");
+            }
+            let mut paths = BTreeSet::new();
+            if step
+                .paths
+                .iter()
+                .any(|path| !valid_path(path) || !paths.insert(path))
+            {
+                return Err("plan_step_path");
+            }
+            if step.assignment().text.len() > 16 * 1024 {
+                return Err("plan_step_description");
+            }
+            if step.access == Access::Write {
+                writes.extend(step.paths.iter());
+                if writes.len() > 32 {
+                    return Err("plan_step_scope");
+                }
+            }
+        }
+        if !proposal.checks.is_empty() && writes.is_empty() {
+            return Err("plan_check_scope");
+        }
+        for step in &proposal.steps {
+            let mut dependencies = BTreeSet::new();
+            if step
+                .depends_on
+                .iter()
+                .any(|id| id == &step.id || !ids.contains(id.as_str()) || !dependencies.insert(id))
+            {
+                return Err("plan_dependency");
+            }
+        }
+        let mut visited = BTreeSet::new();
+        while visited.len() < ids.len() {
+            let before = visited.len();
+            for step in &proposal.steps {
+                if step
+                    .depends_on
+                    .iter()
+                    .all(|id| visited.contains(id.as_str()))
+                {
+                    visited.insert(step.id.as_str());
+                }
+            }
+            if before == visited.len() {
+                return Err("plan_dependency_cycle");
+            }
+        }
+        Ok(Self(proposal))
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.0.summary
+    }
+
+    pub fn steps(&self) -> &[Step] {
+        &self.0.steps
+    }
+
+    pub(crate) fn checks(&self) -> &[Check] {
+        &self.0.checks
+    }
+
+    pub(crate) fn manual_checks(&self) -> &[String] {
+        &self.0.manual_checks
+    }
+
+    pub(crate) fn execution_ready(&self) -> Result<()> {
+        if !self.manual_checks().is_empty() {
+            return Err("orchestration_manual_checks_required");
+        }
+        if self.0.steps.iter().any(|step| step.access == Access::Write) && self.checks().is_empty()
+        {
+            return Err("orchestration_missing_checks");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn candidate_access(&self, step: &Step) -> bool {
+        if step.access == Access::Write {
+            return true;
+        }
+        let mut pending: Vec<_> = step.depends_on.iter().collect();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if visited.insert(id)
+                && let Some(dependency) = self.steps().iter().find(|task| &task.id == id)
+            {
+                if dependency.access == Access::Write {
+                    return true;
+                }
+                pending.extend(&dependency.depends_on);
+            }
+        }
+        false
+    }
+
+    pub fn encode(&self) -> Result<String> {
+        serde_json::to_string(&self.0).map_err(|_| "plan_schema")
+    }
+
+    /// A step may start after its dependencies succeed and while there is a
+    /// compatible slot. This projection does not itself authorize dispatch.
+    pub fn ready(&self, progress: &BTreeMap<String, Progress>) -> Result<Vec<&Step>> {
+        let steps = self.steps();
+        for id in progress.keys() {
+            let step = steps
+                .iter()
+                .find(|step| step.id == *id)
+                .ok_or("plan_progress_identity")?;
+            if !dependencies_succeeded(step, progress) {
+                return Err("plan_progress_dependency");
+            }
+        }
+        let mut active: Vec<_> = steps
+            .iter()
+            .filter(|step| progress.get(&step.id) == Some(&Progress::Running))
+            .collect();
+        if active.len() > ACTIVE_CHILDREN
+            || active.iter().enumerate().any(|(index, step)| {
+                active[index + 1..]
+                    .iter()
+                    .any(|other| !compatible(step, other))
+            })
+        {
+            return Err("plan_progress_conflict");
+        }
+        let mut ready = Vec::new();
+        for step in steps {
+            if active.len() == ACTIVE_CHILDREN {
+                break;
+            }
+            if !progress.contains_key(&step.id)
+                && dependencies_succeeded(step, progress)
+                && active.iter().all(|other| compatible(step, other))
+            {
+                active.push(step);
+                ready.push(step);
+            }
+        }
+        Ok(ready)
+    }
+}
+
+fn valid_text(text: &str, limit: usize) -> bool {
+    !text.trim().is_empty()
+        && text.len() <= limit
+        && text
+            .chars()
+            .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+}
+
+pub(super) fn valid_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && !matches!(part, "." | ".." | ".git"))
+        && !ansa_linux::fs::protected_path(Path::new(path))
+}
+
+fn dependencies_succeeded(step: &Step, progress: &BTreeMap<String, Progress>) -> bool {
+    step.depends_on
+        .iter()
+        .all(|dependency| progress.get(dependency) == Some(&Progress::Succeeded))
+}
+
+fn compatible(first: &Step, second: &Step) -> bool {
+    match (first.access, second.access) {
+        (Access::Read, Access::Read) => true,
+        (Access::Write, Access::Write) => false,
+        _ => {
+            !first.paths.is_empty()
+                && !second.paths.is_empty()
+                && first.paths.iter().all(|first| {
+                    let first = Path::new(first);
+                    second.paths.iter().all(|second| {
+                        let second = Path::new(second);
+                        !first.starts_with(second) && !second.starts_with(first)
+                    })
+                })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(id: &str, access: Access, path: &str, depends_on: &[&str]) -> Step {
+        Step {
+            id: id.into(),
+            task: format!("Inspect or address {id}"),
+            access,
+            paths: vec![path.into()],
+            depends_on: depends_on.iter().map(|id| (*id).to_owned()).collect(),
+            acceptance: "Explain the evidence for the result".into(),
+        }
+    }
+
+    fn plan(steps: Vec<Step>) -> Result<Plan> {
+        Plan::parse(
+            &serde_json::to_string(&Proposal {
+                schema_version: 1,
+                summary: "Find out why the report sometimes comes back empty".into(),
+                steps,
+                checks: Vec::new(),
+                manual_checks: Vec::new(),
+            })
+            .unwrap(),
+        )
+    }
+
+    fn ids<'a>(plan: &'a Plan, progress: &BTreeMap<String, Progress>) -> Vec<&'a str> {
+        plan.ready(progress)
+            .unwrap()
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn vague_task_can_propose_two_independent_reads_before_writing() {
+        let plan = plan(vec![
+            step("fix", Access::Write, "src/report.rs", &["input", "format"]),
+            step("input", Access::Read, "src/input.rs", &[]),
+            step("format", Access::Read, "src/report.rs", &[]),
+            step("tests", Access::Read, "tests", &[]),
+        ])
+        .unwrap();
+        assert_eq!(Plan::parse(&plan.encode().unwrap()), Ok(plan.clone()));
+        assert_eq!(ids(&plan, &BTreeMap::new()), ["input", "format"]);
+        let mut progress = BTreeMap::from([
+            ("input".into(), Progress::Succeeded),
+            ("format".into(), Progress::Running),
+        ]);
+        assert_eq!(ids(&plan, &progress), ["tests"]);
+        progress.insert("format".into(), Progress::Succeeded);
+        assert_eq!(ids(&plan, &progress), ["fix", "tests"]);
+        progress.insert("format".into(), Progress::Failed);
+        assert_eq!(ids(&plan, &progress), ["tests"]);
+        progress.insert("fix".into(), Progress::Succeeded);
+        assert_eq!(plan.ready(&progress), Err("plan_progress_dependency"));
+    }
+
+    #[test]
+    fn writer_blocks_other_writers_and_overlapping_reads() {
+        let plan = plan(vec![
+            step("fix", Access::Write, "src/report.rs", &[]),
+            step("other-fix", Access::Write, "src/input.rs", &[]),
+            step("source", Access::Read, "src", &[]),
+            step("tests", Access::Read, "tests", &[]),
+        ])
+        .unwrap();
+        assert_eq!(ids(&plan, &BTreeMap::new()), ["fix", "tests"]);
+        let mut progress = BTreeMap::from([("fix".into(), Progress::Running)]);
+        assert_eq!(ids(&plan, &progress), ["tests"]);
+        progress.insert("source".into(), Progress::Running);
+        assert_eq!(plan.ready(&progress), Err("plan_progress_conflict"));
+    }
+
+    #[test]
+    fn rejects_a_cycle_missing_dependency_and_protected_paths() {
+        assert_eq!(
+            plan(vec![
+                step("first", Access::Read, "src", &["second"]),
+                step("second", Access::Read, "tests", &["first"]),
+            ]),
+            Err("plan_dependency_cycle")
+        );
+        assert_eq!(
+            plan(vec![step("first", Access::Read, "src", &["missing"])]),
+            Err("plan_dependency")
+        );
+        for path in [
+            "/etc",
+            "src/../secret",
+            ".git/index",
+            "src/.env.local",
+            "src//report",
+        ] {
+            assert_eq!(
+                plan(vec![step("first", Access::Write, path, &[])]),
+                Err("plan_step_path"),
+                "{path}"
+            );
+        }
+        let mut write = step("first", Access::Write, "src", &[]);
+        write.paths.clear();
+        assert_eq!(plan(vec![write]), Err("plan_step_scope"));
+    }
+}

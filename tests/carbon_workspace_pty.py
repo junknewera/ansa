@@ -100,6 +100,26 @@ def local(screen, command):
     screen.send(command.rstrip() + "\r")
 
 
+def approve_helpers(screen, prompt):
+    screen.send(prompt + "\r")
+    until(screen, lambda frame: "Начать" in frame and "Уточнить" in frame and "Отмена" in frame,
+          "interactive orchestration approval")
+    screen.send(b"\r")
+    until(screen, lambda frame: "Сводка готова" in frame and ready(screen), "coordinator's synthesis")
+    assert "Синтетический результат проверки" not in visible(screen), "helper report shown as a chat message"
+
+
+def open_helper(screen):
+    local(screen, "/agents")
+    until(screen, lambda frame: "Агенты разговора" in frame and helper_title(frame), "helper roster")
+    screen.send(b"\r")
+    until(screen, lambda frame: helper_title(screen.vt.line(1)) and ready(screen), "open helper archive")
+
+
+def helper_title(text):
+    return "Найти файлы" in text or "Проверить, достаточно" in text
+
+
 def reading(screen):
     return "История" in screen.vt.line(1)
 
@@ -178,27 +198,24 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     until(screen, lambda frame: not reading(screen) and "TYPED_WHILE_READING" in body(screen), "Enter returned to latest and showed the submitted message")
     until(screen, lambda frame: completed(root, submitted) and ready(screen), "send while reading completed")
     assert sum(row["kind"] == "accepted" and row["text"] == submitted for row in records(root)) == 1
-    local(screen, "/agent CHILD_HISTORY_TASK")
-    until(screen, lambda frame: "CHILD_HISTORY_TASK" in screen.vt.line(1) and completed(root, "CHILD_HISTORY_TASK") and ready(screen), "agent completed in titled child chat")
+    approve_helpers(screen, "Запусти субагента: CHILD_HISTORY_TASK")
+    open_helper(screen)
     screen.send("CHILD_DRAFT Ж")
     until(screen, lambda frame: screen.vt.line(-4) == "› CHILD_DRAFT Ж", "child draft")
     paint_quiet(screen)
-    until(screen, lambda frame: ready(screen) and "CHILD_HISTORY_TASK" in screen.vt.line(1),
+    until(screen, lambda frame: ready(screen) and helper_title(screen.vt.line(1)),
           "completed child frame before Ctrl+C")
     screen.send(b"\x03")
     until(screen, lambda frame: screen.vt.line(-4) == "›", "Ctrl+C cleared the child draft")
     screen.send("CHILD_DRAFT Ж")
     until(screen, lambda frame: screen.vt.line(-4) == "› CHILD_DRAFT Ж", "new child draft")
     mouse(screen, 64, 2, 5)
-    until(screen, lambda frame: reading(screen), "child mouse reading")
     screen.send(b"\x1bg")
     for _ in range(8): screen.drain(.01)
-    assert "CHILD_HISTORY_TASK" in screen.vt.line(1) and reading(screen), "Alt navigated out of child"
-    escape(screen)
-    until(screen, lambda frame: "CHILD_HISTORY_TASK" in screen.vt.line(1) and not reading(screen), "first child Esc returns latest")
+    assert helper_title(screen.vt.line(1)), "mouse or Alt navigated out of child"
     assert screen.vt.line(-4) == "› CHILD_DRAFT Ж"
     escape(screen)
-    until(screen, lambda frame: "CHILD_HISTORY_TASK" not in screen.vt.line(1) and ready(screen), "second child Esc returns parent")
+    until(screen, lambda frame: not helper_title(screen.vt.line(1)) and ready(screen), "child Esc returns parent")
 
 
 def split_source_scroll(screen, root, cwd):
@@ -926,38 +943,50 @@ def plan_agent_inherits(screen, root, cwd):
           and "OMH_TOOL_OK:OMH_FIXED_VALUE_42" in frame, "parent reply rendered")
     local(screen, "/plan")
     until(screen, lambda frame: "План" in screen.vt.line(-2), "parent entered plan")
-    screen.send("Запусти субагента: " + child + "\r")
-    until(screen, lambda frame: completed(root, child) and parent in screen.vt.line(1)
-          and f"Результат субагента «{child}»" in frame and ready(screen), "plan child returned its result")
-    child_turn, = [row for row in records(root) if row['kind'] == 'accepted' and row['text'] == child]
-    assert child_turn['mode'] == 'plan'
+    before = journals(root)
+    screen.send("Запусти субагента: подготовка\r")
+    until(screen, lambda frame: "Уточнить" in frame, "cancel preview")
+    escape(screen)
+    screen.send(b"\t")
+    until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "third Tab mode")
+    screen.send("ORCHESTRATION_LONG_PLAN_FIXTURE\r")
+    until(screen, lambda frame: "Проверить перенос длинного плана" in frame, "long proposal")
+    assert "VISIBLE_END_OF_STEP" not in visible(screen)
+    screen.send(b"\x1b[6~")
+    until(screen, lambda frame: "VISIBLE_END_OF_STEP" in frame, "full step accessible before approval")
+    escape(screen)
+    assert journals(root) == before, "preview, scroll or cancel executed a helper"
+    approve_helpers(screen, "Запусти субагента: " + child)
+    accepted = [row for row in records(root) if row['kind'] == 'accepted']
+    helpers = [row for row in accepted if row['command'] == 'assignment']
+    assert len(helpers) == 2 and all(row['mode'] == 'plan' for row in helpers)
+    assert sum(row.get('handoff') is True for row in accepted) == 1
 
 
 def session_agent_titles_restart(screen, root, cwd):
-    parent, child, nested = "PARENT_TITLE", "AGENT_TITLE", "NESTED_TITLE"
+    parent = "PARENT_TITLE"
     screen.send(parent + "\r")
     until(screen, lambda frame: completed(root, parent) and ready(screen), "parent title committed")
-    screen.send("Запусти субагента: " + child + "\r")
-    until(screen, lambda frame: completed(root, child) and parent in screen.vt.line(1)
-          and f"Результат субагента «{child}»" in frame and ready(screen), "explicit request returned its child result to the parent")
-    local(screen, "/agents")
-    until(screen, lambda frame: "Агенты разговора" in frame and child in frame, "background child listed")
-    screen.send(b"\r")
-    until(screen, lambda frame: child in screen.vt.line(1) and ready(screen), "open completed child from agent tree")
-    local(screen, "/agent " + nested)
-    until(screen, lambda frame: completed(root, nested) and nested in screen.vt.line(1) and ready(screen), "nested agent own title committed")
+    screen.send(b"\t\t")
+    until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "third Tab mode")
+    screen.send("Почему отчёт иногда пустой?\r")
+    until(screen, lambda frame: "Уточнить" in frame, "plan from a vague request")
+    before_refine = journals(root)
+    screen.send(b"\x1b[B\r")
+    until(screen, lambda frame: "Введите уточнение" in frame, "refinement returned to composer")
+    assert journals(root) == before_refine, "refinement launched a helper"
+    approve_helpers(screen, "Проверить формат входных данных")
+    open_helper(screen)
     escape(screen)
-    until(screen, lambda frame: child in screen.vt.line(1) and nested not in screen.vt.line(1), "nested agent parent")
-    escape(screen)
-    until(screen, lambda frame: parent in screen.vt.line(1) and child not in screen.vt.line(1), "agent returned to root conversation")
+    until(screen, lambda frame: parent in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
     local(screen, "/agents")
-    until(screen, lambda frame: "Агенты разговора" in frame and child in frame and nested in frame, "completed parent-child agent tree")
+    until(screen, lambda frame: "Агенты разговора" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "both completed helpers listed")
     assert not re.search(r"\bs_\d+_", screen.vt.line(1)), "agent breadcrumb displays an ID instead of a title"
     escape(screen)
-    until(screen, lambda frame: "Агенты разговора" not in frame and child not in screen.vt.line(1), "agent inspector closed before session command")
+    until(screen, lambda frame: "Агенты разговора" not in frame and not helper_title(screen.vt.line(1)), "agent inspector closed before session command")
     local(screen, "/sessions")
     until(screen, lambda frame: "Сессии проекта" in frame and "Выбрать разговор" in frame and parent in frame, "human-readable root session picker")
-    assert child not in popup_text(screen) and nested not in popup_text(screen), "agents leaked into conversation picker"
+    assert not helper_title(popup_text(screen)), "agents leaked into conversation picker"
     escape(screen)
     until(screen, lambda frame: "Сессии проекта" not in frame and parent in screen.vt.line(1), "session picker closed before exit")
     parent_id = next(json.loads((directory / "info.json").read_text())["id"]
@@ -972,12 +1001,67 @@ def session_agent_titles_restart(screen, root, cwd):
     screen.additional_screens = [("restart", restarted)]
     until(restarted, lambda frame: parent in restarted.vt.line(1) and ready(restarted), "saved parent title restored")
     local(restarted, "/agents")
-    until(restarted, lambda frame: "Агенты разговора" in frame and child in frame and nested in frame, "completed agent tree restored without resuming agents")
+    until(restarted, lambda frame: "Агенты разговора" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "completed agent tree rebuilt from journals")
     assert "Заверш" in visible(restarted), "restarted completed agents lost their observed status"
     assert not re.search(r"\bs_\d+_", restarted.vt.line(1)) and journals(root) == before
     restarted.result = restarted.finish(signal.SIGTERM)
     assert restarted.result["exit"] == 143 and restarted.result["termios_restored"] and restarted.result["flags_restored"], restarted.result
     assert journals(root) == before, "viewing saved session/agent titles changed canonical journals"
+    return "normal"
+
+
+def orchestration_candidate(screen, root, cwd):
+    def git(*args, path=cwd):
+        return subprocess.check_output(["git", *args], cwd=path, text=True)
+
+    git("init", "-q")
+    report = cwd / "report.txt"
+    report.write_text("committed version\n")
+    git("add", "report.txt")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "fixture")
+    report.write_text("before fixture\n")
+    before = git("status", "--short")
+    screen.send(b"\t\t")
+    until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "writer plan mode")
+    screen.send("ORCHESTRATION_WRITE_FIXTURE\r")
+    until(screen, lambda frame: "Независимое ревью" in frame or "независимое ревью" in frame,
+          "plan discloses verification and fixes")
+    assert not (home := root / "home/.ansa/orchestration").exists()
+    screen.send(b"\r")
+    until(screen, lambda frame: "ansa-result готова" in frame and "Проверенные изменения" in frame,
+          "reviewed isolated candidate and diff", timeout=15)
+    checkout, = home.glob("*/*/checkout")
+    assert git("show", "ansa-result:report.txt", path=checkout) == "after fixture\n"
+    assert report.read_text() == "before fixture\n"
+    assert git("show", ":report.txt") == "committed version\n"
+    assert git("status", "--short") == before
+    results = [event for event in records(root) if event["kind"] == "outcome"]
+    assert len(results) == 2, "edit and independent diff review should each use a native tool"
+    run = checkout.parent
+    parent_id = run.parent.name
+    until(screen, lambda frame: (run / "summary-admitted").is_file(), "durable parent handoff receipt")
+    before_journals = journals(root)
+    frozen = git("rev-parse", "ansa-result", path=checkout)
+    local(screen, "/exit")
+    result = screen.finish()
+    assert result["exit"] == 0 and result["termios_restored"], result
+    # Lose only the coordinator's derived acknowledgement. Native outcomes,
+    # candidate identity and parent acceptance remain durable.
+    (run / "summary-admitted").unlink()
+    pending = run / "summary-admitted.pending"
+    pending.touch()
+    pending.chmod(0o600)
+    restarted = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--session", parent_id])
+    screen.additional_screens = [("restart", restarted)]
+    local(restarted, "/sessions")
+    until(restarted, lambda frame: "Продолжить оркестрацию" in frame, "explicit continuation from original ledgers")
+    restarted.send(b"\r")
+    until(restarted, lambda frame: "Проверенные изменения" in frame, "reconciled exact original candidate", timeout=15)
+    until(restarted, lambda frame: (run / "summary-admitted").is_file(), "restored durable handoff receipt")
+    assert git("rev-parse", "ansa-result", path=checkout) == frozen
+    assert journals(root) == before_journals, "reconciliation executed a second tool or repeated the handoff"
+    restarted.result = restarted.finish(signal.SIGTERM)
+    assert restarted.result["exit"] == 143 and restarted.result["termios_restored"], restarted.result
     return "normal"
 
 
@@ -995,6 +1079,7 @@ def main():
              ("model-effort-pair", model_effort_pair),
              ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),
+             ("orchestration-candidate", orchestration_candidate),
              ("terminal-interrupt-app-escape", terminal_interrupt_and_app_escape),
              ("terminal-eof-exit", terminal_eof_and_exit),
              ("outer-eof-cleans-terminal", outer_eof_cleans_terminal),

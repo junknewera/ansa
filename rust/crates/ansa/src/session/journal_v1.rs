@@ -1,6 +1,7 @@
 //! OMHJ1 framing. Torn tails are retained and linked by a new part.
 use super::{Result, need, num};
 use crate::protocol::{json::Json, legacy_json_v1::sha256};
+pub use ansa_linux::journal::DirectoryIdentity;
 use ansa_linux::journal::Files;
 use std::{
     fs::File,
@@ -197,15 +198,31 @@ fn digest(file: &File) -> Result<String> {
 impl Journal {
     pub fn open(
         path: &Path,
+        replay: impl FnMut(&Json) -> Result<()>,
+        observe: Option<Observer>,
+    ) -> Result<Self> {
+        Self::load(Files::open(path), false, replay, observe)
+    }
+
+    pub fn open_existing(
+        path: &Path,
+        identity: DirectoryIdentity,
+        replay: impl FnMut(&Json) -> Result<()>,
+        observe: Option<Observer>,
+    ) -> Result<Self> {
+        Self::load(Files::open_existing(path, identity), true, replay, observe)
+    }
+
+    fn load(
+        files: std::io::Result<Files>,
+        strict_recovery: bool,
         mut replay: impl FnMut(&Json) -> Result<()>,
         observe: Option<Observer>,
     ) -> Result<Self> {
-        let files = Files::open(path).map_err(|e| {
-            if e.to_string() == "session_busy" {
-                "session_busy"
-            } else {
-                "journal_directory_open"
-            }
+        let files = files.map_err(|error| match error.to_string().as_str() {
+            "session_busy" => "session_busy",
+            "journal_directory_identity" => "journal_directory_identity",
+            _ => "journal_directory_open",
         })?;
         let names = files.names().map_err(|_| "journal_parts_limit")?;
         let mut journal = Self {
@@ -222,15 +239,18 @@ impl Journal {
             observe,
         };
         let result = (|| {
-            for (index, filename) in names.iter().enumerate() {
+            for (index, entry) in names.iter().enumerate() {
+                let filename = name(index);
                 need(
-                    filename.to_str() == Some(name(index).as_str()),
+                    entry.to_str() == Some(filename.as_str()),
                     "journal_part_sequence",
                 )?;
-                let mut file = journal
-                    .files
-                    .part(&name(index), false)
-                    .map_err(|_| "journal_part_open")?;
+                let mut file = if strict_recovery {
+                    journal.files.private_part(&filename)
+                } else {
+                    journal.files.part(&filename, false)
+                }
+                .map_err(|_| "journal_part_open")?;
                 let expected_size = file.metadata().map_err(|_| "journal_part_type")?.len();
                 let expected = header(index, &journal.previous_part);
                 let actual = read(&mut file, expected.len())?;
@@ -281,6 +301,18 @@ impl Journal {
                     file.metadata().map_err(|_| "journal_part_type")?.len() == expected_size,
                     "journal_write_conflict",
                 )?;
+                if strict_recovery {
+                    need(!journal.new_part, "journal_incomplete")?;
+                    need(
+                        journal
+                            .files
+                            .unchanged(&filename, &file, expected_size)
+                            .map_err(|_| "journal_write_conflict")?,
+                        "journal_write_conflict",
+                    )?;
+                    // The old writer could have lost the fsync acknowledgement.
+                    file.sync_all().map_err(|_| "journal_sync")?;
+                }
                 journal.expected_size = expected_size;
                 journal.previous_part = digest(&file)?;
                 journal.file = Some(file);
@@ -290,13 +322,25 @@ impl Journal {
                 journal.part += 1;
                 journal.file = None;
             }
+            if strict_recovery {
+                need(!journal.empty(), "session_missing_init")?;
+                journal.files.sync().map_err(|_| "journal_sync")?;
+            }
             Ok(())
         })();
         if let Err(code) = result {
+            if strict_recovery {
+                return Err(code);
+            }
             journal.failed = true;
             journal.diagnostic = code;
         }
         Ok(journal)
+    }
+    pub(crate) fn identity(&self) -> Result<DirectoryIdentity> {
+        self.files
+            .identity()
+            .map_err(|_| "journal_directory_identity")
     }
     pub fn empty(&self) -> bool {
         self.sequence == 0

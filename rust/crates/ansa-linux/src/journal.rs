@@ -123,6 +123,25 @@ pub struct Files {
     _lock: File,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl DirectoryIdentity {
+    pub fn capture(directory: &File) -> io::Result<Self> {
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(io::Error::other("journal_directory_type"));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
 /// Read-only inspection coexists with the exclusive writer. It creates no
 /// files, obtains no lease, and exposes only checked ordinary journal parts.
 pub struct ReadOnly {
@@ -423,13 +442,37 @@ impl Files {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         File::open(parent)?.sync_all()?;
+        Self::lock(directory, OFlags::CREATE)
+    }
+
+    /// Recover an existing private journal under its original directory lease.
+    /// Recovery must never create a directory or replace a missing lock.
+    pub fn open_existing(path: &Path, expected: DirectoryIdentity) -> io::Result<Self> {
+        let directory = crate::fs::private_directory(path)?;
+        if DirectoryIdentity::capture(&directory)? != expected {
+            return Err(io::Error::other("journal_directory_identity"));
+        }
+        Self::lock(directory, OFlags::empty())
+    }
+
+    pub fn identity(&self) -> io::Result<DirectoryIdentity> {
+        DirectoryIdentity::capture(&self.directory)
+    }
+
+    fn lock(directory: File, create: OFlags) -> io::Result<Self> {
         let lock = File::from(fs::openat(
             &directory,
             "lock",
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC | create,
             Mode::RUSR | Mode::WUSR,
         )?);
-        if !lock.metadata()?.is_file() || lock.metadata()?.nlink() != 1 {
+        let metadata = lock.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || create.is_empty()
+                && (metadata.uid() != rustix::process::geteuid().as_raw()
+                    || metadata.mode() & 0o077 != 0)
+        {
             return Err(io::Error::other("journal_lock_type"));
         }
         fs::flock(&lock, FlockOperation::NonBlockingLockExclusive)
@@ -457,6 +500,14 @@ impl Files {
         Ok(names)
     }
     pub fn part(&self, name: &str, create: bool) -> io::Result<File> {
+        self.open_part(name, create, false)
+    }
+
+    pub fn private_part(&self, name: &str) -> io::Result<File> {
+        self.open_part(name, false, true)
+    }
+
+    fn open_part(&self, name: &str, create: bool, private: bool) -> io::Result<File> {
         if name.len() != 29
             || !name.starts_with("part-")
             || !name.ends_with(".log")
@@ -475,7 +526,13 @@ impl Files {
             flags,
             Mode::RUSR | Mode::WUSR,
         )?);
-        if !file.metadata()?.is_file() || file.metadata()?.nlink() != 1 {
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || private
+                && (metadata.uid() != rustix::process::geteuid().as_raw()
+                    || metadata.mode() & 0o077 != 0)
+        {
             return Err(io::Error::other("journal_part_type"));
         }
         Ok(file)
