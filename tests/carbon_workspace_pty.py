@@ -850,7 +850,8 @@ def completion_and_help(screen, root, cwd):
     command_rows = [match for row in range(screen.vt.rows)
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
-    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions", "/new", "/fork", "/btw", "/plan", "/copy", "/resume", "/help", "/exit"}
+    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions",
+                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert "/run" not in visible(screen), "removed /run remains advertised"
@@ -868,6 +869,9 @@ def completion_and_help(screen, root, cwd):
     until(screen, lambda frame: "План" in screen.vt.line(-2) and screen.vt.line(-4) == "›", "trailing-space /plan routed locally")
     screen.send("/plan \r")
     until(screen, lambda frame: "План" not in screen.vt.line(-2) and screen.vt.line(-4) == "›", "/plan returns to work")
+    local(screen, "/pr main")
+    until(screen, lambda frame: "Черновик PR доступен в сетевом режиме ansa" in frame,
+          "/pr stays local and refuses publishing offline")
     assert journals(root) == before, "whitespace in local commands dispatched canonical user turns"
     screen.send("/exit \r")
     return "normal"
