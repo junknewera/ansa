@@ -297,27 +297,28 @@ impl Workbench {
                 .report(io, "Применяю модель и уровень рассуждения…");
         }
     }
+    fn terminal_dimensions(&self) -> Option<(u16, u16)> {
+        // A key can arrive after the Files footer has been written but before
+        // the writer acknowledges the whole frame. Use the newest geometry.
+        self.last_frame
+            .as_ref()
+            .or(self.displayed.as_ref())
+            .and_then(|frame| frame.inspector_bounds())
+            .filter(|(_, _, width, height)| *width > 0 && *height > 0)
+            .map(|(_, _, width, height)| (height.clamp(1, 128) as u16, width.clamp(1, 256) as u16))
+    }
     pub(super) fn terminal_focused(&self) -> bool {
         self.menu.is_none()
             && self.focus == Focus::Inspector
             && matches!(self.panel, Some(Panel::Terminal))
-            && self
-                .displayed
-                .as_ref()
-                .and_then(|frame| frame.inspector_bounds())
-                .is_some_and(|(_, _, width, height)| width > 0 && height > 0)
+            && self.terminal_dimensions().is_some()
     }
     pub(super) fn open_terminal(&mut self, io: &Io) {
-        if self
-            .displayed
-            .as_ref()
-            .and_then(|frame| frame.inspector_bounds())
-            .is_none_or(|(_, _, width, height)| width == 0 || height == 0)
-        {
+        let Some((rows, columns)) = self.terminal_dimensions() else {
             self.focus = Focus::Chat;
             self.report(io, "Увеличьте окно для панели терминала");
             return;
-        }
+        };
         let directory = match &self.panel {
             Some(Panel::Files(files)) => files
                 .document
@@ -339,16 +340,7 @@ impl Workbench {
             self.terminal_size = None;
         }
         if self.terminal.is_none() {
-            let (_, _, width, height) = self
-                .displayed
-                .as_ref()
-                .and_then(|frame| frame.inspector_bounds())
-                .unwrap_or((0, 0, 80, 20));
-            match crate::frontend::terminal_pane::TerminalPane::spawn(
-                &directory,
-                height.clamp(1, 128) as u16,
-                width.clamp(1, 256) as u16,
-            ) {
+            match crate::frontend::terminal_pane::TerminalPane::spawn(&directory, rows, columns) {
                 Ok(terminal) => self.terminal = Some(terminal),
                 Err(error) => {
                     self.report(io, &format!("Не удалось открыть терминал: {error}"));
