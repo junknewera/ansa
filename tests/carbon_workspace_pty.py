@@ -698,6 +698,17 @@ def outer_eof_cleans_terminal(screen, root, cwd):
 
 
 def native_terminal_panel(screen, root, cwd):
+    home = root / "home"
+    catalog = home / ".ansa/sessions"
+    before = set(catalog.iterdir())
+    rejected = Pty(screen.child.args[0], root, home, home, "", True,
+                   argv=["--offline", "--native-terminals"])
+    rejected.vt = Terminal(80, 24)
+    screen.additional_screens = [("home-rejected", rejected)]
+    rejected.result = rejected.finish()
+    assert rejected.result["exit"] == 2 and rejected.result["termios_restored"]
+    assert "укажи папку проекта через --cwd".encode() in rejected.raw
+    assert set(catalog.iterdir()) == before, "invalid workspace created a session"
     screen.send("/term")
     until(screen, lambda frame: "/terminals" in body(screen), "native terminal command completion")
     screen.send(b"\t\r")
@@ -718,7 +729,7 @@ def native_terminal_panel(screen, root, cwd):
     assert result["exit"] == 0 and result["termios_restored"]
     assert session.with_name("closed-v1.json").is_file(), "clean host closed with a durable seal"
     resumed = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--session", session.parents[1].name])
-    screen.additional_screens = [("resumed", resumed)]
+    screen.additional_screens.append(("resumed", resumed))
     local(resumed, "/plan")
     resumed.send("SEALED_PLAN\r")
     until(resumed, lambda frame: completed(root, "SEALED_PLAN"), "Plan admitted after a clean restart")

@@ -328,6 +328,12 @@ fn text(args: &[String]) -> Result<i32> {
         write_json(&settings.effective()?)?;
         return Ok(0);
     }
+    if parsed.native_terminals && settings.directory.starts_with(&settings.cwd) {
+        eprintln!(
+            "Рабочая папка содержит каталог данных ansa. Для предпросмотра терминалов укажи папку проекта через --cwd."
+        );
+        return Ok(2);
+    }
     let mut bound = binding();
     bound.requested_model = settings.model.clone();
     bound.returned_model = settings.returned_model.clone();
