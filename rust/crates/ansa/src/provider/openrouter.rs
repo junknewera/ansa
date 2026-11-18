@@ -535,7 +535,13 @@ mod tests {
         ));
         let answer = route.generate(&request, &stop).unwrap();
         assert_eq!(answer.child_result().unwrap().summary, "Checked");
-        assert_eq!(answer.context_usage(), Some((500000, 1000000)));
+        assert_eq!(
+            answer.context_budget(),
+            Some(native::ContextBudget {
+                window: 1_000_000,
+                tokens: Some(500_000)
+            })
+        );
         assert_eq!(calls.load(Ordering::Acquire), 6);
         assert_eq!(
             verify_probe(&response(r#"{"value":"wrong","value":"schema-enforced"}"#)),

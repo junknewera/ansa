@@ -20,6 +20,45 @@ impl NativeItem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextBudget {
+    pub window: usize,
+    pub tokens: Option<usize>,
+}
+impl ContextBudget {
+    pub(crate) fn save(self, fields: &mut Vec<(&str, Json)>) -> Result<(), &'static str> {
+        if let Some(tokens) = self.tokens {
+            fields.push(("context_tokens", Json::parse(&tokens.to_string())?));
+            fields.push(("context_window", Json::parse(&self.window.to_string())?));
+        } else {
+            // Older readers expect both fields in the measured representation.
+            fields.push((
+                "model_context_window",
+                Json::parse(&self.window.to_string())?,
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn load(value: &Json) -> Result<Option<Self>, &'static str> {
+        let measured = value.has("context_tokens") || value.has("context_window");
+        let window_only = value.has("model_context_window");
+        let (window, tokens) = match (measured, window_only) {
+            (false, false) => return Ok(None),
+            (true, false) => (
+                value.usize_field("context_window")?,
+                Some(value.usize_field("context_tokens")?),
+            ),
+            (false, true) => (value.usize_field("model_context_window")?, None),
+            (true, true) => return Err("saved_response_context_usage"),
+        };
+        if window < 2 || tokens == Some(0) {
+            return Err("saved_response_context_usage");
+        }
+        Ok(Some(Self { window, tokens }))
+    }
+}
+
 /// Persisted response envelope. Loading always reconstructs the SSE lifecycle
 /// and routes it through the same production reducer as a network response.
 pub fn save(response: &AdmittedResponse) -> Result<Json, &'static str> {
@@ -38,9 +77,10 @@ pub fn save(response: &AdmittedResponse) -> Result<Json, &'static str> {
             )?,
         ),
     ];
-    if let Some((tokens, window)) = response.context_usage() {
-        fields.push(("context_tokens", Json::parse(&tokens.to_string())?));
-        fields.push(("context_window", Json::parse(&window.to_string())?));
+    if let Some(budget) = response.context_budget() {
+        budget.save(&mut fields)?;
+    } else if let Some(tokens) = response.token_usage() {
+        fields.push(("measured_context_tokens", Json::parse(&tokens.to_string())?));
     }
     Json::object(fields)
 }
@@ -144,15 +184,17 @@ pub fn load(value: &Json) -> Result<AdmittedResponse, &'static str> {
         &[body.as_bytes()],
         limits,
     )?;
-    if value.has("context_tokens") || value.has("context_window") {
-        let tokens = value.usize_field("context_tokens")?;
-        let window = value.usize_field("context_window")?;
-        if tokens == 0 || window < 2 {
+    let budget = ContextBudget::load(value)?;
+    if value.has("measured_context_tokens") {
+        let tokens = value.usize_field("measured_context_tokens")?;
+        if budget.is_some() || tokens == 0 {
             return Err("saved_response_context_usage");
         }
+        Ok(response.with_token_usage(Some(tokens)))
+    } else if let Some(budget) = budget {
         Ok(response
-            .with_token_usage(Some(tokens))
-            .with_context_window(Some(window)))
+            .with_token_usage(budget.tokens)
+            .with_context_window(Some(budget.window)))
     } else {
         Ok(response)
     }
