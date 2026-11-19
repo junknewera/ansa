@@ -345,7 +345,8 @@ async fn schedule(
                 tokio::time::sleep(Duration::from_millis(40)).await;
                 continue;
             }
-            let ready: Vec<_> = run.ready()?.into_iter().cloned().collect();
+            let slots = factory.orchestration_slots().saturating_sub(active.len());
+            let ready: Vec<_> = run.ready()?.into_iter().take(slots).cloned().collect();
             if ready.is_empty() && active.is_empty() {
                 break;
             }

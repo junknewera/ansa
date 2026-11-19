@@ -685,6 +685,21 @@ impl Reducer {
         {
             return Err("terminal_error_metadata");
         };
+        if self.siwc
+            && let Some(format) = self.request.final_format()
+        {
+            let expected = format.format()?;
+            let actual = terminal.field("text").and_then(|text| text.field("format"));
+            if !actual.is_ok_and(|actual| {
+                ["type", "name", "strict", "schema"].iter().all(|key| {
+                    actual
+                        .field(key)
+                        .is_ok_and(|value| expected.field(key) == Ok(value))
+                })
+            }) {
+                return Err("siwc_structured_format_unconfirmed");
+            }
+        }
         let mut items = Vec::new();
         let output = terminal.field("output")?.elements()?;
         if self.siwc

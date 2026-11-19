@@ -1,5 +1,6 @@
 """Production Carbon workspace acceptance with synthetic homes and real PTYs."""
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -774,8 +775,7 @@ def native_terminal_panel(screen, root, cwd):
     return "normal"
 
 
-def live_terminal_opt_in(screen, root, cwd):
-    home = root / "live-home"
+def seed_siwc(home):
     auth = home / ".ansa/auth"
     auth.mkdir(parents=True, mode=0o700)
     (home / ".ansa").chmod(0o700)
@@ -789,6 +789,12 @@ def live_terminal_opt_in(screen, root, cwd):
         path = auth / filename
         path.write_text(json.dumps(value))
         path.chmod(0o600)
+    return auth
+
+
+def live_terminal_opt_in(screen, root, cwd):
+    home = root / "live-home"
+    auth = seed_siwc(home)
 
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -1199,6 +1205,49 @@ def openrouter_orchestration(screen, root, cwd):
     return "normal"
 
 
+def siwc_orchestration(screen, root, cwd):
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "GPT ready without a network call")
+    screen.send(b"\t\t")
+    until(screen, lambda _: "Orchestration" in screen.vt.line(-2), "GPT orchestration mode")
+    for prompt in ("UNCONFIRMED_FORMAT", "UNCONSTRAINED_FORMAT"):
+        screen.send(prompt + "\r")
+        until(screen, lambda frame: "ChatGPT did not confirm the strict plan format" in frame
+              and screen.vt.line(-4) == "› " + prompt, "unconfirmed response rejected and draft restored")
+        assert not (root / "home/.ansa/orchestration").exists()
+        assert [row["kind"] for row in records(root)] == ["init"]
+        screen.send(b"\x03")
+        until(screen, lambda _: screen.vt.line(-4) == "›", "failed draft can be edited")
+    screen.send(b"Inspect this workspace\r")
+    until(screen, lambda frame: "SIWC_CARBON_PLAN" in frame and "Start" in frame,
+          "strict GPT plan displayed for approval")
+    assert not (root / "home/.ansa/orchestration").exists()
+    screen.send(b"\r")
+    until(screen, lambda frame: "SIWC_CARBON_DONE" in frame and ready(screen, "gpt-6.2-sol"),
+          "strict GPT helpers ran their tools and the coordinator answered")
+    assert "SIWC_HELPER_DONE" not in body(screen), "helper result leaked into the conversation"
+    assert sum(row["kind"] == "outcome" for row in records(root)) == 2
+    assert len(list((root / "home/.ansa/sessions").iterdir())) == 3
+
+    handoff, = (row["turn"] for row in records(root) if row.get("handoff") is True)
+    until(screen, lambda _: any(row["kind"] == "done" and row["turn"] == handoff for row in records(root))
+          and "Tab mode" in screen.vt.line(-2), "coordinator is idle before lock test")
+    paint_quiet(screen)
+
+    with (root / "home/.ansa/auth/lock").open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        screen.send(b"Cancel this draft\r")
+        until(screen, lambda frame: "Drafting a plan" in frame, "plan waits for the shared account lock")
+        time.sleep(0.1)
+        screen.send(b"\x03")
+        until(screen, lambda frame: "Drafting a plan" not in frame
+              and screen.vt.line(-4) == "› Cancel this draft", "cancel keeps the pending draft")
+        screen.send(b"\x03")
+        until(screen, lambda _: screen.vt.line(-4) == "›", "clear the pending draft")
+        local(screen, "/exit")
+        assert screen.finish()["exit"] == 0, "exit waited for the locked account after cancelling"
+    return "normal"
+
+
 def main():
     cases = [("input-copy-resize", input_and_copy), ("mouse-copy-resize", mouse_copy),
              ("mouse-selection-scroll", selection_scroll),
@@ -1222,7 +1271,8 @@ def main():
              ("editor-early-exit", editor_early_exit),
              ("editor-stopped", lambda *a: editor_early_exit(*a, True)),
              ("editor-missing", editor_missing), ("normal-exit", normal_exit),
-             ("openrouter-orchestration", openrouter_orchestration)]
+             ("openrouter-orchestration", openrouter_orchestration),
+             ("siwc-orchestration", siwc_orchestration)]
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -1232,7 +1282,7 @@ def main():
     if args.selected_cases:
         cases = [(name, case) for name, case in cases if name in args.selected_cases]
     else:
-        cases = [(name, case) for name, case in cases if name != "openrouter-orchestration"]
+        cases = [(name, case) for name, case in cases if name not in ("openrouter-orchestration", "siwc-orchestration")]
     results = []
     for name, case in cases:
         started = time.monotonic()
@@ -1249,11 +1299,14 @@ def main():
             editor.chmod(0o700)
             editor_path = cwd / "does-not-exist" if name == "editor-missing" else editor
             extra = ["--native-terminals"] if name == "native-terminal-panel" else []
-            if name == "openrouter-orchestration":
+            if name in ("openrouter-orchestration", "siwc-orchestration"):
                 home.chmod(0o700)
                 cwd.chmod(0o700)
+                if name == "siwc-orchestration":
+                    seed_siwc(home)
+                adapter = name.replace("-orchestration", "-carbon")
                 screen = Pty(str(args.binary.resolve()), root, home, cwd, "", True, size=(100, 32),
-                             argv=["--frontend-fixture", str(root), "openrouter-carbon"])
+                             argv=["--frontend-fixture", str(root), adapter])
                 screen.vt = Terminal(100, 32)
             else:
                 screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)}, argv_extra=extra)

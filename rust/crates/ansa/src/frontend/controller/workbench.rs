@@ -646,6 +646,7 @@ enum Menu {
         selected: usize,
     },
     Themes(ThemePreview),
+    DraftingPlan,
     Loading(String),
     Sessions {
         entries: Vec<SessionSummary>,
@@ -1004,6 +1005,11 @@ impl Workbench {
         self.exit_deadline.take().is_some()
     }
     fn interrupt(&mut self, io: &Io, now: Instant) -> bool {
+        if matches!(self.menu, Some(Menu::DraftingPlan)) {
+            self.disarm_exit();
+            self.escape(io);
+            return false;
+        }
         let slot = &mut self.slots[self.current];
         if !slot.state.editor.bytes.is_empty()
             || slot.state.editor.overflow
@@ -1699,7 +1705,9 @@ impl Workbench {
         if !matches!(slot.kind, Kind::Main | Kind::Fork) || slot.active() {
             return;
         }
-        if self.orchestration_mode {
+        if self.orchestration_mode
+            || (slot.state.mode == AgentMode::Plan && self.factory.orchestration_route().is_err())
+        {
             self.orchestration_mode = false;
             self.refinement = None;
             slot.state.mode = AgentMode::Basic;
@@ -1762,8 +1770,7 @@ impl Workbench {
         }
         self.planning_context = Some((id, slot.id.clone(), prompt, token));
         slot.state.status.clear();
-        self.refinement = None;
-        self.menu = Some(Menu::Loading("Drafting a plan".into()));
+        self.menu = Some(Menu::DraftingPlan);
         true
     }
 
@@ -2127,6 +2134,16 @@ impl Workbench {
         };
         let lost_context = matches!(event.payload, EventPayload::ResyncRequired { .. })
             && self.discard_contexts(id);
+        if matches!(event.payload, EventPayload::ResyncRequired { .. })
+            && self
+                .planning_context
+                .as_ref()
+                .is_some_and(|(_, owner, _, _)| owner == id)
+        {
+            self.cancel_modal();
+            self.menu = None;
+            self.report(io, "Could not load plan context. Retry the request");
+        }
         if let EventPayload::ContextSnapshot { command, seed } = &event.payload
             && self
                 .planning_context
@@ -2421,6 +2438,10 @@ impl Workbench {
                 self.menu = None;
                 match result {
                     Ok(proposal) => {
+                        let slot = &mut self.slots[self.current];
+                        slot.state.editor.clear();
+                        slot.state.input_history.reset();
+                        self.refinement = None;
                         let blocked = proposal.plan.execution_ready().err();
                         self.show_orchestration_plan(&proposal.plan, None);
                         self.frames.clear();
@@ -2432,7 +2453,16 @@ impl Workbench {
                             selected: usize::from(blocked.is_some()),
                         });
                     }
-                    Err(code) => self.report(io, &format!("Could not draft plan ({code})")),
+                    Err(code) => {
+                        if code == "siwc_structured_format_unconfirmed" {
+                            self.report(
+                                io,
+                                "ChatGPT did not confirm the strict plan format · Tab Work",
+                            );
+                        } else {
+                            self.report(io, &format!("Could not draft plan ({code})"));
+                        }
+                    }
                 }
             }
             Job::OrchestrationDone { owner, result } => {
@@ -3059,7 +3089,7 @@ impl Workbench {
                 let theme = preview.current();
                 self.set_theme(theme);
             }
-            Some(Menu::Loading(_)) => {}
+            Some(Menu::Loading(_) | Menu::DraftingPlan) => {}
             Some(Menu::Sessions {
                 entries,
                 selected,
@@ -3163,6 +3193,7 @@ impl Workbench {
                 }
                 Menu::Themes(preview) => self.commit_theme(preview.current()),
                 Menu::Loading(title) => self.menu = Some(Menu::Loading(title)),
+                Menu::DraftingPlan => self.menu = Some(Menu::DraftingPlan),
                 Menu::Sessions {
                     entries,
                     selected,
@@ -3507,6 +3538,11 @@ impl Workbench {
                 title: title.clone(),
                 subtitle: "Loading…".into(),
                 footer: "Esc cancel".into(),
+                ..Popup::default()
+            },
+            Menu::DraftingPlan => Popup {
+                title: "Drafting a plan".into(),
+                footer: "Esc or Ctrl+C cancel".into(),
                 ..Popup::default()
             },
             Menu::Sessions {
@@ -4436,6 +4472,10 @@ pub async fn run_attached(
                 if !accepted {
                     work.pending_context.remove(&id);
                     work.orchestration_summary.retain(|_, pending| pending.0 != id);
+                    if work.planning_context.as_ref().is_some_and(|(pending, _, _, _)| pending.0 == id) {
+                        work.cancel_modal();
+                        work.menu = None;
+                    }
                 }
             }
             if work.exit_deadline.is_some_and(|deadline| now >= deadline || work.slots[work.current].interruptible()) {
@@ -4566,8 +4606,10 @@ pub async fn run_attached(
                                                 {
                                                     slot.follow_accepted_submit = Some(id.clone());
                                                 }
-                                                slot.state.editor.clear();
-                                                slot.state.input_history.reset();
+                                                if !matches!(work.menu, Some(Menu::DraftingPlan)) {
+                                                    slot.state.editor.clear();
+                                                    slot.state.input_history.reset();
+                                                }
                                                 slot.refresh = Instant::now();
                                             }
                                         }
