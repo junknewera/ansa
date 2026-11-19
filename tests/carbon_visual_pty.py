@@ -668,6 +668,25 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     until(screen, lambda _: image_bytes(screen, started) is not None, 'complete reopened chart')
     snapshot(screen, 'reopened-chart')
     escape(screen)
+    screen.send('chart draft')
+    until(screen, lambda _: 'chart draft' in screen.vt.line(-4), 'draft before keyboard navigation')
+    screen.send(b'\x07')
+    for _ in range(12):
+        screen.drain(.03)
+        visible(screen)
+        if screen.vt.attribute('Открыть график · chart.png')[1] is not None:
+            break
+        screen.send(b'\x1b[B')
+    else:
+        raise AssertionError('could not focus the chart result')
+    screen.send(b'\r')
+    until(screen, lambda text: 'PNG · 160 × 80' in text, 'Enter opened selected PNG')
+    escape(screen)
+    until(screen, lambda text: 'PNG · 160 × 80' not in text and 'chart draft' in screen.vt.line(-4)
+          and screen.vt.attribute('Открыть график · chart.png')[1] is not None,
+          'Esc restored result focus and draft')
+    escape(screen)
+    screen.send(b'\x03')
     other = cwd / 'other.png'
     Image.new('RGB', (240, 120), (40, 90, 190)).save(other)
     (root / 'preview-other').touch()
@@ -724,6 +743,12 @@ def dataset_chart(binary, adapter, root, home, cwd, screens):
     digest = hashlib.sha256(image_bytes(screen, pending)[1]).hexdigest()
     assert digest == descriptor['sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
     snapshot(screen, 'dataset-chart')
+    escape(screen)
+    row, column = screen.vt.location('Источник · sales.csv')
+    click(screen, column, row)
+    until(screen, lambda text: 'sales.csv · только чтение' in text and '2026-03-03,550' in text,
+          'open the source CSV bound to the completed calculation')
+    escape(screen)
     finish(screen)
     return {'canonical_png_sha256': digest, 'bytes': path.stat().st_size}
 

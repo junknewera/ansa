@@ -65,6 +65,7 @@ struct Slot {
     tool_expanded: std::collections::BTreeSet<String>,
     tool_anchor_limit: Option<usize>,
     images_through: Option<usize>,
+    candidate_reviews: std::collections::VecDeque<ux::CandidateView>,
 }
 impl Slot {
     fn new(
@@ -113,6 +114,7 @@ impl Slot {
             tool_expanded: Default::default(),
             tool_anchor_limit: None,
             images_through: None,
+            candidate_reviews: std::collections::VecDeque::new(),
         }
     }
     #[cfg(test)]
@@ -559,6 +561,10 @@ enum Job {
     OrchestrationReceipt {
         result: Result<()>,
     },
+    ArchivedPlan {
+        token: u64,
+        result: Result<orchestration::ArchivedPlan>,
+    },
     DraftPullRequest {
         owner: String,
         result: Result<String>,
@@ -786,7 +792,10 @@ struct Workbench {
     pending_context: BTreeMap<String, CreateIntent>,
     planning_context: Option<(CommandId, String, String, u64)>,
     orchestration_stop: Option<(String, Cancel)>,
+    orchestration_progress: Option<tokio::sync::watch::Receiver<Option<orchestration::RunView>>>,
+    orchestration_views: BTreeMap<String, orchestration::RunView>,
     orchestration_handoffs: BTreeMap<String, String>,
+    orchestration_summary: BTreeMap<String, CommandId>,
     orchestration_mode: bool,
     refinement: Option<String>,
     menu: Option<Menu>,
@@ -812,6 +821,12 @@ struct Workbench {
     selection_frame: Option<(u64, Selection)>,
     next_drag_scroll: Option<Instant>,
     tool_press: Option<ToolPress>,
+    result_selected: Option<String>,
+    agents_return: Option<(String, usize)>,
+    result_scroll: Option<usize>,
+    result_tail: bool,
+    review_redraw: bool,
+    wide_diff: bool,
     frames: std::collections::VecDeque<(u64, carbon::Frame)>,
     displayed: Option<carbon::Frame>,
     operational_frame: Option<u64>,
@@ -898,7 +913,10 @@ impl Workbench {
             pending_context: BTreeMap::new(),
             planning_context: None,
             orchestration_stop: None,
+            orchestration_progress: None,
+            orchestration_views: BTreeMap::new(),
             orchestration_handoffs: BTreeMap::new(),
+            orchestration_summary: BTreeMap::new(),
             orchestration_mode: false,
             refinement: None,
             menu: None,
@@ -924,6 +942,12 @@ impl Workbench {
             selection_frame: None,
             next_drag_scroll: None,
             tool_press: None,
+            result_selected: None,
+            agents_return: None,
+            result_scroll: None,
+            result_tail: false,
+            review_redraw: false,
+            wide_diff: false,
             frames: std::collections::VecDeque::new(),
             displayed: None,
             operational_frame: None,
@@ -1059,6 +1083,20 @@ impl Workbench {
         self.panel = None;
         self.focus = Focus::Chat;
         self.selection = None;
+        self.result_selected = None;
+        self.result_scroll = None;
+        self.result_tail = false;
+        self.review_redraw = false;
+        if self
+            .agents_return
+            .as_ref()
+            .is_some_and(|(id, _)| id == &self.slots[index].id)
+            && let Some((_, selected)) = self.agents_return.take()
+        {
+            self.panel = Some(Panel::Agents { selected });
+            self.focus = Focus::Inspector;
+        }
+        self.wide_diff = false;
         self.tool_press = None;
         self.last_frame = None;
         self.frames.clear();
@@ -1717,6 +1755,7 @@ impl Workbench {
             return false;
         }
         self.planning_context = Some((id, slot.id.clone(), prompt, token));
+        slot.state.status.clear();
         self.refinement = None;
         self.menu = Some(Menu::Loading("Готовлю план".into()));
         true
@@ -1734,13 +1773,19 @@ impl Workbench {
         }
         let owner = self.slots[self.current].id.clone();
         let stop = Cancel::linked(&self.stop);
+        let (progress, receiver) = tokio::sync::watch::channel(None);
+        self.orchestration_progress = Some(receiver);
+        self.orchestration_views.remove(&owner);
+        let slot = &mut self.slots[self.current];
+        slot.state.status.clear();
+        slot.title
+            .get_or_insert_with(|| display_title(&proposal.prompt));
         self.orchestration_stop = Some((owner.clone(), stop.clone()));
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            result: orchestration::execute(&factory, proposal, &stop),
+            result: orchestration::execute(&factory, proposal, &stop, progress),
         });
-        self.report(io, "Помощники выполняют план · Ctrl+C остановить");
     }
 
     fn resume_orchestration(&mut self, identity: RunId, io: &Io) {
@@ -1755,16 +1800,54 @@ impl Workbench {
         }
         let owner = identity.parent_session.clone();
         let stop = Cancel::linked(&self.stop);
+        let (progress, receiver) = tokio::sync::watch::channel(None);
+        self.orchestration_progress = Some(receiver);
+        self.orchestration_views.remove(&owner);
+        self.slots[self.current].state.status.clear();
         self.orchestration_stop = Some((owner.clone(), stop.clone()));
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            result: orchestration::resume(&factory, identity, &stop),
+            result: orchestration::resume(&factory, identity, &stop, progress),
         });
-        self.report(io, "Проверяю исходные журналы помощников");
+    }
+
+    fn update_orchestration_progress(&mut self) -> bool {
+        let Some((owner, _)) = &self.orchestration_stop else {
+            return false;
+        };
+        let Some(progress) = &mut self.orchestration_progress else {
+            return false;
+        };
+        let previous = self.orchestration_views.get(owner);
+        let latest = progress.borrow_and_update();
+        if latest.as_ref() == previous {
+            return false;
+        }
+        if let Some(view) = latest.as_ref() {
+            self.orchestration_views.insert(owner.clone(), view.clone());
+        }
+        true
+    }
+
+    fn collecting_orchestration(&self) -> bool {
+        self.orchestration_progress.is_some()
+            && self
+                .orchestration_stop
+                .as_ref()
+                .is_some_and(|(owner, _)| owner == &self.slots[self.current].id)
     }
 
     fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
+        if !text.trim_start().starts_with('/')
+            && !text.trim().is_empty()
+            && (self.collecting_orchestration()
+                || self
+                    .orchestration_summary
+                    .contains_key(&self.slots[self.current].id))
+        {
+            return (false, false);
+        }
         if !text.trim().is_empty()
             && !text.trim_start().starts_with('/')
             && (self.orchestration_mode || commands::agent_task(text).is_some())
@@ -2069,6 +2152,31 @@ impl Workbench {
         {
             return;
         }
+        if self
+            .orchestration_summary
+            .get(id)
+            .is_some_and(|summary| match &event.payload {
+                EventPayload::Done => event.turn.0 == summary.0,
+                EventPayload::CommandReplayed { command, state } => {
+                    command == summary
+                        && matches!(state.as_str(), "completed" | "cancelled" | "paused")
+                }
+                EventPayload::RuntimeError { command, .. } => {
+                    command.as_ref() == Some(summary) || event.turn.0 == summary.0
+                }
+                EventPayload::FrontendSnapshot(snapshot) => {
+                    snapshot.submit.as_ref() == Some(summary)
+                        && !snapshot.worker_busy
+                        && matches!(
+                            snapshot.state.as_str(),
+                            "completed" | "cancelled" | "paused"
+                        )
+                }
+                _ => false,
+            })
+        {
+            self.orchestration_summary.remove(id);
+        }
         let committed = match &event.payload {
             EventPayload::FrontendSnapshot(snapshot)
                 if snapshot.durable && !snapshot.storage_failed =>
@@ -2249,6 +2357,34 @@ impl Workbench {
                     );
                 }
             }
+            Job::ArchivedPlan { token, result } => {
+                if token == self.file_token
+                    && matches!(self.panel, Some(Panel::Orchestration { .. }))
+                    && self.menu.is_none()
+                {
+                    match result {
+                        Ok(archive) => {
+                            self.show_orchestration_plan(&archive.plan, Some(&archive.prompt));
+                            match archive.candidate {
+                                Ok(Some(candidate)) => {
+                                    let view = ux::CandidateView::new(archive.run, candidate);
+                                    self.slots[self.current].remember_candidate(view);
+                                    self.review_redraw = true;
+                                }
+                                Err(code) => {
+                                    self.report(io, &format!("Diff и проверки недоступны ({code})"))
+                                }
+                                Ok(None) => {}
+                            }
+                        }
+                        Err(code) => {
+                            self.panel = None;
+                            self.focus = Focus::Chat;
+                            self.report(io, &format!("Не удалось открыть план ({code})"));
+                        }
+                    }
+                }
+            }
             Job::OrchestrationPlan {
                 owner,
                 token,
@@ -2264,79 +2400,46 @@ impl Workbench {
                 self.menu = None;
                 match result {
                     Ok(proposal) => {
-                        let mut lines = vec![proposal.plan.summary().to_owned(), String::new()];
-                        for check in proposal.plan.command_checks() {
-                            let argv = serde_json::json!(check.argv);
-                            lines.push(format!("Команда в копии проекта с вашими правами {argv}"));
-                        }
-                        if proposal
-                            .plan
-                            .steps()
-                            .iter()
-                            .any(|step| step.access == crate::orchestration::plan::Access::Write)
-                        {
-                            lines.push("После правок - проверка diff и независимое ревью. До двух исправлений в указанных путях.".into());
-                            lines.push(String::new());
-                        }
-                        for (index, step) in proposal.plan.steps().iter().enumerate() {
-                            let access = match step.access {
-                                crate::orchestration::plan::Access::Read => "Чтение",
-                                crate::orchestration::plan::Access::Write => {
-                                    "Правки в рабочей копии"
-                                }
-                            };
-                            lines.push(format!("{}. {} · {}", index + 1, step.id, access));
-                            lines.extend(step.task.lines().map(str::to_owned));
-                            if !step.paths.is_empty() {
-                                lines.extend(step.paths.iter().cloned());
-                            }
-                            if !step.depends_on.is_empty() {
-                                lines.push(format!("После шагов {}", step.depends_on.join(", ")));
-                            }
-                            lines.extend(step.acceptance.lines().map(str::to_owned));
-                            lines.push(String::new());
-                        }
-                        for check in proposal.plan.checks() {
-                            lines.push(format!("Проверка файла {}", check.path));
-                            lines.extend(check.contains.lines().map(str::to_owned));
-                        }
-                        for check in proposal.plan.manual_checks() {
-                            lines.push("Требуется дополнительная проверка".into());
-                            lines.extend(check.lines().map(str::to_owned));
-                        }
-                        self.panel = Some(Panel::Orchestration { lines, offset: 0 });
+                        let blocked = proposal.plan.execution_ready().err();
+                        self.show_orchestration_plan(&proposal.plan, None);
                         self.frames.clear();
                         self.displayed = None;
                         self.operational_frame = None;
                         self.last_frame = None;
-                        self.focus = Focus::Inspector;
                         self.menu = Some(Menu::Orchestration {
                             proposal: Box::new(proposal),
-                            selected: 0,
+                            selected: usize::from(blocked.is_some()),
                         });
                     }
                     Err(code) => self.report(io, &format!("Не удалось подготовить план ({code})")),
                 }
             }
             Job::OrchestrationDone { owner, result } => {
+                self.update_orchestration_progress();
+                self.orchestration_progress = None;
                 self.orchestration_stop = None;
+                if result.is_err() {
+                    self.orchestration_views.remove(&owner);
+                    if matches!(self.panel, Some(Panel::Agents { .. })) && self.can_job(io) {
+                        let factory = self.factory.clone();
+                        let stop = Cancel::linked(&self.stop);
+                        self.jobs.spawn_blocking(move || Job::CachedSummaries {
+                            result: factory.summaries(&stop),
+                        });
+                    }
+                }
                 let foreground = self.slots[self.current].id == owner;
                 let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner) else {
                     return;
                 };
                 match result {
                     Ok(completed) if !self.input_closed && !parent.active() => {
-                        if let Some(candidate) = completed.candidate
-                            && foreground
-                        {
-                            self.panel = Some(Panel::EditDiff {
-                                title: "Проверенные изменения · ansa-result".into(),
-                                rows: std::sync::Arc::new(super::super::diff::patch_rows(
-                                    &candidate.diff,
-                                )),
-                                offset: 0,
-                                column: 0,
-                            });
+                        if let Some(candidate) = completed.candidate {
+                            let review = ux::CandidateView::new(completed.id.clone(), candidate);
+                            if foreground && self.panel.is_none() {
+                                self.panel = Some(review.panel());
+                            }
+                            parent.remember_candidate(review);
                         }
                         let mut command = parent.state.command(
                             &parent.handle,
@@ -2347,15 +2450,20 @@ impl Workbench {
                         );
                         command.command = CommandId(format!("summary-{}", completed.id));
                         command.turn = TurnId(format!("summary-{}", completed.id));
+                        let summary = command.command.clone();
                         if parent.state.post_command(
                             &parent.handle,
                             command,
                             &mut parent.replies,
                             false,
                         ) {
+                            parent.state.status.clear();
+                            self.orchestration_summary.insert(owner.clone(), summary);
                             self.orchestration_handoffs
                                 .insert(owner.clone(), completed.id);
-                            parent.show_latest();
+                            if parent.state.follow_tail {
+                                parent.show_latest();
+                            }
                         } else {
                             parent
                                 .state
@@ -2596,6 +2704,7 @@ impl Workbench {
                         Ok(FileValue::Listing(listing)) => files.listing = Some(listing),
                         Ok(FileValue::Document(document)) => {
                             files.document = Some(document);
+                            files.offset = files.offset.min(files.last_line());
                             files.preview_cache = None;
                         }
                         Ok(FileValue::Image(_)) => unreachable!("handled image"),
@@ -2668,6 +2777,7 @@ impl Workbench {
             } else {
                 Focus::Chat
             };
+            self.restore_result_scroll();
             return;
         }
         if let Some(Panel::Files(files)) = &mut self.panel
@@ -2678,6 +2788,12 @@ impl Workbench {
         self.pending_editor = None;
         if self.panel.take().is_some() {
             self.focus = Focus::Chat;
+            self.wide_diff = false;
+            self.restore_result_scroll();
+            return;
+        }
+        if self.result_selected.take().is_some() {
+            self.leave_results();
             return;
         }
         if self.slots[self.current].kind != Kind::Agent
@@ -2876,6 +2992,10 @@ impl Workbench {
     fn navigate(&mut self, older: bool) {
         self.selection = None;
         self.tool_press = None;
+        if self.menu.is_none() && self.focus == Focus::Chat && self.result_selected.is_some() {
+            self.navigate_results(Some(older));
+            return;
+        }
         if self.menu.is_none()
             && let Some(completion) = &mut self.completion
         {
@@ -2956,6 +3076,19 @@ impl Workbench {
         }
     }
     fn enter(&mut self, io: &Io) -> Option<String> {
+        if self.menu.is_none()
+            && self.focus == Focus::Chat
+            && let Some(key) = self.result_selected.clone()
+        {
+            if let Some(frame) = &self.displayed
+                && frame.tool_actions.iter().any(|(_, action)| action == &key)
+            {
+                let edit = frame.edit_view(&key);
+                let output = frame.output_view(&key);
+                self.activate_result(key, edit, output, io);
+            }
+            return None;
+        }
         if let Some(completion) = &self.completion
             && self.menu.is_none()
             && self.focus == Focus::Chat
@@ -3074,8 +3207,13 @@ impl Workbench {
                     }
                 }
                 Some(Panel::Agents { selected }) => {
-                    if let Some((id, _)) = self.agent_rows().get(*selected) {
+                    if let Some((id, agent)) = self.agent_rows().get(*selected) {
+                        if agent.state == "Работает" && self.collecting_orchestration() {
+                            self.report(io, "Разговор доступен после завершения работы помощника");
+                            return None;
+                        }
                         let id = id.clone();
+                        self.agents_return = Some((self.slots[self.current].id.clone(), *selected));
                         self.resume(id, io);
                     }
                 }
@@ -3285,64 +3423,7 @@ impl Workbench {
                 if let Some((column, row, key, edit, output)) = self.tool_press.take()
                     && (column, row) == (mouse.column, mouse.row)
                 {
-                    if let Some(operation) = key.strip_prefix("image:") {
-                        let slot = &self.slots[self.current];
-                        let source = slot.timeline.as_ref().and_then(|page| {
-                            page.entries.iter().find_map(|entry| {
-                                graphics::Source::from_entry(entry, &slot.id)
-                                    .filter(|(id, _)| *id == operation)
-                                    .map(|(_, source)| source)
-                            })
-                        });
-                        if let Some(source) = source {
-                            self.show_image(source, io);
-                        }
-                        self.selection = None;
-                        return;
-                    }
-                    if key.starts_with("output:") {
-                        self.selection = None;
-                        if let Some(view) = output {
-                            if !matches!(self.panel, Some(Panel::Output { .. })) {
-                                self.output_back = self.panel.take().map(Box::new);
-                            }
-                            self.panel = Some(Panel::Output { view, offset: 0 });
-                            self.focus = Focus::Inspector;
-                        } else {
-                            self.report(io, "Вывод этой операции вне текущего отображения");
-                        }
-                        return;
-                    }
-                    if key.starts_with("diff:") {
-                        self.selection = None;
-                        if let Some(edit) = edit {
-                            let filename = Path::new(&edit.path)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or(&edit.path);
-                            self.panel = Some(Panel::EditDiff {
-                                title: format!(
-                                    "{} · +{} -{} · Diff правки",
-                                    filename, edit.diff.added, edit.diff.removed
-                                ),
-                                rows: std::sync::Arc::new(edit.diff.rows.clone()),
-                                offset: 0,
-                                column: 0,
-                            });
-                            self.focus = Focus::Inspector;
-                        } else {
-                            self.report(io, "Данные этой правки вне текущей страницы истории");
-                        }
-                        return;
-                    }
-                    let slot = &mut self.slots[self.current];
-                    if !slot.tool_expanded.remove(&key) && slot.tool_expanded.len() < 4096 {
-                        slot.tool_expanded.insert(key);
-                    }
-                    slot.tool_anchor_limit =
-                        self.displayed.as_ref().map(|frame| frame.scroll_limit);
-                    slot.state.reading = None;
-                    self.selection = None;
+                    self.activate_result(key, edit, output, io);
                     return;
                 }
                 if let Some(mut selection) = self.selection.take()
@@ -3439,7 +3520,11 @@ impl Workbench {
                     .iter()
                     .map(|m| Choice {
                         label: m.0.clone(),
-                        detail: m.1.clone(),
+                        detail: if m.0 == m.1 {
+                            String::new()
+                        } else {
+                            m.1.clone()
+                        },
                     })
                     .collect(),
                 selected: *selected,
@@ -3474,15 +3559,21 @@ impl Workbench {
     fn inspector(&self) -> Option<Inspector> {
         match self.panel.as_ref()? {
             Panel::Orchestration { lines, offset } => {
-                let selected = match &self.menu {
-                    Some(Menu::Orchestration { selected, .. }) => *selected,
-                    _ => 0,
-                };
-                let actions = ["Начать", "Уточнить", "Отмена"]
+                let footer = if let Some(Menu::Orchestration { selected, proposal }) = &self.menu {
+                    let blocked = proposal.plan.execution_ready().err();
+                    let actions = [
+                        if blocked.is_none() {
+                            "Начать"
+                        } else {
+                            "Запуск недоступен"
+                        },
+                        "Уточнить",
+                        "Отмена",
+                    ]
                     .into_iter()
                     .enumerate()
                     .map(|(index, label)| {
-                        if index == selected {
+                        if index == *selected {
                             format!("[{label}]")
                         } else {
                             label.into()
@@ -3490,11 +3581,15 @@ impl Workbench {
                     })
                     .collect::<Vec<String>>()
                     .join("   ");
+                    format!("{actions}   ·   ↑/↓ · Enter")
+                } else {
+                    "PgUp/PgDn или прокрутка · Esc чат".into()
+                };
                 Some(Inspector {
                     title: "План работы · PgUp/PgDn или прокрутка".into(),
                     lines: lines.clone(),
                     offset: *offset,
-                    footer: format!("{actions}   ·   ↑/↓ выбрать · Enter"),
+                    footer,
                     kind: InspectorKind::Plan,
                     ..Inspector::default()
                 })
@@ -3558,7 +3653,7 @@ impl Workbench {
                 kind: InspectorKind::Diff,
                 diff: Some(rows.clone()),
                 diff_column: *column,
-                footer: "j/k строки · h/l горизонтально · g/G начало/конец · Esc чат".into(),
+                footer: "j/k строки · h/l горизонтально · f ширина · Esc чат".into(),
                 ..Inspector::default()
             }),
             Panel::Agents { selected } => Some(Inspector {
@@ -3633,13 +3728,37 @@ impl Workbench {
                     };
                     Some(Inspector {
                         title: format!(
-                            "{} · только чтение{}",
-                            document.path.display(),
+                            "{} · {}{}{}",
+                            document
+                                .path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
+                            if files.tab == 1 {
+                                if matches!(
+                                    document.diff.status,
+                                    DiffStatus::Modified
+                                        | DiffStatus::Untracked
+                                        | DiffStatus::Unchanged
+                                ) {
+                                    "HEAD → рабочий файл"
+                                } else {
+                                    "Diff"
+                                }
+                            } else {
+                                "только чтение"
+                            },
                             if document.truncated {
                                 " · фрагмент"
                             } else {
                                 ""
-                            }
+                            },
+                            document
+                                .path
+                                .parent()
+                                .map(|parent| self.relative_directory(parent))
+                                .filter(|parent| parent != ".")
+                                .map_or_else(String::new, |parent| format!(" · {parent}"))
                         ),
                         tabs: vec![
                             "Файлы".into(),
@@ -3652,7 +3771,14 @@ impl Workbench {
                         lines: text.lines().map(String::from).collect(),
                         offset: files.offset,
                         footer: files.jump.as_ref().map_or_else(
-                            || "s/d/p вкладки · :строка · e редактор · q терминал · Esc чат".into(),
+                            || {
+                                if files.tab == 1 {
+                                    "f развернуть diff · s/d/p вкладки · Esc чат".into()
+                                } else {
+                                    "s/d/p вкладки · :строка · e редактор · q терминал · Esc чат"
+                                        .into()
+                                }
+                            },
                             |line| format!(":{line}"),
                         ),
                         kind,
@@ -3667,7 +3793,7 @@ impl Workbench {
                     let listing = files.listing.as_ref();
                     Some(Inspector {
                         title: listing
-                            .map_or_else(|| "Файлы".into(), |l| l.path.display().to_string()),
+                            .map_or_else(|| "Файлы".into(), |l| self.relative_directory(&l.path)),
                         tabs: vec!["Файлы".into(), "Терминал".into()],
                         lines: listing.map_or_else(Vec::new, |l| {
                             l.entries
@@ -3746,6 +3872,24 @@ impl Workbench {
                 .map(|completion| completion.popup(completion.exact_command(&slot.state.editor))),
             animate: self.animation_enabled(),
             animation_frame: Self::animation_frame(),
+            draft_notice: !slot.state.editor.bytes.is_empty()
+                && (self.collecting_orchestration()
+                    || self.orchestration_summary.contains_key(&slot.id)),
+            interrupt_hint: if !slot.state.editor.bytes.is_empty() {
+                "Ctrl+C очистить"
+            } else if self.collecting_orchestration() || slot.interruptible() {
+                "Ctrl+C остановить"
+            } else {
+                ""
+            },
+            result_selected: self
+                .result_selected
+                .clone()
+                .filter(|_| self.focus == Focus::Chat),
+            wide_diff: self.wide_diff
+                && self.focus == Focus::Inspector
+                && (matches!(&self.panel, Some(Panel::EditDiff { .. }))
+                    || matches!(&self.panel, Some(Panel::Files(files)) if files.tab == 1)),
         }
     }
     fn animation_enabled(&self) -> bool {
@@ -3754,10 +3898,11 @@ impl Workbench {
             && slot.state.follow_tail
             && self.menu.is_none()
             && self.completion.is_none()
-            && slot.state.snapshot.as_ref().is_some_and(|view| {
-                view.worker_busy
-                    && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
-            })
+            && (self.collecting_orchestration()
+                || slot.state.snapshot.as_ref().is_some_and(|view| {
+                    view.worker_busy
+                        && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
+                }))
             && std::env::var_os("ANSA_NO_ANIMATION").is_none()
     }
     fn animation_frame() -> u8 {
@@ -3859,8 +4004,8 @@ impl Workbench {
         let mut frame = if let Some(selection) = &self.selection {
             let mut ui = self.ui();
             ui.animate = false;
+            let projected = self.projected();
             let slot = &mut self.slots[self.current];
-            let projected = slot.projected();
             let mut live = slot
                 .state
                 .render_workspace(io, context, &ui, projected.as_deref());
@@ -3908,8 +4053,8 @@ impl Workbench {
         } else {
             let mut ui = self.ui();
             ui.animate &= io.color;
+            let projected = self.projected();
             let slot = &mut self.slots[self.current];
-            let projected = slot.projected();
             slot.state
                 .render_workspace(io, context, &ui, projected.as_deref())
         };
@@ -3944,8 +4089,8 @@ impl Workbench {
             if let Some(panel) = &mut ui.inspector {
                 panel.lines = lines;
             }
+            let projected = self.projected();
             let slot = &mut self.slots[self.current];
-            let projected = slot.projected();
             frame = slot
                 .state
                 .render_workspace(io, context, &ui, projected.as_deref());
@@ -4221,6 +4366,7 @@ pub async fn run_attached(
                 }
             }
             let now = Instant::now();
+            dirty |= work.update_orchestration_progress();
             dirty |= work.tick_drag(io, now);
             work.refresh_terminal_screen(now);
             work.flush_terminal_input(io);
@@ -4254,7 +4400,10 @@ pub async fn run_attached(
                 if slot.state.explicit_status { dirty |= slot.state.wait_clock.tick(now); }
             }
             for (id, accepted) in admissions {
-                if !accepted { work.pending_context.remove(&id); }
+                if !accepted {
+                    work.pending_context.remove(&id);
+                    work.orchestration_summary.retain(|_, pending| pending.0 != id);
+                }
             }
             if work.exit_deadline.is_some_and(|deadline| now >= deadline || work.slots[work.current].interruptible()) {
                 dirty |= work.disarm_exit();
@@ -4286,6 +4435,16 @@ pub async fn run_attached(
                             // Modal/read-only navigation never edits a draft.
                             if byte.is_ascii() && !work.input_editor().escape_pending() && !work.input_editor().pasting() {
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());
+                                if byte == 7 && work.focus == Focus::Chat && work.menu.is_none() && work.completion.is_none() {
+                                    work.navigate_results(None);
+                                    continue;
+                                }
+                                if byte == b'f' && work.focus == Focus::Inspector
+                                    && (matches!(&work.panel, Some(Panel::EditDiff { .. }))
+                                        || matches!(&work.panel, Some(Panel::Files(files)) if files.tab == 1 && files.document.is_some())) {
+                                    work.wide_diff = !work.wide_diff;
+                                    continue;
+                                }
                                 if matches!(byte, b'j' | b'k') && !jumping && (work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Files(_) | Panel::EditDiff { .. } | Panel::Output { .. }))) { work.navigate(byte == b'k'); continue; }
                                 let file_visible = work.displayed.as_ref().map_or(1, |frame| frame.inspector_content_rows).max(1);
                                 let inspector_width = work.displayed.as_ref().and_then(|frame|frame.chat_bounds).map_or(io.size.0.saturating_sub(1),|(_,_,right)|io.size.0.saturating_sub(right+4));

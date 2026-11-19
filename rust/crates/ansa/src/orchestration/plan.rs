@@ -208,13 +208,13 @@ impl Plan {
     }
 
     pub(crate) fn execution_ready(&self) -> Result<()> {
+        if self.steps().iter().all(|step| step.access == Access::Read) {
+            return Ok(());
+        }
         if !self.manual_checks().is_empty() {
             return Err("orchestration_manual_checks_required");
         }
-        if self.0.steps.iter().any(|step| step.access == Access::Write)
-            && self.checks().is_empty()
-            && self.command_checks().is_empty()
-        {
+        if self.checks().is_empty() && self.command_checks().is_empty() {
             return Err("orchestration_missing_checks");
         }
         Ok(())

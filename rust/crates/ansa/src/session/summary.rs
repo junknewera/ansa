@@ -256,7 +256,13 @@ pub(crate) fn read(
                 accepted_text = content;
                 plan = event.has("mode") && event.text_field("mode")? == "plan";
                 paused = false;
-                if !internal {
+                let question = if internal {
+                    super::state::displayed_handoff_question(text)
+                } else {
+                    Some(text.to_owned())
+                };
+                if let Some(question) = &question {
+                    let text = question.as_str();
                     if summary.title.is_none() {
                         let title = if saved.final_format()
                             == Some(crate::provider::structured::FinalFormat::ChildResult)

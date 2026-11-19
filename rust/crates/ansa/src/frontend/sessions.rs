@@ -279,7 +279,9 @@ impl Factory {
             "explicit project paths. Use repository-relative paths such as src/lib.rs, without a ",
             "leading slash, ./, .., or duplicates. For unscoped reads use an empty paths array. ",
             "Dependencies reference step IDs. For every write plan provide concrete ",
-            "checks as path and substring assertions against the final checkout. The user must approve the plan before execution. "
+            "checks as path and substring assertions against the final checkout. Leave manual_checks empty for ",
+            "read-only investigations and describe any actions recommended after the report in acceptance. ",
+            "The user must approve the plan before execution. "
         ));
         if format == FinalFormat::OrchestrationPlanWithCommands {
             epoch.instructions.push_str("List repository test commands that are needed or explicitly requested in command_checks using argv arrays. Each command starts in a fresh copy of the frozen checkout, at its root. Put checks requiring human interaction in manual_checks.");

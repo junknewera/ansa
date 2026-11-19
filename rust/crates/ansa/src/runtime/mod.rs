@@ -119,6 +119,7 @@ pub struct ChildAttempt {
     mode: AgentMode,
     text_sha256: String,
     state: ChildAttemptState,
+    latest_tool: Option<(String, Option<String>)>,
 }
 
 impl ChildAttempt {
@@ -145,6 +146,11 @@ impl ChildAttempt {
     }
     pub fn state(&self) -> &ChildAttemptState {
         &self.state
+    }
+    pub(crate) fn latest_tool(&self) -> Option<(&str, Option<&str>)> {
+        self.latest_tool
+            .as_ref()
+            .map(|(name, target)| (name.as_str(), target.as_deref()))
     }
     pub fn into_state(self) -> ChildAttemptState {
         self.state

@@ -546,6 +546,40 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
     header.edit = edit.clone();
     header.status = Some(start..end);
     out.push(header);
+    if !tool.uncertain
+        && !tool.volatile_outcome
+        && matches!(
+            tool.detail.phase,
+            ToolPhase::Finished {
+                execution: Execution::Succeeded,
+                effects: Effects::KnownResult
+            }
+        )
+        && let Some(output) = tool.output_json.as_ref()
+        && !output.has("error")
+        && output
+            .field("executed")
+            .and_then(crate::protocol::json::Json::boolean)
+            != Ok(false)
+        && let Some(path) = match tool.detail.name.as_str() {
+            "read_file" if output.has("content") => output.text_field("path").ok(),
+            "dataset_inspect" if output.has("rows") => tool
+                .arguments_json
+                .as_ref()
+                .and_then(|value| value.text_field("path").ok()),
+            "python_execute" if output.has("artifacts") => tool
+                .arguments_json
+                .as_ref()
+                .and_then(|value| value.text_field("path").ok()),
+            _ => None,
+        }
+    {
+        out.push(entry(
+            format!("Источник · {path}"),
+            Some(format!("file:0:{path}")),
+            "tool_child_success",
+        ));
+    }
     if tool.detail.name == "edit_file"
         && edit.is_none()
         && !tool.uncertain
@@ -663,6 +697,52 @@ pub(super) fn project(
                 output: None,
                 status: None,
             }));
+            if row.role == "user"
+                && let Some(run) = row.turn.0.strip_prefix("summary-")
+                && crate::provider::contracts::valid_id(run)
+            {
+                items.push(Item::Text(entry(
+                    "Утверждённый план".into(),
+                    Some(format!("plan:{run}")),
+                    "tool_success",
+                )));
+            }
+            if row.role == "assistant" && row.text.contains("#L") {
+                let mut links = BTreeSet::new();
+                for event in pulldown_cmark::Parser::new(&row.text) {
+                    let pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link {
+                        dest_url, ..
+                    }) = event
+                    else {
+                        continue;
+                    };
+                    let Some((path, line)) = dest_url.rsplit_once("#L") else {
+                        continue;
+                    };
+                    let Ok(line) = line.parse::<usize>() else {
+                        continue;
+                    };
+                    if line == 0
+                        || path.contains(':')
+                        || path.chars().any(char::is_control)
+                        || !std::path::Path::new(path)
+                            .components()
+                            .all(|part| matches!(part, std::path::Component::Normal(_)))
+                        || path.is_empty()
+                        || !links.insert((path.to_owned(), line))
+                    {
+                        continue;
+                    }
+                    items.push(Item::Text(entry(
+                        format!("Ссылка из ответа · {path}:{line}"),
+                        Some(format!("file:{line}:{path}")),
+                        "tool_detail",
+                    )));
+                    if links.len() == 8 {
+                        break;
+                    }
+                }
+            }
             continue;
         };
         let key = format!("{}:{}", row.request.0, detail.operation);

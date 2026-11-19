@@ -440,6 +440,24 @@ impl Owner {
             turn: lookup.turn.clone(),
             mode: lookup.submit.mode,
             text_sha256: crate::protocol::legacy_json_v1::sha256(lookup.submit.text.as_bytes()),
+            latest_tool: self
+                .activity
+                .iter()
+                .rev()
+                .find_map(|activity| match activity {
+                    Activity::Started(tool) => {
+                        let target = self
+                            .state
+                            .turn
+                            .as_ref()
+                            .and_then(|turn| turn.intent.as_ref())
+                            .filter(|intent| intent.operation == tool.operation.0)
+                            .and_then(|intent| intent.arguments.text_field("path").ok())
+                            .map(|path| path.chars().take(120).collect());
+                        Some((tool.name.clone(), target))
+                    }
+                    Activity::Finished(_) => None,
+                }),
             state,
         })
     }

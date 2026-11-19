@@ -37,7 +37,7 @@ def start(binary, root, home, cwd, extra=None, argv_extra=()):
                  argv=["--offline", "--cwd", str(cwd), *argv_extra],
                  extra_env={"SHELL": shell, **(extra or {})})
     screen.vt = Terminal(100, 32)
-    until(screen, lambda text: "ANSA" in text and "Tab фокус" in text and ready(screen), "first workspace frame")
+    until(screen, lambda text: "ANSA" in text and "Tab режим" in text and ready(screen), "first workspace frame")
     return screen
 
 
@@ -45,6 +45,16 @@ def escape(screen):
     screen.send(b"\x1b")
     for _ in range(8):
         screen.drain(.01)
+
+
+def select_result(screen, label):
+    screen.send(b"\x07")
+    for _ in range(screen.vt.rows):
+        paint_quiet(screen)
+        if any(line.startswith(f"› {label}") for line in visible(screen).splitlines()):
+            return
+        screen.send(b"\x1b[B")
+    raise AssertionError((label, visible(screen)))
 
 
 def body(screen):
@@ -101,6 +111,8 @@ def local(screen, command):
 
 
 def approve_helpers(screen, prompt):
+    until(screen, lambda frame: ready(screen) and "Ctrl+C остановить" not in screen.vt.line(-2),
+          "current turn settled before proposing helpers")
     screen.send(prompt + "\r")
     until(screen, lambda frame: "Начать" in frame and "Уточнить" in frame and "Отмена" in frame,
           "interactive orchestration approval")
@@ -233,10 +245,12 @@ def split_source_scroll(screen, root, cwd):
     right = chat_width + 3
     first_source = lambda: "".join(screen.vt.cells[6][right:]).rstrip()
     until(screen, lambda frame: marker in body(screen) and first_source().startswith("SRC_000"), "split Source ready")
+    paint_quiet(screen)
     left = tuple(tuple(row[:chat_width]) for row in screen.vt.cells[3:-5])
     at = len(screen.raw)
     screen.send("jjjjj")
     until(screen, lambda frame: first_source().startswith("SRC_005"), "right Source scrolled")
+    paint_quiet(screen)
     delta = screen.raw[at:]
     assert left == tuple(tuple(row[:chat_width]) for row in screen.vt.cells[3:-5]), "Source scroll moved the chat"
     assert b"\x1b[2K" not in delta and b"\x1b[2J" not in delta, "Source scroll cleared complete rows"
@@ -953,6 +967,12 @@ def plan_agent_inherits(screen, root, cwd):
     escape(screen)
     screen.send(b"\t")
     until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "third Tab mode")
+    screen.send("ORCHESTRATION_BLOCKED_WRITE_FIXTURE\r")
+    until(screen, lambda frame: "Перед запуском нужна ручная проверка" in frame and "[Уточнить]" in frame,
+          "write plan explains blocked approval before Enter")
+    screen.send(b"\x1b[A\r")
+    until(screen, lambda frame: "[Запуск недоступен]" in frame, "blocked write plan remains open")
+    escape(screen)
     screen.send("ORCHESTRATION_LONG_PLAN_FIXTURE\r")
     until(screen, lambda frame: "Проверить перенос длинного плана" in frame, "long proposal")
     assert "VISIBLE_END_OF_STEP" not in visible(screen)
@@ -970,7 +990,8 @@ def plan_agent_inherits(screen, root, cwd):
 def session_agent_titles_restart(screen, root, cwd):
     parent = "PARENT_TITLE"
     screen.send(parent + "\r")
-    until(screen, lambda frame: completed(root, parent) and ready(screen), "parent title committed")
+    until(screen, lambda frame: completed(root, parent) and ready(screen) and "OMH_TOOL_OK" in frame
+          and "Ctrl+C остановить" not in screen.vt.line(-2), "parent turn settled and title committed")
     screen.send(b"\t\t")
     until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "third Tab mode")
     screen.send("Почему отчёт иногда пустой?\r")
@@ -983,8 +1004,7 @@ def session_agent_titles_restart(screen, root, cwd):
     open_helper(screen)
     escape(screen)
     until(screen, lambda frame: parent in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
-    local(screen, "/agents")
-    until(screen, lambda frame: "Агенты разговора" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "both completed helpers listed")
+    until(screen, lambda frame: "Агенты разговора" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "Esc restored roster with both completed helpers")
     assert not re.search(r"\bs_\d+_", screen.vt.line(1)), "agent breadcrumb displays an ID instead of a title"
     escape(screen)
     until(screen, lambda frame: "Агенты разговора" not in frame and not helper_title(screen.vt.line(1)), "agent inspector closed before session command")
@@ -1023,7 +1043,7 @@ def orchestration_candidate(screen, root, cwd):
     report.write_text("committed version\n")
     check_marker = root / "check-ran"
     check = cwd / "check.sh"
-    check.write_text(f'#!/bin/sh\nset -eu\ngrep -qx "after fixture" report.txt\nprintf x >> "{check_marker}"\n')
+    check.write_text(f'#!/bin/sh\nset -eu\ngrep -qx "after fixture" report.txt\nprintf x >> "{check_marker}"\nprintf "fixture-check-output\\n"\n')
     check.chmod(0o700)
     git("add", "report.txt", "check.sh")
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "fixture")
@@ -1045,6 +1065,30 @@ def orchestration_candidate(screen, root, cwd):
     assert git("show", ":report.txt") == "committed version\n"
     assert git("status", "--short") == before
     assert check_marker.read_text() == "x"
+    assert "снимок проекта → ansa-result" in visible(screen)
+    screen.send(b"\t")
+    for cols, rows in [(80, 24), (120, 36)]:
+        screen.resize(cols, rows)
+        screen.vt = Terminal(cols, rows)
+        until(screen, lambda frame: "report.txt · +1 −1" in frame, "candidate diff at terminal size")
+        screen.send(b"f")
+        until(screen, lambda frame: any(line.startswith("report.txt · +1 −1") for line in frame.splitlines())
+              and "after fixture" in frame, "wide diff with its actual comparison base")
+        screen.send(b"f")
+    screen.resize(100, 32)
+    screen.vt = Terminal(100, 32)
+    until(screen, lambda frame: "report.txt · +1 −1" in frame, "diff restored after resize")
+    escape(screen)
+    screen.send("review draft")
+    until(screen, lambda frame: "./check.sh · пройдено" in frame, "confirmed command as chat result")
+    select_result(screen, "./check.sh · пройдено")
+    screen.send(b"\r")
+    until(screen, lambda frame: "fixture-check-output" in frame, "show actual command output")
+    escape(screen)
+    until(screen, lambda frame: "› ./check.sh · пройдено" in frame and "review draft" in screen.vt.line(-4),
+          "same keyboard result and draft after Esc")
+    escape(screen)
+    screen.send(b"\x03")
     results = [event for event in records(root) if event["kind"] == "outcome"]
     assert len(results) == 2, "edit and independent diff review should each use a native tool"
     run = checkout.parent
@@ -1063,6 +1107,18 @@ def orchestration_candidate(screen, root, cwd):
     pending.chmod(0o600)
     restarted = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--session", parent_id])
     screen.additional_screens = [("restart", restarted)]
+    until(restarted, lambda frame: "Утверждённый план" in frame, "plan link after restart")
+    select_result(restarted, "Утверждённый план")
+    restarted.send(b"\r")
+    until(restarted, lambda frame: "Исходный запрос" in frame, "original question from approved run ledger")
+    escape(restarted)
+    escape(restarted)
+    until(restarted, lambda frame: "./check.sh · пройдено" in frame, "verified checks recovered from their receipts")
+    select_result(restarted, "./check.sh · пройдено")
+    restarted.send(b"\r")
+    until(restarted, lambda frame: "fixture-check-output" in frame, "verified command output after restarting")
+    escape(restarted)
+    escape(restarted)
     local(restarted, "/sessions")
     until(restarted, lambda frame: "Продолжить оркестрацию" in frame, "explicit continuation from original ledgers")
     restarted.send(b"\r")
@@ -1081,11 +1137,34 @@ def openrouter_orchestration(screen, root, cwd):
           and screen.vt.line(-4).startswith("›"), "pinned OpenRouter model")
     screen.send(b"\t\t")
     until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "OpenRouter plan mode")
-    screen.send("summarize fixture\r")
+    held_child = root / "hold-orchestration-child"
+    held_summary = root / "hold-orchestration-summary"
+    held_child.touch()
+    held_summary.touch()
+    prompt = "summarize fixture " + ("details " * 70) + "END_OF_USER_REQUEST"
+    screen.send(prompt + "\r")
     until(screen, lambda frame: "OPENROUTER_CARBON_PLAN" in frame and "Начать" in frame, "validated strict plan")
     assert not (root / "home/.ansa/orchestration").exists()
+    assert "Рекомендация после отчёта" in visible(screen)
     screen.send(b"\r")
+    until(screen, lambda frame: "0 из 1 агентов" in frame, "read-only plan starts despite a post-report recommendation")
+    screen.send("keep draft\r")
+    until(screen, lambda frame: "Черновик · можно отправить после завершения" in frame and "keep draft" in screen.vt.line(-4),
+          "draft retained while helper runs")
+    held_child.unlink()
+    until(screen, lambda frame: "Координатор готовит сводку" in frame, "summary phase comes from coordinator state")
+    held_summary.unlink()
     until(screen, lambda frame: "OPENROUTER_CARBON_DONE" in frame, "coordinator summary", timeout=15)
+    until(screen, lambda frame: "Координатор готовит сводку" not in frame and "Утверждённый план" in frame,
+          "completed coordination leaves original request and plan in history")
+    assert "summarize fixture" in visible(screen) and "END_OF_USER_REQUEST" in visible(screen) and "keep draft" in screen.vt.line(-4)
+    assert not any(row.get("text") == "keep draft" for row in records(root))
+    select_result(screen, "Утверждённый план")
+    screen.send(b"\r")
+    until(screen, lambda frame: "OPENROUTER_CARBON_PLAN" in frame, "read approved plan from its journal")
+    escape(screen)
+    escape(screen)
+    screen.send(b"\x03")
     local(screen, "/exit")
     return "normal"
 

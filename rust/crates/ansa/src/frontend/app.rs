@@ -611,16 +611,33 @@ pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
         openrouter::{CATALOG, ENDPOINT, PROVIDER},
         transport::http::Head,
     };
-    let exchange: Exchange = Arc::new(move |request, _| {
+    let hold_child = root.join("hold-orchestration-child");
+    let hold_summary = root.join("hold-orchestration-summary");
+    let exchange: Exchange = Arc::new(move |request, stop| {
         let content = if request.url == CATALOG {
             json!({"data":{"id":OPENROUTER_MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}})
         } else {
             let request: Value =
                 serde_json::from_str(request.body.expose()).map_err(|_| "fixture_body")?;
             let format = &request["response_format"]["json_schema"];
+            let hold = match format["name"].as_str() {
+                Some("ansa_child_result_v1") => Some(&hold_child),
+                None if request.get("tools").is_none() => Some(&hold_summary),
+                _ => None,
+            };
+            if let Some(hold) = hold {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                while hold.exists() {
+                    stop.check()?;
+                    if std::time::Instant::now() >= deadline {
+                        return Err("fixture_hold_timeout");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
             let text = match format["name"].as_str() {
                 Some("ansa_native_schema_probe") if format["strict"] == true => r#"{"value":"schema-enforced"}"#.into(),
-                Some("ansa_orchestration_plan_v2") if format["strict"] == true => json!({"schema_version":1,"summary":"OPENROUTER_CARBON_PLAN","steps":[{"id":"one","task":"Проверить вход","access":"read","paths":[],"depends_on":[],"acceptance":"Ответ получен"}],"checks":[],"manual_checks":[],"command_checks":[]}).to_string(),
+                Some("ansa_orchestration_plan_v2") if format["strict"] == true => json!({"schema_version":1,"summary":"OPENROUTER_CARBON_PLAN","steps":[{"id":"one","task":"Проверить вход","access":"read","paths":[],"depends_on":[],"acceptance":"Ответ получен"}],"checks":[],"manual_checks":["Утвердить удаление после отчёта"],"command_checks":[]}).to_string(),
                 Some("ansa_child_result_v1") if format["strict"] == true && request["tool_choice"] == "none" => r#"{"status":"completed","summary":"Синтетическая проверка пройдена","findings":[]}"#.into(),
                 None if request.get("tools").is_some() => "Готов к итоговому ответу".into(),
                 None => "OPENROUTER_CARBON_DONE".into(),

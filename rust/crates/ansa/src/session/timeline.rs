@@ -293,8 +293,14 @@ impl Timeline {
                 self.final_text.clear();
                 self.names.clear();
                 self.purposes.clear();
-                if !event.has("handoff") {
-                    self.append("user", event.text_field("text")?.into(), "accepted");
+                let text = event.text_field("text")?;
+                let displayed = if event.has("handoff") {
+                    super::state::displayed_handoff_question(text)
+                } else {
+                    Some(text.to_owned())
+                };
+                if let Some(displayed) = displayed {
+                    self.append("user", displayed, "accepted");
                 }
             }
             "response" => {

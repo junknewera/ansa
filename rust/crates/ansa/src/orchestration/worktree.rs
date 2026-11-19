@@ -42,6 +42,7 @@ struct SnapshotBinding {
 pub struct Frozen {
     commit: String,
     diff: String,
+    paths: Vec<String>,
 }
 
 impl Frozen {
@@ -51,6 +52,9 @@ impl Frozen {
 
     pub fn diff(&self) -> &str {
         &self.diff
+    }
+    pub(crate) fn paths(&self) -> &[String] {
+        &self.paths
     }
 }
 
@@ -235,7 +239,7 @@ impl Worktree {
         if file_names(&self.path, &[], stop)? != names {
             return Err("worktree_source_changed");
         }
-        let diff = self.checked_diff(&tree, scope, stop)?;
+        let (diff, paths) = self.checked_diff(&tree, scope, stop)?;
         let commit = object_id(command(
             &self.path,
             &[
@@ -255,7 +259,11 @@ impl Worktree {
             None,
             stop,
         )?)?;
-        Ok(Frozen { commit, diff })
+        Ok(Frozen {
+            commit,
+            diff,
+            paths,
+        })
     }
 
     pub(crate) fn candidate(&self, number: u8, scope: &[String], stop: &Cancel) -> Result<Frozen> {
@@ -268,8 +276,12 @@ impl Worktree {
                 return Err("worktree_candidate_identity");
             }
             self.check_candidate_parent(&commit, stop)?;
-            let diff = self.checked_diff(&commit, scope, stop)?;
-            return Ok(Frozen { commit, diff });
+            let (diff, paths) = self.checked_diff(&commit, scope, stop)?;
+            return Ok(Frozen {
+                commit,
+                diff,
+                paths,
+            });
         }
         let frozen = self.freeze(scope, stop)?;
         local::publish_recovered(&directory, &name, frozen.commit.as_bytes())
@@ -277,7 +289,12 @@ impl Worktree {
         Ok(frozen)
     }
 
-    fn checked_diff(&self, target: &str, scope: &[String], stop: &Cancel) -> Result<String> {
+    fn checked_diff(
+        &self,
+        target: &str,
+        scope: &[String],
+        stop: &Cancel,
+    ) -> Result<(String, Vec<String>)> {
         let changed = command(
             &self.path,
             &[
@@ -293,11 +310,16 @@ impl Worktree {
             stop,
         )?;
         let changed = changed.strip_suffix(&[0]).ok_or("worktree_no_changes")?;
+        let mut paths = Vec::new();
         for path in changed.split(|byte| *byte == 0) {
-            let path = Path::new(std::str::from_utf8(path).map_err(|_| "worktree_path_encoding")?);
-            if !scope.iter().any(|allowed| path.starts_with(allowed)) {
+            let path = std::str::from_utf8(path).map_err(|_| "worktree_path_encoding")?;
+            if !scope
+                .iter()
+                .any(|allowed| Path::new(path).starts_with(allowed))
+            {
                 return Err("worktree_change_outside_approval");
             }
+            paths.push(path.to_owned());
         }
         command(
             &self.path,
@@ -327,7 +349,10 @@ impl Worktree {
             None,
             stop,
         )?;
-        String::from_utf8(diff).map_err(|_| "worktree_diff_encoding")
+        Ok((
+            String::from_utf8(diff).map_err(|_| "worktree_diff_encoding")?,
+            paths,
+        ))
     }
 
     fn check_candidate_parent(&self, commit: &str, stop: &Cancel) -> Result<()> {
@@ -341,6 +366,24 @@ impl Worktree {
             return Err("worktree_candidate_identity");
         }
         Ok(())
+    }
+
+    pub(crate) fn inspect_candidate(
+        &self,
+        commit: &str,
+        scope: &[String],
+        stop: &Cancel,
+    ) -> Result<Frozen> {
+        if !valid_object(commit) {
+            return Err("worktree_candidate_identity");
+        }
+        self.check_candidate_parent(commit, stop)?;
+        let (diff, paths) = self.checked_diff(commit, scope, stop)?;
+        Ok(Frozen {
+            commit: commit.into(),
+            diff,
+            paths,
+        })
     }
 
     pub fn local_branch(&self, frozen: &Frozen, stop: &Cancel) -> Result<()> {
