@@ -111,6 +111,8 @@ def local(screen, command):
 
 
 def approve_helpers(screen, prompt):
+    until(screen, lambda frame: ready(screen) and "Ctrl+C остановить" not in screen.vt.line(-2),
+          "current turn settled before proposing helpers")
     screen.send(prompt + "\r")
     until(screen, lambda frame: "Начать" in frame and "Уточнить" in frame and "Отмена" in frame,
           "interactive orchestration approval")
