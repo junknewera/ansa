@@ -288,7 +288,7 @@ impl Factory {
     }
 
     pub(super) fn orchestration_route(&self) -> Result<()> {
-        if self.offline || self.openrouter.is_some() {
+        if self.offline || self.openrouter.is_some() || self.auth.is_some() {
             Ok(())
         } else {
             Err("strict_orchestration_route_unavailable")
@@ -301,6 +301,11 @@ impl Factory {
             route.require_strict(stop)?;
         }
         stop.check()
+    }
+
+    pub(super) fn orchestration_slots(&self) -> usize {
+        // ChatGPT sign-in holds the account lease across each stream.
+        if self.auth.is_some() { 1 } else { usize::MAX }
     }
 
     pub(super) fn with_openrouter(mut self, route: Arc<OpenRouter>) -> Self {
@@ -319,6 +324,7 @@ impl Factory {
                 .as_ref()
                 .is_some_and(|route| route.binding() != &request.binding)
             || self.openrouter.is_none() && request.binding.provider == "openrouter"
+            || self.auth.is_some() && request.binding.provider != "openai-siwc"
         {
             return Err("session_provider_context");
         }
@@ -344,6 +350,28 @@ impl Factory {
             return Arc::new(move |request, stop, _| pilot.generate(request, stop));
         }
         Arc::new(|request, stop, _| offline::generate(request, stop))
+    }
+
+    fn orchestration_runtime(
+        &self,
+        request: &Request,
+        stop: &Cancel,
+    ) -> Result<(Generate, Options)> {
+        if let Some(auth) = &self.auth {
+            let (account, generate, mut options) = app::authorized_with_cancel(
+                auth.clone(),
+                request.binding.requested_model.clone(),
+                stop,
+            )?;
+            if account != request.binding.account || account != self.account {
+                return Err("auth_account_mismatch");
+            }
+            options.compact = None;
+            options.keep_recent_turns = 0;
+            Ok((generate, options))
+        } else {
+            Ok((self.orchestration_generator(), Options::default()))
+        }
     }
 
     pub(super) fn plan_orchestration(
@@ -392,8 +420,9 @@ impl Factory {
             Request::new(source.binding, epoch, empty.advertisement().clone(), input)?
                 .with_effort(source.effort)?
                 .with_final_format(Some(format));
-        (self.orchestration_generator())(&configuration, stop, Arc::new(|_| Ok(())))?
-            .orchestration_plan()
+        let (generate, options) = self.orchestration_runtime(&configuration, stop)?;
+        (options.check_request)(&configuration, 0, stop)?;
+        generate(&configuration, stop, Arc::new(|_| Ok(())))?.orchestration_plan()
     }
 
     pub(super) fn orchestration_child(
@@ -407,8 +436,13 @@ impl Factory {
     ) -> Result<Created> {
         self.orchestration_route()?;
         self.check_orchestration_context(source)?;
+        let (generate, options) = self.orchestration_runtime(source, stop)?;
         let mut settings = self.settings.clone();
         settings.cwd = workspace.to_owned();
+        settings.model.clone_from(&source.binding.requested_model);
+        settings
+            .returned_model
+            .clone_from(&source.binding.returned_model);
         let scope = TaskScope::new(workspace, writes)?;
         let mut epoch = agent_epoch(&settings)?;
         epoch.instructions.push_str(concat!(
@@ -459,14 +493,14 @@ impl Factory {
             selected.id.as_str().into(),
             configuration,
             tools,
-            self.orchestration_generator(),
+            generate,
             Limits {
                 submit_ids: 1,
                 tool_rounds: self.settings.tool_rounds,
                 tool_calls: self.settings.tool_calls,
                 ..Limits::default()
             },
-            child_options(&selected, None, stop, false),
+            child_options(options, &selected, None, stop, false),
         )?;
         Ok(Created {
             runtime,
@@ -517,8 +551,11 @@ impl Factory {
             .map(|path| Ok(path.text()?.to_owned()))
             .collect::<Result<Vec<_>>>()?;
         let mut settings = self.settings.clone();
-        settings.cwd = PathBuf::from(provenance.field("settings")?.text_field("cwd")?);
-        if settings.effective()? != *provenance.field("settings")? {
+        let saved_settings = provenance.field("settings")?;
+        settings.cwd = PathBuf::from(saved_settings.text_field("cwd")?);
+        settings.model = saved_settings.text_field("model")?.into();
+        settings.returned_model = saved_settings.text_field("returned_model")?.into();
+        if settings.effective()? != *saved_settings {
             return Err("session_configuration_mismatch");
         }
         let scope = TaskScope::new(&settings.cwd, &writes)?;
@@ -530,18 +567,24 @@ impl Factory {
             &std::env::current_exe().map_err(|_| "process_executable")?,
             scope,
         )?;
+        let (generate, options) = if inspect_only {
+            let generate: Generate = Arc::new(|_, _, _| Err("session_read_only"));
+            (generate, Options::default())
+        } else {
+            self.orchestration_runtime(&configuration, stop)?
+        };
         let runtime = Runtime::new(
             id.into(),
             configuration,
             tools,
-            self.orchestration_generator(),
+            generate,
             Limits {
                 submit_ids: 1,
                 tool_rounds: self.settings.tool_rounds,
                 tool_calls: self.settings.tool_calls,
                 ..Limits::default()
             },
-            child_options(&selected, Some(identity), stop, inspect_only),
+            child_options(options, &selected, Some(identity), stop, inspect_only),
         )?;
         Ok(Created {
             runtime,
@@ -992,26 +1035,41 @@ fn base_state(value: &Json) -> Result<Json> {
 }
 
 fn child_options(
+    options: Options,
     selected: &Selected,
     identity: Option<DirectoryIdentity>,
     stop: &Cancel,
     inspect_only: bool,
 ) -> Options {
+    let request = stop.clone();
     let dispatch = stop.clone();
     let tools = stop.clone();
+    let check_request = options.check_request.clone();
+    let check_dispatch = options.check_dispatch.clone();
+    let tool_guard = options.tool_guard.clone();
     Options {
         directory: Some(selected.directory.clone()),
         existing_journal: identity,
         inspect_only,
-        check_dispatch: Arc::new(move |_, turn| Cancel::combined(turn, &dispatch).check()),
+        check_request: Arc::new(move |value, epoch, turn| {
+            let stop = Cancel::combined(turn, &request);
+            stop.check()?;
+            check_request(value, epoch, &stop)
+        }),
+        check_dispatch: Arc::new(move |epoch, turn| {
+            let stop = Cancel::combined(turn, &dispatch);
+            stop.check()?;
+            check_dispatch(epoch, &stop)
+        }),
         tool_guard: Arc::new(move |turn| {
             let stop = Cancel::combined(turn, &tools);
             stop.check()?;
+            let lease = tool_guard(&stop)?;
             Ok(Lease {
-                ownership: Box::new(()),
-                stop,
+                stop: Cancel::combined(&stop, &lease.stop),
+                ..lease
             })
         }),
-        ..Options::default()
+        ..options
     }
 }

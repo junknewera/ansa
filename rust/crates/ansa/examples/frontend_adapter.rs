@@ -595,6 +595,9 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
     if mode == "openrouter-carbon" {
         return app::openrouter_carbon_fixture(root);
     }
+    if mode == "siwc-carbon" {
+        return app::siwc_carbon_fixture(root);
+    }
     let mut io = Io::open(mode != "backpressure" && mode != "large-jsonl")?;
     let hold_terminal_for_cancel = mode == "terminal" && io.raw.is_some();
     let failure = match mode {

@@ -312,7 +312,15 @@ pub fn authorized(
     auth: Arc<AuthManager>,
     model: String,
 ) -> Result<(String, Generate, RuntimeOptions)> {
-    let guard = Authorization::new(auth.clone(), &auth.status()?, model)?;
+    authorized_with_cancel(auth, model, &Cancel::default())
+}
+
+pub(super) fn authorized_with_cancel(
+    auth: Arc<AuthManager>,
+    model: String,
+    stop: &Cancel,
+) -> Result<(String, Generate, RuntimeOptions)> {
+    let guard = Authorization::new(auth.clone(), &auth.status_with_cancel(stop)?, model)?;
     let account = guard.account().to_owned();
     let guard = Arc::new(Mutex::new(guard));
     let check = guard.clone();
@@ -378,12 +386,13 @@ pub fn authorized(
     Ok((account, generate, options))
 }
 fn text(args: &[String]) -> Result<i32> {
-    text_with_openrouter(args, load_openrouter)
+    text_with_providers(args, load_openrouter, auth_manager)
 }
 
-fn text_with_openrouter(
+fn text_with_providers(
     args: &[String],
-    load: impl FnOnce(&Path) -> Result<Arc<OpenRouter>>,
+    load_openrouter: impl FnOnce(&Path) -> Result<Arc<OpenRouter>>,
+    load_siwc: impl FnOnce(&Path) -> Result<Arc<AuthManager>>,
 ) -> Result<i32> {
     let default_auth = if args.iter().any(|arg| arg == "--openrouter") {
         openrouter_auth_path()?
@@ -444,7 +453,10 @@ fn text_with_openrouter(
     bound.requested_model = settings.model.clone();
     bound.returned_model = settings.returned_model.clone();
     let mut workspace_auth = None;
-    let openrouter = parsed.openrouter.then(|| load(&parsed.auth)).transpose()?;
+    let openrouter = parsed
+        .openrouter
+        .then(|| load_openrouter(&parsed.auth))
+        .transpose()?;
     let (generate, mut options) = if let Some(route) = &openrouter {
         bound = route.binding().clone();
         openrouter_runtime(route.clone())
@@ -459,7 +471,7 @@ fn text_with_openrouter(
             },
         )
     } else {
-        let auth = auth_manager(&parsed.auth)?;
+        let auth = load_siwc(&parsed.auth)?;
         let (account, generate, options) = authorized(auth.clone(), settings.model.clone())?;
         workspace_auth = Some(auth);
         bound.account = account;
@@ -669,9 +681,137 @@ pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
         crate::auth::Secret::new("synthetic-fixture-key-0123456789".into()),
         exchange,
     )?);
-    text_with_openrouter(&["--openrouter".into(), "--cwd".into(), cwd.into()], |_| {
-        Ok(route)
-    })
+    text_with_providers(
+        &["--openrouter".into(), "--cwd".into(), cwd.into()],
+        |_| Ok(route),
+        |_| Err("fixture_provider"),
+    )
+}
+
+#[cfg(feature = "frontend-test-adapter")]
+pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
+    use crate::{auth::manager::HttpReply, transport::http::Head};
+    use serde_json::{Value, json};
+    const MODEL: &str = "gpt-6.2-sol";
+    ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
+    let fixture_home = root.join("home");
+    if home()? != fixture_home {
+        return Err("fixture_home");
+    }
+    let cwd = fixture_home.join("workspace");
+    ansa_linux::fs::private_directory(&cwd).map_err(|_| "fixture_workspace")?;
+    let auth_path = fixture_home.join(".ansa/auth");
+    let mut args = vec!["--model".into(), MODEL.into()];
+    for (flag, path) in [("--cwd", &cwd), ("--auth-dir", &auth_path)] {
+        args.extend([
+            flag.into(),
+            path.to_str().ok_or("fixture_workspace")?.into(),
+        ]);
+    }
+    text_with_providers(
+        &args,
+        |_| Err("fixture_provider"),
+        |path| {
+            if path != auth_path {
+                return Err("fixture_provider");
+            }
+            Ok(Arc::new(AuthManager::new(
+                path,
+                Arc::new(|request, _| {
+                    if request.url != "https://api.openai.com/v1/models" {
+                        return Err("fixture_unexpected_exchange");
+                    }
+                    Ok(HttpReply {
+                        head: Head {
+                            status: 200,
+                            content_types: vec!["application/json".into()],
+                        },
+                        body: json!({"models":[{"slug":MODEL,"visibility":"list"}]}).to_string(),
+                    })
+                }),
+                Arc::new(|| 2_000_000_000),
+                None,
+                Some(Arc::new(move |request, bearer, feed, stop| {
+                    if bearer.expose() != "synthetic-access" {
+                        return Err("fixture_bearer");
+                    }
+                    let request: Value =
+                        serde_json::from_str(&request.dump()).map_err(|_| "fixture_body")?;
+                    if request["model"] != MODEL
+                        || request["store"] != false
+                        || request["stream"] != true
+                    {
+                        return Err("fixture_request");
+                    }
+                    let input = request["input"].as_array().ok_or("fixture_input")?;
+                    let last = input.last().ok_or("fixture_input")?;
+                    let text = request.get("text");
+                    let format = &request["text"]["format"];
+                    let name = format["name"].as_str();
+                    if text.is_some()
+                        && (format["strict"] != true || format["type"] != "json_schema")
+                    {
+                        return Err("fixture_format");
+                    }
+                    let call = name == Some("ansa_child_result_v1")
+                        && last["type"] != "function_call_output";
+                    let item = if call {
+                        if !request["tools"].to_string().contains("list_directory") {
+                            return Err("fixture_tools");
+                        }
+                        let token = request["instructions"]
+                            .as_str()
+                            .and_then(|instructions| {
+                                instructions.split_once("instruction_token is ")
+                            })
+                            .and_then(|(_, suffix)| suffix.split_once('.'))
+                            .map(|(token, _)| token)
+                            .ok_or("fixture_instruction_token")?;
+                        let arguments = json!({"path":".","instruction_token":token}).to_string();
+                        json!({"type":"function_call","id":"call-item","call_id":"fixture-call","namespace":"omh","name":"list_directory","arguments":arguments,"status":"completed"})
+                    } else {
+                        let answer = match name {
+                        Some("ansa_orchestration_plan_v2") if request["tools"] == json!([]) =>
+                            json!({"schema_version":1,"summary":"SIWC_CARBON_PLAN","steps":[
+                                {"id":"one","task":"Inspect the fixture","access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"},
+                                {"id":"two","task":"Check the fixture again","access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"}
+                            ],"checks":[],"manual_checks":[],"command_checks":[]}).to_string(),
+                        Some("ansa_child_result_v1") if last["output"].as_str().is_some_and(|output| output.contains("\"entries\"")) =>
+                            r#"{"status":"completed","summary":"SIWC_HELPER_DONE","findings":[]}"#.into(),
+                        None => "SIWC_CARBON_DONE".into(),
+                        _ => return Err("fixture_format"),
+                    };
+                        json!({"type":"message","id":"fixture-message","role":"assistant","status":"completed","content":[{"type":"output_text","text":answer}]})
+                    };
+                    let mut added = item.clone();
+                    added["status"] = json!("in_progress");
+                    if call {
+                        added["arguments"] = json!("");
+                    }
+                    let mut completed = json!({"id":"fixture-response","model":MODEL,"status":"completed","output":[item]});
+                    if let Some(text) = text
+                        && last["content"] != "UNCONFIRMED_FORMAT"
+                    {
+                        completed["text"] = text.clone();
+                        if last["content"] == "UNCONSTRAINED_FORMAT" {
+                            completed["text"]["format"]["strict"] = json!(false);
+                        }
+                    }
+                    let events = [
+                        json!({"type":"response.created","sequence_number":0,"response":{"id":"fixture-response","model":MODEL,"status":"in_progress","output":[]}}),
+                        json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":added}),
+                        json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":item}),
+                        json!({"type":"response.completed","sequence_number":3,"response":completed}),
+                    ];
+                    for event in events {
+                        stop.check()?;
+                        feed(format!("data: {event}\n\n").as_bytes())?;
+                    }
+                    Ok(())
+                })),
+            )?))
+        },
+    )
 }
 
 fn auth_cli(command: &str, path: &Path) -> Result<i32> {
