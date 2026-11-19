@@ -439,7 +439,7 @@ impl Slot {
                 );
             }
         } else {
-            self.state.report(io, "Нет активного шага");
+            self.state.report(io, "No active step");
         }
     }
     fn projected(&self) -> Option<Vec<Entry>> {
@@ -473,7 +473,7 @@ impl Slot {
                     output: None,
                     status: None,
                     role: "tool_success".into(),
-                    text: format!("> Открыть график · {}", png.name()),
+                    text: format!("> Open chart · {}", png.name()),
                 },
             );
         }
@@ -507,9 +507,9 @@ impl Slot {
                         "{}\n({})",
                         preview.text,
                         if preview.state == "discarded" {
-                            "незавершённый ответ"
+                            "incomplete response"
                         } else {
-                            "предварительный ответ"
+                            "response preview"
                         }
                     ),
                 });
@@ -1018,7 +1018,7 @@ impl Workbench {
         {
             stop.cancel();
             self.disarm_exit();
-            self.report(io, "Останавливаю текущую задачу");
+            self.report(io, "Stopping the current task");
         } else if slot.interruptible() {
             self.disarm_exit();
             self.cancel_current(io);
@@ -1046,7 +1046,7 @@ impl Workbench {
             slot.closing = true;
             slot.pending_prompt = None;
             slot.handle.request_shutdown();
-            slot.state.report(io, "Открытие сессии отменено");
+            slot.state.report(io, "Session open cancelled");
             let parent = slot.parent.clone();
             let id = slot.id.clone();
             self.discard_contexts(&id);
@@ -1105,7 +1105,7 @@ impl Workbench {
     }
     fn can_job(&mut self, io: &Io) -> bool {
         if self.jobs.len() + self.pending_context.len() >= MAX_JOBS {
-            self.report(io, "Дождитесь текущего открытия");
+            self.report(io, "Wait for the current window to open");
             false
         } else {
             true
@@ -1113,7 +1113,7 @@ impl Workbench {
     }
     fn create(&mut self, kind: Kind, prompt: Option<String>, foreground: bool, io: &Io) -> bool {
         if self.slots.len() + self.jobs.len() + self.pending_context.len() >= MAX_SESSIONS {
-            self.report(io, "Достигнут предел открытых сессий (16)");
+            self.report(io, "Open session limit reached (16)");
             return false;
         }
         if matches!(kind, Kind::Agent | Kind::Btw)
@@ -1130,7 +1130,7 @@ impl Workbench {
                 + self.jobs.len()
                 >= MAX_BACKGROUND
         {
-            self.report(io, "Одновременно доступны четыре фоновых разговора");
+            self.report(io, "Up to four background conversations can run");
             return false;
         }
         if !self.can_job(io) {
@@ -1150,10 +1150,7 @@ impl Workbench {
         }
         if kind == Kind::Console {
             if self.slots[self.current].active() {
-                self.report(
-                    io,
-                    "Командная панель доступна после остановки текущей задачи",
-                );
+                self.report(io, "The command panel is available once the task stops");
                 return false;
             }
             if let Some(index) = self.slots.iter().position(|s| {
@@ -1184,7 +1181,7 @@ impl Workbench {
             .state
             .post_command(&slot.handle, command, &mut slot.replies, false)
         {
-            slot.state.report(io, "Дождитесь текущих запросов");
+            slot.state.report(io, "Wait for the current requests");
             return false;
         }
         self.pending_context.insert(
@@ -1197,7 +1194,7 @@ impl Workbench {
                 plan_only: slot.state.mode == AgentMode::Plan,
             },
         );
-        self.report(io, "Создаю сессию");
+        self.report(io, "Creating session");
         true
     }
     fn open_file(&mut self, path: PathBuf, io: &Io) {
@@ -1262,7 +1259,7 @@ impl Workbench {
             .terminal_owner(&self.slots[self.current].id)
             .is_none()
         {
-            self.report(io, "Откройте новый разговор с --native-terminals");
+            self.report(io, "Open a new conversation with --native-terminals");
             return;
         }
         self.file_token = self.file_token.wrapping_add(1);
@@ -1321,14 +1318,14 @@ impl Workbench {
                 let screen = host.capture(Writer::Human, &id, epoch, 0)?;
                 if let Some(exit) = &screen.exit {
                     title.push_str(if exit.cleanup_known {
-                        " · завершён"
+                        " · exited"
                     } else {
-                        " · остановка не подтверждена"
+                        " · stop unconfirmed"
                     });
                 }
                 let mut text = screen.text;
                 if screen.truncated {
-                    text.push_str("\nЭкран сокращён");
+                    text.push_str("\nScreen truncated");
                 }
                 Ok(carbon::OutputView { title, text })
             })();
@@ -1346,9 +1343,9 @@ impl Workbench {
         self.report(
             io,
             if copied {
-                "Путь скопирован"
+                "Path copied"
             } else {
-                "Не удалось скопировать путь"
+                "Could not copy the path"
             },
         );
     }
@@ -1363,7 +1360,7 @@ impl Workbench {
             || !self.pending_context.is_empty()
             || self.orchestration_stop.is_some()
         {
-            self.report(io, "Редактор доступен после остановки текущих задач");
+            self.report(io, "The editor is available once the current tasks stop");
             return;
         }
         let Some(Panel::Files(files)) = &self.panel else {
@@ -1543,7 +1540,7 @@ impl Workbench {
             Ok(()) => {
                 self.saved_theme = theme;
                 if self.theme_revision == revision && !self.terminating && !self.input_closed {
-                    self.report(io, &format!("Тема {} сохранена", self.saved_theme.name()));
+                    self.report(io, &format!("Theme {} saved", self.saved_theme.name()));
                 }
             }
             Err(code) => {
@@ -1555,7 +1552,7 @@ impl Workbench {
                     }
                 }
                 if !self.terminating && !self.input_closed {
-                    self.report(io, &format!("Не удалось сохранить тему: {code}"));
+                    self.report(io, &format!("Could not save theme: {code}"));
                 }
             }
         }
@@ -1591,7 +1588,7 @@ impl Workbench {
         self.cancel_modal();
         let token = self.modal_token;
         let owner = self.slots[self.current].id.clone();
-        self.menu = Some(Menu::Loading("Сессии проекта".into()));
+        self.menu = Some(Menu::Loading("Project sessions".into()));
         self.jobs.spawn_blocking(move || Job::Sessions {
             continuation: orchestration::latest_continuation(&factory, &owner)
                 .ok()
@@ -1611,7 +1608,7 @@ impl Workbench {
     }
     fn open_models(&mut self, effort: bool, io: &Io) {
         if self.slots[self.current].kind == Kind::Console {
-            self.report(io, "У командной панели нет модели");
+            self.report(io, "The command panel has no model");
             return;
         }
         let factory = self.factory.clone();
@@ -1652,7 +1649,7 @@ impl Workbench {
     fn send_result(&mut self, io: &Io) {
         let slot = &self.slots[self.current];
         let Some(parent) = slot.parent.clone() else {
-            self.report(io, "У этой сессии нет родительского разговора");
+            self.report(io, "This session has no parent conversation");
             return;
         };
         let text = slot
@@ -1663,12 +1660,12 @@ impl Workbench {
             .map(|s| s.text.clone())
             .unwrap_or_default();
         if text.is_empty() {
-            self.report(io, "Нет подтверждённого результата для отправки");
+            self.report(io, "No confirmed result to send");
             return;
         }
         let label = slot.kind.name();
         let source = slot.id.clone();
-        let message = format!("Результат {label} {source}:\n{text}");
+        let message = format!("Result from {label} {source}:\n{text}");
         if let Some(index) = self.slots.iter().position(|s| s.id == parent) {
             let target = &mut self.slots[index];
             if target
@@ -1676,15 +1673,12 @@ impl Workbench {
                 .text(&message, &target.handle, io, &mut target.replies)
                 .0
             {
-                self.report(io, "Результат отправлен в родительский разговор");
+                self.report(io, "Result sent to parent");
             } else {
-                self.report(
-                    io,
-                    "Родительский разговор пока не принимает сообщения; результат сохранён здесь",
-                );
+                self.report(io, "Result saved here. The parent is busy");
             }
         } else {
-            self.report(io, "Сначала откройте родительскую сессию через /sessions");
+            self.report(io, "Open the parent session with /sessions");
         }
     }
 
@@ -1710,11 +1704,11 @@ impl Workbench {
             slot.state.mode
         });
         let mode = if self.orchestration_mode {
-            "Оркестрация"
+            "Orchestration"
         } else if slot.state.mode == AgentMode::Plan {
-            "Планирование"
+            "Planning"
         } else {
-            "Работа"
+            "Work"
         };
         self.report(io, mode);
     }
@@ -1723,12 +1717,12 @@ impl Workbench {
         if self.factory.orchestration_route().is_err() {
             self.report(
                 io,
-                "Для оркестрации нужна модель с подтверждённой поддержкой строгой схемы ответа",
+                "Orchestration requires a route with verified structured outputs",
             );
             return false;
         }
         if self.orchestration_stop.is_some() || self.slots[self.current].active() {
-            self.report(io, "Дождитесь завершения текущей задачи");
+            self.report(io, "Wait for the current task to finish");
             return false;
         }
         if !self.can_job(io) {
@@ -1736,10 +1730,10 @@ impl Workbench {
         }
         let prompt = self.refinement.as_ref().map_or_else(
             || text.to_owned(),
-            |previous| format!("{previous}\n\nУточнение: {text}"),
+            |previous| format!("{previous}\n\nClarification: {text}"),
         );
         if prompt.len() > 16 * 1024 {
-            self.report(io, "Запрос с уточнениями слишком длинный");
+            self.report(io, "The request and its clarifications are too long");
             return false;
         }
         self.cancel_modal();
@@ -1751,13 +1745,13 @@ impl Workbench {
             .state
             .post_command(&slot.handle, command, &mut slot.replies, false)
         {
-            self.report(io, "Дождитесь текущих запросов");
+            self.report(io, "Wait for the current requests");
             return false;
         }
         self.planning_context = Some((id, slot.id.clone(), prompt, token));
         slot.state.status.clear();
         self.refinement = None;
-        self.menu = Some(Menu::Loading("Готовлю план".into()));
+        self.menu = Some(Menu::Loading("Drafting a plan".into()));
         true
     }
 
@@ -1768,7 +1762,7 @@ impl Workbench {
             || slot.id != proposal.seed.source_session().0
             || !self.can_job(io)
         {
-            self.report(io, "Дождитесь завершения текущей задачи");
+            self.report(io, "Wait for the current task to finish");
             return;
         }
         let owner = self.slots[self.current].id.clone();
@@ -1795,7 +1789,7 @@ impl Workbench {
             || slot.id != identity.parent_session
             || !self.can_job(io)
         {
-            self.report(io, "Дождитесь завершения текущей задачи");
+            self.report(io, "Wait for the current task to finish");
             return;
         }
         let owner = identity.parent_session.clone();
@@ -1883,7 +1877,10 @@ impl Workbench {
                 (true, false)
             }
             "/agent" => {
-                self.report(io, "Попросите основного агента подключить помощников или выберите оркестрацию клавишей Tab");
+                self.report(
+                    io,
+                    "Ask the main agent to delegate or switch to Orchestration with Tab",
+                );
                 (true, false)
             }
             "/agents" => {
@@ -1908,9 +1905,9 @@ impl Workbench {
             }
             "/pr" => {
                 if argument.is_empty() {
-                    self.report(io, "Укажите базовую ветку, например /pr main");
+                    self.report(io, "Specify a base branch, for example /pr main");
                 } else if self.orchestration_stop.is_some() || self.slots[self.current].active() {
-                    self.report(io, "Дождитесь завершения текущей задачи");
+                    self.report(io, "Wait for the current task to finish");
                 } else if self.can_job(io) {
                     let owner = self.slots[self.current].id.clone();
                     let factory = self.factory.clone();
@@ -1921,7 +1918,7 @@ impl Workbench {
                         result: super::super::publish::draft(&factory, &owner, &base, &stop),
                         owner,
                     });
-                    self.report(io, "Готовлю черновик PR · Ctrl+C остановить");
+                    self.report(io, "Preparing a draft PR · Ctrl+C stop");
                 }
                 (true, false)
             }
@@ -1937,7 +1934,7 @@ impl Workbench {
                 (true, false)
             }
             "/run" => {
-                self.report(io, "Терминал проекта: /files, затем q");
+                self.report(io, "Project terminal: /files, then q");
                 (false, false)
             }
             "/theme" => {
@@ -1965,7 +1962,7 @@ impl Workbench {
                 (true, false)
             }
             "/basic" if self.slots[self.current].kind == Kind::Btw => {
-                self.report(io, "Режим /btw: только чтение");
+                self.report(io, "/btw is read-only");
                 (true, false)
             }
             _ => {
@@ -1975,7 +1972,7 @@ impl Workbench {
                         .as_ref()
                         .is_some_and(|(owner, _)| owner == &self.slots[self.current].id)
                 {
-                    self.report(io, "Дождитесь завершения текущей задачи");
+                    self.report(io, "Wait for the current task to finish");
                     return (false, false);
                 }
                 if matches!(command, "/basic" | "/plan") && argument.is_empty() {
@@ -1986,7 +1983,7 @@ impl Workbench {
                 if slot.kind == Kind::Console && !text.starts_with('/') {
                     slot.state.report(
                         io,
-                        "Архив консоли. Esc - родительский разговор; /files - файлы и терминал",
+                        "Console archive · Esc parent · /files files and terminal",
                     );
                     return (false, false);
                 }
@@ -2023,7 +2020,7 @@ impl Workbench {
             return;
         }
         if self.slots.len() + self.jobs.len() >= MAX_SESSIONS {
-            self.report(io, "Достигнут предел открытых сессий (16)");
+            self.report(io, "Open session limit reached (16)");
             return;
         }
         if !self.can_job(io) {
@@ -2060,7 +2057,7 @@ impl Workbench {
                 slot.pending_prompt = None;
                 slot.handle.request_shutdown();
                 let parent = slot.parent.clone();
-                let message = format!("Не удалось открыть сессию: {code}");
+                let message = format!("Could not open session: {code}");
                 slot.state.report(io, &message);
                 if self.current == index {
                     if let Some(parent) = parent.and_then(|parent| {
@@ -2094,7 +2091,7 @@ impl Workbench {
                 self.slots[index].state.exit = 1;
                 self.slots[index]
                     .state
-                    .report(io, "Не удалось создать сессию: агент завершил работу");
+                    .report(io, "Could not create session: agent exited");
             }
             return;
         };
@@ -2249,10 +2246,8 @@ impl Workbench {
         slot.state.apply(&event, io);
         if lost_context {
             slot.state.exit = 1;
-            slot.state.report(
-                io,
-                "Не удалось восстановить контекст; повторите команду создания сессии",
-            );
+            slot.state
+                .report(io, "Could not restore context. Retry the session command");
         }
         if reading.is_some() {
             slot.state.reading = reading;
@@ -2338,12 +2333,12 @@ impl Workbench {
             Job::DraftPullRequest { owner, result } => {
                 self.orchestration_stop = None;
                 let message = match result {
-                    Ok(url) => format!("Черновик PR · {url}"),
-                    Err("draft_release_missing") => "В разговоре пока нет проверенной ветки".into(),
-                    Err("draft_snapshot_private_changes") => "В исходном снимке есть локальные изменения. Для публикации нужен кандидат, проверенный на чистой базе".into(),
-                    Err("draft_base_changed") => "Базовая ветка на GitHub отличается от проверенной версии".into(),
-                    Err("draft_requires_network") => "Черновик PR доступен в сетевом режиме ansa".into(),
-                    Err(code) => format!("Не удалось создать черновик PR ({code})"),
+                    Ok(url) => format!("Draft PR · {url}"),
+                    Err("draft_release_missing") => "This conversation has no verified branch yet".into(),
+                    Err("draft_snapshot_private_changes") => "The snapshot contains local changes. Publishing requires a candidate verified on a clean base".into(),
+                    Err("draft_base_changed") => "The GitHub base branch has changed".into(),
+                    Err("draft_requires_network") => "Opening a draft PR requires network access".into(),
+                    Err(code) => format!("Could not open draft PR ({code})"),
                 };
                 if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
                     slot.state.report(io, &message);
@@ -2351,10 +2346,7 @@ impl Workbench {
             }
             Job::OrchestrationReceipt { result } => {
                 if let Err(code) = result {
-                    self.report(
-                        io,
-                        &format!("Не удалось сохранить отметку о передаче ({code})"),
-                    );
+                    self.report(io, &format!("Could not record result delivery ({code})"));
                 }
             }
             Job::ArchivedPlan { token, result } => {
@@ -2371,16 +2363,15 @@ impl Workbench {
                                     self.slots[self.current].remember_candidate(view);
                                     self.review_redraw = true;
                                 }
-                                Err(code) => {
-                                    self.report(io, &format!("Diff и проверки недоступны ({code})"))
-                                }
+                                Err(code) => self
+                                    .report(io, &format!("Diff and checks unavailable ({code})")),
                                 Ok(None) => {}
                             }
                         }
                         Err(code) => {
                             self.panel = None;
                             self.focus = Focus::Chat;
-                            self.report(io, &format!("Не удалось открыть план ({code})"));
+                            self.report(io, &format!("Could not open plan ({code})"));
                         }
                     }
                 }
@@ -2411,7 +2402,7 @@ impl Workbench {
                             selected: usize::from(blocked.is_some()),
                         });
                     }
-                    Err(code) => self.report(io, &format!("Не удалось подготовить план ({code})")),
+                    Err(code) => self.report(io, &format!("Could not draft plan ({code})")),
                 }
             }
             Job::OrchestrationDone { owner, result } => {
@@ -2467,21 +2458,19 @@ impl Workbench {
                         } else {
                             parent
                                 .state
-                                .report(io, "Результаты сохранены в журналах помощников");
+                                .report(io, "Results are in the agents' transcripts");
                         }
                     }
                     Ok(_) => parent
                         .state
-                        .report(io, "Результаты сохранены в журналах помощников"),
+                        .report(io, "Results are in the agents' transcripts"),
                     Err("auth_cancelled" | "run_cancelled") => {
-                        parent.state.report(io, "План остановлен")
+                        parent.state.report(io, "Plan stopped")
                     }
                     Err("orchestration_paused") => parent
                         .state
-                        .report(io, "Помощник приостановлен · продолжить через /sessions"),
-                    Err(code) => parent
-                        .state
-                        .report(io, &format!("План остановлен ({code})")),
+                        .report(io, "Agent paused · resume with /sessions"),
+                    Err(code) => parent.state.report(io, &format!("Plan stopped ({code})")),
                 }
             }
             Job::TerminalScreen { token, result } => {
@@ -2495,9 +2484,9 @@ impl Workbench {
                 {
                     *pending = false;
                     *view = Some(result.unwrap_or_else(|error| carbon::OutputView {
-                        title: "Терминал агента".into(),
+                        title: "Agent terminal".into(),
                         text: if error == "terminal_not_open" {
-                            "Агент ещё не открыл терминал".into()
+                            "The agent has not opened a terminal yet".into()
                         } else {
                             diagnostics::error(error)
                         },
@@ -2533,7 +2522,7 @@ impl Workbench {
                             if let Some(theme) = catalog.find(&requested) {
                                 self.commit_theme(theme.clone());
                             } else {
-                                self.report(io, "Тема недоступна. /theme - выбрать доступную тему");
+                                self.report(io, "Theme unavailable. Choose a theme with /theme");
                             }
                         } else {
                             let preview = ThemePreview::new(catalog.themes, self.theme.clone());
@@ -2547,7 +2536,7 @@ impl Workbench {
                         self.theme_initialized = true;
                     }
                     if code != "theme_cancelled" {
-                        self.report(io, &format!("Не удалось прочитать темы: {code}"));
+                        self.report(io, &format!("Could not load themes: {code}"));
                     }
                 }
             },
@@ -2575,7 +2564,7 @@ impl Workbench {
                             self.theme_error = Some(code);
                             self.report(
                                 io,
-                                &format!("Auto DMS: не удалось обновить палитру ({code})"),
+                                &format!("Auto DMS: could not refresh palette ({code})"),
                             );
                         }
                         Err(_) => {}
@@ -2609,11 +2598,11 @@ impl Workbench {
                         if foreground {
                             self.switch(self.slots.len() - 1);
                         } else {
-                            self.report(io, "Субагент запущен · /agents");
+                            self.report(io, "Agent started · /agents");
                         }
                     }
                 }
-                Err(code) => self.report(io, &format!("Не удалось открыть сессию: {code}")),
+                Err(code) => self.report(io, &format!("Could not open session: {code}")),
             },
             Job::Sessions {
                 result,
@@ -2632,7 +2621,7 @@ impl Workbench {
                         continuation,
                     })
                 }
-                Err(code) => self.report(io, &format!("Не удалось прочитать сессии: {code}")),
+                Err(code) => self.report(io, &format!("Could not load sessions: {code}")),
             },
             Job::CachedSummaries { result } => {
                 if let Ok(summaries) = result {
@@ -2673,7 +2662,7 @@ impl Workbench {
                         if matches!(self.menu, Some(Menu::Loading(_))) {
                             self.menu = None;
                         }
-                        self.report(io, &format!("Не удалось обновить каталог моделей: {code}"));
+                        self.report(io, &format!("Could not refresh model list: {code}"));
                     }
                 }
             }
@@ -2708,12 +2697,12 @@ impl Workbench {
                             files.preview_cache = None;
                         }
                         Ok(FileValue::Image(_)) => unreachable!("handled image"),
-                        Err(code) => self.report(io, &format!("Не удалось открыть файл: {code}")),
+                        Err(code) => self.report(io, &format!("Could not open file: {code}")),
                     }
                 } else if let Err(code) = result {
                     self.panel = None;
                     self.focus = Focus::Chat;
-                    self.report(io, &format!("Не удалось открыть график ({code})"));
+                    self.report(io, &format!("Could not open chart ({code})"));
                 }
             }
             Job::Preview { token, width, rows } => {
@@ -2733,7 +2722,7 @@ impl Workbench {
             }
             Job::EditorReady { result, .. } => match result {
                 Ok(command) => self.pending_editor = Some(command),
-                Err(code) => self.report(io, &format!("Не удалось открыть редактор: {code}")),
+                Err(code) => self.report(io, &format!("Could not open editor: {code}")),
             },
         }
     }
@@ -3109,9 +3098,9 @@ impl Workbench {
                                 .is_some_and(|(_, _, width, height)| width >= 30 && height > 0))
                     {
                         let text = if proposal.plan.execution_ready().is_err() {
-                            "Уточните проверку результата перед запуском"
+                            "Refine the verification step before starting"
                         } else {
-                            "Увеличьте окно, чтобы прочитать план"
+                            "Widen the terminal to read the plan"
                         };
                         self.report(io, text);
                         self.menu = Some(Menu::Orchestration { proposal, selected });
@@ -3123,9 +3112,9 @@ impl Workbench {
                         0 => self.approve_orchestration(*proposal, io),
                         1 => {
                             self.refinement = Some(proposal.prompt);
-                            self.report(io, "Введите уточнение к плану");
+                            self.report(io, "Enter a clarification for the plan");
                         }
-                        _ => self.report(io, "План отменён"),
+                        _ => self.report(io, "Plan cancelled"),
                     }
                 }
                 Menu::Themes(preview) => self.commit_theme(preview.current()),
@@ -3208,8 +3197,8 @@ impl Workbench {
                 }
                 Some(Panel::Agents { selected }) => {
                     if let Some((id, agent)) = self.agent_rows().get(*selected) {
-                        if agent.state == "Работает" && self.collecting_orchestration() {
-                            self.report(io, "Разговор доступен после завершения работы помощника");
+                        if agent.state == "Running" && self.collecting_orchestration() {
+                            self.report(io, "The transcript is available once the agent finishes");
                             return None;
                         }
                         let id = id.clone();
@@ -3432,7 +3421,7 @@ impl Workbench {
                 {
                     self.report(
                         io,
-                        "Выделение превышает лимит clipboard или очередь вывода заполнена",
+                        "Could not copy selection. The clipboard limit or output queue is full",
                     );
                 }
             }
@@ -3452,28 +3441,28 @@ impl Workbench {
             Menu::Orchestration { .. } => return None,
             Menu::Themes(preview) => Popup {
                 title: "/theme".into(),
-                subtitle: "Предпросмотр темы".into(),
+                subtitle: "Theme preview".into(),
                 items: preview
                     .themes()
                     .iter()
                     .map(|theme| Choice {
                         label: theme.name().into(),
                         detail: if theme.id() == preview.original().id() {
-                            "текущая".into()
+                            "current".into()
                         } else if theme.is_dynamic() {
-                            "системная палитра".into()
+                            "system palette".into()
                         } else {
                             theme.id().into()
                         },
                     })
                     .collect(),
                 selected: preview.selected(),
-                footer: "Enter сохранить · Esc отменить".into(),
+                footer: "Enter save · Esc cancel".into(),
             },
             Menu::Loading(title) => Popup {
                 title: title.clone(),
-                subtitle: "Загрузка…".into(),
-                footer: "Esc отменить".into(),
+                subtitle: "Loading…".into(),
+                footer: "Esc cancel".into(),
                 ..Popup::default()
             },
             Menu::Sessions {
@@ -3482,26 +3471,26 @@ impl Workbench {
                 resume_target,
                 continuation,
             } => Popup {
-                title: "Сессии проекта".into(),
-                subtitle: "Выбрать разговор".into(),
+                title: "Project sessions".into(),
+                subtitle: "Choose a conversation".into(),
                 items: resume_target
                     .iter()
                     .map(|_| Choice {
-                        label: "Продолжить текущий запрос".into(),
+                        label: "Resume current request".into(),
                         detail: String::new(),
                     })
                     .chain(continuation.iter().map(|(_, title)| Choice {
-                        label: "Продолжить оркестрацию".into(),
+                        label: "Resume orchestration".into(),
                         detail: title.clone(),
                     }))
                     .chain(entries.iter().map(|e| Choice {
-                        label: e.title.clone().unwrap_or_else(|| "Новый разговор".into()),
+                        label: e.title.clone().unwrap_or_else(|| "New conversation".into()),
                         detail: format!(
                             "{} · {}{}",
                             if e.entry.kind == "fork" {
-                                "Ветка"
+                                "Fork"
                             } else {
-                                "Разговор"
+                                "Conversation"
                             },
                             e.status.label(),
                             e.preview
@@ -3511,11 +3500,11 @@ impl Workbench {
                     }))
                     .collect(),
                 selected: *selected,
-                footer: "Enter открыть · Esc назад".into(),
+                footer: "Enter open · Esc back".into(),
             },
             Menu::Models { models, selected } => Popup {
                 title: "/model".into(),
-                subtitle: "Для следующих сообщений".into(),
+                subtitle: "Applies to future messages".into(),
                 items: models
                     .iter()
                     .map(|m| Choice {
@@ -3528,7 +3517,7 @@ impl Workbench {
                     })
                     .collect(),
                 selected: *selected,
-                footer: "Enter выбрать effort · Esc отменить".into(),
+                footer: "Enter choose effort · Esc cancel".into(),
             },
             Menu::Efforts {
                 model,
@@ -3537,19 +3526,19 @@ impl Workbench {
                 previous,
             } => Popup {
                 title: "/effort".into(),
-                subtitle: format!("{model} · для следующих сообщений"),
+                subtitle: format!("{model} · future messages"),
                 items: values
                     .iter()
                     .map(|e| Choice {
-                        label: e.clone().unwrap_or_else(|| "По умолчанию".into()),
+                        label: e.clone().unwrap_or_else(|| "Default".into()),
                         detail: String::new(),
                     })
                     .collect(),
                 selected: *selected,
                 footer: if previous.is_some() {
-                    "Enter применить пару · Esc к моделям"
+                    "Enter apply · Esc models"
                 } else {
-                    "Enter применить · Esc отменить"
+                    "Enter apply · Esc cancel"
                 }
                 .into(),
             },
@@ -3563,12 +3552,12 @@ impl Workbench {
                     let blocked = proposal.plan.execution_ready().err();
                     let actions = [
                         if blocked.is_none() {
-                            "Начать"
+                            "Start"
                         } else {
-                            "Запуск недоступен"
+                            "Start unavailable"
                         },
-                        "Уточнить",
-                        "Отмена",
+                        "Refine",
+                        "Cancel",
                     ]
                     .into_iter()
                     .enumerate()
@@ -3583,10 +3572,10 @@ impl Workbench {
                     .join("   ");
                     format!("{actions}   ·   ↑/↓ · Enter")
                 } else {
-                    "PgUp/PgDn или прокрутка · Esc чат".into()
+                    "PgUp/PgDn or scroll · Esc chat".into()
                 };
                 Some(Inspector {
-                    title: "План работы · PgUp/PgDn или прокрутка".into(),
+                    title: "Plan · PgUp/PgDn or scroll".into(),
                     lines: lines.clone(),
                     offset: *offset,
                     footer,
@@ -3597,8 +3586,8 @@ impl Workbench {
             Panel::Terminal => {
                 let snapshot = self.terminal.as_ref()?.snapshot();
                 Some(Inspector {
-                    title: format!("Терминал · {}", snapshot.cwd.display()),
-                    tabs: vec!["Файлы".into(), "Терминал".into()],
+                    title: format!("Terminal · {}", snapshot.cwd.display()),
+                    tabs: vec!["Files".into(), "Terminal".into()],
                     selected_tab: 1,
                     kind: InspectorKind::Command,
                     rendered: Some(
@@ -3615,11 +3604,11 @@ impl Workbench {
                         .map(|(row, column)| (usize::from(column), usize::from(row))),
                     footer: snapshot.error.clone().unwrap_or_else(|| {
                         if snapshot.exited {
-                            "Терминал завершён · нажмите «Файлы»".into()
+                            "Terminal exited · select Files".into()
                         } else if snapshot.shell_ready {
-                            "Esc к файлам · команды выполняются локально".into()
+                            "Esc files · commands run locally".into()
                         } else {
-                            "Ctrl+C прервать · ввод передаётся программе".into()
+                            "Ctrl+C interrupt · keys go to the program".into()
                         }
                     }),
                     ..Inspector::default()
@@ -3629,17 +3618,17 @@ impl Workbench {
                 title: view.title.clone(),
                 lines: self.output_lines(&view.text),
                 offset: *offset,
-                footer: "j/k строки · PgUp/PgDn страницы · g/G начало/конец · Esc назад".into(),
+                footer: "j/k lines · PgUp/PgDn pages · g/G start/end · Esc back".into(),
                 ..Inspector::default()
             }),
             Panel::NativeTerminal { view, .. } => Some(Inspector {
                 title: view
                     .as_ref()
-                    .map_or_else(|| "Терминал агента".into(), |view| view.title.clone()),
+                    .map_or_else(|| "Agent terminal".into(), |view| view.title.clone()),
                 lines: view.as_ref().map_or_else(Vec::new, |view| {
                     view.text.lines().map(str::to_owned).collect()
                 }),
-                footer: "Esc чат".into(),
+                footer: "Esc chat".into(),
                 ..Inspector::default()
             }),
             Panel::EditDiff {
@@ -3653,21 +3642,21 @@ impl Workbench {
                 kind: InspectorKind::Diff,
                 diff: Some(rows.clone()),
                 diff_column: *column,
-                footer: "j/k строки · h/l горизонтально · f ширина · Esc чат".into(),
+                footer: "j/k lines · h/l horizontal · f expand · Esc chat".into(),
                 ..Inspector::default()
             }),
             Panel::Agents { selected } => Some(Inspector {
-                title: "Агенты разговора".into(),
+                title: "Conversation agents".into(),
                 agents: self.agent_rows().into_iter().map(|(_, row)| row).collect(),
                 selected: Some(*selected),
-                footer: "↑/↓ список · Enter разговор · Esc назад".into(),
+                footer: "↑/↓ select · Enter transcript · Esc back".into(),
                 kind: InspectorKind::Agents,
                 ..Inspector::default()
             }),
             Panel::Image { name, view, .. } => Some(Inspector {
-                title: format!("График · {name}"),
+                title: format!("Chart · {name}"),
                 lines: view.as_ref().map_or_else(
-                    || vec!["Открытие PNG…".into()],
+                    || vec!["Opening PNG…".into()],
                     |image| {
                         let mut lines = vec![format!("PNG · {} × {}", image.width, image.height)];
                         if self.graphics_id.is_none() {
@@ -3677,9 +3666,9 @@ impl Workbench {
                     },
                 ),
                 footer: if self.focus == Focus::Inspector {
-                    "Enter копировать путь · Esc закрыть"
+                    "Enter copy path · Esc close"
                 } else {
-                    "Tab график · Esc закрыть"
+                    "Tab chart · Esc close"
                 }
                 .into(),
                 kind: InspectorKind::Image,
@@ -3688,10 +3677,10 @@ impl Workbench {
             Panel::Files(files) => {
                 if files.loading {
                     return Some(Inspector {
-                        title: "Файлы".into(),
-                        tabs: vec!["Файлы".into(), "Терминал".into()],
-                        lines: vec!["Открываю…".into()],
-                        footer: "q терминал · Esc чат".into(),
+                        title: "Files".into(),
+                        tabs: vec!["Files".into(), "Terminal".into()],
+                        lines: vec!["Opening…".into()],
+                        footer: "q terminal · Esc chat".into(),
                         ..Inspector::default()
                     });
                 }
@@ -3700,14 +3689,14 @@ impl Workbench {
                         1 => (
                             InspectorKind::Diff,
                             if document.diff.status == DiffStatus::Unchanged {
-                                "Изменений относительно HEAD нет"
+                                "No changes since HEAD"
                             } else if matches!(
                                 document.diff.status,
                                 DiffStatus::NoRepository
                                     | DiffStatus::NoCommit
                                     | DiffStatus::Unavailable
                             ) {
-                                "Diff недоступен: нет Git HEAD либо файл превышает лимит"
+                                "Diff unavailable: HEAD is missing or the file is too large"
                             } else {
                                 &document.diff.text
                             },
@@ -3718,10 +3707,10 @@ impl Workbench {
                                 if files.preview_rows().is_some() {
                                     ""
                                 } else {
-                                    "Готовлю просмотр..."
+                                    "Preparing preview…"
                                 }
                             } else {
-                                "Preview доступен для Markdown"
+                                "Preview supports Markdown"
                             },
                         ),
                         _ => (InspectorKind::Source, document.source.as_str()),
@@ -3741,15 +3730,15 @@ impl Workbench {
                                         | DiffStatus::Untracked
                                         | DiffStatus::Unchanged
                                 ) {
-                                    "HEAD → рабочий файл"
+                                    "HEAD → working file"
                                 } else {
                                     "Diff"
                                 }
                             } else {
-                                "только чтение"
+                                "read-only"
                             },
                             if document.truncated {
-                                " · фрагмент"
+                                " · excerpt"
                             } else {
                                 ""
                             },
@@ -3761,8 +3750,8 @@ impl Workbench {
                                 .map_or_else(String::new, |parent| format!(" · {parent}"))
                         ),
                         tabs: vec![
-                            "Файлы".into(),
-                            "Терминал".into(),
+                            "Files".into(),
+                            "Terminal".into(),
                             "Source".into(),
                             "Diff".into(),
                             "Preview".into(),
@@ -3773,10 +3762,9 @@ impl Workbench {
                         footer: files.jump.as_ref().map_or_else(
                             || {
                                 if files.tab == 1 {
-                                    "f развернуть diff · s/d/p вкладки · Esc чат".into()
+                                    "f expand diff · s/d/p tabs · Esc chat".into()
                                 } else {
-                                    "s/d/p вкладки · :строка · e редактор · q терминал · Esc чат"
-                                        .into()
+                                    "s/d/p tabs · :line · e editor · q terminal · Esc chat".into()
                                 }
                             },
                             |line| format!(":{line}"),
@@ -3793,8 +3781,8 @@ impl Workbench {
                     let listing = files.listing.as_ref();
                     Some(Inspector {
                         title: listing
-                            .map_or_else(|| "Файлы".into(), |l| self.relative_directory(&l.path)),
-                        tabs: vec!["Файлы".into(), "Терминал".into()],
+                            .map_or_else(|| "Files".into(), |l| self.relative_directory(&l.path)),
+                        tabs: vec!["Files".into(), "Terminal".into()],
                         lines: listing.map_or_else(Vec::new, |l| {
                             l.entries
                                 .iter()
@@ -3805,7 +3793,8 @@ impl Workbench {
                         }),
                         selected: Some(files.selected),
                         offset: files.selected.saturating_sub(8),
-                        footer: "j/k список · h назад · l каталог · Enter файл · q терминал".into(),
+                        footer: "j/k move · h parent · l directory · Enter file · q terminal"
+                            .into(),
                         ..Inspector::default()
                     })
                 }
@@ -3827,7 +3816,7 @@ impl Workbench {
             if let Some(title) = self.known_title(&id) {
                 breadcrumb.push(title);
             } else if id == slot.id && slot.kind == Kind::Fork {
-                breadcrumb.push("Ветка".into());
+                breadcrumb.push("Fork".into());
             }
             if let Some(ancestor) = self.slots.iter().find(|s| s.id == id) {
                 current = ancestor.parent.clone();
@@ -3845,7 +3834,7 @@ impl Workbench {
         Workspace {
             breadcrumb: breadcrumb.join(" / "),
             model: if slot.kind == Kind::Console {
-                "Локальная консоль".into()
+                "Local console".into()
             } else {
                 generation.map_or_else(String::new, |g| g.model.clone())
             },
@@ -3853,7 +3842,7 @@ impl Workbench {
                 .and_then(|g| g.effort.clone())
                 .unwrap_or_default(),
             activity: if self.orchestration_mode {
-                "Оркестрация".into()
+                "Orchestration".into()
             } else {
                 String::new()
             },
@@ -3876,9 +3865,9 @@ impl Workbench {
                 && (self.collecting_orchestration()
                     || self.orchestration_summary.contains_key(&slot.id)),
             interrupt_hint: if !slot.state.editor.bytes.is_empty() {
-                "Ctrl+C очистить"
+                "Ctrl+C clear draft"
             } else if self.collecting_orchestration() || slot.interruptible() {
-                "Ctrl+C остановить"
+                "Ctrl+C stop"
             } else {
                 ""
             },
@@ -4039,9 +4028,9 @@ impl Workbench {
             let status = if !self.slots[self.current].state.status.trim().is_empty() {
                 self.slots[self.current].state.status.trim()
             } else if self.slots[self.current].startup_cancelled {
-                "Открытие сессии отменено"
+                "Session open cancelled"
             } else {
-                "Открытие сессии"
+                "Opening session"
             };
             let mut frame = carbon::layout_full(&[], b"", 0, status, 0, context, io.size, io.color);
             if let Some(frame) = &mut frame
@@ -4105,7 +4094,7 @@ impl Workbench {
             let size = (bounds.3.clamp(1, 128) as u16, bounds.2.clamp(1, 256) as u16);
             if let Err(error) = terminal.resize(size.0, size.1) {
                 if error.kind() != std::io::ErrorKind::WouldBlock {
-                    self.report(io, &format!("Размер терминала не обновлён: {error}"));
+                    self.report(io, &format!("Could not resize terminal: {error}"));
                 }
             } else {
                 self.terminal_size = Some(size);
@@ -4331,7 +4320,7 @@ pub async fn run_attached(
                 if written != wait.written { wait.written = written; wait.progress = now; }
                 now.duration_since(wait.progress) >= Duration::from_millis(250) || now.duration_since(wait.began) >= Duration::from_secs(1)
             }) {
-                work.cancel_editor_request(); work.report(io, "Не удалось передать терминал редактору: вывод не завершился"); dirty = true;
+                work.cancel_editor_request(); work.report(io, "Could not hand off the terminal to the editor: output is still pending"); dirty = true;
             }
             if let Some(mut editor) = work.editor.take() {
                 if editor_cancel_since.is_some_and(|began| began.elapsed() >= Duration::from_secs(2)) || (finished && terminating_since.is_some_and(|began| began.elapsed() >= Duration::from_secs(2))) {
@@ -4340,15 +4329,15 @@ pub async fn run_attached(
                     finished = true; work.terminating = true;
                 } else { match editor.poll(io) {
                     Ok(Some(status)) => {
-                        if status.cleanup_unknown { work.report(io, "Редактор завершён; состояние отделившихся процессов неизвестно"); }
-                        else { work.report(io, &format!("Редактор завершён: {}", status.code)); }
+                        if status.cleanup_unknown { work.report(io, "Editor exited. Detached process state is unknown"); }
+                        else { work.report(io, &format!("Editor exited: {}", status.code)); }
                         work.last_frame = None; work.displayed = None; work.frames.clear(); dirty = true;
                         editor_cancel_since = None;
                         if !finished && !work.input_closed && let Some(Panel::Files(files)) = &work.panel && let Some(document) = &files.document { work.open_file(document.path.clone(), io); }
                     }
                     Ok(None) => work.editor = Some(editor),
                     Err(code) => {
-                        work.report(io, &format!("Не удалось открыть редактор: {code}")); work.last_frame = None; dirty = true;
+                        work.report(io, &format!("Could not open editor: {code}")); work.last_frame = None; dirty = true;
                         work.slots[work.current].state.exit = 1;
                         if code == "editor_cleanup_unknown" { failure.get_or_insert(code); finished = true; work.terminating = true; }
                         editor_cancel_since = None;
@@ -4362,7 +4351,7 @@ pub async fn run_attached(
                 work.editor_wait = None;
                 match io.start_editor(&command.argv, &work.factory.settings.cwd) {
                     Ok(editor) => { work.editor = Some(editor); editor_cancel_since = None; }
-                    Err(code) => work.report(io, &format!("Не удалось открыть редактор: {code}")),
+                    Err(code) => work.report(io, &format!("Could not open editor: {code}")),
                 }
             }
             let now = Instant::now();
@@ -5213,7 +5202,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(shown.contains("descriptor purpose") && shown.contains("ARGS_CANARY"));
-        assert!(shown.contains("выполняется"));
+        assert!(shown.contains("running"));
         slot.runtime.shutdown().await.unwrap();
     }
 }

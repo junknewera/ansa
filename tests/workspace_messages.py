@@ -78,7 +78,7 @@ def run(binary, output):
             cases.append("reconnect-lookup-preserves-identity-and-rejects-wrong-cancel")
 
             local(screen, "/plan")
-            until(screen, lambda text: "План" in text and ready(screen), "Carbon plan mode")
+            until(screen, lambda text: "Plan" in text and ready(screen), "Carbon plan mode")
             next_id = f"r_{editor.sequence + 1}"
             denied = response(editor, "submit_message", text="NO_MODE_ESCALATION", turn=next_id, target=None, expected_mode="basic")
             assert denied["code"] == "workspace_mode_changed", denied

@@ -27,7 +27,7 @@ def exercise(binary, output, name, terminate):
         try:
             screen = start(binary, root, home, cwd, {"EDITOR": str(editor)})
             local(screen, "/files notes.md")
-            until(screen, lambda text: "только чтение" in text and "fixture document" in text,
+            until(screen, lambda text: "read-only" in text and "fixture document" in text,
                   "stable file inspector")
             for _ in range(12):
                 screen.drain(.01)
@@ -56,7 +56,7 @@ def exercise(binary, output, name, terminate):
                 until(screen, lambda text: "stalled" in text,
                       "bounded handoff drain error after flow-control recovery")
                 screen.send(b"\x1b")
-                until(screen, lambda text: "q терминал" not in text,
+                until(screen, lambda text: "q terminal" not in text,
                       "file inspector closed after failed handoff")
                 screen.send("AFTER_EDITOR_SETUP")
                 until(screen, lambda text: "AFTER_EDITOR_SETUP" in text,

@@ -19,10 +19,10 @@ impl CandidateView {
         let removed = rows.iter().filter(|row| row.kind == Kind::Remove).count();
         let changed = match candidate.paths.as_slice() {
             [path] => path.clone(),
-            paths => format!("Файлов: {}", paths.len()),
+            paths => format!("Files: {}", paths.len()),
         };
         let heading = format!("{changed} · +{added} −{removed}");
-        let title = format!("{heading} · снимок проекта → ansa-result");
+        let title = format!("{heading} · project snapshot → ansa-result");
         Self {
             run,
             heading,
@@ -34,7 +34,7 @@ impl CandidateView {
 
     pub(super) fn panel(&self) -> Panel {
         Panel::EditDiff {
-            title: format!("{} · Проверенные изменения", self.title),
+            title: format!("{} · Verified changes", self.title),
             rows: self.rows.clone(),
             offset: 0,
             column: 0,
@@ -67,7 +67,7 @@ impl Workbench {
                 let mut review_entries = vec![result_entry(review.heading.clone(), diff, None)];
                 review_entries.extend(review.checks.iter().enumerate().map(|(index, view)| {
                     result_entry(
-                        format!("{} · пройдено", view.title),
+                        format!("{} · passed", view.title),
                         Some(format!("output:verification:{}:{index}", review.run)),
                         Some(view.clone()),
                     )
@@ -82,13 +82,13 @@ impl Workbench {
             let view = self.orchestration_views.get(&slot.id);
             entries.push(Entry {
                 text: view.map_or_else(
-                    || "Готовлю помощников".into(),
+                    || "Starting agents".into(),
                     |view| {
                         if view.reviewing {
-                            "Проверяю правки помощников".into()
+                            "Verifying agent changes".into()
                         } else {
                             format!(
-                                "{} · {} из {} агентов завершили работу",
+                                "{} · {}/{} agents done",
                                 view.title,
                                 view.done,
                                 view.plan.steps().len()
@@ -107,7 +107,7 @@ impl Workbench {
                 entries.pop();
             }
             entries.push(Entry {
-                text: "Координатор готовит сводку".into(),
+                text: "Coordinator is writing the summary".into(),
                 role: "activity".into(),
                 action: None,
                 status: None,
@@ -139,50 +139,50 @@ impl Workbench {
         use crate::orchestration::plan::Access;
         let mut lines = vec![plan.summary().to_owned(), String::new()];
         if let Some(prompt) = prompt {
-            lines.push("Исходный запрос".into());
+            lines.push("Original request".into());
             lines.extend(prompt.lines().map(str::to_owned));
             lines.push(String::new());
         }
         if let Err(code) = plan.execution_ready() {
             lines.push(if code == "orchestration_manual_checks_required" {
-                "Перед запуском нужна ручная проверка. Выберите «Уточнить».".into()
+                "A manual check is required before starting. Select Refine.".into()
             } else {
-                "Добавьте проверку результата правок через «Уточнить».".into()
+                "Select Refine to add a check for the changes.".into()
             });
             lines.push(String::new());
         }
         for check in plan.command_checks() {
             lines.push(format!(
-                "Команда в копии проекта с вашими правами {}",
+                "Command runs in the project copy with your permissions: {}",
                 serde_json::json!(check.argv)
             ));
         }
         for (index, step) in plan.steps().iter().enumerate() {
             let access = match step.access {
-                Access::Read => "Чтение",
-                Access::Write => "Правки в рабочей копии",
+                Access::Read => "Read",
+                Access::Write => "Edit workspace copy",
             };
             lines.push(format!("{}. {} · {access}", index + 1, step.id));
             lines.extend(step.task.lines().map(str::to_owned));
             lines.extend(step.paths.iter().cloned());
             if !step.depends_on.is_empty() {
-                lines.push(format!("После шагов {}", step.depends_on.join(", ")));
+                lines.push(format!("After steps {}", step.depends_on.join(", ")));
             }
             lines.extend(step.acceptance.lines().map(str::to_owned));
             lines.push(String::new());
         }
         if plan.steps().iter().any(|step| step.access == Access::Write) {
-            lines.push("После правок - проверка diff и независимое ревью. До двух исправлений в указанных путях.".into());
+            lines.push("Changes go through a diff check and independent review. Up to two fixes in the listed paths.".into());
         }
         for check in plan.checks() {
-            lines.push(format!("Проверка файла {}", check.path));
+            lines.push(format!("Check file {}", check.path));
             lines.extend(check.contains.lines().map(str::to_owned));
         }
         for check in plan.manual_checks() {
             lines.push(if plan.execution_ready().is_ok() {
-                "Рекомендация после отчёта".into()
+                "Follow-up recommendation".into()
             } else {
-                "Ручная проверка".into()
+                "Manual check".into()
             });
             lines.extend(check.lines().map(str::to_owned));
         }
@@ -273,7 +273,7 @@ impl Workbench {
                 self.file_token = self.file_token.wrapping_add(1);
                 let token = self.file_token;
                 self.panel = Some(Panel::Orchestration {
-                    lines: vec!["Загружаю план".into()],
+                    lines: vec!["Loading plan".into()],
                     offset: 0,
                 });
                 self.focus = Focus::Inspector;
@@ -317,7 +317,7 @@ impl Workbench {
                 .unwrap_or(&edit.path);
             self.panel = Some(Panel::EditDiff {
                 title: format!(
-                    "{} · +{} -{} · Diff правки",
+                    "{} · +{} -{} · Edit diff",
                     filename, edit.diff.added, edit.diff.removed
                 ),
                 rows: std::sync::Arc::new(edit.diff.rows.clone()),
@@ -411,7 +411,7 @@ impl Workbench {
     }
     pub(super) fn title(&self, id: &str) -> String {
         self.known_title(id)
-            .unwrap_or_else(|| "Новый разговор".into())
+            .unwrap_or_else(|| "New conversation".into())
     }
     pub(super) fn known_title(&self, id: &str) -> Option<String> {
         self.slots
@@ -538,13 +538,13 @@ impl Workbench {
                 .and_then(|slot| slot.state.snapshot.as_ref())
                 .map(|view| {
                     if view.worker_busy {
-                        "Работает"
+                        "Running"
                     } else {
                         match view.state.as_str() {
-                            "completed" => "Завершён",
-                            "cancelled" => "Остановлен",
-                            "paused" => "Пауза",
-                            _ => "Готов",
+                            "completed" => "Completed",
+                            "cancelled" => "Stopped",
+                            "paused" => "Paused",
+                            _ => "Ready",
                         }
                     }
                 })
@@ -552,7 +552,7 @@ impl Workbench {
                     self.summaries
                         .iter()
                         .find(|s| s.entry.id == *id)
-                        .map_or("Недоступен", |s| s.status.label())
+                        .map_or("Unavailable", |s| s.status.label())
                 });
             let generation = live
                 .and_then(|slot| slot.state.snapshot.as_ref())
@@ -671,7 +671,7 @@ impl Workbench {
             &mut slot.replies,
         ) {
             slot.state
-                .report(io, "Применяю модель и уровень рассуждения…");
+                .report(io, "Applying model and reasoning effort…");
         }
     }
     fn terminal_dimensions(&self) -> Option<(u16, u16)> {
@@ -693,7 +693,7 @@ impl Workbench {
     pub(super) fn open_terminal(&mut self, io: &Io) {
         let Some((rows, columns)) = self.terminal_dimensions() else {
             self.focus = Focus::Chat;
-            self.report(io, "Увеличьте окно для панели терминала");
+            self.report(io, "Widen the window to open the terminal panel");
             return;
         };
         let directory = match &self.panel {
@@ -720,7 +720,7 @@ impl Workbench {
             match crate::frontend::terminal_pane::TerminalPane::spawn(&directory, rows, columns) {
                 Ok(terminal) => self.terminal = Some(terminal),
                 Err(error) => {
-                    self.report(io, &format!("Не удалось открыть терминал: {error}"));
+                    self.report(io, &format!("Could not open terminal: {error}"));
                     return;
                 }
             }
@@ -732,7 +732,7 @@ impl Workbench {
             {
                 self.report(
                     io,
-                    &format!("Терминал остаётся в {}: {error}", snapshot.cwd.display()),
+                    &format!("Terminal is still in {}: {error}", snapshot.cwd.display()),
                 );
             }
         }
@@ -772,7 +772,7 @@ impl Workbench {
             if self.terminal_pending_input.len() + bytes.len() <= 64 * 1024 {
                 self.terminal_pending_input.extend_from_slice(bytes);
             } else {
-                self.report(io, "Терминал занят: дождитесь приёма ввода");
+                self.report(io, "Terminal busy. Wait for pending input to finish");
             }
             return;
         }
@@ -788,7 +788,7 @@ impl Workbench {
                     break;
                 }
                 Err(error) => {
-                    self.report(io, &format!("Ввод терминала недоступен: {error}"));
+                    self.report(io, &format!("Terminal input unavailable: {error}"));
                     break;
                 }
             }

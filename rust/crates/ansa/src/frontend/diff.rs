@@ -271,7 +271,7 @@ pub fn between(before: &str, after: &str) -> Option<Diff> {
                 kind: Kind::Notice,
                 old: None,
                 new: None,
-                text: "\\ Нет переноса строки в конце файла".into(),
+                text: "\\ No newline at end of file".into(),
             });
         }
     }

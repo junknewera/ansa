@@ -342,11 +342,11 @@ impl Store {
                 }
                 _ => result
                     .warnings
-                    .push("Некорректный ui.json; выберите тему заново".into()),
+                    .push("Invalid ui.json. Choose a theme again".into()),
             },
             Ok(None) => {}
             Err("theme_cancelled") => return Err("theme_cancelled"),
-            Err(_) => result.warnings.push("Не удалось прочитать ui.json".into()),
+            Err(_) => result.warnings.push("Could not read ui.json".into()),
         }
         if let Ok(theme) = self.dynamic(stop) {
             result.themes.push(theme);
@@ -363,7 +363,7 @@ impl Store {
                 if entries.1 {
                     result
                         .warnings
-                        .push("Каталог тем превышает предел 128 файлов".into());
+                        .push("Theme directory exceeds the 128-file limit".into());
                 }
                 for entry in entries.0 {
                     if stop.cancelled() {
@@ -383,7 +383,7 @@ impl Store {
                 if names.len() > THEME_LIMIT {
                     result
                         .warnings
-                        .push("Показаны первые 32 пользовательские темы".into());
+                        .push("Showing the first 32 custom themes".into());
                     names.truncate(THEME_LIMIT);
                 }
                 for name in names {
@@ -397,21 +397,19 @@ impl Store {
                         }) {
                         Ok(theme) => result.themes.push(theme),
                         Err("theme_cancelled") => return Err("theme_cancelled"),
-                        Err(_) => result
-                            .warnings
-                            .push(format!("Не удалось загрузить тему {name}")),
+                        Err(_) => result.warnings.push(format!("Could not load theme {name}")),
                     }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => result
                 .warnings
-                .push("Каталог пользовательских тем недоступен".into()),
+                .push("Custom theme directory unavailable".into()),
         }
         if result.find(&result.selected).is_none() {
             result
                 .warnings
-                .push("Сохранённая тема недоступна; выбран Carbon".into());
+                .push("Saved theme unavailable. Using Carbon".into());
             result.selected = "carbon".into();
         }
         if stop.cancelled() {

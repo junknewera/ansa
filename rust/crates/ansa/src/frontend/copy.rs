@@ -13,10 +13,10 @@ pub(super) struct CopyHistory {
 impl CopyHistory {
     pub fn start(&mut self, total: usize) -> Result<(), &'static str> {
         if self.active {
-            return Err("Копирование уже выполняется");
+            return Err("Copy already in progress");
         }
         if total == 0 {
-            return Err("История пока пуста");
+            return Err("No messages to copy");
         }
         *self = Self {
             total,
@@ -45,7 +45,7 @@ impl CopyHistory {
             self.active = false;
             self.pending = None;
             self.data.clear();
-            self.result = Some(Err("Историю не удалось прочитать"));
+            self.result = Some(Err("Could not read history"));
         }
     }
     pub fn apply(&mut self, page: &TranscriptPage) {
@@ -67,12 +67,12 @@ impl CopyHistory {
             || page.total < self.total
         {
             self.active = false;
-            self.result = Some(Err("Историю не удалось прочитать"));
+            self.result = Some(Err("Could not read history"));
             return;
         }
         for entry in page.entries.iter().take(self.total - self.cursor) {
             let role = if entry.role == "user" {
-                "Вы:\n"
+                "You:\n"
             } else {
                 "ansa:\n"
             };
@@ -80,7 +80,7 @@ impl CopyHistory {
                 self.active = false;
                 self.data.clear();
                 self.result = Some(Err(
-                    "Диалог больше 64 KiB: выделите нужный фрагмент терминалом",
+                    "Transcript exceeds 64 KiB. Select the section you want to copy",
                 ));
                 return;
             }
@@ -131,7 +131,7 @@ mod tests {
         let p = page("Ж😀".into());
         copy.apply(&p);
         copy.apply(&p);
-        assert_eq!(copy.take().unwrap().unwrap(), "Вы:\nЖ😀\n\n");
+        assert_eq!(copy.take().unwrap().unwrap(), "You:\nЖ😀\n\n");
         assert!(copy.take().is_none());
         assert!(copy.query().is_none());
     }

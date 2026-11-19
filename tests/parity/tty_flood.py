@@ -37,7 +37,7 @@ class CancelAck:
 
     def _signal_boundary(self):
         if not self.boundary and self.end == self.offset:
-            need(not footer_phase(self.terminal, 'отменено'), 'Cancel phase already visible before signal')
+            need(not footer_phase(self.terminal, 'cancelled'), 'Cancel phase already visible before signal')
             self.boundary = True
 
     def update(self, trace, raw):
@@ -61,7 +61,7 @@ class CancelAck:
             self.count += 1
             if end <= self.offset:
                 self._signal_boundary()
-            elif self.ack_ns is None and footer_phase(self.terminal, 'отменено'):
+            elif self.ack_ns is None and footer_phase(self.terminal, 'cancelled'):
                 self.ack_ns = at
         need(self.end == len(raw) and self.boundary, 'incomplete read trace')
 
@@ -80,7 +80,7 @@ def capture(binary,directory):
         try:
             root,home,cwd=frontend_io.fixture(root);home.chmod(0o700);cwd.chmod(0o700)
             # Popen/preexec completes before starting this driver's only thread.
-            screen=metrics.ObservedPty(str(binary),root,home,cwd,'cancel',True);screen.wait('готов');screen.send('question\r');frontend_io.wait_file(root/'generated')
+            screen=metrics.ObservedPty(str(binary),root,home,cwd,'cancel',True);screen.wait('ready');screen.send('question\r');frontend_io.wait_file(root/'generated')
             def flood():
                 while not stop.is_set():
                     try:written[0]+=os.write(screen.master,b'z'*4096)

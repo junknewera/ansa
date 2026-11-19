@@ -145,14 +145,14 @@ fn publish_progress(
             let (state, detail) = if let Some(result) = result {
                 (
                     if result.status == ChildStatus::Completed {
-                        "Завершён"
+                        "Completed"
                     } else {
-                        "Остановлен"
+                        "Stopped"
                     },
                     result.findings.first().unwrap_or(&result.summary).clone(),
                 )
             } else {
-                ("Работает", details.get(id).cloned().unwrap_or_default())
+                ("Running", details.get(id).cloned().unwrap_or_default())
             };
             Some((
                 session.to_owned(),
@@ -311,11 +311,11 @@ async fn schedule(
                 let id = &active[index].task.id;
                 if let Some((name, target)) = receipt.latest_tool() {
                     let label = match name {
-                        "list_directory" => "Просмотр",
-                        "read_file" => "Чтение",
-                        "search_files" => "Поиск",
-                        "edit_file" => "Правка",
-                        _ => "Инструмент",
+                        "list_directory" => "List",
+                        "read_file" => "Read",
+                        "search_files" => "Search",
+                        "edit_file" => "Edit",
+                        _ => "Tool",
                     };
                     details.insert(
                         id.clone(),
@@ -572,11 +572,11 @@ fn run_command_checks(
             passed.push(view);
         } else {
             failures.push(format!(
-                "Проверка {} завершилась ошибкой ({})",
+                "Check {} failed ({})",
                 check.argv[0],
                 output
                     .field("exit_code")
-                    .map_or_else(|_| "запуск".into(), Json::dump)
+                    .map_or_else(|_| "startup".into(), Json::dump)
             ));
         }
     }
@@ -620,7 +620,7 @@ fn passed_check(
     {
         return None;
     }
-    let mut text = String::from("Код завершения 0\n");
+    let mut text = String::from("Exit code 0\n");
     for key in ["stdout", "stderr"] {
         if let Ok(value) = output.text_field(key)
             && !value.is_empty()
@@ -629,7 +629,7 @@ fn passed_check(
         }
     }
     if output.field("truncated").and_then(Json::boolean) == Ok(true) {
-        text.push_str("\nВывод сокращён");
+        text.push_str("\nOutput truncated");
     }
     Some(super::carbon::OutputView {
         title: argv.join(" "),
@@ -643,11 +643,11 @@ fn append_review_checks(
     verdict: &ChildResult,
 ) {
     checks.extend(plan.checks().iter().map(|check| super::carbon::OutputView {
-        title: format!("{} · проверка содержимого", check.path),
-        text: format!("В файле найден ожидаемый текст\n\n{}", check.contains),
+        title: format!("{} · content check", check.path),
+        text: format!("Matched expected text\n\n{}", check.contains),
     }));
     checks.push(super::carbon::OutputView {
-        title: "Независимое ревью".into(),
+        title: "Independent review".into(),
         text: std::iter::once(&verdict.summary)
             .chain(&verdict.findings)
             .cloned()

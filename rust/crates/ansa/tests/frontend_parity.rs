@@ -261,7 +261,7 @@ fn carbon_keeps_role_markdown_and_clears_shrunk_rows() {
         &history,
         b"draft",
         3,
-        "basic  1 с",
+        "basic  1 s",
         0,
         "context",
         (80, 48),
@@ -270,7 +270,7 @@ fn carbon_keeps_role_markdown_and_clears_shrunk_rows() {
     .unwrap();
     let delta = tick.paint_changes(&full);
     assert!(!delta.contains("bold") && !delta.contains("draft") && !delta.contains("\x1b[2J"));
-    assert!(delta.contains("1 с"));
+    assert!(delta.contains("1 s"));
     let resized = carbon::layout_full(
         &history,
         b"draft",

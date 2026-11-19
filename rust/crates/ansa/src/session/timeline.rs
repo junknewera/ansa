@@ -434,7 +434,7 @@ impl Timeline {
                 let text = std::mem::take(&mut self.final_text);
                 self.append("assistant", text, "completed");
             }
-            "cancel" => self.append("notice", "Текущий шаг остановлен".into(), "cancelled"),
+            "cancel" => self.append("notice", "Current step stopped".into(), "cancelled"),
             _ => {}
         }
         Ok(())

@@ -37,7 +37,7 @@ def start(binary, root, home, cwd, extra=None, argv_extra=()):
                  argv=["--offline", "--cwd", str(cwd), *argv_extra],
                  extra_env={"SHELL": shell, **(extra or {})})
     screen.vt = Terminal(100, 32)
-    until(screen, lambda text: "ANSA" in text and "Tab режим" in text and ready(screen), "first workspace frame")
+    until(screen, lambda text: "ANSA" in text and "Tab mode" in text and ready(screen), "first workspace frame")
     return screen
 
 
@@ -48,6 +48,7 @@ def escape(screen):
 
 
 def select_result(screen, label):
+    paint_quiet(screen)
     screen.send(b"\x07")
     for _ in range(screen.vt.rows):
         paint_quiet(screen)
@@ -111,10 +112,10 @@ def local(screen, command):
 
 
 def approve_helpers(screen, prompt):
-    until(screen, lambda frame: ready(screen) and "Ctrl+C остановить" not in screen.vt.line(-2),
+    until(screen, lambda frame: ready(screen) and "Ctrl+C stop" not in screen.vt.line(-2),
           "current turn settled before proposing helpers")
     screen.send(prompt + "\r")
-    until(screen, lambda frame: "Начать" in frame and "Уточнить" in frame and "Отмена" in frame,
+    until(screen, lambda frame: "Start" in frame and "Refine" in frame and "Cancel" in frame,
           "interactive orchestration approval")
     screen.send(b"\r")
     until(screen, lambda frame: "Сводка готова" in frame and ready(screen), "coordinator's synthesis")
@@ -123,7 +124,7 @@ def approve_helpers(screen, prompt):
 
 def open_helper(screen):
     local(screen, "/agents")
-    until(screen, lambda frame: "Агенты разговора" in frame and helper_title(frame), "helper roster")
+    until(screen, lambda frame: "Conversation agents" in frame and helper_title(frame), "helper roster")
     screen.send(b"\r")
     until(screen, lambda frame: helper_title(screen.vt.line(1)) and ready(screen), "open helper archive")
 
@@ -133,7 +134,7 @@ def helper_title(text):
 
 
 def reading(screen):
-    return "История" in screen.vt.line(1)
+    return "History" in screen.vt.line(1)
 
 
 def records(root):
@@ -145,22 +146,22 @@ def records(root):
 
 
 def shell_ready(screen):
-    return "Esc к файлам" in visible(screen)
+    return "Esc files" in visible(screen)
 
 
 def inspector_first(screen):
     # At narrow sizes Files is stacked below the chat; its content row follows
     # the visible tabs and rule instead of occupying a fixed screen row.
     tabs = next(row for row in range(3, screen.vt.rows - 5)
-                if "Файлы" in screen.vt.line(row) and "Source" in screen.vt.line(row))
+                if "Files" in screen.vt.line(row) and "Source" in screen.vt.line(row))
     return screen.vt.line(tabs + 2)
 
 
 def terminal(screen):
     local(screen, "/files")
-    until(screen, lambda frame: "q терминал" in frame, "Files inspector")
+    until(screen, lambda frame: "q terminal" in frame, "Files inspector")
     screen.send("q")
-    until(screen, lambda frame: "Терминал ·" in frame and shell_ready(screen), "embedded shell ready")
+    until(screen, lambda frame: "Terminal ·" in frame and shell_ready(screen), "embedded shell ready")
 
 
 def seed_history(binary, root, cwd):
@@ -312,13 +313,13 @@ def inline_tool_details(screen, root, cwd):
     until(screen, lambda frame: completed(root, "TOOLS_TASK") and ready(screen) and "get_test_value" in body(screen), "compact completed tool")
     compact = body(screen)
     headers = [line for line in compact.splitlines() if re.match(r"[>v] get_test_value\b", line)]
-    assert len(headers) == 1 and "готово" in headers[0], "tool lifecycle was split into duplicate rows"
-    assert "prepared" not in compact and "KnownResult" not in compact and "Аргументы" not in compact
+    assert len(headers) == 1 and "done" in headers[0], "tool lifecycle was split into duplicate rows"
+    assert "prepared" not in compact and "KnownResult" not in compact and "Arguments" not in compact
     screen.send("TOOLS_DRAFT Ж")
     until(screen, lambda frame: screen.vt.line(-4) == "› TOOLS_DRAFT Ж", "tool draft")
     row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> get_test_value"))
     click(screen, 0, row)
-    until(screen, lambda frame: "Аргументы" in body(screen) and "Вывод" in body(screen), "tool row opened inline")
+    until(screen, lambda frame: "Arguments" in body(screen) and "Output" in body(screen), "tool row opened inline")
     expanded = body(screen)
     assert "value: OMH_FIXED_VALUE_42" in expanded and "ok: true" in expanded
     assert '{"ok"' not in expanded and "KnownResult" not in expanded, "details exposed the raw protocol instead of readable values"
@@ -327,7 +328,7 @@ def inline_tool_details(screen, root, cwd):
     assert screen.vt.line(-4) == "› TOOLS_DRAFT Ж"
     row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("v get_test_value"))
     click(screen, 0, row)
-    until(screen, lambda frame: "Аргументы" not in body(screen) and "> get_test_value" in body(screen), "tool row collapsed")
+    until(screen, lambda frame: "Arguments" not in body(screen) and "> get_test_value" in body(screen), "tool row collapsed")
 
     # Dragging a tool row selects text rather than activating its click target.
     paint_quiet(screen)
@@ -339,12 +340,12 @@ def inline_tool_details(screen, root, cwd):
     assert copied(screen, at) == "get_test_value", "tool-row drag did not copy the displayed text"
     escape(screen)
     screen.send(b"\x14")
-    until(screen, lambda frame: "Аргументы" in body(screen) and "Вывод" in body(screen), "Ctrl+T opened tool details")
+    until(screen, lambda frame: "Arguments" in body(screen) and "Output" in body(screen), "Ctrl+T opened tool details")
     assert screen.vt.line(-4) == "› TOOLS_DRAFT Ж"
     before = journals(root)
-    row = next(row for row in range(3, screen.vt.rows - 5) if "Весь вывод" in screen.vt.line(row))
-    click(screen, screen.vt.line(row).index("Весь вывод"), row)
-    until(screen, lambda frame: "value: OMH_FIXED_VALUE_42" in frame and "j/k строки" in frame, "complete readable output inspector")
+    row = next(row for row in range(3, screen.vt.rows - 5) if "Full output" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index("Full output"), row)
+    until(screen, lambda frame: "value: OMH_FIXED_VALUE_42" in frame and "j/k lines" in frame, "complete readable output inspector")
     assert screen.vt.line(-4) == "› TOOLS_DRAFT Ж"
     output_before = body(screen)
     screen.send("Ж界😀")
@@ -354,7 +355,7 @@ def inline_tool_details(screen, root, cwd):
     assert screen.vt.line(-4) == "› TOOLS_DRAFT Ж", "read-only output accepted Unicode, paste or deletion into the draft"
     assert body(screen) == output_before and journals(root) == before, "read-only output input changed the view or canonical journal"
     escape(screen)
-    until(screen, lambda frame: "j/k строки" not in frame and "get_test_value" in frame, "output inspector returned to chat")
+    until(screen, lambda frame: "j/k lines" not in frame and "get_test_value" in frame, "output inspector returned to chat")
     assert journals(root) == before and screen.vt.line(-4) == "› TOOLS_DRAFT Ж"
 
 
@@ -399,7 +400,7 @@ def mouse_copy(screen, root, cwd):
     screen.resize(80, 20)
     screen.vt = Terminal(80, 20)
     screen.wait(b"\x1b[7mMOUSE_COPY", before_resize)
-    until(screen, lambda frame: model in screen.vt.line(-2) and "Сообщение агенту" not in screen.vt.line(-2), "compact status after resize")
+    until(screen, lambda frame: model in screen.vt.line(-2) and "Message agent" not in screen.vt.line(-2), "compact status after resize")
     mouse(screen, 0, 2 + len("MOUSE_COPY") - 1, row, release=True)
     text = copied(screen, at)
     assert text == "MOUSE_COPY" and "\x1b" not in text, repr(text)
@@ -430,7 +431,7 @@ def selection_scroll(screen, root, cwd):
     screen.resize(126, 32)
     screen.vt = Terminal(126, 32)
     local(screen, "/files")
-    until(screen, lambda frame: "panel/" in frame and "l каталог" in frame, "split file listing")
+    until(screen, lambda frame: "panel/" in frame and "l directory" in frame, "split file listing")
     screen.send(b"\r")
     paint_quiet(screen)
     assert "panel/" in visible(screen), "Enter entered a directory"
@@ -460,7 +461,7 @@ def selection_scroll(screen, root, cwd):
     mouse(screen, 0, 2, row, release=True)
     text = copied(screen, at)
     assert "HISTORY_FIRST" in text and "HISTORY_SEED_19" in text, text[-500:]
-    assert "INSPECTOR_NEVER_COPY" not in text and "Файлы" not in text and "\x1b" not in text
+    assert "INSPECTOR_NEVER_COPY" not in text and "Files" not in text and "\x1b" not in text
     assert screen.raw[at:].count(b"\x1b]52;c;") == 1
 
 
@@ -468,7 +469,7 @@ def branches(screen, root, cwd):
     screen.send("parent-marker\r")
     until(screen, lambda frame: "OMH_TOOL_OK:OMH_FIXED_VALUE_42" in frame, "parent completion")
     local(screen, "/fork")
-    until(screen, lambda frame: "Ветка" in screen.vt.line(1), "fork conversation")
+    until(screen, lambda frame: "Fork" in screen.vt.line(1), "fork conversation")
     assert "parent-marker" in visible(screen)
     screen.send("child-marker\r")
     until(screen, lambda frame: "child-marker" in screen.vt.line(1) and completed(root, "child-marker") and ready(screen), "fork completion")
@@ -481,7 +482,7 @@ def branches(screen, root, cwd):
     until(screen, lambda frame: "side-marker" not in screen.vt.line(1), "side parent return")
     assert "side-marker" not in visible(screen)
     local(screen, "/sessions")
-    until(screen, lambda frame: "Сессии проекта" in frame and "Выбрать разговор" in frame and "child-marker" in frame, "session picker with saved conversation titles")
+    until(screen, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame and "child-marker" in frame, "session picker with saved conversation titles")
     assert "parent-marker" in popup_text(screen) and "child-marker" in popup_text(screen)
     assert "side-marker" not in popup_text(screen), "side conversation leaked into the main/fork picker"
     assert not re.search(r"\bs_\d+_", screen.vt.line(1)), "conversation breadcrumb uses storage IDs as titles"
@@ -491,19 +492,19 @@ def branches(screen, root, cwd):
 def files_and_terminal(screen, root, cwd):
     (cwd / "notes.md").write_text("# Fixture heading\n\n**content**\n")
     local(screen, "/files notes.md")
-    until(screen, lambda frame: "только чтение" in frame and "Fixture heading" in frame, "file source")
+    until(screen, lambda frame: "read-only" in frame and "Fixture heading" in frame, "file source")
     screen.send("p")
     until(screen, lambda frame: "Fixture heading" in frame and "**content**" not in frame, "Markdown preview")
     screen.send("d")
-    until(screen, lambda frame: "Diff недоступен" in frame, "non-Git diff explicit")
+    until(screen, lambda frame: "Diff unavailable" in frame, "non-Git diff explicit")
     before = journals(root)
     screen.send("q")
-    until(screen, lambda frame: "Терминал ·" in frame and shell_ready(screen), "file inspector opened embedded terminal")
+    until(screen, lambda frame: "Terminal ·" in frame and shell_ready(screen), "file inspector opened embedded terminal")
     screen.send("ANSA_PTY_VALUE=CONSOLE_ONLY; export ANSA_PTY_VALUE; printf '%s:%s\\n' \"$ANSA_PTY_VALUE\" \"$$\" > terminal-state; printf CONSOLE_ONLY\r")
     until(screen, lambda frame: (cwd / "terminal-state").exists() and "CONSOLE_ONLY" in frame and shell_ready(screen), "manual shell output")
     state = (cwd / "terminal-state").read_text()
     escape(screen)
-    until(screen, lambda frame: "q терминал" in frame and "Esc к файлам" not in frame, "prompt Esc returned to Files")
+    until(screen, lambda frame: "q terminal" in frame and "Esc files" not in frame, "prompt Esc returned to Files")
     screen.send("q")
     until(screen, lambda frame: shell_ready(screen), "same terminal reopened")
     screen.send("printf '%s:%s\\n' \"$ANSA_PTY_VALUE\" \"$$\" > terminal-state-again; false; printf ' STATUS:%s ' \"$?\"\r")
@@ -511,9 +512,9 @@ def files_and_terminal(screen, root, cwd):
     assert (cwd / "terminal-state-again").read_text() == state, "q created a second shell or lost its environment"
     terminal_copy_then_input(screen, root, cwd)
     escape(screen)
-    until(screen, lambda frame: "q терминал" in frame and "Esc к файлам" not in frame, "terminal returned to files again")
+    until(screen, lambda frame: "q terminal" in frame and "Esc files" not in frame, "terminal returned to files again")
     escape(screen)
-    until(screen, lambda frame: "q терминал" not in frame, "Files returned to chat")
+    until(screen, lambda frame: "q terminal" not in frame, "Files returned to chat")
     assert "CONSOLE_ONLY" not in body(screen), "manual terminal output leaked into model conversation"
     assert journals(root) == before, "manual shell activity entered the canonical journal"
 
@@ -545,7 +546,7 @@ def terminal_copy_then_input(screen, root, cwd):
     except AssertionError:
         # Preserve a concrete recovery proof before failing the regression.
         escape(screen)
-        until(screen, lambda frame: "q терминал" in frame and "Esc к файлам" not in frame, "Files after frozen terminal selection")
+        until(screen, lambda frame: "q terminal" in frame and "Esc files" not in frame, "Files after frozen terminal selection")
         screen.send("q")
         until(screen, lambda frame: after in frame and shell_ready(screen), "new child output becomes visible after reopening terminal")
         observation["visible_after_reopen"] = True
@@ -557,7 +558,7 @@ def terminal_copy_then_input(screen, root, cwd):
 def editor_case(screen, root, cwd, cancel):
     (cwd / "notes.md").write_text("original\n")
     local(screen, "/files notes.md")
-    until(screen, lambda frame: "только чтение" in frame, "editor source")
+    until(screen, lambda frame: "read-only" in frame, "editor source")
     at = len(screen.raw)
     screen.send("e")
     screen.wait("EDITOR_READY", since=at)
@@ -572,7 +573,7 @@ def editor_case(screen, root, cwd, cancel):
         screen.send(b"save\r")
     screen.wait(b"\x1b[?1002h", since=resumed)
     screen.wait(b"\x1b[?1049l\x1b[?25h\x1b[0m", since=resumed)
-    until(screen, lambda frame: "ANSA" in frame and "только чтение" in frame, "editor terminal restored")
+    until(screen, lambda frame: "ANSA" in frame and "read-only" in frame, "editor terminal restored")
     assert not screen.vt.alternate and screen.vt.cursor_visible and not screen.vt.sgr, "editor screen modes not restored"
     if not cancel:
         until(screen, lambda frame: "edited" in frame, "edited file reloaded")
@@ -591,11 +592,11 @@ def editor_case(screen, root, cwd, cancel):
 def editor_early_exit(screen, root, cwd, stopped=False):
     (cwd / "notes.md").write_text("original\n")
     local(screen, "/files notes.md")
-    until(screen, lambda frame: "только чтение" in frame, "early editor source")
+    until(screen, lambda frame: "read-only" in frame, "early editor source")
     at = len(screen.raw)
     screen.send("e")
     screen.wait(b"\x1b[?1002h", since=at)
-    until(screen, lambda frame: "только чтение" in frame and "ANSA" in frame, "early editor return")
+    until(screen, lambda frame: "read-only" in frame and "ANSA" in frame, "early editor return")
     if stopped:
         assert not (cwd / "after-stop").exists(), "stopped editor was resumed"
     else:
@@ -621,11 +622,11 @@ def editor_early_exit(screen, root, cwd, stopped=False):
 def editor_missing(screen, root, cwd):
     (cwd / "notes.md").write_text("original\n")
     local(screen, "/files notes.md")
-    until(screen, lambda frame: "только чтение" in frame, "missing editor source")
+    until(screen, lambda frame: "read-only" in frame, "missing editor source")
     at = len(screen.raw)
     screen.send("e")
     screen.wait(b"\x1b[?1002h", since=at)
-    until(screen, lambda frame: "Не удалось открыть редактор" in frame, "missing editor diagnostic")
+    until(screen, lambda frame: "Could not open editor" in frame, "missing editor diagnostic")
     assert os.tcgetpgrp(screen.master) == screen.child.pid
     escape(screen)
     screen.send("restored-after-error")
@@ -656,7 +657,7 @@ def terminal_interrupt_and_app_escape(screen, root, cwd):
     escape(screen)
     until(screen, lambda frame: (cwd / "app-key").exists() and "APP_KEY_DONE" in frame and shell_ready(screen), "foreground app received Escape")
     assert (cwd / "app-key").read_bytes() == b"\x1b", "Escape navigated away instead of reaching the foreground reader"
-    assert "Терминал ·" in visible(screen) and journals(root) == before
+    assert "Terminal ·" in visible(screen) and journals(root) == before
     assert os.tcgetpgrp(screen.master) == screen.child.pid, "manual shell stole the outer terminal foreground group"
     at = len(screen.raw)
     screen.resize(10, 7)
@@ -671,9 +672,9 @@ def terminal_interrupt_and_app_escape(screen, root, cwd):
     assert journals(root) == before, "hidden terminal input entered the model journal"
     screen.send(b"\x15")
     escape(screen)
-    until(screen, lambda frame: "q терминал" in frame and "Esc к файлам" not in frame, "prompt Escape returns to Files")
+    until(screen, lambda frame: "q terminal" in frame and "Esc files" not in frame, "prompt Escape returns to Files")
     escape(screen)
-    until(screen, lambda frame: "q терминал" not in frame, "Files Escape returns to chat")
+    until(screen, lambda frame: "q terminal" not in frame, "Files Escape returns to chat")
     screen.send("SURVIVED_TERMINAL")
     until(screen, lambda frame: screen.vt.line(-4) == "› SURVIVED_TERMINAL", "composer after foreground interrupt")
     assert journals(root) == before and not (cwd / "cancel-late").exists()
@@ -682,9 +683,9 @@ def terminal_interrupt_and_app_escape(screen, root, cwd):
 def click_files_tab(screen):
     visible(screen)
     row = next(row for row in range(3, screen.vt.rows - 5)
-               if "Файлы" in screen.vt.line(row) and "Терминал" in screen.vt.line(row))
-    click(screen, screen.vt.line(row).index("Файлы") + 1, row)
-    until(screen, lambda frame: "q терминал" in frame and "Esc к файлам" not in frame, "Files tab after shell exit")
+               if "Files" in screen.vt.line(row) and "Terminal" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index("Files") + 1, row)
+    until(screen, lambda frame: "q terminal" in frame and "Esc files" not in frame, "Files tab after shell exit")
 
 
 def terminal_eof_and_exit(screen, root, cwd):
@@ -693,17 +694,17 @@ def terminal_eof_and_exit(screen, root, cwd):
     screen.send("printf '%s' \"$$\" > first-shell.pid\r")
     until(screen, lambda frame: (cwd / "first-shell.pid").exists() and shell_ready(screen), "first shell identity")
     screen.send(b"\x04")
-    until(screen, lambda frame: "Терминал завершён" in frame, "Ctrl+D exits embedded shell only")
+    until(screen, lambda frame: "Terminal exited" in frame, "Ctrl+D exits embedded shell only")
     assert screen.child.poll() is None and journals(root) == before
     click_files_tab(screen)
     screen.send("q")
     until(screen, lambda frame: shell_ready(screen), "q starts a new shell after explicit shell EOF")
     screen.send("printf '%s' \"$$\" > second-shell.pid; exit 7\r")
-    until(screen, lambda frame: (cwd / "second-shell.pid").exists() and "Терминал завершён" in frame, "exit 7 leaves workspace alive")
+    until(screen, lambda frame: (cwd / "second-shell.pid").exists() and "Terminal exited" in frame, "exit 7 leaves workspace alive")
     assert (cwd / "first-shell.pid").read_text() != (cwd / "second-shell.pid").read_text()
     click_files_tab(screen)
     escape(screen)
-    until(screen, lambda frame: "q терминал" not in frame, "chat after embedded shell exits")
+    until(screen, lambda frame: "q terminal" not in frame, "chat after embedded shell exits")
     screen.send("AFTER_SHELL_EOF")
     until(screen, lambda frame: screen.vt.line(-4) == "› AFTER_SHELL_EOF", "shell EOF did not close or corrupt composer")
     assert journals(root) == before, "shell EOF/exit mutated the model journal"
@@ -740,20 +741,20 @@ def native_terminal_panel(screen, root, cwd):
     screen.additional_screens = [("home-rejected", rejected)]
     rejected.result = rejected.finish()
     assert rejected.result["exit"] == 2 and rejected.result["termios_restored"]
-    assert "укажи папку проекта через --cwd".encode() in rejected.raw
+    assert "Use --cwd to select a project".encode() in rejected.raw
     assert set(catalog.iterdir()) == before, "invalid workspace created a session"
     screen.send("/term")
     until(screen, lambda frame: "/terminals" in body(screen), "native terminal command completion")
     screen.send(b"\t\r")
-    until(screen, lambda frame: "Терминал агента" in frame and "Агент ещё не открыл терминал" in frame,
+    until(screen, lambda frame: "Agent terminal" in frame and "The agent has not opened a terminal yet" in frame,
           "managed terminal panel in the normal Carbon entry point")
     session, = (root / "home/.ansa/sessions").glob("*/terminal-host-v1/terminal-v1.json")
     escape(screen)
-    until(screen, lambda frame: "Терминал агента" not in frame, "Esc returned to the chat")
+    until(screen, lambda frame: "Agent terminal" not in frame, "Esc returned to the chat")
     screen.send("TERMINAL_DEMO\r")
     until(screen, lambda frame: completed(root, "TERMINAL_DEMO"), "offline terminal tool created a PTY")
     local(screen, "/terminals")
-    until(screen, lambda frame: "Демо-терминал" in frame and "ANSA_TERMINAL_READY" in body(screen),
+    until(screen, lambda frame: "Demo terminal" in frame and "ANSA_TERMINAL_READY" in body(screen),
           "Carbon renders live PTY output")
     escape(screen)
     until(screen, lambda frame: "ANSA_TERMINAL_READY" not in body(screen), "Esc returned to the chat")
@@ -833,34 +834,34 @@ def live_terminal_opt_in(screen, root, cwd):
 def completion_and_help(screen, root, cwd):
     before = journals(root)
     screen.send("/mo")
-    until(screen, lambda frame: "/model" in body(screen) and "Tab/→ дописать" in frame, "slash prefix suggestions")
+    until(screen, lambda frame: "/model" in body(screen) and "Tab/→ complete" in frame, "slash prefix suggestions")
     screen.send(b"\t")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Для следующих сообщений" not in frame, "Tab completes without dispatch")
+    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Applies to future messages" not in frame, "Tab completes without dispatch")
     assert journals(root) == before
     screen.send(b"\r")
-    until(screen, lambda frame: "Для следующих сообщений" in frame, "Enter opens the completed command")
+    until(screen, lambda frame: "Applies to future messages" in frame, "Enter opens the completed command")
     escape(screen)
-    until(screen, lambda frame: "Для следующих сообщений" not in frame, "model menu closed before typing another prefix")
+    until(screen, lambda frame: "Applies to future messages" not in frame, "model menu closed before typing another prefix")
     screen.send("/")
     until(screen, lambda frame: "/model" in body(screen) and "/effort" in body(screen), "all command suggestions")
     screen.send(b"\x1b[B\x1b[C")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /effort" and "По умолчанию" not in frame, "arrows choose and Right inserts only")
+    until(screen, lambda frame: screen.vt.line(-4) == "› /effort" and "Default" not in frame, "arrows choose and Right inserts only")
     assert journals(root) == before
     screen.send(b"\x15")
     screen.send(b"/exit" + b"\x1b[D" * 4 + b"\r")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Для следующих сообщений" not in frame,
+    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Applies to future messages" not in frame,
           "Enter at a partial token inserts the selected command")
     assert journals(root) == before
     screen.send(b"\x15")
     screen.send("Проверь /mo потом")
     screen.send(b"\x1b[D" * len(" потом"))
-    until(screen, lambda frame: "/model" in body(screen) and "Tab/→ дописать" in frame, "completion at a middle word boundary")
+    until(screen, lambda frame: "/model" in body(screen) and "Tab/→ complete" in frame, "completion at a middle word boundary")
     screen.send(b"\t")
     until(screen, lambda frame: screen.vt.line(-4) == "› Проверь /model потом", "middle completion preserves prefix and suffix")
     assert journals(root) == before
     screen.send(b"\x05\x15")
     screen.send("?")
-    until(screen, lambda frame: "Команды ANSA" in frame, "empty composer question mark opens help")
+    until(screen, lambda frame: "ANSA commands" in frame, "empty composer question mark opens help")
     command_rows = [match for row in range(screen.vt.rows)
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
@@ -870,21 +871,21 @@ def completion_and_help(screen, root, cwd):
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert "/run" not in visible(screen), "removed /run remains advertised"
     screen.send(b"\x1b[B\r")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /effort" and "Команды ANSA" not in frame, "help arrows select and Enter only inserts")
+    until(screen, lambda frame: screen.vt.line(-4) == "› /effort" and "ANSA commands" not in frame, "help arrows select and Enter only inserts")
     assert journals(root) == before
     screen.send(b"\x15")
     screen.send("text?")
-    until(screen, lambda frame: screen.vt.line(-4) == "› text?" and "Команды ANSA" not in frame, "question mark inside text stays text")
+    until(screen, lambda frame: screen.vt.line(-4) == "› text?" and "ANSA commands" not in frame, "question mark inside text stays text")
     assert journals(root) == before
     screen.send(b"\x05\x15")
     # An ordinary whitespace delimiter is also valid for no-argument local
     # commands. It must never turn /exit or a mode switch into a model prompt.
     screen.send("/plan \r")
-    until(screen, lambda frame: "План" in screen.vt.line(-2) and screen.vt.line(-4) == "›", "trailing-space /plan routed locally")
+    until(screen, lambda frame: "Plan" in screen.vt.line(-2) and screen.vt.line(-4) == "›", "trailing-space /plan routed locally")
     screen.send("/plan \r")
-    until(screen, lambda frame: "План" not in screen.vt.line(-2) and screen.vt.line(-4) == "›", "/plan returns to work")
+    until(screen, lambda frame: "Plan" not in screen.vt.line(-2) and screen.vt.line(-4) == "›", "/plan returns to work")
     local(screen, "/pr main")
-    until(screen, lambda frame: "Черновик PR доступен в сетевом режиме ansa" in frame,
+    until(screen, lambda frame: "Opening a draft PR requires network access" in frame,
           "/pr stays local and refuses publishing offline")
     assert journals(root) == before, "whitespace in local commands dispatched canonical user turns"
     screen.send("/exit \r")
@@ -893,7 +894,7 @@ def completion_and_help(screen, root, cwd):
 
 def new_resume_and_exit(screen, root, cwd):
     assert screen.vt.line(0) == "ANSA" and screen.vt.line(1) == ""
-    assert "готов" not in screen.vt.line(-2) and cwd.name in screen.vt.line(-2)
+    assert "ready" not in screen.vt.line(-2) and cwd.name in screen.vt.line(-2)
     screen.send("PREVIOUS_SESSION\r")
     until(screen, lambda frame: completed(root, "PREVIOUS_SESSION") and "OMH_TOOL_OK" in frame,
           "previous session committed")
@@ -903,29 +904,29 @@ def new_resume_and_exit(screen, root, cwd):
           and sum(row["kind"] == "init" for row in records(root)) == 2, "new conversation with an empty transcript")
     assert sum(row["kind"] == "accepted" for row in records(root)) == 1
     local(screen, "/resume")
-    until(screen, lambda frame: "Сессии проекта" in frame and "PREVIOUS_SESSION" in popup_text(screen),
+    until(screen, lambda frame: "Project sessions" in frame and "PREVIOUS_SESSION" in popup_text(screen),
           "resume opened saved sessions on an idle chat")
     assert "resume_not_available" not in visible(screen)
     escape(screen)
-    until(screen, lambda frame: "Сессии проекта" not in frame, "session picker closed")
+    until(screen, lambda frame: "Project sessions" not in frame, "session picker closed")
     local(screen, f"/resume {previous.name}")
     until(screen, lambda frame: "PREVIOUS_SESSION" in screen.vt.line(1), "resume with an ID reopened that conversation")
     screen.send("Черновик Ж界")
     until(screen, lambda frame: screen.vt.line(-4) == "› Черновик Ж界", "draft before interrupt")
     screen.send(b"\x03")
     until(screen, lambda frame: screen.vt.line(-4) == "›", "interrupt clears the draft")
-    assert "ещё раз для выхода" not in visible(screen)
+    assert "again to exit" not in visible(screen)
     local(screen, "/status")
     until(screen, lambda frame: "ansa: completed" in frame, "explicit status before exit")
     screen.send(b"\x03")
-    until(screen, lambda frame: "Ctrl+C ещё раз для выхода" in screen.vt.line(-1), "first empty interrupt confirms exit")
+    until(screen, lambda frame: "Press Ctrl+C again to exit" in screen.vt.line(-1), "first empty interrupt confirms exit")
     screen.send("x")
-    until(screen, lambda frame: screen.vt.line(-4) == "› x" and "ещё раз для выхода" not in frame,
+    until(screen, lambda frame: screen.vt.line(-4) == "› x" and "again to exit" not in frame,
           "typing disarms exit")
     screen.send(b"\x03")
     until(screen, lambda frame: screen.vt.line(-4) == "›", "draft cleared after disarming")
     screen.send(b"\x03")
-    until(screen, lambda frame: "Ctrl+C ещё раз для выхода" in screen.vt.line(-1), "exit armed again")
+    until(screen, lambda frame: "Press Ctrl+C again to exit" in screen.vt.line(-1), "exit armed again")
     screen.send(b"\x03")
     return "normal"
 
@@ -933,19 +934,19 @@ def new_resume_and_exit(screen, root, cwd):
 def model_effort_pair(screen, root, cwd):
     before = journals(root)
     local(screen, "/model")
-    until(screen, lambda frame: "Для следующих сообщений" in frame and "Enter выбрать effort" in frame, "model selection stage")
+    until(screen, lambda frame: "Applies to future messages" in frame and "Enter choose effort" in frame, "model selection stage")
     screen.send(b"\r")
-    until(screen, lambda frame: "По умолчанию" in frame and "Enter применить пару" in frame, "effort selection follows model")
+    until(screen, lambda frame: "Default" in frame and "Enter apply" in frame, "effort selection follows model")
     assert journals(root) == before, "choosing a model committed before effort confirmation"
     escape(screen)
-    until(screen, lambda frame: "Enter выбрать effort" in frame, "effort Esc returns to model list")
+    until(screen, lambda frame: "Enter choose effort" in frame, "effort Esc returns to model list")
     escape(screen)
     assert journals(root) == before, "cancelling the staged pair wrote runtime state"
-    until(screen, lambda frame: "Enter выбрать effort" not in frame, "model picker cancelled before reopening")
+    until(screen, lambda frame: "Enter choose effort" not in frame, "model picker cancelled before reopening")
     local(screen, "/model")
-    until(screen, lambda frame: "Enter выбрать effort" in frame, "cached model picker reopens")
+    until(screen, lambda frame: "Enter choose effort" in frame, "cached model picker reopens")
     screen.send(b"\r")
-    until(screen, lambda frame: "Enter применить пару" in frame, "pair ready to apply")
+    until(screen, lambda frame: "Enter apply" in frame, "pair ready to apply")
     screen.send(b"\r")
     until(screen, lambda frame: sum(row["kind"] == "generation_selected" for row in records(root)) == 1 and ready(screen), "single durable combined selection")
     events = records(root)
@@ -960,18 +961,18 @@ def plan_agent_inherits(screen, root, cwd):
     until(screen, lambda frame: completed(root, parent) and ready(screen)
           and "OMH_TOOL_OK:OMH_FIXED_VALUE_42" in frame, "parent reply rendered")
     local(screen, "/plan")
-    until(screen, lambda frame: "План" in screen.vt.line(-2), "parent entered plan")
+    until(screen, lambda frame: "Plan" in screen.vt.line(-2), "parent entered plan")
     before = journals(root)
     screen.send("Запусти субагента: подготовка\r")
-    until(screen, lambda frame: "Уточнить" in frame, "cancel preview")
+    until(screen, lambda frame: "Refine" in frame, "cancel preview")
     escape(screen)
     screen.send(b"\t")
-    until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "third Tab mode")
+    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "third Tab mode")
     screen.send("ORCHESTRATION_BLOCKED_WRITE_FIXTURE\r")
-    until(screen, lambda frame: "Перед запуском нужна ручная проверка" in frame and "[Уточнить]" in frame,
+    until(screen, lambda frame: "A manual check is required before starting" in frame and "[Refine]" in frame,
           "write plan explains blocked approval before Enter")
     screen.send(b"\x1b[A\r")
-    until(screen, lambda frame: "[Запуск недоступен]" in frame, "blocked write plan remains open")
+    until(screen, lambda frame: "[Start unavailable]" in frame, "blocked write plan remains open")
     escape(screen)
     screen.send("ORCHESTRATION_LONG_PLAN_FIXTURE\r")
     until(screen, lambda frame: "Проверить перенос длинного плана" in frame, "long proposal")
@@ -991,28 +992,28 @@ def session_agent_titles_restart(screen, root, cwd):
     parent = "PARENT_TITLE"
     screen.send(parent + "\r")
     until(screen, lambda frame: completed(root, parent) and ready(screen) and "OMH_TOOL_OK" in frame
-          and "Ctrl+C остановить" not in screen.vt.line(-2), "parent turn settled and title committed")
+          and "Ctrl+C stop" not in screen.vt.line(-2), "parent turn settled and title committed")
     screen.send(b"\t\t")
-    until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "third Tab mode")
+    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "third Tab mode")
     screen.send("Почему отчёт иногда пустой?\r")
-    until(screen, lambda frame: "Уточнить" in frame, "plan from a vague request")
+    until(screen, lambda frame: "Refine" in frame, "plan from a vague request")
     before_refine = journals(root)
     screen.send(b"\x1b[B\r")
-    until(screen, lambda frame: "Введите уточнение" in frame, "refinement returned to composer")
+    until(screen, lambda frame: "Enter a clarification" in frame, "refinement returned to composer")
     assert journals(root) == before_refine, "refinement launched a helper"
     approve_helpers(screen, "Проверить формат входных данных")
     open_helper(screen)
     escape(screen)
     until(screen, lambda frame: parent in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
-    until(screen, lambda frame: "Агенты разговора" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "Esc restored roster with both completed helpers")
+    until(screen, lambda frame: "Conversation agents" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "Esc restored roster with both completed helpers")
     assert not re.search(r"\bs_\d+_", screen.vt.line(1)), "agent breadcrumb displays an ID instead of a title"
     escape(screen)
-    until(screen, lambda frame: "Агенты разговора" not in frame and not helper_title(screen.vt.line(1)), "agent inspector closed before session command")
+    until(screen, lambda frame: "Conversation agents" not in frame and not helper_title(screen.vt.line(1)), "agent inspector closed before session command")
     local(screen, "/sessions")
-    until(screen, lambda frame: "Сессии проекта" in frame and "Выбрать разговор" in frame and parent in frame, "human-readable root session picker")
+    until(screen, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame and parent in frame, "human-readable root session picker")
     assert not helper_title(popup_text(screen)), "agents leaked into conversation picker"
     escape(screen)
-    until(screen, lambda frame: "Сессии проекта" not in frame and parent in screen.vt.line(1), "session picker closed before exit")
+    until(screen, lambda frame: "Project sessions" not in frame and parent in screen.vt.line(1), "session picker closed before exit")
     parent_id = next(json.loads((directory / "info.json").read_text())["id"]
                      for directory in (root / "home/.ansa/sessions").iterdir()
                      if any(event["kind"] == "accepted" and event["text"] == parent
@@ -1025,8 +1026,8 @@ def session_agent_titles_restart(screen, root, cwd):
     screen.additional_screens = [("restart", restarted)]
     until(restarted, lambda frame: parent in restarted.vt.line(1) and ready(restarted), "saved parent title restored")
     local(restarted, "/agents")
-    until(restarted, lambda frame: "Агенты разговора" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "completed agent tree rebuilt from journals")
-    assert "Заверш" in visible(restarted), "restarted completed agents lost their observed status"
+    until(restarted, lambda frame: "Conversation agents" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "completed agent tree rebuilt from journals")
+    assert "Completed" in visible(restarted), "restarted completed agents lost their observed status"
     assert not re.search(r"\bs_\d+_", restarted.vt.line(1)) and journals(root) == before
     restarted.result = restarted.finish(signal.SIGTERM)
     assert restarted.result["exit"] == 143 and restarted.result["termios_restored"] and restarted.result["flags_restored"], restarted.result
@@ -1050,14 +1051,14 @@ def orchestration_candidate(screen, root, cwd):
     report.write_text("before fixture\n")
     before = git("status", "--short")
     screen.send(b"\t\t")
-    until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "writer plan mode")
+    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "writer plan mode")
     screen.send("ORCHESTRATION_COMMAND_FIXTURE\r")
-    until(screen, lambda frame: "Независимое ревью" in frame or "независимое ревью" in frame,
+    until(screen, lambda frame: "Independent review" in frame or "independent review" in frame,
           "plan discloses verification and fixes")
     assert not (home := root / "home/.ansa/orchestration").exists()
     assert "./check.sh" in visible(screen) and not check_marker.exists()
     screen.send(b"\r")
-    until(screen, lambda frame: "ansa-result готова" in frame and "Проверенные изменения" in frame,
+    until(screen, lambda frame: "ansa-result готова" in frame and "Verified changes" in frame,
           "reviewed isolated candidate and diff", timeout=15)
     checkout, = home.glob("*/*/checkout")
     assert git("show", "ansa-result:report.txt", path=checkout) == "after fixture\n"
@@ -1065,7 +1066,7 @@ def orchestration_candidate(screen, root, cwd):
     assert git("show", ":report.txt") == "committed version\n"
     assert git("status", "--short") == before
     assert check_marker.read_text() == "x"
-    assert "снимок проекта → ansa-result" in visible(screen)
+    assert "project snapshot → ansa-result" in visible(screen)
     screen.send(b"\t")
     for cols, rows in [(80, 24), (120, 36)]:
         screen.resize(cols, rows)
@@ -1080,12 +1081,12 @@ def orchestration_candidate(screen, root, cwd):
     until(screen, lambda frame: "report.txt · +1 −1" in frame, "diff restored after resize")
     escape(screen)
     screen.send("review draft")
-    until(screen, lambda frame: "./check.sh · пройдено" in frame, "confirmed command as chat result")
-    select_result(screen, "./check.sh · пройдено")
+    until(screen, lambda frame: "./check.sh · passed" in frame, "confirmed command as chat result")
+    select_result(screen, "./check.sh · passed")
     screen.send(b"\r")
     until(screen, lambda frame: "fixture-check-output" in frame, "show actual command output")
     escape(screen)
-    until(screen, lambda frame: "› ./check.sh · пройдено" in frame and "review draft" in screen.vt.line(-4),
+    until(screen, lambda frame: "› ./check.sh · passed" in frame and "review draft" in screen.vt.line(-4),
           "same keyboard result and draft after Esc")
     escape(screen)
     screen.send(b"\x03")
@@ -1107,22 +1108,22 @@ def orchestration_candidate(screen, root, cwd):
     pending.chmod(0o600)
     restarted = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--session", parent_id])
     screen.additional_screens = [("restart", restarted)]
-    until(restarted, lambda frame: "Утверждённый план" in frame, "plan link after restart")
-    select_result(restarted, "Утверждённый план")
+    until(restarted, lambda frame: "Approved plan" in frame, "plan link after restart")
+    select_result(restarted, "Approved plan")
     restarted.send(b"\r")
-    until(restarted, lambda frame: "Исходный запрос" in frame, "original question from approved run ledger")
+    until(restarted, lambda frame: "Original request" in frame, "original question from approved run ledger")
     escape(restarted)
     escape(restarted)
-    until(restarted, lambda frame: "./check.sh · пройдено" in frame, "verified checks recovered from their receipts")
-    select_result(restarted, "./check.sh · пройдено")
+    until(restarted, lambda frame: "./check.sh · passed" in frame, "verified checks recovered from their receipts")
+    select_result(restarted, "./check.sh · passed")
     restarted.send(b"\r")
     until(restarted, lambda frame: "fixture-check-output" in frame, "verified command output after restarting")
     escape(restarted)
     escape(restarted)
     local(restarted, "/sessions")
-    until(restarted, lambda frame: "Продолжить оркестрацию" in frame, "explicit continuation from original ledgers")
+    until(restarted, lambda frame: "Resume orchestration" in frame, "explicit continuation from original ledgers")
     restarted.send(b"\r")
-    until(restarted, lambda frame: "Проверенные изменения" in frame, "reconciled exact original candidate", timeout=15)
+    until(restarted, lambda frame: "Verified changes" in frame, "reconciled exact original candidate", timeout=15)
     until(restarted, lambda frame: (run / "summary-admitted").is_file(), "restored durable handoff receipt")
     assert git("rev-parse", "ansa-result", path=checkout) == frozen
     assert check_marker.read_text() == "x", "recovery ran the completed command again"
@@ -1136,30 +1137,30 @@ def openrouter_orchestration(screen, root, cwd):
     until(screen, lambda frame: "deepseek/deepseek-v4.1-flash-1017" in frame
           and screen.vt.line(-4).startswith("›"), "pinned OpenRouter model")
     screen.send(b"\t\t")
-    until(screen, lambda frame: "Оркестрация" in screen.vt.line(-2), "OpenRouter plan mode")
+    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "OpenRouter plan mode")
     held_child = root / "hold-orchestration-child"
     held_summary = root / "hold-orchestration-summary"
     held_child.touch()
     held_summary.touch()
     prompt = "summarize fixture " + ("details " * 70) + "END_OF_USER_REQUEST"
     screen.send(prompt + "\r")
-    until(screen, lambda frame: "OPENROUTER_CARBON_PLAN" in frame and "Начать" in frame, "validated strict plan")
+    until(screen, lambda frame: "OPENROUTER_CARBON_PLAN" in frame and "Start" in frame, "validated strict plan")
     assert not (root / "home/.ansa/orchestration").exists()
-    assert "Рекомендация после отчёта" in visible(screen)
+    assert "Follow-up recommendation" in visible(screen)
     screen.send(b"\r")
-    until(screen, lambda frame: "0 из 1 агентов" in frame, "read-only plan starts despite a post-report recommendation")
+    until(screen, lambda frame: "0/1 agents" in frame, "read-only plan starts despite a post-report recommendation")
     screen.send("keep draft\r")
-    until(screen, lambda frame: "Черновик · можно отправить после завершения" in frame and "keep draft" in screen.vt.line(-4),
+    until(screen, lambda frame: "Draft · send after the task finishes" in frame and "keep draft" in screen.vt.line(-4),
           "draft retained while helper runs")
     held_child.unlink()
-    until(screen, lambda frame: "Координатор готовит сводку" in frame, "summary phase comes from coordinator state")
+    until(screen, lambda frame: "Coordinator is writing the summary" in frame, "summary phase comes from coordinator state")
     held_summary.unlink()
     until(screen, lambda frame: "OPENROUTER_CARBON_DONE" in frame, "coordinator summary", timeout=15)
-    until(screen, lambda frame: "Координатор готовит сводку" not in frame and "Утверждённый план" in frame,
+    until(screen, lambda frame: "Coordinator is writing the summary" not in frame and "Approved plan" in frame,
           "completed coordination leaves original request and plan in history")
     assert "summarize fixture" in visible(screen) and "END_OF_USER_REQUEST" in visible(screen) and "keep draft" in screen.vt.line(-4)
     assert not any(row.get("text") == "keep draft" for row in records(root))
-    select_result(screen, "Утверждённый план")
+    select_result(screen, "Approved plan")
     screen.send(b"\r")
     until(screen, lambda frame: "OPENROUTER_CARBON_PLAN" in frame, "read approved plan from its journal")
     escape(screen)

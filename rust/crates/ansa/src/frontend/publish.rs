@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-const TITLE: &str = "Проверенные изменения ansa";
+const TITLE: &str = "Verified changes from ansa";
 const PR_FIELDS: &str =
     "url,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,isCrossRepository,state";
 
@@ -564,7 +564,7 @@ pub(super) fn draft(factory: &Factory, parent: &str, base: &str, stop: &Cancel) 
                         "--title",
                         TITLE,
                         "--body",
-                        "Кандидат прошёл проверки и независимое ревью в ansa.",
+                        "The candidate passed its checks and independent review in ansa.",
                         "--draft",
                     ],
                 )?;
