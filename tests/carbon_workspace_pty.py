@@ -1217,16 +1217,27 @@ def siwc_orchestration(screen, root, cwd):
         assert [row["kind"] for row in records(root)] == ["init"]
         screen.send(b"\x03")
         until(screen, lambda _: screen.vt.line(-4) == "›", "failed draft can be edited")
-    screen.send(b"Inspect this workspace\r")
-    until(screen, lambda frame: "SIWC_CARBON_PLAN" in frame and "Start" in frame,
-          "strict GPT plan displayed for approval")
+    screen.send(b"UNNAMED_READ_SCOPE\r")
+    until(screen, lambda frame: "Name the read folder in your request" in frame
+          and screen.vt.line(-4) == "› UNNAMED_READ_SCOPE", "the model cannot select an unrelated folder")
+    assert [row["kind"] for row in records(root)] == ["init"]
+    screen.send(b"\x03")
+    until(screen, lambda _: screen.vt.line(-4) == "›", "clear the unnamed folder request")
+    screen.send(b"Inspect Workspace/pet\r")
+    until(screen, lambda frame: "Read folder" in frame and "SIWC_CARBON_PLAN" in frame and "Start" in frame,
+          "the read folder and plan are visible before approval")
+    selected = str(root / "home/Workspace/pet")
+    assert f"Read folder · {selected}" in visible(screen), "the approval screen must show the canonical read folder"
     assert not (root / "home/.ansa/orchestration").exists()
     screen.send(b"\r")
     until(screen, lambda frame: "SIWC_CARBON_DONE" in frame and ready(screen, "gpt-6.2-sol"),
           "strict GPT helpers ran their tools and the coordinator answered")
     assert "SIWC_HELPER_DONE" not in body(screen), "helper result leaked into the conversation"
-    assert sum(row["kind"] == "outcome" for row in records(root)) == 2
+    all_records = records(root)
+    assert sum(row["kind"] == "outcome" for row in all_records) == 3
     assert len(list((root / "home/.ansa/sessions").iterdir())) == 3
+    assert [row["configuration"]["epoch"]["exact_state"]["settings"]["cwd"]
+            for row in all_records if row["kind"] == "init" and "final_format" in row["configuration"]] == [selected, selected]
 
     handoff, = (row["turn"] for row in records(root) if row.get("handoff") is True)
     until(screen, lambda _: any(row["kind"] == "done" and row["turn"] == handoff for row in records(root))
@@ -1304,6 +1315,9 @@ def main():
                 cwd.chmod(0o700)
                 if name == "siwc-orchestration":
                     seed_siwc(home)
+                    nested = home / "Workspace/pet/ansa"
+                    nested.mkdir(parents=True)
+                    (nested / "AGENTS.md").write_text("Follow the fixture instructions.\n" * 600 + "END_NESTED_INSTRUCTIONS\n")
                 adapter = name.replace("-orchestration", "-carbon")
                 screen = Pty(str(args.binary.resolve()), root, home, cwd, "", True, size=(100, 32),
                              argv=["--frontend-fixture", str(root), adapter])

@@ -18,9 +18,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+const TOOL_RESULT_BYTES: usize = 120 * 1024;
+
 pub(crate) fn result(value: Json) -> Outcome {
     let text = value.dump();
-    Outcome::succeeded(if text.len() > 120 * 1024 {
+    Outcome::succeeded(if text.len() > TOOL_RESULT_BYTES {
         r#"{"error":"tool_output_limit"}"#.into()
     } else {
         text
@@ -117,30 +119,29 @@ impl Host {
         Ok(resolved)
     }
     pub fn instructions(&self, directory: &Path, args: &Json) -> Result<Option<Outcome>> {
-        let complete = saved_instructions(directory, &self.settings.home)?;
-        let base = self.epoch.exact_state.field("instructions")?.elements()?;
-        let mut added = vec![];
-        let mut bytes = 0;
-        for file in &complete {
-            if !base.contains(file) {
-                let len = file.text_field("text")?.len();
-                if len > 8192 - bytes {
-                    return Err("instruction_size_limit");
-                }
-                bytes += len;
-                added.push(file.clone());
-            }
-        }
-        let token = sha256(Json::array(complete)?.dump().as_bytes());
+        let complete = Json::array(saved_instructions(directory, &self.settings.home)?)?;
+        let token = sha256(complete.dump().as_bytes());
         if args.text_field("instruction_token")? == token {
             return Ok(None);
         }
-        Ok(Some(result(Json::object(vec![
+        let base = self.epoch.exact_state.field("instructions")?.elements()?;
+        let added = complete
+            .elements()?
+            .iter()
+            .filter(|file| !base.contains(file))
+            .cloned()
+            .collect();
+        let output = Json::object(vec![
             ("status", s("instructions_required")?),
             ("executed", b(false)),
             ("instruction_token", s(&token)?),
             ("instructions", Json::array(added)?),
-        ])?)))
+        ])?
+        .dump();
+        if output.len() > TOOL_RESULT_BYTES {
+            return Err("instruction_size_limit");
+        }
+        Ok(Some(Outcome::succeeded(output)))
     }
     pub fn list(&self, args: &Json, stop: &Cancel) -> Result<Outcome> {
         let path = self.path(args.text_field("path")?)?;
@@ -150,7 +151,9 @@ impl Host {
         let mut entries = vec![];
         let mut bytes = 0;
         let mut truncated = false;
-        for entry in std::fs::read_dir(&path).map_err(|_| "file_access_failed")? {
+        for entry in ansa_linux::fs::read_directory(&path, self.scope.is_none())
+            .map_err(|_| "file_access_failed")?
+        {
             if stop.cancelled() {
                 return Ok(error("cancelled"));
             }
@@ -159,24 +162,16 @@ impl Host {
                 break;
             }
             let entry = entry.map_err(|_| "file_access_failed")?;
-            if self.protected_path(&entry.path()) {
+            if self.protected_path(&path.join(&entry.name)) {
                 continue;
             }
             let value = Json::object(vec![
                 (
                     "name",
-                    s(&ansa_linux::fs::utf8_text(
-                        entry.file_name().as_encoded_bytes(),
-                    ))?,
+                    s(&ansa_linux::fs::utf8_text(entry.name.as_encoded_bytes()))?,
                 ),
-                ("directory", b(entry.path().is_dir())),
-                (
-                    "symlink",
-                    b(entry
-                        .file_type()
-                        .map_err(|_| "file_access_failed")?
-                        .is_symlink()),
-                ),
+                ("directory", b(entry.directory)),
+                ("symlink", b(entry.symlink)),
             ])?;
             if !append(&mut entries, value, &mut bytes) {
                 truncated = true;

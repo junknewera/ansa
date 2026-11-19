@@ -93,6 +93,66 @@ pub fn regular_single(file: &File) -> io::Result<bool> {
     Ok(meta.is_file() && meta.nlink() == 1)
 }
 
+pub struct DirectoryEntry {
+    pub name: std::ffi::OsString,
+    pub directory: bool,
+    pub symlink: bool,
+    pub regular: bool,
+}
+
+pub struct DirectoryEntries {
+    entries: rustix::fs::Dir,
+    follow_link_directories: bool,
+}
+
+pub fn read_directory(path: &Path, follow_link_directories: bool) -> io::Result<DirectoryEntries> {
+    use rustix::fs::{Dir, OFlags};
+    let directory = open_nofollow(path, OFlags::RDONLY | OFlags::DIRECTORY)?;
+    let entries = Dir::new(directory)?;
+    Ok(DirectoryEntries {
+        entries,
+        follow_link_directories,
+    })
+}
+
+impl Iterator for DirectoryEntries {
+    type Item = io::Result<DirectoryEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use rustix::fs::{AtFlags, FileType, statat};
+        use std::os::unix::ffi::OsStrExt;
+        let entry = loop {
+            match self.entries.next()? {
+                Ok(entry) if matches!(entry.file_name().to_bytes(), b"." | b"..") => continue,
+                Ok(entry) => break entry,
+                Err(error) => return Some(Err(error.into())),
+            }
+        };
+        let name = entry.file_name();
+        let stat = |flags| self.entries.fd().and_then(|fd| statat(fd, name, flags));
+        let kind = match entry.file_type() {
+            FileType::Unknown => match stat(AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                Err(error) => return Some(Err(error.into())),
+            },
+            kind => kind,
+        };
+        let symlink = kind == FileType::Symlink;
+        let directory = kind == FileType::Directory
+            || (symlink
+                && self.follow_link_directories
+                && stat(AtFlags::empty()).is_ok_and(|stat| {
+                    FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+                }));
+        Some(Ok(DirectoryEntry {
+            name: std::ffi::OsStr::from_bytes(name.to_bytes()).to_owned(),
+            directory,
+            symlink,
+            regular: kind == FileType::RegularFile,
+        }))
+    }
+}
+
 /// Traverse workspace-relative directories from a pinned descriptor.
 pub fn open_relative_directory(directory: &File, path: &Path) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags};
@@ -351,6 +411,25 @@ pub fn read_record(directory: &File, name: &str) -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn directory_listing_uses_the_original_descriptor() {
+        let root = std::env::temp_dir().join(format!("ansa-listing-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let folder = root.join("folder");
+        let replacement = root.join("replacement");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(folder.join("first"), b"fixture").unwrap();
+        std::fs::write(replacement.join("second"), b"fixture").unwrap();
+        let mut entries = read_directory(&folder, false).unwrap();
+        std::fs::rename(&folder, root.join("original")).unwrap();
+        std::os::unix::fs::symlink(&replacement, &folder).unwrap();
+        assert!(read_directory(&folder, false).is_err());
+        assert_eq!(entries.next().unwrap().unwrap().name, "first");
+        assert!(entries.next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn readiness_record_is_invisible_until_complete_and_cannot_replace_a_claim() {
         use std::os::unix::fs::DirBuilderExt;

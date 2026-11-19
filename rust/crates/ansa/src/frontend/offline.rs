@@ -158,17 +158,17 @@ fn orchestration_fixture(request: &Request) -> Result<Option<AdmittedResponse>> 
         }
     }
     let text = match request.final_format() {
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands) if user == "ORCHESTRATION_LONG_PLAN_FIXTURE" => serde_json::json!({
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder) if user == "ORCHESTRATION_LONG_PLAN_FIXTURE" => serde_json::json!({
             "schema_version": 1, "summary": "Проверить перенос длинного плана", "checks":[], "manual_checks":[], "steps": [
                 {"id":"long", "task":format!("{}VISIBLE_END_OF_STEP", "длинная строка ".repeat(130)), "access":"read", "paths":[], "depends_on":[], "acceptance":"Прочитать строку целиком"}
             ]
         }).to_string(),
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_BLOCKED_WRITE_FIXTURE") => serde_json::json!({
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_BLOCKED_WRITE_FIXTURE") => serde_json::json!({
             "schema_version": 1, "summary": "Обновить тестовый отчёт", "checks":[{"path":"report.txt","contains":"after fixture"}], "manual_checks": if user == "ORCHESTRATION_BLOCKED_WRITE_FIXTURE" { vec!["Подтвердить исходные данные"] } else { vec![] }, "steps": [
                 {"id":"edit", "task":"Синтетическая правка отчёта", "access":"write", "paths":["report.txt"], "depends_on":[], "acceptance":"Тестовый отчёт содержит after fixture"}
             ]
         }).to_string(),
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands) => serde_json::json!({
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder) => serde_json::json!({
             "schema_version": 1,
             "summary": "Разобрать запрос и собрать подтверждения",
             "checks": [],
@@ -200,15 +200,21 @@ fn orchestration_fixture(request: &Request) -> Result<Option<AdmittedResponse>> 
         }
         None => return Ok(None),
     };
-    let text = if request.final_format() == Some(FinalFormat::OrchestrationPlanWithCommands) {
+    let text = if request
+        .final_format()
+        .is_some_and(FinalFormat::has_command_checks)
+    {
         let checks = if user == "ORCHESTRATION_COMMAND_FIXTURE" {
             serde_json::json!([{"argv":["./check.sh"]}])
         } else {
             serde_json::json!([])
         };
-        Json::parse(&text)?
-            .with("command_checks", Json::parse(&checks.to_string())?)?
-            .dump()
+        let mut plan =
+            Json::parse(&text)?.with("command_checks", Json::parse(&checks.to_string())?)?;
+        if request.final_format() == Some(FinalFormat::OrchestrationPlanWithReadFolder) {
+            plan = plan.with("read_folder", Json::parse("null")?)?;
+        }
+        plan.dump()
     } else {
         text
     };

@@ -56,6 +56,8 @@ struct Proposal {
     schema_version: u8,
     summary: String,
     steps: Vec<Step>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_folder: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     checks: Vec<Check>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -158,6 +160,14 @@ impl Plan {
         {
             return Err("plan_check_scope");
         }
+        if let Some(folder) = &proposal.read_folder
+            && (folder.trim().is_empty()
+                || folder.len() > 4096
+                || folder.chars().any(char::is_control)
+                || !writes.is_empty())
+        {
+            return Err("plan_read_folder");
+        }
         for step in &proposal.steps {
             let mut dependencies = BTreeSet::new();
             if step
@@ -193,6 +203,22 @@ impl Plan {
 
     pub fn steps(&self) -> &[Step] {
         &self.0.steps
+    }
+
+    pub(crate) fn read_folder(&self) -> Option<&str> {
+        self.0.read_folder.as_deref()
+    }
+
+    pub(crate) fn resolve_read_folder(&mut self, folder: String) -> Result<()> {
+        if self.0.read_folder.is_none()
+            || !Path::new(&folder).is_absolute()
+            || folder.len() > 4096
+            || folder.chars().any(char::is_control)
+        {
+            return Err("plan_read_folder");
+        }
+        self.0.read_folder = Some(folder);
+        Ok(())
     }
 
     pub(crate) fn checks(&self) -> &[Check] {
@@ -349,6 +375,7 @@ mod tests {
                 schema_version: 1,
                 summary: "Find out why the report sometimes comes back empty".into(),
                 steps,
+                read_folder: None,
                 checks: Vec::new(),
                 command_checks: Vec::new(),
                 manual_checks: Vec::new(),

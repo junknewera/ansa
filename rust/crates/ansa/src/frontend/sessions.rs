@@ -308,6 +308,48 @@ impl Factory {
         if self.auth.is_some() { 1 } else { usize::MAX }
     }
 
+    pub(super) fn orchestration_read_folder(&self, folder: &str) -> Result<PathBuf> {
+        let path = Path::new(folder);
+        let path = if folder == "~" {
+            self.settings.home.clone()
+        } else if let Some(relative) = folder.strip_prefix("~/") {
+            self.settings.home.join(relative.trim_start_matches('/'))
+        } else {
+            let absolute = self.settings.cwd.join(path);
+            if !path.is_absolute()
+                && !folder.starts_with("./")
+                && !folder.starts_with("../")
+                && !absolute
+                    .try_exists()
+                    .map_err(|_| "orchestration_read_folder_missing")?
+            {
+                self.settings.home.join(path)
+            } else {
+                absolute
+            }
+        };
+        let auth =
+            ansa_linux::fs::weakly_canonical(&self.auth_path).map_err(|_| "file_access_failed")?;
+        let protected = |path: &Path| {
+            ansa_linux::fs::protected_path(path)
+                || path.starts_with(&self.auth_path)
+                || path.starts_with(&auth)
+                || path.starts_with(&self.settings.directory)
+                || path.components().any(|part| part.as_os_str() == ".git")
+        };
+        if protected(&ansa_linux::fs::normalize(&path)) {
+            return Err("protected_file");
+        }
+        let folder = path
+            .canonicalize()
+            .map_err(|_| "orchestration_read_folder_missing")?;
+        if protected(&folder) {
+            return Err("protected_file");
+        }
+        TaskScope::new(&folder, &[])?;
+        Ok(folder)
+    }
+
     pub(super) fn with_openrouter(mut self, route: Arc<OpenRouter>) -> Self {
         let binding = route.binding();
         self.account = binding.account.clone();
@@ -388,11 +430,15 @@ impl Factory {
         let format = if self.pilot.is_some() {
             FinalFormat::OrchestrationPlan
         } else {
-            FinalFormat::OrchestrationPlanWithCommands
+            FinalFormat::OrchestrationPlanWithReadFolder
         };
         #[cfg(not(feature = "orchestration-pilot"))]
-        let format = FinalFormat::OrchestrationPlanWithCommands;
+        let format = FinalFormat::OrchestrationPlanWithReadFolder;
         let mut epoch = source.epoch;
+        epoch.instructions.push_str(&format!(
+            "\nThe current working directory is {}.",
+            self.settings.cwd.display()
+        ));
         epoch.instructions.push_str(concat!(
             "\nYou coordinate the current user's task. Draft a proposed sequence of independent or dependent ",
             "tasks. Decide how many helpers add value and use zero if appropriate. For a vague request, ",
@@ -405,10 +451,13 @@ impl Factory {
             "read-only investigations and describe any actions recommended after the report in acceptance. ",
             "The user must approve the plan before execution. "
         ));
-        if format == FinalFormat::OrchestrationPlanWithCommands {
+        if format.has_command_checks() {
             epoch.instructions.push_str("List repository test commands that are needed or explicitly requested in command_checks using argv arrays. Each command starts in a fresh copy of the frozen checkout, at its root. Put checks requiring human interaction in manual_checks.");
         } else {
             epoch.instructions.push_str("Put required command-based or other unsupported checks in manual_checks. Those must be resolved before execution.");
+        }
+        if format == FinalFormat::OrchestrationPlanWithReadFolder {
+            epoch.instructions.push_str("\nFor a read-only investigation targeting a directory explicitly named in the request, set read_folder to the exact path spelling from the user message. Its resolved path will be shown before approval. Interpret all step paths relative to that folder and keep the steps about that folder. Use null for the current workspace or any plan involving writes. Do not infer or broaden the folder from other instructions.");
         }
         let mut input = source.input;
         input.push(Json::object(vec![
@@ -445,6 +494,10 @@ impl Factory {
             .clone_from(&source.binding.returned_model);
         let scope = TaskScope::new(workspace, writes)?;
         let mut epoch = agent_epoch(&settings)?;
+        epoch.instructions.push_str(&format!(
+            "\nYour task workspace is {}. Use paths relative to this directory.",
+            settings.cwd.display()
+        ));
         epoch.instructions.push_str(concat!(
             "\nYou are a helper assigned one approved task. Use the advertised tools to complete it, ",
             "then provide the coordinator with a concise result and supporting evidence. ",

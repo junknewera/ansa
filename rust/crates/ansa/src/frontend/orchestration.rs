@@ -41,7 +41,14 @@ impl Proposal {
         prompt: String,
         stop: &Cancel,
     ) -> Result<Self> {
-        let plan = factory.plan_orchestration(seed.clone(), &prompt, stop)?;
+        let mut plan = factory.plan_orchestration(seed.clone(), &prompt, stop)?;
+        if let Some(folder) = plan.read_folder() {
+            if !named_folder(&prompt, folder) {
+                return Err("orchestration_read_folder_not_named");
+            }
+            let resolved = factory.orchestration_read_folder(folder)?;
+            plan.resolve_read_folder(crate::config::path_text(&resolved)?.to_owned())?;
+        }
         let digest = crate::protocol::legacy_json_v1::sha256(plan.encode()?.as_bytes());
         Ok(Self {
             prompt,
@@ -50,6 +57,46 @@ impl Proposal {
             digest,
         })
     }
+}
+
+fn named_folder(mut prompt: &str, folder: &str) -> bool {
+    let separator = |ch: char| ch.is_whitespace() || "()[]<>,!?".contains(ch);
+    loop {
+        prompt = prompt.trim_start_matches(separator);
+        let Some(first) = prompt.chars().next() else {
+            return false;
+        };
+        if matches!(first, '`' | '"' | '\'') {
+            let Some((path, rest)) = prompt[1..].split_once(first) else {
+                return false;
+            };
+            let after = rest.strip_prefix('.').unwrap_or(rest);
+            if path == folder && after.chars().next().is_none_or(separator) {
+                return true;
+            }
+            prompt = if rest.chars().next().is_none_or(separator) {
+                rest
+            } else {
+                rest.split_once(separator).map_or("", |(_, rest)| rest)
+            };
+        } else {
+            let (path, rest) = prompt.split_once(separator).unwrap_or((prompt, ""));
+            if path == folder || path.strip_suffix('.') == Some(folder) {
+                return true;
+            }
+            prompt = rest;
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn read_folder_consent_matches_complete_paths() {
+    assert!(named_folder("Inspect Workspace/pet.", "Workspace/pet"));
+    assert!(named_folder("Read `/tmp/pet archive`.", "/tmp/pet archive"));
+    assert!(!named_folder("Read \"/tmp/pet archive\"", "/tmp/pet"));
+    assert!(!named_folder("Read \"/tmp/pet:archive\"", "/tmp/pet"));
+    assert!(!named_folder("Read /tmp/pet/ansa", "/tmp/pet"));
 }
 
 struct Child {
@@ -298,6 +345,10 @@ async fn schedule(
     let context = run.context().ok_or("orchestration_context")?;
     let prompt = context.prompt.clone();
     let source = Request::load(&Json::parse(&context.configuration)?)?;
+    let read_folder = run
+        .plan()
+        .read_folder()
+        .map_or_else(|| factory.settings.cwd.clone(), PathBuf::from);
     let mut details = BTreeMap::new();
     let result = async {
         loop {
@@ -356,7 +407,7 @@ async fn schedule(
                     let worktree = &candidate.as_ref().ok_or("worktree_missing")?.0;
                     worktree.path()
                 } else {
-                    factory.settings.cwd.as_path()
+                    read_folder.as_path()
                 };
                 active.push(start_child(factory, &mut run, task, workspace, &source, stop).await?);
             }
