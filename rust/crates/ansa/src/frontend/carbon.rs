@@ -1572,7 +1572,11 @@ pub fn layout_workspace(
             .as_ref()
             .is_some_and(|panel| panel.kind == InspectorKind::Command);
     let navigation = if ui.result_selected.is_some() {
-        "↑/↓ результат · Enter открыть · Esc ввод"
+        if narrow {
+            "↑/↓ · Enter · Esc"
+        } else {
+            "↑/↓ результат · Enter открыть · Esc ввод"
+        }
     } else if ui.popup.is_some() {
         ""
     } else if ui.suggestions.is_some() {
@@ -1598,24 +1602,32 @@ pub fn layout_workspace(
     } else {
         ui.interrupt_hint
     };
-    let hint = [
+    let hints = [
         interrupt,
         navigation,
         if results {
-            "Ctrl+G результаты"
+            if narrow {
+                "Ctrl+G"
+            } else {
+                "Ctrl+G результаты"
+            }
         } else {
             ""
         },
-        if narrow || ui.result_selected.is_some() {
+        if ui.result_selected.is_some() || ui.popup.is_some() {
             ""
         } else {
             "? помощь"
         },
-    ]
-    .into_iter()
-    .filter(|hint| !hint.is_empty())
-    .collect::<Vec<_>>()
-    .join(" · ");
+    ];
+    let mut hint = String::new();
+    for next in hints.into_iter().filter(|hint| !hint.is_empty()) {
+        let gap = if hint.is_empty() { "" } else { " · " };
+        if cells(&hint) + cells(gap) + cells(next) <= width / 2 {
+            hint.push_str(gap);
+            hint.push_str(next);
+        }
+    }
     rows.push(heading(&metadata, &hint, width, color));
     // Diagnostics are separate from frozen transcript rows.
     let notice = status.lines().nth(1).unwrap_or_default();
