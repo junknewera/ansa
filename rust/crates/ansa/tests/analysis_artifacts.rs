@@ -473,7 +473,10 @@ async fn invalid_or_missing_dataset_is_known_and_does_not_start_a_worker() {
         }
         if index == 2 {
             fs::create_dir(root.cwd().join("nested")).unwrap();
-            local::write(&root.cwd().join("nested/AGENTS.md"), &"x".repeat(8193));
+            local::write(
+                &root.cwd().join("nested/AGENTS.md"),
+                &"x".repeat(64 * 1024 + 1),
+            );
             local::write(&root.cwd().join(path), "date,value\n2026-01-01,1\n");
         }
         let mut run = runtime(
@@ -497,6 +500,9 @@ async fn invalid_or_missing_dataset_is_known_and_does_not_start_a_worker() {
         );
         let result = Json::parse(&event.output).unwrap();
         assert!(result.has("error"));
+        if index == 2 {
+            assert_eq!(result.text_field("error"), Ok("instruction_size_limit"));
+        }
         f::until(&run.handle(), |p| matches!(p, EventPayload::Done)).await;
         assert!(!root.0.join("session/artifacts").exists());
         assert!(
