@@ -255,7 +255,7 @@ fn terminal_fixture(request: &Request) -> Result<Option<AdmittedResponse>> {
         let hash = sha256(Json::array(request.input.clone())?.dump().as_bytes());
         let suffix = &hash[..16];
         let arguments = serde_json::json!({
-            "label": "Демо-терминал",
+            "label": "Demo terminal",
             "cwd": ".",
             "argv": ["sh", "-c", "printf 'ANSA_%s\\n' TERMINAL_READY; exec sh -i"],
             "rows": 24,
@@ -291,10 +291,7 @@ fn terminal_fixture(request: &Request) -> Result<Option<AdmittedResponse>> {
         }
         let part = obj(vec![
             ("type", s("output_text")),
-            (
-                "text",
-                s("Демо-терминал открыт. Экран доступен через /terminals."),
-            ),
+            ("text", s("Demo terminal opened. View it with /terminals.")),
         ]);
         (
             format!("fixture_terminal_done_{suffix}"),

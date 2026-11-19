@@ -30,7 +30,7 @@ impl Progress {
             .and_then(|clock| {
                 clock.started.map(|started| {
                     format!(
-                        " · {} мс",
+                        " · {} ms",
                         clock
                             .stopped
                             .unwrap_or(now)
@@ -182,31 +182,31 @@ impl Progress {
     pub fn elapsed(&self) -> Option<String> {
         self.clock.as_ref().map(|c| {
             format!(
-                "{}{} с",
-                if c.resumed { "с /resume: " } else { "" },
+                "{}{} s",
+                if c.resumed { "since /resume: " } else { "" },
                 self.seconds
             )
         })
     }
     pub fn phase(view: &Snapshot, preview: bool) -> &'static str {
         if view.storage_failed {
-            return "ошибка сохранения";
+            return "save error";
         }
         if view.recovery_operation.is_some() {
             return "effect_unknown";
         }
         match view.state.as_str() {
-            "idle" | "completed" => "готов",
-            "cancelled" if view.worker_busy => "отменено; завершение",
-            "cancelled" => "отменено",
-            "paused" => "пауза",
-            "generating" if preview => "получение ответа",
-            "generating" => "ожидание модели",
-            "executing" => "инструмент",
-            "compacting" => "сжатие контекста",
-            "persisting" | "finishing" => "сохранение",
-            "loading" => "открытие сессии",
-            _ => "в работе",
+            "idle" | "completed" => "ready",
+            "cancelled" if view.worker_busy => "cancelling",
+            "cancelled" => "cancelled",
+            "paused" => "paused",
+            "generating" if preview => "receiving response",
+            "generating" => "waiting for model",
+            "executing" => "running tool",
+            "compacting" => "compacting context",
+            "persisting" | "finishing" => "saving",
+            "loading" => "opening session",
+            _ => "working",
         }
     }
     pub fn entries(&self, view: &Snapshot, expanded: bool, now: Instant) -> Vec<Entry> {
@@ -226,7 +226,7 @@ impl Progress {
                 output: None,
                 status: None,
                 role: "tool".into(),
-                text: format!("Ещё {begin} вызовов - Ctrl+T: подробности"),
+                text: format!("{begin} more calls · Ctrl+T details"),
             });
         }
         for activity in &view.tools[begin..] {
@@ -237,9 +237,9 @@ impl Progress {
                     if view.recovery_operation.as_ref() == Some(&tool.operation) {
                         "effect_unknown"
                     } else if !view.worker_busy {
-                        "ожидает проверки"
+                        "pending validation"
                     } else {
-                        "выполняется"
+                        "running"
                     },
                     None,
                 ),
@@ -249,10 +249,10 @@ impl Progress {
                         "effect_unknown"
                     } else {
                         match tool.execution {
-                            Execution::Succeeded => "готово",
-                            Execution::Failed => "ошибка",
-                            Execution::Cancelled => "отменён",
-                            Execution::Denied => "отклонён",
+                            Execution::Succeeded => "done",
+                            Execution::Failed => "error",
+                            Execution::Cancelled => "cancelled",
+                            Execution::Denied => "denied",
                         }
                     },
                     Some(tool.output.as_str()),
@@ -262,7 +262,7 @@ impl Progress {
                 .and_then(|c| {
                     c.started.map(|started| {
                         format!(
-                            " ~{} мс",
+                            " ~{} ms",
                             c.stopped
                                 .unwrap_or(now)
                                 .saturating_duration_since(started)
@@ -280,7 +280,7 @@ impl Progress {
                     text.push_str(&preview);
                 }
                 if output.chars().nth(limit).is_some() {
-                    text.push_str("\n[вывод сокращён]");
+                    text.push_str("\n[output truncated]");
                 }
             }
             result.push(Entry {
@@ -340,7 +340,7 @@ mod tests {
         v.worker_busy = false;
         progress.observe(&v, start + Duration::from_secs(1));
         progress.tick(start + Duration::from_secs(2));
-        assert_eq!(progress.elapsed().as_deref(), Some("2 с"));
+        assert_eq!(progress.elapsed().as_deref(), Some("2 s"));
         v.submit = Some("submit".into());
         v.worker_busy = true;
         for (index, stage) in ["generating", "executing", "generating", "finishing"]
@@ -354,7 +354,7 @@ mod tests {
         v.state = "completed".into();
         progress.observe(&v, start + Duration::from_secs(9));
         progress.observe(&v, start + Duration::from_secs(20));
-        assert_eq!(progress.elapsed().as_deref(), Some("9 с"));
+        assert_eq!(progress.elapsed().as_deref(), Some("9 s"));
         let mut reopened = Progress::default();
         v.state = "paused".into();
         v.worker_busy = true;
@@ -365,7 +365,7 @@ mod tests {
         v.state = "generating".into();
         reopened.observe(&v, start);
         reopened.tick(start + Duration::from_secs(2));
-        assert_eq!(reopened.elapsed().as_deref(), Some("с /resume: 2 с"));
+        assert_eq!(reopened.elapsed().as_deref(), Some("since /resume: 2 s"));
     }
     #[test]
     fn tool_snapshots_do_not_reset_timing_or_hide_unknown_effects() {
@@ -395,7 +395,7 @@ mod tests {
         assert!(
             entries[0]
                 .text
-                .contains("run_command: effect_unknown ~3000 мс")
+                .contains("run_command: effect_unknown ~3000 ms")
         );
         let frame = super::super::carbon::layout(
             &entries,
@@ -412,7 +412,7 @@ mod tests {
         assert!(!frame.lines.join("\n").contains('\x1b'));
         let mut reopened = Progress::default();
         reopened.observe(&v, start);
-        assert!(!reopened.entries(&v, false, start)[0].text.contains(" мс"));
+        assert!(!reopened.entries(&v, false, start)[0].text.contains(" ms"));
         v.recovery_operation = Some("operation".into());
         assert_eq!(Progress::phase(&v, false), "effect_unknown");
     }
@@ -431,7 +431,7 @@ mod tests {
         assert!(
             progress.entries(&v, false, start)[0]
                 .text
-                .contains("read_file: выполняется")
+                .contains("read_file: running")
         );
         let finished = Finished {
             operation: "op".into(),
@@ -448,7 +448,7 @@ mod tests {
         assert!(
             progress.entries(&v, false, start)[0]
                 .text
-                .contains("read_file: готово")
+                .contains("read_file: done")
         );
         let mut unknown = match &v.tools[0] {
             Activity::Finished(result) => result.clone(),

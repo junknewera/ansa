@@ -9,71 +9,71 @@ pub struct Command {
 const COMMANDS: &[Command] = &[
     Command {
         name: "/model",
-        description: "Выбрать модель и уровень рассуждения",
+        description: "Choose a model and reasoning effort",
     },
     Command {
         name: "/effort",
-        description: "Изменить уровень рассуждения модели",
+        description: "Change reasoning effort",
     },
     Command {
         name: "/thinking",
-        description: "Уровень рассуждения · алиас /effort",
+        description: "Reasoning effort · alias for /effort",
     },
     Command {
         name: "/theme",
-        description: "Оформление интерфейса",
+        description: "Choose a theme",
     },
     Command {
         name: "/files",
-        description: "Файлы, diff и терминал проекта",
+        description: "Browse files, diffs, and the project terminal",
     },
     Command {
         name: "/agents",
-        description: "Помощники текущего разговора",
+        description: "View agents in this conversation",
     },
     Command {
         name: "/pr",
-        description: "Создать черновик PR из проверенной ветки",
+        description: "Open a draft PR from a verified branch",
     },
     Command {
         name: "/sessions",
-        description: "Открыть сохранённый разговор",
+        description: "Open a saved conversation",
     },
     Command {
         name: "/new",
-        description: "Начать новый разговор",
+        description: "Start a new conversation",
     },
     Command {
         name: "/fork",
-        description: "Продолжить разговор отдельной веткой",
+        description: "Fork the current conversation",
     },
     Command {
         name: "/btw",
-        description: "Побочный разговор с доступом только для чтения",
+        description: "Start a read-only side conversation",
     },
     Command {
         name: "/plan",
-        description: "Переключить режим планирования",
+        description: "Toggle planning mode",
     },
     Command {
         name: "/copy",
-        description: "Скопировать подтверждённый диалог",
+        description: "Copy the confirmed transcript",
     },
     Command {
         name: "/resume",
-        description: "Открыть список сессий",
+        description: "Open the session list",
     },
     Command {
         name: "/help",
-        description: "Команды и клавиши",
+        description: "Commands and shortcuts",
     },
     Command {
         name: "/exit",
-        description: "Завершить ANSA",
+        description: "Exit ANSA",
     },
     Command {
         name: "/terminals",
-        description: "Посмотреть терминал агента",
+        description: "View the agent terminal",
     },
 ];
 
@@ -168,7 +168,7 @@ impl Completion {
     }
     pub fn popup(&self, exact_command: bool) -> Popup {
         Popup {
-            title: "Команды".into(),
+            title: "Commands".into(),
             subtitle: String::new(),
             items: self
                 .matches
@@ -180,9 +180,9 @@ impl Completion {
                 .collect(),
             selected: self.selected,
             footer: if exact_command {
-                "Enter выполнить · Tab/→ дописать · Esc закрыть"
+                "Enter run · Tab/→ complete · Esc close"
             } else {
-                "↑/↓ выбрать · Enter/Tab/→ дописать · Esc закрыть"
+                "↑/↓ select · Enter/Tab/→ complete · Esc close"
             }
             .into(),
         }
@@ -194,8 +194,8 @@ pub fn help(selected: usize) -> Popup {
 
 pub(crate) fn help_with_commands(selected: usize, commands: &[Command]) -> Popup {
     Popup {
-        title: "Команды ANSA".into(),
-        subtitle: "Ctrl+J новая строка · Ctrl+C очистить ввод или остановить шаг".into(),
+        title: "ANSA commands".into(),
+        subtitle: "Ctrl+J newline · Ctrl+C clear draft or stop".into(),
         items: commands
             .iter()
             .map(|command| Choice {
@@ -204,7 +204,7 @@ pub(crate) fn help_with_commands(selected: usize, commands: &[Command]) -> Popup
             })
             .collect(),
         selected,
-        footer: "↑/↓ выбрать · Enter вставить · Esc закрыть".into(),
+        footer: "↑/↓ select · Enter insert · Esc close".into(),
     }
 }
 

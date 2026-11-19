@@ -428,7 +428,7 @@ fn text_with_openrouter(
     }
     if parsed.native_terminals && settings.directory.starts_with(&settings.cwd) {
         eprintln!(
-            "Рабочая папка содержит каталог данных ansa. Для постоянного терминала укажи папку проекта через --cwd."
+            "The working directory contains ansa data. Use --cwd to select a project for the persistent terminal."
         );
         return Ok(2);
     }
@@ -681,7 +681,7 @@ fn auth_cli(command: &str, path: &Path) -> Result<i32> {
                 }
             }
             let mut launcher = Launcher(None);
-            eprintln!("Continue with ChatGPT в открывшемся браузере.");
+            eprintln!("Continue with ChatGPT in your browser.");
             manager.login(
                 |url| {
                     if url.contains("id_token_hint") {

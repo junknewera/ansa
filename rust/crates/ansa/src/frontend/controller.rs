@@ -319,17 +319,17 @@ impl State {
             self.copy
                 .start(self.snapshot.as_ref().map_or(0, |v| v.transcript_size))
         } else {
-            Err("/copy доступен в интерактивном терминале")
+            Err("/copy requires an interactive terminal")
         };
-        self.report(io, result.err().unwrap_or("Копирование диалога..."));
+        self.report(io, result.err().unwrap_or("Copying transcript…"));
     }
     fn copy_page(&mut self, handle: &Handle, replies: &mut Replies, io: &Io) {
         if let Some(result) = self.copy.take() {
             let message = match result {
                 Ok(text) if io.writer.clipboard(&text) => {
-                    "Диалог отправлен в буфер терминала (OSC 52)"
+                    "Transcript copied to the terminal clipboard (OSC 52)"
                 }
-                Ok(_) => "Копирование недоступно: очередь вывода заполнена",
+                Ok(_) => "Could not copy. The output queue is full",
                 Err(message) => message,
             };
             self.report(io, message);
@@ -367,7 +367,7 @@ impl State {
             text.push_str(&wait);
         }
         if let Some(elapsed) = self.progress.elapsed() {
-            text.push_str(&format!("\nВремя задачи: {elapsed}"));
+            text.push_str(&format!("\nTask time: {elapsed}"));
         }
         text.push('\n');
         text
@@ -388,12 +388,12 @@ impl State {
             let Some(value) = words.next() else {
                 self.report(
                     io,
-                    "Укажите /model MODEL или /effort LEVEL (default - выбор провайдера)\n",
+                    "Use /model MODEL or /effort LEVEL (default uses the provider setting)\n",
                 );
                 return (true, false);
             };
             if words.next().is_some() {
-                self.report(io, "Ожидалось одно значение\n");
+                self.report(io, "Expected one value\n");
                 return (false, false);
             }
             let Some(snapshot) = &self.snapshot else {
@@ -415,7 +415,7 @@ impl State {
                 }
             };
             self.post(handle, CommandPayload::SetGeneration(selection), replies);
-            self.report(io, "Проверяю выбор для следующих сообщений...\n");
+            self.report(io, "Checking settings for future messages…\n");
             return (true, false);
         }
         match text {
@@ -666,7 +666,7 @@ impl State {
                 self.report(
                     io,
                     &format!(
-                        "{} · {} - со следующего сообщения\n",
+                        "{} · {} applies to future messages\n",
                         selection.model,
                         selection.effort.as_deref().unwrap_or("default")
                     ),
@@ -772,9 +772,9 @@ impl State {
                     "{}{}",
                     preview.text,
                     if preview.state == "discarded" {
-                        " (незавершённый ответ)"
+                        " (incomplete response)"
                     } else if view.state != "completed" {
-                        " (предварительный ответ)"
+                        " (response preview)"
                     } else {
                         ""
                     }
@@ -795,14 +795,14 @@ impl State {
                     .is_some_and(|p| p.kind == carbon::InspectorKind::Command);
             [
                 if ui.activity.is_empty() {
-                    (self.mode == AgentMode::Plan).then_some("План")
+                    (self.mode == AgentMode::Plan).then_some("Plan")
                 } else {
                     Some(ui.activity.as_str())
                 },
                 (ui.focus == carbon::Focus::Inspector).then_some(if terminal {
-                    "Терминал"
+                    "Terminal"
                 } else {
-                    "Панель"
+                    "Panel"
                 }),
                 (!view.worker_busy && !matches!(view.state.as_str(), "idle" | "completed"))
                     .then_some(phase),
@@ -832,7 +832,7 @@ impl State {
             .filter(|f| f.state == "queued")
             .count();
         if ui.is_none() && queued > 0 {
-            status.push_str(&format!("  сообщений ожидает: {queued}"));
+            status.push_str(&format!("  queued messages: {queued}"));
         }
         if let Some(projected) = projected {
             entries = projected.to_vec();
@@ -842,7 +842,7 @@ impl State {
         }
         if !self.follow_tail && ui.is_none() {
             let unread = view.transcript_size.saturating_sub(self.reading_total);
-            status.push_str(&format!("  чтение, новых: {unread}"));
+            status.push_str(&format!("  reading, new: {unread}"));
         }
         // A live notice has a reserved row outside the frozen conversation.
         // Keep the code first so even a narrow terminal shows the failure.
@@ -858,9 +858,9 @@ impl State {
             format!("ansa: {} tools={}", view.state, view.completed_tools)
         } else if ui.is_none() && self.status.is_empty() && diagnostics::needs_attention(view) {
             if view.resume_available && !view.storage_failed && view.recovery_operation.is_none() {
-                "/resume - продолжить; /cancel - отменить запрос".into()
+                "/resume to continue or /cancel to cancel the request".into()
             } else {
-                "/resume недоступен; /cancel - отменить запрос".into()
+                "/resume unavailable · /cancel to cancel the request".into()
             }
         } else {
             self.status.trim().to_owned()

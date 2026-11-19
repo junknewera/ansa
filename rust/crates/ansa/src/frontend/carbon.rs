@@ -813,7 +813,7 @@ fn layout_impl(
     lines.push(editor);
     let mut clipped = String::new();
     let mut used = 0;
-    let text = format!("{status}  / команды  Tab фокус  ? помощь");
+    let text = format!("{status}  / commands  Tab focus  ? help");
     for glyph in glyphs(text.as_bytes()) {
         if glyph.newline || used + glyph.width > cols {
             break;
@@ -959,7 +959,7 @@ const DIFF_ADD: &str = "\x1b[48;2;24;58;39m";
 const DIFF_REMOVE: &str = "\x1b[48;2;68;31;36m";
 const USER_MESSAGE: &str = "\x1b[48;2;29;35;39m";
 const RESET: &str = "\x1b[0m";
-const EXIT_HINT: &str = "Ctrl+C ещё раз для выхода";
+const EXIT_HINT: &str = "Press Ctrl+C again to exit";
 const SELECTED: &str = "\x1b[48;2;46;63;88m\x1b[38;2;232;240;255m";
 
 fn tool_ink(role: &str) -> &'static str {
@@ -1411,7 +1411,7 @@ pub fn layout_workspace(
         if !breadcrumb.is_empty() {
             breadcrumb.push_str(" · ");
         }
-        breadcrumb.push_str("История");
+        breadcrumb.push_str("History");
         if ui.new_events > 0 {
             breadcrumb.push_str(&format!(" ↓ {}", ui.new_events));
         }
@@ -1575,30 +1575,30 @@ pub fn layout_workspace(
         if narrow {
             "↑/↓ · Enter · Esc"
         } else {
-            "↑/↓ результат · Enter открыть · Esc ввод"
+            "↑/↓ select · Enter open · Esc input"
         }
     } else if ui.popup.is_some() {
         ""
     } else if ui.suggestions.is_some() {
-        "Tab дописать"
+        "Tab complete"
     } else if terminal {
-        "Клик по чату"
+        "Click chat"
     } else if ui.focus == Focus::Inspector || ui.wide_diff {
-        "Tab → чат"
+        "Tab → chat"
     } else if let Some(panel) = &ui.inspector {
         match panel.kind {
             InspectorKind::Diff => "Tab → diff",
-            InspectorKind::Agents => "Tab → агенты",
-            InspectorKind::Image => "Tab → график",
-            _ => "Tab → панель",
+            InspectorKind::Agents => "Tab → agents",
+            InspectorKind::Image => "Tab → chart",
+            _ => "Tab → panel",
         }
     } else {
-        "Tab режим"
+        "Tab mode"
     };
     let results =
         !chat.tool_actions.is_empty() && ui.result_selected.is_none() && ui.focus == Focus::Chat;
     let interrupt = if terminal {
-        "Ctrl+C программе"
+        "Ctrl+C to program"
     } else {
         ui.interrupt_hint
     };
@@ -1606,18 +1606,14 @@ pub fn layout_workspace(
         interrupt,
         navigation,
         if results {
-            if narrow {
-                "Ctrl+G"
-            } else {
-                "Ctrl+G результаты"
-            }
+            if narrow { "Ctrl+G" } else { "Ctrl+G results" }
         } else {
             ""
         },
         if ui.result_selected.is_some() || ui.popup.is_some() {
             ""
         } else {
-            "? помощь"
+            "? help"
         },
     ];
     let mut hint = String::new();
@@ -1637,7 +1633,7 @@ pub fn layout_workspace(
         notice
     };
     let notice = if notice.is_empty() && ui.draft_notice {
-        "Черновик · можно отправить после завершения"
+        "Draft · send after the task finishes"
     } else {
         notice
     };

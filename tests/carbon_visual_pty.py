@@ -285,10 +285,10 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     screen.send('VISUAL_TASK\r')
     until(screen, lambda text: completed(root, 'VISUAL_TASK') and 'get_test_value' in text and 'OMH_TOOL_OK:OMH_FIXED_VALUE_42' in text, 'committed colored tool and final text')
     headers = [screen.vt.line(row) for row in range(3, screen.vt.rows - 5) if 'get_test_value' in screen.vt.line(row)]
-    assert len(headers) == 1 and '▸' in headers[0] and 'готово' in headers[0], headers
+    assert len(headers) == 1 and '▸' in headers[0] and 'done' in headers[0], headers
     target_fg = screen.vt.attribute('get_test_value')[0]
     answer_fg = screen.vt.attribute('OMH_TOOL_OK:OMH_FIXED_VALUE_42')[0]
-    status_fg = screen.vt.attribute('готово')[0]
+    status_fg = screen.vt.attribute('done')[0]
     assert target_fg is not None and status_fg is not None and target_fg != answer_fg
     user_bg = screen.vt.attribute('VISUAL_TASK', last=True)[1]
     assert user_bg is not None and screen.vt.attribute('VISUAL_TASK', last=True)[2], 'user text lost its visual emphasis'
@@ -300,19 +300,19 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     snapshot(screen, 'compact')
     row, column = screen.vt.location('get_test_value')
     click(screen, column, row)
-    until(screen, lambda text: 'Аргументы' in text and 'Вывод' in text and '▾' in text, 'colored inline expand')
+    until(screen, lambda text: 'Arguments' in text and 'Output' in text and '▾' in text, 'colored inline expand')
     assert screen.vt.attribute('get_test_value')[0] == target_fg
     assert screen.vt.attribute('VISUAL_TASK', last=True)[1] == user_bg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     snapshot(screen, 'expanded')
     row, column = screen.vt.location('get_test_value')
     click(screen, column, row)
-    until(screen, lambda text: 'Аргументы' not in text and '▸' in text, 'colored inline collapse')
+    until(screen, lambda text: 'Arguments' not in text and '▸' in text, 'colored inline collapse')
     before = journals(root)
     row, column = screen.vt.location('get_test_value')
     mouse(screen, 0, column, row)
     mouse(screen, 32, column + len('get_test_value') - 1, row)
-    until(screen, lambda text: attribute_is(screen, 'готово', 0, status_fg), 'selection retained unselected status color')
+    until(screen, lambda text: attribute_is(screen, 'done', 0, status_fg), 'selection retained unselected status color')
     until(screen, lambda text: screen.vt.attribute('get_test_value')[1] is not None, 'selection highlight painted')
     selected_bg = screen.vt.attribute('get_test_value')[1]
     assert selected_bg is not None, 'local text selection has no visible background'
@@ -324,7 +324,7 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     screen.wait(b'\x1b[H\x1b[2J', since=at)
     screen.vt = StyledTerminal(72, 40)
     until(screen, lambda text: 'get_test_value' in text and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'colored frozen resize')
-    assert screen.vt.attribute('готово')[0] == status_fg
+    assert screen.vt.attribute('done')[0] == status_fg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     assert screen.vt.attribute('get_test_value')[1] == selected_bg, 'resize lost local selection color'
     snapshot(screen, 'resized-selection')
@@ -368,26 +368,26 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     baseline = screen.vt.attribute('ANSA')[0]
     before = journals(root)
     local(screen, '/theme')
-    until(screen, lambda text: 'Предпросмотр темы' in text, 'theme picker')
+    until(screen, lambda text: 'Theme preview' in text, 'theme picker')
     screen.send(b'\x1b[B')
     until(screen, lambda text: 'ANSA' in text and not attribute_is(screen, 'ANSA', 0, baseline), 'Pink live preview')
     snapshot(screen, 'pink-preview')
     escape(screen)
-    until(screen, lambda text: 'Предпросмотр темы' not in text and attribute_is(screen, 'ANSA', 0, baseline), 'Esc rolled back theme')
+    until(screen, lambda text: 'Theme preview' not in text and attribute_is(screen, 'ANSA', 0, baseline), 'Esc rolled back theme')
     assert preferences(home) is None, 'preview wrote preferences before Enter'
     local(screen, '/theme')
-    until(screen, lambda text: 'Предпросмотр темы' in text, 'theme picker for commit')
+    until(screen, lambda text: 'Theme preview' in text, 'theme picker for commit')
     screen.send(b'\x1b[B')
     until(screen, lambda text: 'ANSA' in text and not attribute_is(screen, 'ANSA', 0, baseline), 'Pink second preview')
     pink = screen.vt.attribute('ANSA')[0]
     screen.send(b'\r')
-    until(screen, lambda text: preferences(home) == 'pink' and 'Предпросмотр темы' not in text, 'Enter persisted Pink')
+    until(screen, lambda text: preferences(home) == 'pink' and 'Theme preview' not in text, 'Enter persisted Pink')
     assert screen.vt.attribute('ANSA')[0] == pink
     choices = []
     last = pink
     for name in ['red', 'blue', 'amber']:
         local(screen, f'/theme {name}')
-        until(screen, lambda text: 'ANSA' in text and 'Загрузка' not in text and not attribute_is(screen, 'ANSA', 0, last), f'rapid {name} accepted')
+        until(screen, lambda text: 'ANSA' in text and 'Loading' not in text and not attribute_is(screen, 'ANSA', 0, last), f'rapid {name} accepted')
         last = screen.vt.attribute('ANSA')[0]
         native_background(screen, 'ANSA', '›')
         choices.append(name)
@@ -414,11 +414,11 @@ def theme_preferences(binary, adapter, root, home, cwd, screens):
     snapshot(restarted, 'dms-updated')
     prefs_before = (home / '.ansa/ui.json').read_bytes()
     local(restarted, '/theme')
-    until(restarted, lambda text: 'Предпросмотр темы' in text, 'DMS theme picker')
+    until(restarted, lambda text: 'Theme preview' in text, 'DMS theme picker')
     restarted.send(b'\x1b[A')
     until(restarted, lambda text: 'ANSA' in text and not attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'DMS picker preview')
     escape(restarted)
-    until(restarted, lambda text: 'Предпросмотр темы' not in text and attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'DMS preview rollback')
+    until(restarted, lambda text: 'Theme preview' not in text and attribute_is(restarted, 'ANSA', 0, (240, 136, 186)), 'DMS preview rollback')
     assert (home / '.ansa/ui.json').read_bytes() == prefs_before
     restarted.send('/')
     until(restarted, lambda text: attribute_is(restarted, '/model', 1, (73, 56, 71)), 'DMS colors the local completion selection')
@@ -441,7 +441,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
 
         def activity():
             return [(row, screen.vt.line(row)[0]) for row in range(3, screen.vt.rows - 5)
-                    if screen.vt.line(row)[:1] in spinners and 'ожидание модели' in screen.vt.line(row)]
+                    if screen.vt.line(row)[:1] in spinners and 'waiting for model' in screen.vt.line(row)]
 
         until(screen, lambda text: 'EDIT_VISUAL_TASK' in screen.vt.line(3) and bool(activity()),
               'accepted user body and generating activity under fixture hold', timeout=3)
@@ -467,7 +467,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         snapshot(screen, 'idle-animation')
     finally:
         hold.unlink(missing_ok=True)
-    until(screen, lambda text: completed(root, 'EDIT_VISUAL_TASK') and 'EDIT_DONE' in text and 'Изменён' in text, 'acknowledged edit inline diff')
+    until(screen, lambda text: completed(root, 'EDIT_VISUAL_TASK') and 'EDIT_DONE' in text and 'Edited' in text, 'acknowledged edit inline diff')
     assert (cwd / 'edit-target.rs').read_text() == 'fn main() {\n    new();\n}\n'
     assert '(+1 -1)' in visible(screen)
     old_row, _ = screen.vt.location('old();')
@@ -487,21 +487,21 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     native_background(screen, 'EDIT_DRAFT Ж')
     before = journals(root)
     snapshot(screen, 'inline-diff')
-    row, column = screen.vt.location('Изменён')
+    row, column = screen.vt.location('Edited')
     mouse(screen, 0, column, row)
     escape(screen)
     mouse(screen, 0, column, row, True)
     for _ in range(8): screen.drain(.01)
-    assert 'Diff правки' not in visible(screen), 'Esc did not cancel the pending click'
-    row, column = screen.vt.location('Изменён')
+    assert 'Edit diff' not in visible(screen), 'Esc did not cancel the pending click'
+    row, column = screen.vt.location('Edited')
     click(screen, column, row)
-    until(screen, lambda text: 'Diff правки' in text and 'j/k строки' in text, 'complete per-edit Diff inspector')
+    until(screen, lambda text: 'Edit diff' in text and 'j/k lines' in text, 'complete per-edit Diff inspector')
     assert screen.vt.attribute('old();')[1] == removed and screen.vt.attribute('new();')[1] == added
     assert screen.vt.attribute('fn main()')[1] is None
     assert 'EDIT_DRAFT Ж' in screen.vt.line(-4)
     snapshot(screen, 'full-diff')
     escape(screen)
-    until(screen, lambda text: 'Diff правки' not in text and 'Изменён' in text and 'EDIT_DONE' in text, 'Esc returned from edit diff')
+    until(screen, lambda text: 'Edit diff' not in text and 'Edited' in text and 'EDIT_DONE' in text, 'Esc returned from edit diff')
     assert 'EDIT_DRAFT Ж' in screen.vt.line(-4) and journals(root) == before
     rows = records(root)
     assert sum(row['kind'] == 'accepted' for row in rows) == 1
@@ -529,7 +529,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
 
             def quiet_activity():
                 return [row for row in range(3, quiet.vt.rows - 5)
-                        if quiet.vt.line(row).startswith('◷ ') and 'ожидание модели' in quiet.vt.line(row)]
+                        if quiet.vt.line(row).startswith('◷ ') and 'waiting for model' in quiet.vt.line(row)]
 
             until(quiet, lambda text: 'EDIT_REDUCED_MOTION_TASK' in quiet.vt.line(3) and bool(quiet_activity()),
                   'reduced-motion activity under fixture hold', timeout=3)
@@ -575,7 +575,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         rejection.touch()
         paused = start(adapter, failed_root, failed_home, failed_cwd, screens, 'paused-draft', adapter=True)
         paused.send('FAILED_TURN\r')
-        until(paused, lambda text: 'terminal_item_count' in text and 'пауза' in paused.vt.line(-2),
+        until(paused, lambda text: 'terminal_item_count' in text and 'paused' in paused.vt.line(-2),
               'provider failure paused the request')
         assert '/sessions' in paused.vt.line(-1) and 'Ctrl+C' in paused.vt.line(-1)
         paused.send('NEXT_TURN Ж\r')
@@ -583,18 +583,18 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         assert sum(row['kind'] == 'accepted' for row in records(failed_root)) == 1
         snapshot(paused, 'paused')
         paused.child.send_signal(signal.SIGINT)
-        until(paused, lambda text: paused.vt.line(-4) == '›' and 'пауза' in paused.vt.line(-2),
+        until(paused, lambda text: paused.vt.line(-4) == '›' and 'paused' in paused.vt.line(-2),
               'Ctrl+C cleared the draft and retained the paused request')
         local(paused, '/resume')
-        until(paused, lambda text: 'Сессии проекта' in text and 'Продолжить текущий запрос' in text,
+        until(paused, lambda text: 'Project sessions' in text and 'Resume current request' in text,
               'resume opened the saved sessions picker')
         paused.send(b'\r')
         until(paused, lambda text: (failed_root / 'generated').stat().st_size == 2
               and sum(row['kind'] == 'pause' for row in records(failed_root)) >= 2
-              and 'пауза' in paused.vt.line(-2), 'picker resumed the same request')
+              and 'paused' in paused.vt.line(-2), 'picker resumed the same request')
         rejection.unlink()
         paused.child.send_signal(signal.SIGINT)
-        until(paused, lambda text: 'отменено' in paused.vt.line(-2), 'Ctrl+C cancelled the paused request')
+        until(paused, lambda text: 'cancelled' in paused.vt.line(-2), 'Ctrl+C cancelled the paused request')
         paused.send('NEXT_TURN Ж\r')
         until(paused, lambda text: completed(failed_root, 'NEXT_TURN Ж') and 'EDIT_DONE' in text,
               'new message sent after cancellation')
@@ -639,17 +639,17 @@ def native_chart(binary, adapter, root, home, cwd, screens):
                    extra_env={'TERM': 'xterm-kitty'})
     pending = len(screen.raw)
     screen.send('Покажи график\r')
-    until(screen, lambda text: 'График · chart.png' in text and 'PNG · 160 × 80' in text
+    until(screen, lambda text: 'Chart · chart.png' in text and 'PNG · 160 × 80' in text
           and completed(root, 'Покажи график'), 'agent opened validated PNG')
     screen.wait(b'\x1b_Ga=T,f=100,t=d,', pending)
-    assert screen.vt.location('График · chart.png')[1] > screen.vt.cols // 3
+    assert screen.vt.location('Chart · chart.png')[1] > screen.vt.cols // 3
     until(screen, lambda _: image_bytes(screen, pending) is not None, 'complete image transfer')
     image_id, data = image_bytes(screen, pending)
     assert data == path.read_bytes()
     snapshot(screen, 'visible-chart')
     started = len(screen.raw)
     screen.send(b'\t')
-    until(screen, lambda text: 'Enter копировать путь' in text, 'graph focused')
+    until(screen, lambda text: 'Enter copy path' in text, 'graph focused')
     for _ in range(2):
         copied_at = len(screen.raw)
         screen.send(b'\r')
@@ -661,10 +661,10 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     screen.wait(delete, started)
     until(screen, lambda text: 'PNG · 160 × 80' not in text, 'Escape closed chart')
     snapshot(screen, 'closed-chart')
-    row, col = screen.vt.location('Открыть график')
+    row, col = screen.vt.location('Open chart')
     started = len(screen.raw)
     click(screen, col, row)
-    until(screen, lambda text: 'График · chart.png' in text, 'chart reopened from chat')
+    until(screen, lambda text: 'Chart · chart.png' in text, 'chart reopened from chat')
     until(screen, lambda _: image_bytes(screen, started) is not None, 'complete reopened chart')
     snapshot(screen, 'reopened-chart')
     escape(screen)
@@ -674,7 +674,7 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     for _ in range(12):
         screen.drain(.03)
         visible(screen)
-        if screen.vt.attribute('Открыть график · chart.png')[1] is not None:
+        if screen.vt.attribute('Open chart · chart.png')[1] is not None:
             break
         screen.send(b'\x1b[B')
     else:
@@ -683,7 +683,7 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     until(screen, lambda text: 'PNG · 160 × 80' in text, 'Enter opened selected PNG')
     escape(screen)
     until(screen, lambda text: 'PNG · 160 × 80' not in text and 'chart draft' in screen.vt.line(-4)
-          and screen.vt.attribute('Открыть график · chart.png')[1] is not None,
+          and screen.vt.attribute('Open chart · chart.png')[1] is not None,
           'Esc restored result focus and draft')
     escape(screen)
     screen.send(b'\x03')
@@ -691,12 +691,12 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     Image.new('RGB', (240, 120), (40, 90, 190)).save(other)
     (root / 'preview-other').touch()
     screen.send('Покажи второй график\r')
-    until(screen, lambda text: 'График · other.png' in text
+    until(screen, lambda text: 'Chart · other.png' in text
           and completed(root, 'Покажи второй график'), 'second chart opened')
     escape(screen)
-    row, col = screen.vt.location('Открыть график · chart.png')
+    row, col = screen.vt.location('Open chart · chart.png')
     click(screen, col, row)
-    until(screen, lambda text: 'График · chart.png' in text, 'first chart still opens')
+    until(screen, lambda text: 'Chart · chart.png' in text, 'first chart still opens')
     escape(screen)
     import struct
     import zlib
@@ -712,11 +712,11 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     until(screen, lambda text: 'preview_png_decode' in text and 'PNG_REJECTED' in text
           and completed(root, 'Проверь повреждённый PNG'),
           'invalid PNG rejected visibly')
-    assert 'График · other.png' not in visible(screen)
-    row, col = screen.vt.location('Открыть график · chart.png')
+    assert 'Chart · other.png' not in visible(screen)
+    row, col = screen.vt.location('Open chart · chart.png')
     reopening = len(screen.raw)
     click(screen, col, row)
-    until(screen, lambda text: 'График · chart.png' in text and image_bytes(screen, reopening) is not None,
+    until(screen, lambda text: 'Chart · chart.png' in text and image_bytes(screen, reopening) is not None,
           'active chart before shutdown')
     started = len(screen.raw)
     finish(screen)
@@ -733,7 +733,7 @@ def dataset_chart(binary, adapter, root, home, cwd, screens):
                    extra_env={'TERM': 'xterm-kitty'})
     pending = len(screen.raw)
     screen.send('Построй график продаж по месяцам\r')
-    until(screen, lambda text: 'График · chart.png' in text and image_bytes(screen, pending) is not None
+    until(screen, lambda text: 'Chart · chart.png' in text and image_bytes(screen, pending) is not None
           and completed(root, 'Построй график продаж по месяцам'), 'CSV analysis opened its PNG', timeout=30)
     path, = (home / '.ansa/sessions').glob('*/artifacts/*/chart.png')
     receipt = json.loads(path.with_name('receipt.json').read_text())
@@ -744,9 +744,9 @@ def dataset_chart(binary, adapter, root, home, cwd, screens):
     assert digest == descriptor['sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
     snapshot(screen, 'dataset-chart')
     escape(screen)
-    row, column = screen.vt.location('Источник · sales.csv')
+    row, column = screen.vt.location('Source · sales.csv')
     click(screen, column, row)
-    until(screen, lambda text: 'sales.csv · только чтение' in text and '2026-03-03,550' in text,
+    until(screen, lambda text: 'sales.csv · read-only' in text and '2026-03-03,550' in text,
           'open the source CSV bound to the completed calculation')
     escape(screen)
     finish(screen)

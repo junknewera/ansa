@@ -106,18 +106,18 @@ fn edit_view(entries: &[transcript::Entry], key: &str) -> Option<EditView> {
 
 fn label(name: &str) -> &str {
     match name {
-        "list_directory" => "Просмотр",
-        "read_file" => "Чтение",
-        "search_files" => "Поиск",
-        "run_command" => "Запуск",
-        "edit_file" => "Правка",
-        "workspace_describe" => "Рабочая среда",
-        "editor_get_context" => "Выделение",
-        "editor_open_file" => "Просмотр в редакторе",
-        "editor_propose_diff" => "Предложение правки",
-        "dataset_inspect" => "Проверка CSV",
-        "python_execute" => "Анализ",
-        "show_png" => "Показ PNG",
+        "list_directory" => "List",
+        "read_file" => "Read",
+        "search_files" => "Search",
+        "run_command" => "Run",
+        "edit_file" => "Edit",
+        "workspace_describe" => "Workspace",
+        "editor_get_context" => "Selection",
+        "editor_open_file" => "Open in editor",
+        "editor_propose_diff" => "Propose edit",
+        "dataset_inspect" => "Inspect CSV",
+        "python_execute" => "Analyze",
+        "show_png" => "Show PNG",
         _ => name,
     }
 }
@@ -129,69 +129,69 @@ fn flag(value: &Json, name: &str) -> bool {
 }
 fn output_notice(tool: &Tool) -> Option<&'static str> {
     if tool.volatile_outcome {
-        return Some("результат не сохранён");
+        return Some("result not saved");
     }
     if tool.partial_output {
-        return Some("вывод частичный");
+        return Some("partial output");
     }
     let Some(value) = tool.output_json.as_ref() else {
         return (tool.detail.name == "run_command"
             && matches!(tool.detail.phase, ToolPhase::Finished { .. }))
-        .then_some("код завершения неизвестен");
+        .then_some("unknown exit code");
     };
     if flag(value, "cleanup_unknown")
         || value.field("cleanup_complete").and_then(Json::boolean) == Ok(false)
     {
-        Some("завершение процессов не подтверждено")
+        Some("process cleanup unconfirmed")
     } else if flag(value, "timed_out") {
-        Some("превышено время")
+        Some("timed out")
     } else if flag(value, "cancelled") || value.text_field("error") == Ok("cancelled") {
-        Some("остановлен")
+        Some("stopped")
     } else if value.text_field("status") == Ok("instructions_required") {
-        Some("не запускался · нужны инструкции")
+        Some("not run · instructions required")
     } else if value.has("error")
         || (tool.detail.name == "run_command"
             && value
                 .field("exit_code")
                 .is_ok_and(|code| code.dump() != "0"))
     {
-        Some("ошибка")
+        Some("error")
     } else if tool.detail.name == "run_command" && !value.has("exit_code") {
-        Some("код завершения неизвестен")
+        Some("unknown exit code")
     } else if flag(value, "truncated") {
-        Some("вывод сокращён")
+        Some("output truncated")
     } else {
         None
     }
 }
 fn status(tool: &Tool) -> &'static str {
     if tool.uncertain {
-        return "результат неизвестен (effect_unknown)";
+        return "unknown result (effect_unknown)";
     }
     match tool.detail.phase {
-        ToolPhase::Prepared if tool.running => "выполняется",
-        ToolPhase::Prepared => "подготовлен",
+        ToolPhase::Prepared if tool.running => "running",
+        ToolPhase::Prepared => "prepared",
         ToolPhase::Finished {
             effects: Effects::Unknown,
             ..
-        } => "результат неизвестен (effect_unknown)",
+        } => "unknown result (effect_unknown)",
         ToolPhase::Finished {
             execution: Execution::Denied,
             effects: Effects::NotStarted,
-        } => "отклонён · не запускался",
+        } => "denied · not run",
         ToolPhase::Finished {
             execution: Execution::Cancelled,
             effects: Effects::NotStarted,
-        } => "остановлен · не запускался",
+        } => "stopped · not run",
         ToolPhase::Finished {
             effects: Effects::NotStarted,
             ..
-        } => "ошибка · не запускался",
+        } => "failed · not run",
         ToolPhase::Finished { execution, .. } => match execution {
-            Execution::Succeeded => output_notice(tool).unwrap_or("готово"),
-            Execution::Failed => "ошибка",
-            Execution::Cancelled => "остановлен",
-            Execution::Denied => "отклонён",
+            Execution::Succeeded => output_notice(tool).unwrap_or("done"),
+            Execution::Failed => "error",
+            Execution::Cancelled => "stopped",
+            Execution::Denied => "denied",
         },
     }
 }
@@ -223,12 +223,12 @@ fn presentation_role(tool: &Tool) -> &'static str {
         || output_notice(tool).is_some_and(|notice| {
             matches!(
                 notice,
-                "результат не сохранён"
-                    | "вывод частичный"
-                    | "вывод сокращён"
-                    | "завершение процессов не подтверждено"
-                    | "не запускался · нужны инструкции"
-                    | "код завершения неизвестен"
+                "result not saved"
+                    | "partial output"
+                    | "output truncated"
+                    | "process cleanup unconfirmed"
+                    | "not run · instructions required"
+                    | "unknown exit code"
             )
         })
     {
@@ -244,12 +244,7 @@ fn presentation_role(tool: &Tool) -> &'static str {
     }
 }
 fn calls(count: usize) -> &'static str {
-    match (count % 100, count % 10) {
-        (11..=14, _) => "вызовов",
-        (_, 1) => "вызов",
-        (_, 2..=4) => "вызова",
-        _ => "вызовов",
-    }
+    if count == 1 { "call" } else { "calls" }
 }
 fn entry(text: String, action: Option<String>, role: &str) -> Entry {
     Entry {
@@ -307,7 +302,7 @@ fn fallback(raw: &str, parsed: Option<&Json>, lines: &mut Vec<String>) {
     if let Some(value) = parsed {
         readable(value, 0, lines);
     } else if raw.trim_start().starts_with(['{', '[']) {
-        lines.push("Неполный структурированный вывод".into());
+        lines.push("Incomplete structured output".into());
     } else {
         lines.extend(raw.lines().map(String::from));
     }
@@ -317,9 +312,9 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
     if !tool.arguments.is_empty() {
         lines.push(
             if tool.partial_arguments {
-                "Аргументы (фрагмент):"
+                "Arguments (excerpt):"
             } else {
-                "Аргументы:"
+                "Arguments:"
             }
             .into(),
         );
@@ -345,13 +340,13 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
             }
             for (key, label) in [
                 ("command", "$"),
-                ("path", "Путь:"),
-                ("cwd", "Каталог:"),
-                ("query", "Поиск:"),
-                ("offset", "Смещение:"),
-                ("max_bytes", "Байт:"),
-                ("start_line", "Со строки:"),
-                ("end_line", "До строки:"),
+                ("path", "Path:"),
+                ("cwd", "Directory:"),
+                ("query", "Query:"),
+                ("offset", "Offset:"),
+                ("max_bytes", "Bytes:"),
+                ("start_line", "First line:"),
+                ("end_line", "Last line:"),
             ] {
                 if let Ok(value) = args.field(key) {
                     lines.push(format!(
@@ -376,19 +371,19 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
     if include_output && !tool.output.is_empty() {
         lines.push(
             if tool.partial_output {
-                "Вывод (фрагмент):"
+                "Output (excerpt):"
             } else {
-                "Вывод:"
+                "Output:"
             }
             .into(),
         );
         let begin = lines.len();
         if let Some(value) = &tool.output_json {
             if let Ok(error) = value.text_field("error") {
-                lines.push(format!("Ошибка: {error}"));
+                lines.push(format!("Error: {error}"));
             }
             if value.text_field("status") == Ok("instructions_required") {
-                lines.push("Нужны инструкции каталога; действие ещё не выполнено".into());
+                lines.push("Directory instructions required. The action has not run".into());
             }
             match tool.detail.name.as_str() {
                 "read_file" => {
@@ -397,7 +392,7 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
                             .field("offset")
                             .ok()
                             .zip(value.field("next_offset").ok())
-                            .map(|(start, end)| format!(" · байты {}-{}", start.dump(), end.dump()))
+                            .map(|(start, end)| format!(" · bytes {}-{}", start.dump(), end.dump()))
                             .unwrap_or_default();
                         lines.push(format!("{path}{range}"));
                     }
@@ -416,7 +411,7 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
                                     "{name}{}{}",
                                     if flag(item, "directory") { "/" } else { "" },
                                     if flag(item, "symlink") {
-                                        " (ссылка)"
+                                        " (symlink)"
                                     } else {
                                         ""
                                     }
@@ -424,7 +419,7 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
                             }
                         }
                         if entries.is_empty() {
-                            lines.push("Каталог пуст".into());
+                            lines.push("Directory is empty".into());
                         }
                     }
                 }
@@ -446,7 +441,7 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
                             }
                         }
                         if matches.is_empty() {
-                            lines.push("Совпадений нет".into());
+                            lines.push("No matches".into());
                         }
                     }
                 }
@@ -460,24 +455,24 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
                         }
                     }
                     if let Ok(exit) = value.field("exit_code") {
-                        lines.push(format!("Код завершения: {}", exit.dump()));
+                        lines.push(format!("Exit code: {}", exit.dump()));
                     }
                     if flag(value, "timed_out") {
-                        lines.push("Превышено время выполнения".into());
+                        lines.push("Timed out".into());
                     }
                     if flag(value, "cancelled") {
-                        lines.push("Команда остановлена".into());
+                        lines.push("Command stopped".into());
                     }
                     if flag(value, "cleanup_unknown")
                         || value.field("cleanup_complete").and_then(Json::boolean) == Ok(false)
                     {
-                        lines.push("Завершение процессов не подтверждено".into());
+                        lines.push("Process cleanup unconfirmed".into());
                     }
                 }
                 _ => readable(value, 0, &mut lines),
             }
             if flag(value, "truncated") {
-                lines.push("Вывод сокращён инструментом".into());
+                lines.push("Tool truncated output".into());
             }
         }
         if lines.len() == begin {
@@ -485,12 +480,12 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
         }
     }
     if tool.partial_output && tool.output.is_empty() {
-        lines.push("Вывод (фрагмент) недоступен на этой странице".into());
+        lines.push("Output excerpt unavailable on this page".into());
     }
     let text = super::workspace::display_text(&lines.join("\n"));
     let mut text = text.chars().take(128 * 1024).collect::<String>();
     if text.len() < lines.iter().map(String::len).sum() {
-        text.push_str("\nВывод сокращён для просмотра");
+        text.push_str("\nOutput truncated for display");
     }
     super::carbon::OutputView {
         title: format!(
@@ -508,7 +503,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
     let mut title = format!(
         "{arrow} {}{}{} · ",
         if edit.is_some() {
-            "Изменён"
+            "Edited"
         } else {
             label(&tool.detail.name)
         },
@@ -520,11 +515,11 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
     }
     let start = title.len();
     title.push_str(status(tool));
-    title.push_str(if status(tool).contains("неизвестен") {
+    title.push_str(if status(tool).contains("unknown") {
         " ?"
-    } else if status(tool).starts_with("остановлен") {
+    } else if status(tool).starts_with("stopped") {
         " ■"
-    } else if status(tool).starts_with("отклонён") {
+    } else if status(tool).starts_with("denied") {
         " ⊘"
     } else {
         match presentation_role(tool) {
@@ -575,7 +570,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         }
     {
         out.push(entry(
-            format!("Источник · {path}"),
+            format!("Source · {path}"),
             Some(format!("file:0:{path}")),
             "tool_child_success",
         ));
@@ -592,7 +587,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         )
     {
         out.push(entry(
-            "  Diff недоступен; результат инструмента можно раскрыть через Ctrl+T".into(),
+            "  Diff unavailable. Press Ctrl+T for tool details".into(),
             None,
             "tool_diff_notice",
         ));
@@ -606,7 +601,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         if edit.diff.rows.len() > 10 {
             let mut notice = entry(
                 format!(
-                    "  Ещё {} строк · нажмите, чтобы открыть diff",
+                    "  {} more lines · open full diff",
                     edit.diff.rows.len() - 10
                 ),
                 Some(action),
@@ -636,7 +631,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         }
         if !full.text.is_empty() {
             let mut link = entry(
-                "  Весь вывод".into(),
+                "  Full output".into(),
                 Some(format!("output:{}", tool.key)),
                 "tool_output",
             );
@@ -654,7 +649,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
                 }
             }
             if let Ok(exit) = value.field("exit_code") {
-                summary.push(format!("Код завершения: {}", exit.dump()));
+                summary.push(format!("Exit code: {}", exit.dump()));
             }
         }
         if summary.is_empty() {
@@ -702,7 +697,7 @@ pub(super) fn project(
                 && crate::provider::contracts::valid_id(run)
             {
                 items.push(Item::Text(entry(
-                    "Утверждённый план".into(),
+                    "Approved plan".into(),
                     Some(format!("plan:{run}")),
                     "tool_success",
                 )));
@@ -734,7 +729,7 @@ pub(super) fn project(
                         continue;
                     }
                     items.push(Item::Text(entry(
-                        format!("Ссылка из ответа · {path}:{line}"),
+                        format!("Response link · {path}:{line}"),
                         Some(format!("file:{line}:{path}")),
                         "tool_detail",
                     )));
@@ -807,7 +802,7 @@ pub(super) fn project(
             let index = tools.len();
             let (name, call) = match activity {
                 Activity::Started(start) => (start.name.clone(), start.call_id.clone()),
-                Activity::Finished(finish) => ("Инструмент".into(), finish.call_id.clone()),
+                Activity::Finished(finish) => ("Tool".into(), finish.call_id.clone()),
             };
             tools.push(Tool {
                 key,
@@ -866,7 +861,7 @@ pub(super) fn project(
                 request: request.0.clone(),
                 detail: ToolDetail {
                     operation: operation.0.clone(),
-                    name: "Инструмент".into(),
+                    name: "Tool".into(),
                     call: String::new(),
                     purpose: "".into(),
                     target: String::new(),
@@ -933,16 +928,16 @@ pub(super) fn project(
                 .any(|tool| tool.running && matches!(tool.detail.phase, ToolPhase::Prepared));
             let problems = group.iter().filter(|tool| failed(tool)).count();
             let state = if problems > 0 {
-                format!(" · проблем: {problems}")
+                format!(" · issues: {problems}")
             } else if active {
-                " · выполняется".into()
+                " · running".into()
             } else if group
                 .iter()
                 .any(|tool| matches!(tool.detail.phase, ToolPhase::Prepared))
             {
-                " · подготовлено".into()
+                " · prepared".into()
             } else {
-                " · готово ✓".into()
+                " · done ✓".into()
             };
             let mut seen = BTreeSet::new();
             let targets = group
@@ -953,7 +948,7 @@ pub(super) fn project(
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut title = format!(
-                "{} Чтение и поиск · {} {}",
+                "{} Read and search · {} {}",
                 if open { "v" } else { ">" },
                 group.len(),
                 calls(group.len())
@@ -1092,17 +1087,17 @@ mod tests {
         for (output, expected) in [
             (
                 r#"{"exit_code":7,"stdout":"","stderr":"command failed\nnext line"}"#,
-                "ошибка",
+                "error",
             ),
-            (r#"{"exit_code":0,"timed_out":true}"#, "превышено время"),
-            (r#"{"exit_code":0,"cancelled":true}"#, "остановлен"),
+            (r#"{"exit_code":0,"timed_out":true}"#, "timed out"),
+            (r#"{"exit_code":0,"cancelled":true}"#, "stopped"),
             (
                 r#"{"exit_code":0,"cleanup_complete":false}"#,
-                "завершение процессов не подтверждено",
+                "process cleanup unconfirmed",
             ),
-            (r#"{"exit_code":0,"truncated":true}"#, "вывод сокращён"),
-            (r#"{"error":"protected_file"}"#, "ошибка"),
-            ("legacy output", "код завершения неизвестен"),
+            (r#"{"exit_code":0,"truncated":true}"#, "output truncated"),
+            (r#"{"error":"protected_file"}"#, "error"),
+            ("legacy output", "unknown exit code"),
         ] {
             let result = row(
                 "op",
@@ -1264,10 +1259,10 @@ mod tests {
         metadata.target = "printf 'a · b' · project".into();
         result.tool = Some(Arc::new(metadata));
         let shown = project(&[result], &view(), &BTreeSet::new(), false, false, |_| {
-            " · 12 мс".into()
+            " · 12 ms".into()
         });
         let header = &shown[0];
-        assert_eq!(&header.text[header.status.clone().unwrap()], "ошибка");
+        assert_eq!(&header.text[header.status.clone().unwrap()], "error");
         assert!(header.text.contains("printf 'a · b'"));
     }
     #[test]
@@ -1409,15 +1404,15 @@ mod tests {
         assert_eq!(frame.edit_view("diff:request:edit").unwrap(), captured);
     }
     #[test]
-    fn group_targets_are_unique_and_counts_use_russian_plural_forms() {
+    fn group_targets_are_unique_and_counts_use_english_plural_forms() {
         for (count, expected) in [
-            (1, "вызов"),
-            (2, "вызова"),
-            (3, "вызова"),
-            (5, "вызовов"),
-            (11, "вызовов"),
-            (21, "вызов"),
-            (24, "вызова"),
+            (1, "call"),
+            (2, "calls"),
+            (3, "calls"),
+            (5, "calls"),
+            (11, "calls"),
+            (21, "calls"),
+            (24, "calls"),
         ] {
             assert_eq!(calls(count), expected);
         }
@@ -1437,7 +1432,7 @@ mod tests {
         });
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].role, "tool_success");
-        assert!(shown[0].text.contains("3 вызова · готово"));
+        assert!(shown[0].text.contains("3 calls · done"));
         assert_eq!(shown[0].text.matches("docs/README.md").count(), 1);
     }
     #[test]
@@ -1460,10 +1455,10 @@ mod tests {
             &BTreeSet::new(),
             false,
             true,
-            |_| " · 12 мс".into(),
+            |_| " · 12 ms".into(),
         );
         assert_eq!(shown.len(), 1);
-        assert!(shown[0].text.contains("выполняется") && shown[0].text.contains("12 мс"));
+        assert!(shown[0].text.contains("running") && shown[0].text.contains("12 ms"));
         assert!(!shown[0].text.contains("raw") && !shown[0].text.contains("printf"));
         let outcome = row(
             "op",
@@ -1486,7 +1481,7 @@ mod tests {
             String::new()
         });
         assert_eq!(compact.len(), 2);
-        assert!(compact[0].text.contains("код завершения неизвестен"));
+        assert!(compact[0].text.contains("unknown exit code"));
         assert!(!text(&compact).contains("KnownResult"));
         let open = project(
             &rows,
@@ -1536,11 +1531,11 @@ mod tests {
         });
         let shown = text(&compact);
         assert!(
-            shown.contains("3 вызова")
+            shown.contains("3 calls")
                 && shown.contains("ACCESS_CANARY")
                 && shown.contains("UNKNOWN_CANARY")
         );
-        assert!(shown.contains("не запускался") && shown.contains("effect_unknown"));
+        assert!(shown.contains("not run") && shown.contains("effect_unknown"));
         assert!(!shown.contains("read ok"));
         let open = project(
             &rows,
@@ -1577,14 +1572,14 @@ mod tests {
             String::new()
         });
         let text = text(&shown);
-        assert!(text.contains("PAGE_FRAGMENT") && text.contains("фрагмент"));
-        assert!(!text.contains("unrelated") && !text.contains("Запуск"));
+        assert!(text.contains("PAGE_FRAGMENT") && text.contains("excerpt"));
+        assert!(!text.contains("unrelated") && !text.contains("Run"));
         let mut first = row("head", "read_file", ToolPhase::Prepared, "FIRST_FRAGMENT");
         Arc::make_mut(first.tool.as_mut().unwrap()).last_chunk = false;
         let first = project(&[first], &live, &BTreeSet::new(), true, false, |_| {
             String::new()
         });
-        assert!(super::tests::text(&first).contains("Аргументы (фрагмент)"));
+        assert!(super::tests::text(&first).contains("Arguments (excerpt)"));
     }
     #[test]
     fn recovery_and_legacy_unknown_results_remain_visible_in_closed_groups() {
@@ -1637,7 +1632,7 @@ mod tests {
         });
         let shown = text(&projected);
         assert!(shown.len() < 4096, "{}", shown.len());
-        assert!(shown.contains("Вывод (фрагмент)"));
+        assert!(shown.contains("Output (excerpt)"));
         assert_eq!(
             projected.iter().filter(|row| row.action.is_some()).count(),
             2

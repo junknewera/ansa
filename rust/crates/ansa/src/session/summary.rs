@@ -33,13 +33,13 @@ pub enum SummaryStatus {
 impl SummaryStatus {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Empty => "Новая",
-            Self::Completed => "Завершена",
-            Self::Cancelled => "Остановлена",
-            Self::Paused => "Приостановлена",
-            Self::Interrupted => "Прервана",
-            Self::Unknown => "Неизвестно",
-            Self::Unavailable => "Недоступна",
+            Self::Empty => "New",
+            Self::Completed => "Completed",
+            Self::Cancelled => "Stopped",
+            Self::Paused => "Paused",
+            Self::Interrupted => "Interrupted",
+            Self::Unknown => "Unknown",
+            Self::Unavailable => "Unavailable",
         }
     }
 }

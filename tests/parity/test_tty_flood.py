@@ -12,17 +12,17 @@ import session_cases as journal
 import tty_flood
 
 
-def initial(phase='ожидание модели'):
-    return b'\x1b[2J\x1b[24;1Hbasic  ' + phase.encode() + b'  0 c'
+def initial(phase='cancelling'):
+    return b'\x1b[2J\x1b[24;1Hbasic  ' + phase.encode() + b'  0 s'
 
 
 def suffix():
-    # Retain the initial о from ожидание and repaint only тменено.
-    return b'\x1b[24;9H\x1b[K' + 'тменено  0 с'.encode()
+    # Retain the initial c and repaint the rest of the phase.
+    return b'\x1b[24;9H\x1b[Kancelled  0 s'
 
 
 def whole():
-    return b'\x1b[24;1H\x1b[2Kbasic  ' + 'отменено  0 с'.encode()
+    return b'\x1b[24;1H\x1b[2Kbasic  ' + 'cancelled  0 s'.encode()
 
 
 def observation(chunks):
@@ -43,21 +43,21 @@ class VisibleCancelTests(unittest.TestCase):
                 raw, trace, sig = observation([initial(), delta])
                 self.assertEqual(tty_flood.cancel_ack(trace, raw, sig), 200)
                 if delta == suffix():
-                    self.assertNotIn('отменено'.encode(), raw[sig['offset']:])
+                    self.assertNotIn('cancelled'.encode(), raw[sig['offset']:])
 
     def test_body_draft_and_footer_detail_words_cannot_ack(self):
         for delta in (
-            b'\x1b[2;1H' + 'отменено'.encode(),
-            b'\x1b[23;1H> ' + 'отменено'.encode(),
-            b'\x1b[24;1Hbasic  ' + 'ожидание модели  вывод: отменено'.encode(),
+            b'\x1b[2;1H' + 'cancelled'.encode(),
+            b'\x1b[23;1H> ' + 'cancelled'.encode(),
+            b'\x1b[24;1Hbasic  waiting for model  output: cancelled',
         ):
             with self.subTest(delta=delta):
                 raw, trace, sig = observation([initial(), delta])
                 with self.assertRaisesRegex(ValueError, 'missing visible Cancel'):
                     tty_flood.cancel_ack(trace, raw, sig)
 
-    def test_split_csi_and_utf8_wait_for_the_complete_visible_phase(self):
-        phase = 'отменено'.encode()
+    def test_split_csi_and_text_wait_for_the_complete_visible_phase(self):
+        phase = 'cancelled'.encode()
         chunks = [initial(), b'\x1b[24;', b'1H\x1b[2Kbasic  ' + phase[:-1], phase[-1:]]
         observed = tty_flood.CancelAck(observation(chunks)[2])
         for end in range(1, len(chunks) + 1):
@@ -67,7 +67,7 @@ class VisibleCancelTests(unittest.TestCase):
 
     def test_cancelled_footer_before_signal_is_not_a_new_ack(self):
         for delta in (b'\r', whole()):
-            raw, trace, sig = observation([initial('отменено'), delta])
+            raw, trace, sig = observation([initial('cancelled'), delta])
             with self.subTest(delta=delta), self.assertRaisesRegex(ValueError, 'before signal'):
                 tty_flood.cancel_ack(trace, raw, sig)
 
@@ -76,7 +76,7 @@ class VisibleCancelTests(unittest.TestCase):
         self.assertEqual(tty_flood.cancel_ack(trace, raw, sig), trace['reads'][1]['at_ns'])
         # A cancelled state earlier in the session is harmless once the current
         # footer shows the new running turn at this signal's offset.
-        before = initial('отменено') + initial()
+        before = initial('cancelled') + initial()
         raw, trace, sig = observation([before, suffix()])
         self.assertEqual(tty_flood.cancel_ack(trace, raw, sig), 200)
 

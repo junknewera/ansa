@@ -170,14 +170,14 @@ fn semantic_palette_keeps_statuses_distinct_and_plain_output_unstyled() {
         entry("assistant", "# Обзор\nОтвет с `кодом`.\x1b[31m"),
     ];
     for (role, text) in [
-        ("tool_success", "> Чтение README.md · готово · 20 мс"),
-        ("tool_running", "> Запуск cargo test · выполняется"),
-        ("tool_error", "> Запуск false · ошибка"),
+        ("tool_success", "> Read README.md · done · 20 ms"),
+        ("tool_running", "> Run cargo test · running"),
+        ("tool_error", "> Run false · error"),
         (
             "tool_warning",
-            "> Запуск command · результат неизвестен (effect_unknown)",
+            "> Run command · unknown result (effect_unknown)",
         ),
-        ("tool_detail", "  Вывод:\n    CONTENT Ж界😀"),
+        ("tool_detail", "  Output:\n    CONTENT Ж界😀"),
     ] {
         let mut row = entry(role, text);
         if role != "tool_detail" {
@@ -191,7 +191,7 @@ fn semantic_palette_keeps_statuses_distinct_and_plain_output_unstyled() {
                 &history,
                 b"draft",
                 5,
-                "basic  инструмент",
+                "basic  running tool",
                 0,
                 "~/ansa",
                 size,
@@ -220,8 +220,8 @@ fn semantic_palette_keeps_statuses_distinct_and_plain_output_unstyled() {
                 .unwrap()
         };
         assert_ne!(
-            row("готово").split("Чтение").next(),
-            row("ошибка").split("Запуск").next()
+            row("done").split("Read").next(),
+            row("error").split("Run").next()
         );
         assert!(raw.contains("▸") && raw.contains("│"));
         only_user_background(&colored, "Прочитай README");
@@ -297,7 +297,7 @@ fn terminal_grid_is_clipped_sanitized_and_keeps_child_sgr_after_theme() {
         let ui = Workspace {
             focus: Focus::Inspector,
             inspector: Some(Inspector {
-                title: "Терминал".into(),
+                title: "Terminal".into(),
                 kind: InspectorKind::Command,
                 rendered: Some(grid.clone()),
                 cursor: Some((2, 0)),
@@ -335,7 +335,7 @@ fn terminal_grid_is_clipped_sanitized_and_keeps_child_sgr_after_theme() {
             !frame
                 .plain_lines()
                 .iter()
-                .any(|line| line.contains("Tab фокус"))
+                .any(|line| line.contains("Tab focus"))
         );
         assert!(!output.contains("\x1b[2J") && !output.contains("\x1b]52"));
         if color {
@@ -434,7 +434,7 @@ fn selection_keeps_copy_bytes_while_runtime_diagnostics_update() {
         &[entry("assistant", "ORIGINAL_COPY")],
         b"draft",
         5,
-        "готов",
+        "ready",
         0,
         "",
         (80, 20),
@@ -453,7 +453,7 @@ fn selection_keeps_copy_bytes_while_runtime_diagnostics_update() {
         &[entry("assistant", "NEW_CONTENT")],
         b"draft",
         5,
-        "ошибка сохранения\neffect_unknown: проверьте результат",
+        "save error\neffect_unknown: проверьте результат",
         0,
         "",
         (80, 20),
@@ -465,7 +465,7 @@ fn selection_keeps_copy_bytes_while_runtime_diagnostics_update() {
     frame.update_status_from(&live);
     let lines = frame.plain_lines().join("\n");
     assert!(lines.contains("ORIGINAL_COPY") && !lines.contains("NEW_CONTENT"));
-    assert!(lines.contains("ошибка сохранения") && lines.contains("effect_unknown"));
+    assert!(lines.contains("save error") && lines.contains("effect_unknown"));
     assert_eq!(selection.finish(12, row).as_deref(), Some("ORIGINAL_COPY"));
     for size in [(10, 12), (80, 7)] {
         let before = carbon::layout_workspace(
@@ -646,7 +646,7 @@ fn workspace_shows_real_data_and_adapts_inspector_to_narrow_screen() {
         &history,
         b"draft",
         3,
-        "План · Чат · готов",
+        "Plan · Chat · ready",
         0,
         "~/project",
         (60, 24),
@@ -659,7 +659,7 @@ fn workspace_shows_real_data_and_adapts_inspector_to_narrow_screen() {
     assert!(!text.contains('\x1b'));
     assert_eq!(narrow.lines.len(), 24);
     let status = &narrow.lines[22];
-    assert!(status.contains("План · Чат · готов") && status.contains("? помощь"));
+    assert!(status.contains("Plan · Chat · ready") && status.contains("? help"));
 }
 #[test]
 fn model_popup_sanitizes_untrusted_fields_and_keeps_next_turn_scope_visible() {
@@ -771,7 +771,7 @@ fn tiny_workspace_keeps_multiline_draft_in_physical_cells() {
         assert!(
             exit.plain_lines()
                 .iter()
-                .any(|row| row.contains("Ctrl+C ещё раз для выхода"))
+                .any(|row| row.contains("Press Ctrl+C again to exit"))
         );
     }
     let input = "first\nЖ界😀\nlast".as_bytes();
@@ -817,8 +817,8 @@ fn help_uses_room_for_complete_command_descriptions() {
     let frame =
         carbon::layout_workspace(&[], b"", 0, "", 0, "project", (100, 32), false, &ui).unwrap();
     let text = frame.plain_lines().join("\n");
-    assert!(text.contains("Выбрать модель и уровень рассуждения"));
-    assert!(text.contains("Файлы, diff и терминал проекта"));
+    assert!(text.contains("Choose a model and reasoning effort"));
+    assert!(text.contains("Browse files, diffs, and the project terminal"));
     assert!(
         frame
             .plain_lines()
