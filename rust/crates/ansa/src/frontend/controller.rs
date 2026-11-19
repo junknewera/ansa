@@ -663,6 +663,9 @@ impl State {
                 self.delivery_event(event.request.as_ref(), commands);
             }
             EventPayload::GenerationSelected { selection, .. } => {
+                if let Some(view) = &mut self.snapshot {
+                    view.generation = selection.clone();
+                }
                 self.report(
                     io,
                     &format!(

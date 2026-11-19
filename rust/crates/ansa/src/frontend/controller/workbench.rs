@@ -20,6 +20,7 @@ use crate::{
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 use tokio::sync::mpsc;
 mod ux;
@@ -598,6 +599,10 @@ enum Job {
     CachedModels {
         result: Result<Option<Json>>,
     },
+    GenerationSaved {
+        owner: String,
+        result: Result<()>,
+    },
     Models {
         owner: String,
         token: u64,
@@ -1137,10 +1142,17 @@ impl Workbench {
             return false;
         }
         if kind == Kind::Main {
-            let source = self.slots[self.current].id.clone();
+            let slot = &self.slots[self.current];
+            let source = slot.id.clone();
+            let generation = slot
+                .state
+                .snapshot
+                .as_ref()
+                .map(|view| view.generation.clone());
+            let generation = generation.filter(|_| slot.kind != Kind::Console);
             let factory = self.factory.clone();
             self.jobs.spawn_blocking(move || Job::Created {
-                result: factory.create(Kind::Main, None),
+                result: factory.create_main(generation),
                 source,
                 prompt: None,
                 foreground,
@@ -1954,6 +1966,24 @@ impl Workbench {
                 self.open_models(true, io);
                 (true, false)
             }
+            "/effort" | "/thinking" => {
+                if argument.split_whitespace().count() != 1 {
+                    self.report(io, "Expected one value");
+                    return (false, false);
+                }
+                let Some(view) = &self.slots[self.current].state.snapshot else {
+                    return (false, false);
+                };
+                let model = view.generation.model.clone();
+                (
+                    self.apply_generation(
+                        model,
+                        (argument != "default").then(|| argument.into()),
+                        io,
+                    ),
+                    false,
+                )
+            }
             "/help" | "/" | "?" => {
                 self.menu = Some(Menu::Help {
                     selected: 0,
@@ -2545,6 +2575,20 @@ impl Workbench {
                 theme,
                 result,
             } => self.saved_theme(revision, theme, result, io),
+            Job::GenerationSaved { owner, result } => {
+                if let Err(code) = result
+                    && let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner)
+                {
+                    if code.starts_with("model_preferences_") {
+                        slot.state
+                            .report(io, "Could not save default model for new sessions");
+                    } else {
+                        slot.state.exit = 1;
+                        slot.state
+                            .report(io, &format!("ansa: {}", diagnostics::error(code)));
+                    }
+                }
+            }
             Job::ThemeReload { revision, result } => {
                 if revision == self.theme_revision
                     && self.theme.is_dynamic()
@@ -4618,6 +4662,11 @@ pub async fn run_attached(
                 }
                 work.saved_theme(revision, theme, result, io);
             }
+            Ok(Job::GenerationSaved {
+                result: Err(code), ..
+            }) if code.starts_with("model_preferences_") => {
+                failure.get_or_insert(code);
+            }
             Ok(_) => {}
             Err(_) => {
                 failure.get_or_insert("workspace_job");
@@ -4868,6 +4917,39 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn delayed_model_save_preserves_newer_choice_and_reasoning_effort() {
+        let root = TestDirectory(std::env::temp_dir().join(format!(
+            "ansa-model-preferences-{}",
+            crate::auth::pkce::random_token(16).unwrap()
+        )));
+        ansa_linux::fs::create_private(&root.0).unwrap();
+        let settings = crate::config::load_agent_settings(&root.0, &root.0).unwrap();
+        let first = Factory::new(
+            settings.clone(),
+            root.0.join("auth"),
+            false,
+            "first".into(),
+            None,
+        );
+        let second = Factory::new(settings, root.0.join("auth"), false, "second".into(), None);
+        let older = GenerationSelection {
+            model: "earlier".into(),
+            effort: None,
+        };
+        let latest = GenerationSelection {
+            model: "latest".into(),
+            effort: Some("high".into()),
+        };
+        let selected = SystemTime::now();
+        first
+            .save_generation(selected + Duration::from_secs(1), &latest)
+            .unwrap();
+        first.save_generation(selected, &older).unwrap();
+        assert_eq!(first.saved_generation(), Some(latest));
+        assert_eq!(second.saved_generation(), None);
     }
 
     #[tokio::test(flavor = "current_thread")]

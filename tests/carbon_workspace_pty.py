@@ -30,14 +30,14 @@ def until(screen, predicate, label, timeout=6):
         screen.drain(.01)
 
 
-def start(binary, root, home, cwd, extra=None, argv_extra=()):
+def start(binary, root, home, cwd, extra=None, argv_extra=(), model="gpt-6.1-sol"):
     shell = shutil.which("bash")
     assert shell, "fixture requires Bash prompt integration"
     screen = Pty(str(binary), root, home, cwd, "", True, size=(100, 32),
                  argv=["--offline", "--cwd", str(cwd), *argv_extra],
                  extra_env={"SHELL": shell, **(extra or {})})
     screen.vt = Terminal(100, 32)
-    until(screen, lambda text: "ANSA" in text and "Tab mode" in text and ready(screen), "first workspace frame")
+    until(screen, lambda text: "ANSA" in text and "Tab mode" in text and ready(screen, model), "first workspace frame")
     return screen
 
 
@@ -102,8 +102,8 @@ def completed(root, message):
     return False
 
 
-def ready(screen):
-    return "gpt-6.1-sol" in screen.vt.line(-2) and screen.vt.line(-4).startswith("›")
+def ready(screen, model="gpt-6.1-sol"):
+    return model in screen.vt.line(-2) and screen.vt.line(-4).startswith("›")
 
 
 def local(screen, command):
@@ -953,6 +953,35 @@ def model_effort_pair(screen, root, cwd):
     selected = [row for row in events if row["kind"] == "generation_selected"]
     assert len(selected) == 1 and selected[0]["effort"] is None
     assert not any(row["kind"] in {"accepted", "response", "intent"} for row in events), "model selection dispatched generation or tools"
+    home = root / "home"
+    initial, = (home / ".ansa/sessions").iterdir()
+    local(screen, "/exit")
+    assert screen.finish()["exit"] == 0
+
+    override = "fixture-other-model"
+    (home / ".ansa/config.json").write_text(json.dumps({"schema_version": 1, "model": override}))
+    restarted = start(screen.child.args[0], root, home, cwd)
+    screen.additional_screens = [("saved-model", restarted)]
+    local(restarted, "/exit")
+    restarted.result = restarted.finish()
+    assert restarted.result["exit"] == 0
+
+    explicit = start(screen.child.args[0], root, home, cwd, argv_extra=["--model", override], model=override)
+    screen.additional_screens.append(("explicit-model", explicit))
+    local(explicit, f"/sessions {initial.name}")
+    until(explicit, lambda frame: ready(explicit), "resumed session uses its own saved model")
+    previous = set((home / ".ansa/sessions").iterdir())
+    local(explicit, "/new")
+    until(explicit, lambda frame: ready(explicit)
+          and sum(row["kind"] == "init" for row in records(root)) == 4,
+          "new conversation inherits the foreground model")
+    created, = set((home / ".ansa/sessions").iterdir()) - previous
+    init, = session_cases.decode({path.name: path.read_bytes() for path in created.glob("part-*.log")})
+    assert init["configuration"]["binding"]["requested_model"] == selected[0]["model"]
+    local(explicit, "/exit")
+    explicit.result = explicit.finish()
+    assert explicit.result["exit"] == 0
+    return "normal"
 
 
 def plan_agent_inherits(screen, root, cwd):

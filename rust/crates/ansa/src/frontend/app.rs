@@ -403,6 +403,14 @@ fn text_with_openrouter(
         return Err("native_terminal_requires_carbon");
     }
     let mut settings = load_agent_settings(&parsed.cwd, &home()?)?;
+    let use_saved_generation = parsed.prompt.is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && !parsed.resume
+        && parsed.session.is_empty()
+        && parsed.model.is_none()
+        && parsed.returned_model.is_none()
+        && !parsed.openrouter;
     if parsed.openrouter
         && [&parsed.model, &parsed.returned_model]
             .into_iter()
@@ -457,16 +465,30 @@ fn text_with_openrouter(
         bound.account = account;
         (generate, options)
     };
+    let mut factory = super::sessions::Factory::new(
+        settings.clone(),
+        parsed.auth.clone(),
+        parsed.offline,
+        bound.account.clone(),
+        workspace_auth,
+    )
+    .with_native_terminals(parsed.native_terminals);
+    if let Some(route) = openrouter {
+        factory = factory.with_openrouter(route);
+    }
+    let mut effort = None;
+    if use_saved_generation && let Some(selection) = factory.saved_generation() {
+        effort.clone_from(&selection.effort);
+        factory.use_generation(selection);
+        settings = factory.settings.clone();
+        bound.requested_model.clone_from(&settings.model);
+        bound.returned_model.clone_from(&settings.returned_model);
+    }
     let mut epoch = agent_epoch(&settings)?;
     if parsed.resume && !parsed.session.is_empty() {
         return Err("session_selection_conflict");
     }
-    let profile = openrouter
-        .as_ref()
-        .map_or(if parsed.offline { "offline" } else { "live" }, |route| {
-            route.binding().account.as_str()
-        });
-    let catalog = settings.catalog(profile)?;
+    let catalog = settings.catalog(factory.profile())?;
     let selected = if !parsed.session.is_empty() {
         catalog.explicit(&parsed.session)?
     } else if parsed.resume {
@@ -484,17 +506,6 @@ fn text_with_openrouter(
             ],
         )
     });
-    let mut factory = super::sessions::Factory::new(
-        settings.clone(),
-        parsed.auth.clone(),
-        parsed.offline,
-        bound.account.clone(),
-        workspace_auth,
-    )
-    .with_native_terminals(parsed.native_terminals);
-    if let Some(route) = openrouter {
-        factory = factory.with_openrouter(route);
-    }
     if let Some(editor) = &editor {
         factory = factory.with_editor(selected.directory.clone(), editor.clone());
     }
@@ -517,7 +528,8 @@ fn text_with_openrouter(
             })
         },
     )?;
-    let configuration = Request::new(bound, epoch, tools.advertisement().clone(), vec![])?;
+    let configuration =
+        Request::new(bound, epoch, tools.advertisement().clone(), vec![])?.with_effort(effort)?;
     options.directory = Some(selected.directory.clone());
     options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&settings));
     if parsed.offline {

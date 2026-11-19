@@ -663,16 +663,48 @@ impl Workbench {
             previous: Some((models, selected)),
         });
     }
-    pub(super) fn apply_generation(&mut self, model: String, effort: Option<String>, io: &Io) {
-        let slot = &mut self.slots[self.current];
-        if slot.state.post(
-            &slot.handle,
-            CommandPayload::SetGeneration(GenerationSelection { model, effort }),
-            &mut slot.replies,
-        ) {
-            slot.state
-                .report(io, "Applying model and reasoning effort…");
+    pub(super) fn apply_generation(
+        &mut self,
+        model: String,
+        effort: Option<String>,
+        io: &Io,
+    ) -> bool {
+        if self.slots[self.current].kind == Kind::Console {
+            self.report(io, "The command panel has no model");
+            return false;
         }
+        if !self.can_job(io) {
+            return false;
+        }
+        let slot = &mut self.slots[self.current];
+        let selection = GenerationSelection { model, effort };
+        let command = slot.state.command(
+            &slot.handle,
+            CommandPayload::SetGeneration(selection.clone()),
+        );
+        let handle = slot.handle.clone();
+        let owner = slot.id.clone();
+        let factory = self.factory.clone();
+        let selected_at = SystemTime::now();
+        self.jobs.spawn(async move {
+            let result = match handle.post(command).await {
+                Ok(PostStatus::Accepted) => tokio::task::spawn_blocking(move || {
+                    factory.save_generation(selected_at, &selection)
+                })
+                .await
+                .unwrap_or(Err("model_preferences_write")),
+                Ok(PostStatus::Duplicate) => Ok(()),
+                Ok(PostStatus::Closed) => Err("runtime_closed"),
+                Ok(PostStatus::QueueFull) => Err("command_queue_full"),
+                Ok(PostStatus::CommandIdLimit) => Err("submit_id_limit"),
+                Ok(_) => Err("generation_selection"),
+                Err(code) => Err(code),
+            };
+            Job::GenerationSaved { owner, result }
+        });
+        slot.state
+            .report(io, "Applying model and reasoning effort…");
+        true
     }
     fn terminal_dimensions(&self) -> Option<(u16, u16)> {
         // A key can arrive after the Files footer has been written but before

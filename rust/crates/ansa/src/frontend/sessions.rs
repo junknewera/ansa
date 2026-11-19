@@ -5,7 +5,7 @@ use crate::{
     config::{AgentSettings, agent_epoch},
     openrouter::OpenRouter,
     protocol::json::Json,
-    provider::request::Request,
+    provider::{contracts::GenerationSelection, request::Request},
     runtime::{DirectoryIdentity, ForkSeed, Generate, Lease, Limits, Options, Runtime},
     session::{
         catalog::{CatalogEntry, Selected},
@@ -16,8 +16,10 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
+    fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const CONSOLE_ACCOUNT: &str = "ansa-local-console";
 
@@ -49,6 +51,7 @@ pub struct Factory {
     pub auth_path: PathBuf,
     pub offline: bool,
     account: String,
+    initial_effort: Option<String>,
     auth: Option<Arc<AuthManager>>,
     editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
     native_terminals: bool,
@@ -76,6 +79,7 @@ impl Factory {
             auth_path,
             offline,
             account,
+            initial_effort: None,
             auth,
             editor: None,
             native_terminals: false,
@@ -147,7 +151,7 @@ impl Factory {
             hub.set_mode(mode);
         }
     }
-    fn profile(&self) -> &str {
+    pub(super) fn profile(&self) -> &str {
         if let Some(route) = &self.openrouter {
             route.binding().account.as_str()
         } else if self.offline {
@@ -155,6 +159,96 @@ impl Factory {
         } else {
             "live"
         }
+    }
+    fn generation_directory(&self) -> PathBuf {
+        let profile = format!("{}\n{}", self.profile(), self.account);
+        self.settings
+            .directory
+            .join("model-defaults")
+            .join(crate::protocol::legacy_json_v1::sha256(profile.as_bytes()))
+    }
+    pub(super) fn saved_generation(&self) -> Option<GenerationSelection> {
+        let directory = ansa_linux::fs::private_directory(&self.generation_directory()).ok()?;
+        Self::read_generation(&directory).map(|(_, selection)| selection)
+    }
+    fn read_generation(directory: &File) -> Option<(u128, GenerationSelection)> {
+        let bytes = ansa_linux::local::read(directory, "generation.json", 4096).ok()??;
+        let value = Json::parse_with_limits(std::str::from_utf8(&bytes).ok()?, 4096, 8, 32).ok()?;
+        if value.usize_field("schema_version").ok()? != 1 {
+            return None;
+        }
+        let selected_at = value.field("selected_at").ok()?.dump().parse().ok()?;
+        let model = value.text_field("model").ok()?;
+        if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+            return None;
+        }
+        let effort = value.field("effort").ok()?;
+        let effort = if effort.is_null() {
+            None
+        } else {
+            let effort = effort.text().ok()?;
+            if !crate::provider::contracts::valid_id(effort) {
+                return None;
+            }
+            Some(effort.into())
+        };
+        Some((
+            selected_at,
+            GenerationSelection {
+                model: model.into(),
+                effort,
+            },
+        ))
+    }
+    pub(super) fn save_generation(
+        &self,
+        selected_at: SystemTime,
+        selection: &GenerationSelection,
+    ) -> Result<()> {
+        let selected_at = selected_at
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "model_preferences_clock")?
+            .as_nanos();
+        let path = self.generation_directory();
+        ansa_linux::fs::create_private(&path).map_err(|_| "model_preferences_directory")?;
+        let directory =
+            ansa_linux::fs::private_directory(&path).map_err(|_| "model_preferences_directory")?;
+        // Keep the lock on the directory so replacement cannot invalidate it.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut lock = directory.try_lock();
+        while matches!(lock, Err(std::fs::TryLockError::WouldBlock)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            lock = directory.try_lock();
+        }
+        lock.map_err(|_| "model_preferences_lock")?;
+        if Self::read_generation(&directory).is_some_and(|(saved, _)| saved > selected_at) {
+            return Ok(());
+        }
+        let data = serde_json::json!({
+            "schema_version": 1,
+            "selected_at": selected_at,
+            "model": selection.model,
+            "effort": selection.effort,
+        });
+        ansa_linux::local::replace_generation(
+            &directory,
+            data.to_string().as_bytes(),
+            &crate::auth::pkce::random_token(16)?.replace('_', "-"),
+        )
+        .map_err(|_| "model_preferences_write")
+    }
+    pub(super) fn use_generation(&mut self, selection: GenerationSelection) {
+        if self.settings.model != selection.model {
+            self.settings.returned_model.clone_from(&selection.model);
+            self.settings.model = selection.model;
+        }
+        self.initial_effort = selection.effort;
+    }
+    pub(super) fn create_main(mut self, selection: Option<GenerationSelection>) -> Result<Created> {
+        if let Some(selection) = selection {
+            self.use_generation(selection);
+        }
+        self.create(Kind::Main, None)
     }
     pub fn entries(&self) -> Result<Vec<CatalogEntry>> {
         self.settings.catalog(self.profile())?.entries()
@@ -701,7 +795,11 @@ impl Factory {
                 }
             });
         }
-        let effort = base.as_ref().and_then(|r| r.effort.clone());
+        let effort = match &base {
+            Some(request) => request.effort.clone(),
+            None if kind == Kind::Main => self.initial_effort.clone(),
+            None => None,
+        };
         let configuration = Request::new(bound, epoch, tools.advertisement().clone(), vec![])?
             .with_effort(effort)?;
         let runtime = Runtime::new(

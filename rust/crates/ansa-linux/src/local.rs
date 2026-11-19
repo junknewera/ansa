@@ -153,6 +153,14 @@ pub fn sync_regular(directory: &File, name: &str) -> io::Result<()> {
 /// Atomically publish the small UI preference file inside an owned private
 /// directory. It carries no runtime state and has last-writer-wins semantics.
 pub fn replace_ui(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()> {
+    replace_preference(directory, "ui.json", bytes, suffix)
+}
+
+pub fn replace_generation(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()> {
+    replace_preference(directory, "generation.json", bytes, suffix)
+}
+
+fn replace_preference(directory: &File, name: &str, bytes: &[u8], suffix: &str) -> io::Result<()> {
     let meta = directory.metadata()?;
     if !meta.is_dir()
         || meta.uid() != rustix::process::geteuid().as_raw()
@@ -169,8 +177,8 @@ pub fn replace_ui(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()
     }
     // Validate any existing destination before publication, including its link
     // count and owner. This never follows a substituted symlink.
-    let _ = read_regular(directory, "ui.json", 4096)?;
-    let pending = format!(".ui.json.pending-{suffix}");
+    let _ = read_regular(directory, name, 4096)?;
+    let pending = format!(".{name}.pending-{suffix}");
     let fd = rustix::fs::openat(
         directory,
         pending.as_str(),
@@ -187,7 +195,7 @@ pub fn replace_ui(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()
     let mut file = File::from(fd);
     file.write_all(bytes)?;
     file.sync_all()?;
-    rustix::fs::renameat(directory, pending.as_str(), directory, "ui.json")?;
+    rustix::fs::renameat(directory, pending.as_str(), directory, name)?;
     directory.sync_all()
 }
 pub fn lock(directory: &File) -> io::Result<File> {

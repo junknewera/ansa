@@ -1,5 +1,20 @@
 # Состояние ansa
 
+## Модель для новых разговоров Carbon
+
+На [`c50d952`](https://github.com/junknewera/ansa/commit/c50d952dd570f585c31553081bbc0660da75e53e)
+Carbon запоминает модель и effort после записи выбора в журнал.
+`/new` наследует настройки открытого разговора. Свежий запуск берёт
+последний подтверждённый выбор аккаунта. При открытии сохранённой
+сессии её настройки восстанавливаются из журнала.
+
+На X13s/NixOS/aarch64 прошли Cargo Debug и Nix Release (394 теста и
+9 doctests в каждом), clippy, fmt и `nix flake check`. В Debug прошли 25
+сценариев Carbon и сценарий с тестовым OpenRouter. Установленный пакет
+прошёл `--self-check`, `--offline-demo` и PTY с выбором модели и перезапуском.
+Замечания независимого ревью закрыты. Отчёты и первый прогон с обнаруженной
+гонкой выхода сохранены в `~/Workspace/pet/ansa-baselines/carbon-model-yEmKt4/`.
+
 ## Carbon: план, прогресс и проверенные результаты
 
 На [`dbcb2e5`](https://github.com/junknewera/ansa/commit/dbcb2e5df5e2d1dae96796d1d4d94ce6acadccbc)
