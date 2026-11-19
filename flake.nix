@@ -44,6 +44,10 @@
           preBuild = ''
             python3 ${./tests/parity/check_toolchain.py} --workspace .
           '';
+          # Other tests may fork while a terminal journal lock is open.
+          preCheck = ''
+            export RUST_TEST_THREADS=1
+          '';
           meta.mainProgram = "ansa";
         };
     in {
