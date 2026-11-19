@@ -579,6 +579,12 @@ impl Run {
         if self.needs_reconciliation || self.storage_failed {
             return None;
         }
+        self.recorded_result(step)
+    }
+
+    /// Archived presentation of the result sealed by this ledger. Dispatch
+    /// and continuation must still use `result` after child reconciliation.
+    pub(crate) fn recorded_result(&self, step: &str) -> Option<&ChildResult> {
         match self.state.children.get(step)?.outcome.as_ref()? {
             Outcome::Result { value, .. } => Some(value),
             _ => None,

@@ -941,6 +941,10 @@ pub struct Workspace {
     pub suggestions: Option<Popup>,
     pub animation_frame: u8,
     pub animate: bool,
+    pub draft_notice: bool,
+    pub interrupt_hint: &'static str,
+    pub result_selected: Option<String>,
+    pub wide_diff: bool,
 }
 const MINT: &str = "\x1b[38;2;133;220;177m";
 const TEXT: &str = "\x1b[38;2;215;223;235m";
@@ -1426,7 +1430,10 @@ pub fn layout_workspace(
         .inspector
         .as_ref()
         .is_some_and(|panel| panel.kind == InspectorKind::Plan);
-    let side_by_side = ui.inspector.is_some() && !plan && (width >= 100 || picture && width >= 63);
+    let side_by_side = ui.inspector.is_some()
+        && !plan
+        && !ui.wide_diff
+        && (width >= 100 || picture && width >= 63);
     let panel_width = if side_by_side {
         if picture {
             width / 2
@@ -1442,7 +1449,9 @@ pub fn layout_workspace(
         width
     };
     let stacked = ui.inspector.is_some() && !side_by_side;
-    let chat_height = if plan {
+    let chat_height = if ui.wide_diff {
+        0
+    } else if plan {
         1
     } else if stacked {
         (body_height / 3).max(1)
@@ -1491,7 +1500,17 @@ pub fn layout_workspace(
         color,
         true,
     )?;
-    let chat_rows = &chat.lines[1..chat_height + 1];
+    let mut chat_rows = chat.lines[1..chat_height + 1].to_vec();
+    if let Some(selected) = &ui.result_selected
+        && let Some((row, _)) = chat.tool_actions.iter().find(|(_, key)| key == selected)
+        && let Some(line) = row.checked_sub(1).and_then(|row| chat_rows.get_mut(row))
+    {
+        *line = if color {
+            styled(&padded(&plain(line), chat_width), SELECTED, true)
+        } else {
+            clipped(&format!("› {}", plain(line)), chat_width)
+        };
+    }
     let mut inspector_bounds = None;
     let mut panes = vec![None; height];
     if let Some(panel) = &ui.inspector {
@@ -1523,12 +1542,12 @@ pub fn layout_workspace(
                 rows.push(line);
             }
         } else {
-            rows.extend_from_slice(chat_rows);
+            rows.extend_from_slice(&chat_rows);
             rows.push(rule(width, color));
             rows.extend(panel_rows);
         }
     } else {
-        rows.extend_from_slice(chat_rows);
+        rows.extend_from_slice(&chat_rows);
     }
     rows.push(rule(width, color));
     let mut cursor_row = rows.len() + editor_cursor_row;
@@ -1552,17 +1571,61 @@ pub fn layout_workspace(
             .inspector
             .as_ref()
             .is_some_and(|panel| panel.kind == InspectorKind::Command);
-    let hint = match (terminal, narrow) {
-        (true, false) => "Клик по чату · Ctrl+C прервать",
-        (true, true) => "Ctrl+C",
-        (false, false) => "/ команды · Tab фокус · ? помощь",
-        (false, true) => "? помощь",
+    let navigation = if ui.result_selected.is_some() {
+        "↑/↓ результат · Enter открыть · Esc ввод"
+    } else if ui.popup.is_some() {
+        ""
+    } else if ui.suggestions.is_some() {
+        "Tab дописать"
+    } else if terminal {
+        "Клик по чату"
+    } else if ui.focus == Focus::Inspector || ui.wide_diff {
+        "Tab → чат"
+    } else if let Some(panel) = &ui.inspector {
+        match panel.kind {
+            InspectorKind::Diff => "Tab → diff",
+            InspectorKind::Agents => "Tab → агенты",
+            InspectorKind::Image => "Tab → график",
+            _ => "Tab → панель",
+        }
+    } else {
+        "Tab режим"
     };
-    rows.push(heading(&metadata, hint, width, color));
+    let results =
+        !chat.tool_actions.is_empty() && ui.result_selected.is_none() && ui.focus == Focus::Chat;
+    let interrupt = if terminal {
+        "Ctrl+C программе"
+    } else {
+        ui.interrupt_hint
+    };
+    let hint = [
+        interrupt,
+        navigation,
+        if results {
+            "Ctrl+G результаты"
+        } else {
+            ""
+        },
+        if narrow || ui.result_selected.is_some() {
+            ""
+        } else {
+            "? помощь"
+        },
+    ]
+    .into_iter()
+    .filter(|hint| !hint.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    rows.push(heading(&metadata, &hint, width, color));
     // Diagnostics are separate from frozen transcript rows.
     let notice = status.lines().nth(1).unwrap_or_default();
     let notice = if notice.is_empty() {
         status.lines().nth(2).unwrap_or_default()
+    } else {
+        notice
+    };
+    let notice = if notice.is_empty() && ui.draft_notice {
+        "Черновик · можно отправить после завершения"
     } else {
         notice
     };
@@ -1718,14 +1781,46 @@ fn paint_popup(rows: &mut [String], popup: &Popup, columns: usize, color: bool) 
     if rows.len() < 6 || columns < 12 {
         return;
     }
-    let width = columns.saturating_sub(6).clamp(10, 90);
+    let label = popup
+        .items
+        .iter()
+        .map(|item| cells(&item.label) + 2)
+        .max()
+        .unwrap_or(0);
+    let detail = popup
+        .items
+        .iter()
+        .map(|item| cells(&item.detail))
+        .max()
+        .unwrap_or(0);
+    let natural = [
+        cells(&popup.title),
+        cells(&popup.subtitle),
+        cells(&popup.footer),
+        label + usize::from(detail > 0) + detail,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(10);
+    let compact = matches!(popup.title.as_str(), "/model" | "/effort");
+    let width = if compact {
+        natural.max(10).min(columns.saturating_sub(2)).min(90)
+    } else {
+        columns.saturating_sub(6).clamp(10, 90)
+    };
     let label_width = popup
         .items
         .iter()
         .map(|item| cells(&item.label) + 2)
         .max()
         .unwrap_or(0)
-        .min(width / 2);
+        .min(if !compact {
+            width / 2
+        } else if detail == 0 {
+            width
+        } else {
+            width.saturating_sub((width / 3).max(1))
+        });
     let visible = popup.items.len().min(rows.len().saturating_sub(6));
     let first = popup.selected.saturating_sub(visible.saturating_sub(1));
     let left = (columns - width - 2) / 2;

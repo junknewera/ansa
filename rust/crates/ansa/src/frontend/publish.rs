@@ -48,6 +48,21 @@ pub(super) fn record_release(
     local::publish_recovered(&directory, "release.json", &bytes).map_err(|_| "draft_release")
 }
 
+pub(super) fn released_candidate(storage: &Path, worktree: &Worktree) -> Result<String> {
+    let directory = local_fs::private_directory(storage).map_err(|_| "draft_release")?;
+    let bytes = local::read(&directory, "release.json", 4096)
+        .map_err(|_| "draft_release")?
+        .ok_or("draft_release_missing")?;
+    let release: Release = serde_json::from_slice(&bytes).map_err(|_| "draft_release")?;
+    if release.baseline != worktree.baseline()
+        || release.source_head != worktree.source_head()
+        || !valid_oid(&release.candidate)
+    {
+        return Err("draft_release");
+    }
+    Ok(release.candidate)
+}
+
 fn latest_release(factory: &Factory, parent: &str) -> Result<(PathBuf, Release, String)> {
     let root = run_root(factory, parent);
     let directory = local_fs::private_directory(&root).map_err(|_| "draft_release_missing")?;

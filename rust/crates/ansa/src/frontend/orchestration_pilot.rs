@@ -708,7 +708,8 @@ fn run_synthetic(
     );
     let proposal = Proposal::generate(factory, seed, prompt.into(), stop)?;
     check_scenario_scope(&proposal.plan, report)?;
-    let completed = orchestration::execute(factory, proposal, stop)?;
+    let (progress, _) = tokio::sync::watch::channel(None);
+    let completed = orchestration::execute(factory, proposal, stop, progress)?;
     let candidate = completed
         .candidate
         .as_ref()

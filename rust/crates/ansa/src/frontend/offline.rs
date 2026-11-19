@@ -163,8 +163,8 @@ fn orchestration_fixture(request: &Request) -> Result<Option<AdmittedResponse>> 
                 {"id":"long", "task":format!("{}VISIBLE_END_OF_STEP", "длинная строка ".repeat(130)), "access":"read", "paths":[], "depends_on":[], "acceptance":"Прочитать строку целиком"}
             ]
         }).to_string(),
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE") => serde_json::json!({
-            "schema_version": 1, "summary": "Обновить тестовый отчёт", "checks":[{"path":"report.txt","contains":"after fixture"}], "manual_checks":[], "steps": [
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_BLOCKED_WRITE_FIXTURE") => serde_json::json!({
+            "schema_version": 1, "summary": "Обновить тестовый отчёт", "checks":[{"path":"report.txt","contains":"after fixture"}], "manual_checks": if user == "ORCHESTRATION_BLOCKED_WRITE_FIXTURE" { vec!["Подтвердить исходные данные"] } else { vec![] }, "steps": [
                 {"id":"edit", "task":"Синтетическая правка отчёта", "access":"write", "paths":["report.txt"], "depends_on":[], "acceptance":"Тестовый отчёт содержит after fixture"}
             ]
         }).to_string(),

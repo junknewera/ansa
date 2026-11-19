@@ -1,12 +1,356 @@
 //! Workspace interactions. Typed runtime state remains the source of truth.
 use super::*;
 use crate::frontend::terminal_input::TerminalEvent;
+use std::sync::Arc;
+
+pub(super) struct CandidateView {
+    run: String,
+    heading: String,
+    title: String,
+    rows: Arc<Vec<crate::frontend::diff::Row>>,
+    checks: Vec<Arc<carbon::OutputView>>,
+}
+
+impl CandidateView {
+    pub(super) fn new(run: String, candidate: orchestration::Candidate) -> Self {
+        use crate::frontend::diff::{Kind, patch_rows};
+        let rows = patch_rows(&candidate.diff);
+        let added = rows.iter().filter(|row| row.kind == Kind::Add).count();
+        let removed = rows.iter().filter(|row| row.kind == Kind::Remove).count();
+        let changed = match candidate.paths.as_slice() {
+            [path] => path.clone(),
+            paths => format!("Файлов: {}", paths.len()),
+        };
+        let heading = format!("{changed} · +{added} −{removed}");
+        let title = format!("{heading} · снимок проекта → ansa-result");
+        Self {
+            run,
+            heading,
+            title,
+            rows: Arc::new(rows),
+            checks: candidate.checks.into_iter().map(Arc::new).collect(),
+        }
+    }
+
+    pub(super) fn panel(&self) -> Panel {
+        Panel::EditDiff {
+            title: format!("{} · Проверенные изменения", self.title),
+            rows: self.rows.clone(),
+            offset: 0,
+            column: 0,
+        }
+    }
+}
+
+impl Slot {
+    pub(super) fn remember_candidate(&mut self, review: CandidateView) {
+        self.candidate_reviews
+            .retain(|previous| previous.run != review.run);
+        if self.candidate_reviews.len() >= 4 {
+            self.candidate_reviews.pop_front();
+        }
+        self.candidate_reviews.push_back(review);
+    }
+}
 
 impl Workbench {
+    pub(super) fn projected(&self) -> Option<Vec<Entry>> {
+        let slot = &self.slots[self.current];
+        let mut entries = slot.projected()?;
+        for review in &slot.candidate_reviews {
+            let plan_key = format!("plan:{}", review.run);
+            if let Some(index) = entries
+                .iter()
+                .position(|entry| entry.action.as_ref() == Some(&plan_key))
+            {
+                let diff = Some(format!("candidate:{}", review.run));
+                let mut review_entries = vec![result_entry(review.heading.clone(), diff, None)];
+                review_entries.extend(review.checks.iter().enumerate().map(|(index, view)| {
+                    result_entry(
+                        format!("{} · пройдено", view.title),
+                        Some(format!("output:verification:{}:{index}", review.run)),
+                        Some(view.clone()),
+                    )
+                }));
+                entries.splice(index + 1..index + 1, review_entries);
+            }
+        }
+        if !slot.state.follow_tail {
+            return Some(entries);
+        }
+        if self.collecting_orchestration() {
+            let view = self.orchestration_views.get(&slot.id);
+            entries.push(Entry {
+                text: view.map_or_else(
+                    || "Готовлю помощников".into(),
+                    |view| {
+                        if view.reviewing {
+                            "Проверяю правки помощников".into()
+                        } else {
+                            format!(
+                                "{} · {} из {} агентов завершили работу",
+                                view.title,
+                                view.done,
+                                view.plan.steps().len()
+                            )
+                        }
+                    },
+                ),
+                role: "activity".into(),
+                action: view.map(|_| "plan:active".into()),
+                status: None,
+                edit: None,
+                output: None,
+            });
+        } else if self.orchestration_summary.contains_key(&slot.id) {
+            if entries.last().is_some_and(|entry| entry.role == "activity") {
+                entries.pop();
+            }
+            entries.push(Entry {
+                text: "Координатор готовит сводку".into(),
+                role: "activity".into(),
+                action: None,
+                status: None,
+                edit: None,
+                output: None,
+            });
+        }
+        Some(entries)
+    }
     pub(super) fn navigating(&self) -> bool {
         self.menu.is_some()
+            || (self.focus == Focus::Chat && self.result_selected.is_some())
             || (self.focus == Focus::Inspector && !matches!(self.panel, Some(Panel::Terminal)))
     }
+
+    pub(super) fn relative_directory(&self, path: &Path) -> String {
+        match path.strip_prefix(&self.factory.settings.cwd) {
+            Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
+            Ok(relative) => relative.display().to_string(),
+            Err(_) => path.display().to_string(),
+        }
+    }
+
+    pub(super) fn show_orchestration_plan(
+        &mut self,
+        plan: &crate::orchestration::plan::Plan,
+        prompt: Option<&str>,
+    ) {
+        use crate::orchestration::plan::Access;
+        let mut lines = vec![plan.summary().to_owned(), String::new()];
+        if let Some(prompt) = prompt {
+            lines.push("Исходный запрос".into());
+            lines.extend(prompt.lines().map(str::to_owned));
+            lines.push(String::new());
+        }
+        if let Err(code) = plan.execution_ready() {
+            lines.push(if code == "orchestration_manual_checks_required" {
+                "Перед запуском нужна ручная проверка. Выберите «Уточнить».".into()
+            } else {
+                "Добавьте проверку результата правок через «Уточнить».".into()
+            });
+            lines.push(String::new());
+        }
+        for check in plan.command_checks() {
+            lines.push(format!(
+                "Команда в копии проекта с вашими правами {}",
+                serde_json::json!(check.argv)
+            ));
+        }
+        for (index, step) in plan.steps().iter().enumerate() {
+            let access = match step.access {
+                Access::Read => "Чтение",
+                Access::Write => "Правки в рабочей копии",
+            };
+            lines.push(format!("{}. {} · {access}", index + 1, step.id));
+            lines.extend(step.task.lines().map(str::to_owned));
+            lines.extend(step.paths.iter().cloned());
+            if !step.depends_on.is_empty() {
+                lines.push(format!("После шагов {}", step.depends_on.join(", ")));
+            }
+            lines.extend(step.acceptance.lines().map(str::to_owned));
+            lines.push(String::new());
+        }
+        if plan.steps().iter().any(|step| step.access == Access::Write) {
+            lines.push("После правок - проверка diff и независимое ревью. До двух исправлений в указанных путях.".into());
+        }
+        for check in plan.checks() {
+            lines.push(format!("Проверка файла {}", check.path));
+            lines.extend(check.contains.lines().map(str::to_owned));
+        }
+        for check in plan.manual_checks() {
+            lines.push(if plan.execution_ready().is_ok() {
+                "Рекомендация после отчёта".into()
+            } else {
+                "Ручная проверка".into()
+            });
+            lines.extend(check.lines().map(str::to_owned));
+        }
+        self.file_token = self.file_token.wrapping_add(1);
+        self.panel = Some(Panel::Orchestration { lines, offset: 0 });
+        self.focus = Focus::Inspector;
+    }
+
+    pub(super) fn navigate_results(&mut self, older: Option<bool>) {
+        let Some(frame) = &self.displayed else { return };
+        let mut seen = std::collections::BTreeSet::new();
+        let keys: Vec<_> = frame
+            .tool_actions
+            .iter()
+            .filter(|(_, key)| seen.insert(key))
+            .collect();
+        let selected = self
+            .result_selected
+            .as_ref()
+            .and_then(|key| keys.iter().position(|(_, shown)| key == shown));
+        let index = match (selected, older) {
+            (_, None) if self.result_selected.is_some() => {
+                self.result_selected = None;
+                self.leave_results();
+                return;
+            }
+            (Some(index), None) => index,
+            (Some(index), Some(true)) => index.saturating_sub(1),
+            (Some(index), Some(false)) => (index + 1).min(keys.len().saturating_sub(1)),
+            (None, _) => 0,
+        };
+        let next = keys.get(index).map(|(_, key)| key.clone());
+        if self.result_selected.is_none() && next.is_some() {
+            let projected = self.projected();
+            let slot = &mut self.slots[self.current];
+            self.result_tail = slot.state.follow_tail;
+            if slot.state.follow_tail {
+                slot.state.follow_tail = false;
+                slot.state.reading = projected;
+                slot.state.reading_total = slot
+                    .state
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |s| s.transcript_size);
+                if let Some(page) = &slot.timeline {
+                    slot.timeline_query.before = page.end;
+                    slot.timeline_query.forward = false;
+                }
+            }
+        }
+        self.result_selected = next;
+    }
+
+    pub(super) fn activate_result(
+        &mut self,
+        key: String,
+        edit: Option<std::sync::Arc<crate::frontend::diff::EditView>>,
+        output: Option<std::sync::Arc<carbon::OutputView>>,
+        io: &Io,
+    ) {
+        self.selection = None;
+        let slot = &self.slots[self.current];
+        if self.result_selected.is_some() && self.result_scroll.is_none() {
+            self.result_scroll = Some(slot.state.scroll);
+        }
+        if let Some(operation) = key.strip_prefix("image:") {
+            let source = slot.timeline.as_ref().and_then(|page| {
+                page.entries.iter().find_map(|entry| {
+                    graphics::Source::from_entry(entry, &slot.id)
+                        .filter(|(id, _)| *id == operation)
+                        .map(|(_, source)| source)
+                })
+            });
+            if let Some(source) = source {
+                self.show_image(source, io);
+                if self.result_selected.is_some() {
+                    self.focus = Focus::Inspector;
+                }
+            }
+        } else if let Some(run) = key.strip_prefix("plan:") {
+            if run == "active" {
+                if let Some(view) = self.orchestration_views.get(&slot.id) {
+                    self.show_orchestration_plan(&view.plan.clone(), None);
+                }
+            } else if self.can_job(io) {
+                let parent = self.slots[self.current].id.clone();
+                let run = run.to_owned();
+                self.file_token = self.file_token.wrapping_add(1);
+                let token = self.file_token;
+                self.panel = Some(Panel::Orchestration {
+                    lines: vec!["Загружаю план".into()],
+                    offset: 0,
+                });
+                self.focus = Focus::Inspector;
+                let factory = self.factory.clone();
+                let stop = Cancel::linked(&self.stop);
+                self.jobs.spawn_blocking(move || Job::ArchivedPlan {
+                    token,
+                    result: orchestration::archived_plan(&factory, parent, &run, &stop),
+                });
+            }
+        } else if let Some(run) = key.strip_prefix("candidate:") {
+            if let Some(review) = slot
+                .candidate_reviews
+                .iter()
+                .find(|review| review.run == run)
+            {
+                self.panel = Some(review.panel());
+                self.focus = Focus::Inspector;
+            }
+        } else if let Some((line, path)) = key
+            .strip_prefix("file:")
+            .and_then(|value| value.split_once(':'))
+        {
+            let token = self.file_token;
+            self.open_file(PathBuf::from(path), io);
+            if self.file_token != token
+                && let Some(Panel::Files(files)) = &mut self.panel
+            {
+                files.offset = line.parse::<usize>().unwrap_or(0).saturating_sub(1);
+            }
+        } else if let Some(view) = output {
+            if !matches!(self.panel, Some(Panel::Output { .. })) {
+                self.output_back = self.panel.take().map(Box::new);
+            }
+            self.panel = Some(Panel::Output { view, offset: 0 });
+            self.focus = Focus::Inspector;
+        } else if let Some(edit) = edit {
+            let filename = Path::new(&edit.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&edit.path);
+            self.panel = Some(Panel::EditDiff {
+                title: format!(
+                    "{} · +{} -{} · Diff правки",
+                    filename, edit.diff.added, edit.diff.removed
+                ),
+                rows: std::sync::Arc::new(edit.diff.rows.clone()),
+                offset: 0,
+                column: 0,
+            });
+            self.focus = Focus::Inspector;
+        } else {
+            let slot = &mut self.slots[self.current];
+            if !slot.tool_expanded.remove(&key) && slot.tool_expanded.len() < 4096 {
+                slot.tool_expanded.insert(key);
+            }
+            slot.tool_anchor_limit = self.displayed.as_ref().map(|frame| frame.scroll_limit);
+            slot.state.reading = None;
+        }
+    }
+
+    pub(super) fn restore_result_scroll(&mut self) {
+        if let Some(scroll) = self.result_scroll.take() {
+            self.slots[self.current].state.scroll = scroll;
+        }
+        if self.result_selected.is_none() && std::mem::take(&mut self.review_redraw) {
+            self.slots[self.current].state.reading = None;
+        }
+    }
+
+    pub(super) fn leave_results(&mut self) {
+        self.restore_result_scroll();
+        if std::mem::take(&mut self.result_tail) {
+            self.slots[self.current].show_latest();
+        }
+    }
+
     pub(super) fn input_editor(&self) -> &crate::frontend::input::Editor {
         if self.navigating() {
             &self.navigation_editor
@@ -120,6 +464,14 @@ impl Workbench {
                 )
             })
             .collect();
+        let progress = self.orchestration_views.get(&root);
+        if let Some(view) = progress {
+            for (id, _) in &view.agents {
+                if !candidates.iter().any(|(candidate, _, _)| candidate == id) {
+                    candidates.push((id.clone(), Some(root.clone()), "agent".into()));
+                }
+            }
+        }
         for slot in &self.slots {
             if !candidates.iter().any(|(id, _, _)| *id == slot.id) {
                 candidates.push((
@@ -172,6 +524,15 @@ impl Workbench {
             if kind != "agent" {
                 continue;
             }
+            if let Some(mut agent) = progress
+                .and_then(|view| view.agents.iter().find(|(agent, _)| agent == id))
+                .map(|(_, agent)| agent.clone())
+            {
+                agent.title = format!("{tree}{branch}{}", agent.title);
+                agent.detail = format!("{indent}{}", agent.detail);
+                result.push((id.clone(), agent));
+                continue;
+            }
             let live = self.slots.iter().find(|slot| slot.id == *id);
             let state = live
                 .and_then(|slot| slot.state.snapshot.as_ref())
@@ -207,11 +568,20 @@ impl Workbench {
                 })
                 .unwrap_or_default();
             let elapsed = live.and_then(|slot| slot.state.progress.elapsed());
-            let detail = match (generation.is_empty(), elapsed) {
-                (false, Some(elapsed)) => format!("{indent}{generation} · {elapsed}"),
-                (false, None) => format!("{indent}{generation}"),
-                (true, Some(elapsed)) => format!("{indent}{elapsed}"),
-                (true, None) => String::new(),
+            let detail = if let Some(preview) = self
+                .summaries
+                .iter()
+                .find(|summary| summary.entry.id == *id)
+                .and_then(|summary| summary.preview.as_ref())
+            {
+                format!("{indent}{preview}")
+            } else {
+                match (generation.is_empty(), elapsed) {
+                    (false, Some(elapsed)) => format!("{indent}{generation} · {elapsed}"),
+                    (false, None) => format!("{indent}{generation}"),
+                    (true, Some(elapsed)) => format!("{indent}{elapsed}"),
+                    (true, None) => String::new(),
+                }
             };
             result.push((
                 id.clone(),
@@ -543,6 +913,21 @@ impl Workbench {
             result.push(part);
         }
         result
+    }
+}
+
+fn result_entry(
+    text: String,
+    action: Option<String>,
+    output: Option<Arc<carbon::OutputView>>,
+) -> Entry {
+    Entry {
+        role: "tool_success".into(),
+        text,
+        action,
+        output,
+        edit: None,
+        status: None,
     }
 }
 

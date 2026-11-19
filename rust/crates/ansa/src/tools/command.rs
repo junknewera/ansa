@@ -299,6 +299,13 @@ impl ProcessRunner {
         self.recover_in(invocation, None)
     }
 
+    pub(crate) fn inspect_outcome(root: &Path, invocation: &Invocation) -> Result<Outcome> {
+        let path = root.join(sha256(invocation.operation.as_bytes()));
+        let directory =
+            ansa_linux::fs::private_directory(&path).map_err(|_| "local_directory_permissions")?;
+        v::admit(&directory, invocation)
+    }
+
     pub(crate) fn recover_in(
         &self,
         invocation: &Invocation,

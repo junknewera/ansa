@@ -20,10 +20,12 @@ use crate::{
 };
 use ansa_linux::{fs, local};
 use std::{
+    collections::BTreeMap,
     fs::File,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::watch;
 
 pub(super) struct Proposal {
     pub prompt: String,
@@ -113,9 +115,84 @@ pub(super) struct Candidate {
     pub commit: String,
     pub workspace: PathBuf,
     pub diff: String,
+    pub paths: Vec<String>,
+    pub checks: Vec<super::carbon::OutputView>,
 }
 
-pub(super) fn execute(factory: &Factory, proposal: Proposal, stop: &Cancel) -> Result<Completed> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RunView {
+    pub plan: Plan,
+    pub title: String,
+    pub done: usize,
+    pub reviewing: bool,
+    pub agents: Vec<(String, super::carbon::AgentLine)>,
+}
+
+fn publish_progress(
+    progress: &watch::Sender<Option<RunView>>,
+    run: &Run,
+    prompt: &str,
+    details: &BTreeMap<String, String>,
+    reviewing: bool,
+) {
+    let mut done = 0;
+    let agents = run
+        .original_children()
+        .filter_map(|(id, session, _)| {
+            let task = run.plan().steps().iter().find(|step| step.id == id)?;
+            let result = run.result(id);
+            done += usize::from(result.is_some());
+            let (state, detail) = if let Some(result) = result {
+                (
+                    if result.status == ChildStatus::Completed {
+                        "Завершён"
+                    } else {
+                        "Остановлен"
+                    },
+                    result.findings.first().unwrap_or(&result.summary).clone(),
+                )
+            } else {
+                ("Работает", details.get(id).cloned().unwrap_or_default())
+            };
+            Some((
+                session.to_owned(),
+                super::carbon::AgentLine {
+                    title: task.task.lines().next().unwrap_or(&task.id).to_owned(),
+                    state: state.into(),
+                    detail,
+                },
+            ))
+        })
+        .collect();
+    let view = RunView {
+        plan: run.plan().clone(),
+        title: prompt
+            .split_whitespace()
+            .take(10)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(72)
+            .collect(),
+        done,
+        reviewing,
+        agents,
+    };
+    progress.send_if_modified(|previous| {
+        if previous.as_ref() == Some(&view) {
+            return false;
+        }
+        *previous = Some(view);
+        true
+    });
+}
+
+pub(super) fn execute(
+    factory: &Factory,
+    proposal: Proposal,
+    stop: &Cancel,
+    progress: watch::Sender<Option<RunView>>,
+) -> Result<Completed> {
     factory.check_orchestration_context(&proposal.seed.request()?)?;
     proposal.plan.execution_ready()?;
     factory.require_orchestration_route(stop)?;
@@ -123,10 +200,15 @@ pub(super) fn execute(factory: &Factory, proposal: Proposal, stop: &Cancel) -> R
         .enable_time()
         .build()
         .map_err(|_| "orchestration_reactor")?;
-    reactor.block_on(execute_owned(factory, proposal, stop))
+    reactor.block_on(execute_owned(factory, proposal, stop, progress))
 }
 
-async fn execute_owned(factory: &Factory, proposal: Proposal, stop: &Cancel) -> Result<Completed> {
+async fn execute_owned(
+    factory: &Factory,
+    proposal: Proposal,
+    stop: &Cancel,
+    progress: watch::Sender<Option<RunView>>,
+) -> Result<Completed> {
     let started = now()?;
     let deadline = started + 15 * 60;
     let parent = &proposal.seed.source_session().0;
@@ -155,7 +237,7 @@ async fn execute_owned(factory: &Factory, proposal: Proposal, stop: &Cancel) -> 
             return Err(code);
         }
     };
-    schedule(factory, run, candidate, Vec::new(), stop).await
+    schedule(factory, run, candidate, Vec::new(), stop, progress).await
 }
 
 fn writer_workspace(
@@ -209,12 +291,14 @@ async fn schedule(
     candidate: Option<(Worktree, File)>,
     mut active: Vec<Child>,
     stop: &Cancel,
+    progress: watch::Sender<Option<RunView>>,
 ) -> Result<Completed> {
     let identity = run.identity().clone();
     let deadline = run.deadline();
     let context = run.context().ok_or("orchestration_context")?;
     let prompt = context.prompt.clone();
     let source = Request::load(&Json::parse(&context.configuration)?)?;
+    let mut details = BTreeMap::new();
     let result = async {
         loop {
             stop.check()?;
@@ -225,6 +309,19 @@ async fn schedule(
             for index in (0..active.len()).rev() {
                 let receipt = active[index].receipt().await?;
                 let id = &active[index].task.id;
+                if let Some((name, target)) = receipt.latest_tool() {
+                    let label = match name {
+                        "list_directory" => "Просмотр",
+                        "read_file" => "Чтение",
+                        "search_files" => "Поиск",
+                        "edit_file" => "Правка",
+                        _ => "Инструмент",
+                    };
+                    details.insert(
+                        id.clone(),
+                        target.map_or_else(|| label.into(), |path| format!("{label} {path}")),
+                    );
+                }
                 run.observe(id, &receipt)?;
                 if !run.active().any(|active_id| active_id == id) {
                     active.swap_remove(index).runtime.shutdown().await?;
@@ -240,6 +337,7 @@ async fn schedule(
                     paused += 1;
                 }
             }
+            publish_progress(&progress, &run, &prompt, &details, false);
             if paused > 0 {
                 if paused == active.len() {
                     return Err("orchestration_paused");
@@ -264,6 +362,7 @@ async fn schedule(
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         let release = if let Some((worktree, _lease)) = &candidate {
+            publish_progress(&progress, &run, &prompt, &details, true);
             if run.plan().steps().iter().any(|step| {
                 !run.result(&step.id)
                     .is_some_and(|result| result.status == ChildStatus::Completed)
@@ -274,22 +373,9 @@ async fn schedule(
         } else {
             None
         };
-        let mut summary = evidence(&run, &prompt)?;
-        if let Some(candidate) = &release {
-            let mut object: serde_json::Value =
-                serde_json::from_str(&summary).map_err(|_| "orchestration_summary")?;
-            object["verified_candidate"] = serde_json::json!({
-                "commit": candidate.commit,
-                "workspace": candidate.workspace,
-                "branch": "ansa-result",
-                "verification": "git diff --check, approved checks and independent review",
-                "command_checks_passed": run.plan().command_checks().len(),
-            });
-            summary = object.to_string();
-        }
         Ok(Completed {
             id: identity.run,
-            evidence: summary,
+            evidence: evidence(&run, &prompt, release.as_ref())?,
             candidate: release,
         })
     }
@@ -351,7 +437,8 @@ async fn review_candidate(
     for attempt in 0..=2 {
         stop.check()?;
         let candidate = worktree.candidate(attempt, &scope, stop)?;
-        let mut failed = run_command_checks(factory, run, worktree, &candidate, attempt, stop)?;
+        let (mut failed, mut checks) =
+            run_command_checks(factory, run, worktree, &candidate, attempt, stop)?;
         let plan = run.plan().encode()?;
         let review_path = worktree.frozen_view(&candidate, attempt, &plan, stop)?;
         failed.extend(Worktree::failed_checks(
@@ -382,10 +469,13 @@ async fn review_candidate(
             worktree.frozen_view(&candidate, attempt, &plan, stop)?;
             worktree.local_branch(&candidate, stop)?;
             super::publish::record_release(storage, worktree, &candidate)?;
+            append_review_checks(&mut checks, run.plan(), &verdict);
             return Ok(Candidate {
                 commit: candidate.commit().into(),
                 workspace: worktree.path().to_owned(),
                 diff: candidate.diff().into(),
+                paths: candidate.paths().to_vec(),
+                checks,
             });
         }
         if verdict.status == ChildStatus::Blocked || attempt == 2 {
@@ -426,10 +516,10 @@ fn run_command_checks(
     candidate: &Frozen,
     attempt: u8,
     stop: &Cancel,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Vec<super::carbon::OutputView>)> {
     let checks = run.plan().command_checks();
     if checks.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let storage = worktree.path().parent().ok_or("worktree_storage")?;
     let runner = ProcessRunner::new(
@@ -439,28 +529,18 @@ fn run_command_checks(
     let plan = run.plan().encode()?;
     let timeout_ms = factory.settings.process_timeout_ms.clamp(1, 300_000);
     let mut failures = Vec::new();
+    let mut passed = Vec::new();
     for (index, check) in checks.iter().enumerate() {
         stop.check()?;
-        let name = format!("check-{attempt}-{index}");
-        let path = storage.join(&name);
-        let arguments = Json::parse(
-            &serde_json::json!({"candidate":candidate.commit(),"argv":check.argv}).to_string(),
-        )?;
-        let invocation = Invocation {
-            operation: crate::protocol::legacy_json_v1::sha256(
-                format!("{}\n{name}\n{}", run.identity().run, arguments.dump()).as_bytes(),
-            ),
-            call: name.clone(),
-            name: "candidate_check".into(),
-            revision: "ansa_candidate_check_v1".into(),
-            arguments,
-        };
+        let invocation = check_invocation(run, candidate, attempt, index, &check.argv)?;
+        let name = &invocation.call;
+        let path = storage.join(name);
         let existing = runner.has_job(&invocation)?;
         if !existing {
             if now()?.saturating_add((timeout_ms as u64).div_ceil(1000)) > run.deadline() {
                 return Err("orchestration_deadline");
             }
-            worktree.frozen_view_named(candidate, &name, &plan, false, stop)?;
+            worktree.frozen_view_named(candidate, name, &plan, false, stop)?;
             if now()?.saturating_add((timeout_ms as u64).div_ceil(1000)) > run.deadline() {
                 return Err("orchestration_deadline");
             }
@@ -488,11 +568,9 @@ fn run_command_checks(
         if output.field("cancelled").and_then(Json::boolean) == Ok(true) {
             return Err("orchestration_check_cancelled");
         }
-        if outcome.execution() != crate::provider::replay::Execution::Succeeded
-            || output.usize_field("exit_code") != Ok(0)
-            || output.field("timed_out").and_then(Json::boolean) != Ok(false)
-            || output.field("cleanup_complete").and_then(Json::boolean) != Ok(true)
-        {
+        if let Some(view) = passed_check(&check.argv, &outcome, &output) {
+            passed.push(view);
+        } else {
             failures.push(format!(
                 "Проверка {} завершилась ошибкой ({})",
                 check.argv[0],
@@ -502,7 +580,80 @@ fn run_command_checks(
             ));
         }
     }
-    Ok(failures)
+    Ok((failures, passed))
+}
+
+fn check_invocation(
+    run: &Run,
+    candidate: &Frozen,
+    attempt: u8,
+    index: usize,
+    argv: &[String],
+) -> Result<Invocation> {
+    let call = format!("check-{attempt}-{index}");
+    let arguments = Json::parse(
+        &serde_json::json!({"candidate": candidate.commit(), "argv": argv}).to_string(),
+    )?;
+    Ok(Invocation {
+        operation: crate::protocol::legacy_json_v1::sha256(
+            format!("{}\n{call}\n{}", run.identity().run, arguments.dump()).as_bytes(),
+        ),
+        call,
+        name: "candidate_check".into(),
+        revision: "ansa_candidate_check_v1".into(),
+        arguments,
+    })
+}
+
+fn passed_check(
+    argv: &[String],
+    outcome: &crate::tools::registry::Outcome,
+    output: &Json,
+) -> Option<super::carbon::OutputView> {
+    use crate::provider::replay::{Effects, Execution};
+    if outcome.effects() != Effects::KnownResult
+        || outcome.execution() != Execution::Succeeded
+        || output.usize_field("exit_code") != Ok(0)
+        || output.field("cancelled").and_then(Json::boolean) == Ok(true)
+        || output.field("timed_out").and_then(Json::boolean) != Ok(false)
+        || output.field("cleanup_complete").and_then(Json::boolean) != Ok(true)
+    {
+        return None;
+    }
+    let mut text = String::from("Код завершения 0\n");
+    for key in ["stdout", "stderr"] {
+        if let Ok(value) = output.text_field(key)
+            && !value.is_empty()
+        {
+            text.push_str(&format!("\n{key}\n{value}\n"));
+        }
+    }
+    if output.field("truncated").and_then(Json::boolean) == Ok(true) {
+        text.push_str("\nВывод сокращён");
+    }
+    Some(super::carbon::OutputView {
+        title: argv.join(" "),
+        text,
+    })
+}
+
+fn append_review_checks(
+    checks: &mut Vec<super::carbon::OutputView>,
+    plan: &Plan,
+    verdict: &ChildResult,
+) {
+    checks.extend(plan.checks().iter().map(|check| super::carbon::OutputView {
+        title: format!("{} · проверка содержимого", check.path),
+        text: format!("В файле найден ожидаемый текст\n\n{}", check.contains),
+    }));
+    checks.push(super::carbon::OutputView {
+        title: "Независимое ревью".into(),
+        text: std::iter::once(&verdict.summary)
+            .chain(&verdict.findings)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -646,7 +797,7 @@ async fn start_child(
     Ok(child)
 }
 
-fn evidence(run: &Run, prompt: &str) -> Result<String> {
+fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> Result<String> {
     // Limit contribution from each child so the final parent input stays
     // within its native cap even when every step returns the maximum.
     let results: Vec<_> = run.plan().steps().iter().map(|step| {
@@ -657,15 +808,42 @@ fn evidence(run: &Run, prompt: &str) -> Result<String> {
         }));
         serde_json::json!({ "step": step.id, "outcome": outcome })
     }).collect();
-    let input = serde_json::json!({
-        "user_request": prompt.chars().take(512).collect::<String>(),
+    let mut evidence = serde_json::json!({
+        "show_approved_plan": true,
+        "user_request": prompt,
         "results": results,
-    })
-    .to_string();
-    if input.len() > 16 * 1024 {
-        return Err("orchestration_summary_limit");
+    });
+    if let Some(candidate) = candidate {
+        evidence["verified_candidate"] = serde_json::json!({
+            "commit": candidate.commit,
+            "workspace": candidate.workspace,
+            "branch": "ansa-result",
+            "verification": "git diff --check, approved checks and independent review",
+            "command_checks_passed": run.plan().command_checks().len(),
+        });
     }
-    Ok(input)
+    let input = evidence.to_string();
+    if input.len() <= 16 * 1024 {
+        return Ok(input);
+    }
+    let text: Vec<_> = prompt.chars().collect();
+    let mut keep = text.len() / 2;
+    while keep > 0 {
+        let excerpt = text
+            .iter()
+            .take(keep / 2)
+            .chain(['\n', '…', '\n'].iter())
+            .chain(text.iter().skip(text.len() - keep.div_ceil(2)))
+            .collect::<String>();
+        evidence["user_request"] = excerpt.into();
+        evidence["user_request_excerpt"] = true.into();
+        let input = evidence.to_string();
+        if input.len() <= 16 * 1024 {
+            return Ok(input);
+        }
+        keep /= 2;
+    }
+    Err("orchestration_summary_limit")
 }
 
 fn now() -> Result<u64> {
@@ -759,17 +937,143 @@ fn continuable(run: &Run, time: u64) -> bool {
     run.may_continue(time) && run.context().is_some() && run.plan().execution_ready().is_ok()
 }
 
-pub(super) fn resume(factory: &Factory, identity: RunId, stop: &Cancel) -> Result<Completed> {
+pub(super) struct ArchivedPlan {
+    pub run: String,
+    pub plan: Plan,
+    pub prompt: String,
+    pub candidate: Result<Option<Candidate>>,
+}
+
+pub(super) fn archived_plan(
+    factory: &Factory,
+    parent: String,
+    id: &str,
+    stop: &Cancel,
+) -> Result<ArchivedPlan> {
+    use crate::provider::contracts::valid_id;
+    if !valid_id(id) {
+        return Err("run_identity");
+    }
+    let entries = factory.entries()?;
+    let mut parent = Some(parent);
+    for _ in 0..128 {
+        let Some(owner) = parent.take().filter(|owner| valid_id(owner)) else {
+            break;
+        };
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == owner)
+            .ok_or("session_workspace_mismatch")?;
+        parent = entry.parent.clone();
+        let identity = RunId {
+            parent_session: owner.clone(),
+            run: id.into(),
+        };
+        let storage = run_root(factory, &owner).join(id);
+        if !storage.join("ledger").exists() {
+            continue;
+        }
+        let run = Run::open(&storage.join("ledger"), &identity)?;
+        let prompt = run
+            .context()
+            .map(|context| context.prompt.clone())
+            .ok_or("orchestration_context")?;
+        let candidate = if storage.join("release.json").exists() {
+            archived_candidate(factory, &run, &storage, stop).map(Some)
+        } else {
+            Ok(None)
+        };
+        return Ok(ArchivedPlan {
+            run: id.into(),
+            plan: run.plan().clone(),
+            prompt,
+            candidate,
+        });
+    }
+    Err("orchestration_plan_missing")
+}
+
+fn archived_candidate(
+    factory: &Factory,
+    run: &Run,
+    storage: &Path,
+    stop: &Cancel,
+) -> Result<Candidate> {
+    let scope: Vec<_> = run
+        .plan()
+        .steps()
+        .iter()
+        .filter(|step| step.access == Access::Write)
+        .flat_map(|step| step.paths.iter().cloned())
+        .collect();
+    let root = Worktree::repository_root(&factory.settings.cwd, stop)?;
+    let worktree = Worktree::reopen(&root, storage, stop)?;
+    let commit = super::publish::released_candidate(storage, &worktree)?;
+    let candidate = worktree.inspect_candidate(&commit, &scope, stop)?;
+    let directory = fs::private_directory(storage).map_err(|_| "orchestration_storage")?;
+    let attempt = (0..=2)
+        .rev()
+        .find(|attempt| {
+            local::read(&directory, &format!("candidate-{attempt}"), 128)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(commit.as_bytes())
+        })
+        .ok_or("worktree_candidate_identity")?;
+    let mut checks = Vec::new();
+    for (index, check) in run.plan().command_checks().iter().enumerate() {
+        stop.check()?;
+        let invocation = check_invocation(run, &candidate, attempt, index, &check.argv)?;
+        let outcome = ProcessRunner::inspect_outcome(&storage.join("check-jobs"), &invocation)?;
+        let output = Json::parse(
+            std::str::from_utf8(outcome.output()).map_err(|_| "orchestration_check_result")?,
+        )?;
+        checks.push(
+            passed_check(&check.argv, &outcome, &output).ok_or("orchestration_check_result")?,
+        );
+    }
+    let phase = format!("review-{attempt}");
+    let id = RunId {
+        parent_session: run.identity().parent_session.clone(),
+        run: phase.clone(),
+    };
+    let reviewer = Run::open(&storage.join(&phase), &id)?;
+    let verdict = reviewer
+        .recorded_result(&phase)
+        .filter(|result| result.status == ChildStatus::Completed)
+        .ok_or("orchestration_review_unresolved")?;
+    append_review_checks(&mut checks, run.plan(), verdict);
+    Ok(Candidate {
+        commit,
+        workspace: worktree.path().into(),
+        diff: candidate.diff().into(),
+        paths: candidate.paths().to_vec(),
+        checks,
+    })
+}
+
+pub(super) fn resume(
+    factory: &Factory,
+    identity: RunId,
+    stop: &Cancel,
+    progress: watch::Sender<Option<RunView>>,
+) -> Result<Completed> {
     factory.orchestration_route()?;
     stop.check()?;
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .map_err(|_| "orchestration_reactor")?;
-    reactor.block_on(resume_owned(factory, identity, stop))
+    reactor.block_on(resume_owned(factory, identity, stop, progress))
 }
 
-async fn resume_owned(factory: &Factory, identity: RunId, stop: &Cancel) -> Result<Completed> {
+async fn resume_owned(
+    factory: &Factory,
+    identity: RunId,
+    stop: &Cancel,
+    progress: watch::Sender<Option<RunView>>,
+) -> Result<Completed> {
     let storage = run_root(factory, &identity.parent_session).join(&identity.run);
     let mut run = Run::open(&storage.join("ledger"), &identity)?;
     if !continuable(&run, now()?) {
@@ -780,7 +1084,7 @@ async fn resume_owned(factory: &Factory, identity: RunId, stop: &Cancel) -> Resu
     factory.require_orchestration_route(stop)?;
     let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
     let active = restore_active(factory, &mut run, stop).await?;
-    schedule(factory, run, candidate, active, stop).await
+    schedule(factory, run, candidate, active, stop, progress).await
 }
 
 async fn restore_active(factory: &Factory, run: &mut Run, stop: &Cancel) -> Result<Vec<Child>> {
