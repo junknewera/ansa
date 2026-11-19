@@ -12,8 +12,25 @@ pub struct InstructionFile {
 pub fn load_instructions(
     directory: &Path,
     home: &Path,
+    limit: usize,
+) -> Result<Vec<InstructionFile>> {
+    let directory = directory.canonicalize().map_err(|_| "file_access_failed")?;
+    load_instructions_at(&directory, home, limit)
+}
+
+fn load_instructions_at(
+    directory: &Path,
+    home: &Path,
     mut limit: usize,
 ) -> Result<Vec<InstructionFile>> {
+    if !directory.is_absolute() || ansa_linux::fs::normalize(directory) != directory {
+        return Err("file_access_failed");
+    }
+    ansa_linux::fs::open_nofollow(
+        directory,
+        ansa_linux::local::read_flags() | ansa_linux::local::ReadFlags::DIRECTORY,
+    )
+    .map_err(|_| "file_access_failed")?;
     let mut files = vec![];
     let mut add = |path: PathBuf| -> Result<()> {
         if let Some(text) = read_text(&path, limit)? {
@@ -23,7 +40,6 @@ pub fn load_instructions(
         Ok(())
     };
     add(home.join(".ansa/AGENTS.md"))?;
-    let directory = directory.canonicalize().map_err(|_| "file_access_failed")?;
     let parents: Vec<_> = directory.ancestors().collect();
     if parents.len() > 128 {
         return Err("instruction_depth_limit");
@@ -45,7 +61,7 @@ pub const BASE: &str = concat!(
     "Keep user-facing answers concise and use the user's language."
 );
 pub fn saved_instructions(directory: &Path, home: &Path) -> Result<Vec<Json>> {
-    load_instructions(directory, home, 64 * 1024)?
+    load_instructions_at(directory, home, 64 * 1024)?
         .into_iter()
         .map(|file| {
             Json::object(vec![

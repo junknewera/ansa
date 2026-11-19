@@ -661,7 +661,7 @@ pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
             }
             let text = match format["name"].as_str() {
                 Some("ansa_native_schema_probe") if format["strict"] == true => r#"{"value":"schema-enforced"}"#.into(),
-                Some("ansa_orchestration_plan_v2") if format["strict"] == true => json!({"schema_version":1,"summary":"OPENROUTER_CARBON_PLAN","steps":[{"id":"one","task":"Проверить вход","access":"read","paths":[],"depends_on":[],"acceptance":"Ответ получен"}],"checks":[],"manual_checks":["Утвердить удаление после отчёта"],"command_checks":[]}).to_string(),
+                Some("ansa_orchestration_plan_v3") if format["strict"] == true => json!({"schema_version":1,"summary":"OPENROUTER_CARBON_PLAN","steps":[{"id":"one","task":"Проверить вход","access":"read","paths":[],"depends_on":[],"acceptance":"Ответ получен"}],"checks":[],"manual_checks":["Утвердить удаление после отчёта"],"command_checks":[],"read_folder":null}).to_string(),
                 Some("ansa_child_result_v1") if format["strict"] == true && request["tool_choice"] == "none" => r#"{"status":"completed","summary":"Синтетическая проверка пройдена","findings":[]}"#.into(),
                 None if request.get("tools").is_some() => "Готов к итоговому ответу".into(),
                 None => "OPENROUTER_CARBON_DONE".into(),
@@ -753,30 +753,55 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                     {
                         return Err("fixture_format");
                     }
+                    let output: Value = last["output"]
+                        .as_str()
+                        .and_then(|output| serde_json::from_str(output).ok())
+                        .unwrap_or_default();
+                    let needs_instructions = output["status"] == "instructions_required";
                     let call = name == Some("ansa_child_result_v1")
-                        && last["type"] != "function_call_output";
+                        && (last["type"] != "function_call_output" || needs_instructions);
+                    let nested = input.iter().any(|item| {
+                        item["content"].as_str().is_some_and(|content| {
+                            content.starts_with("Inspect nested project instructions")
+                        })
+                    });
                     let item = if call {
                         if !request["tools"].to_string().contains("list_directory") {
                             return Err("fixture_tools");
                         }
-                        let token = request["instructions"]
-                            .as_str()
-                            .and_then(|instructions| {
-                                instructions.split_once("instruction_token is ")
-                            })
-                            .and_then(|(_, suffix)| suffix.split_once('.'))
-                            .map(|(token, _)| token)
-                            .ok_or("fixture_instruction_token")?;
-                        let arguments = json!({"path":".","instruction_token":token}).to_string();
-                        json!({"type":"function_call","id":"call-item","call_id":"fixture-call","namespace":"omh","name":"list_directory","arguments":arguments,"status":"completed"})
+                        let token = if needs_instructions {
+                            if !nested
+                                || !output["instructions"][0]["text"]
+                                    .as_str()
+                                    .is_some_and(|text| text.ends_with("END_NESTED_INSTRUCTIONS\n"))
+                            {
+                                return Err("fixture_nested_instructions");
+                            }
+                            output["instruction_token"].as_str()
+                        } else {
+                            request["instructions"]
+                                .as_str()
+                                .and_then(|instructions| {
+                                    instructions.split_once("instruction_token is ")
+                                })
+                                .and_then(|(_, suffix)| suffix.split_once('.'))
+                                .map(|(token, _)| token)
+                        }
+                        .ok_or("fixture_instruction_token")?;
+                        let path = if nested { "ansa" } else { "." };
+                        let round = usize::from(needs_instructions);
+                        let arguments = json!({"path":path,"instruction_token":token}).to_string();
+                        json!({"type":"function_call","id":format!("call-item-{round}"),"call_id":format!("fixture-call-{round}"),"namespace":"omh","name":"list_directory","arguments":arguments,"status":"completed"})
                     } else {
                         let answer = match name {
-                        Some("ansa_orchestration_plan_v2") if request["tools"] == json!([]) =>
+                        Some("ansa_orchestration_plan_v3") if request["tools"] == json!([]) =>
                             json!({"schema_version":1,"summary":"SIWC_CARBON_PLAN","steps":[
                                 {"id":"one","task":"Inspect the fixture","access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"},
-                                {"id":"two","task":"Check the fixture again","access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"}
-                            ],"checks":[],"manual_checks":[],"command_checks":[]}).to_string(),
-                        Some("ansa_child_result_v1") if last["output"].as_str().is_some_and(|output| output.contains("\"entries\"")) =>
+                                {"id":"two","task":if last["content"] == "Inspect Workspace/pet" { "Inspect nested project instructions" } else { "Check the fixture again" },"access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"}
+                            ],"checks":[],"manual_checks":[],"command_checks":[],"read_folder":match last["content"].as_str() {
+                                Some("Inspect Workspace/pet" | "UNNAMED_READ_SCOPE") => Some("Workspace/pet"), _ => None
+                            }}).to_string(),
+                        Some("ansa_child_result_v1") if output["entries"].is_array() =>
                             r#"{"status":"completed","summary":"SIWC_HELPER_DONE","findings":[]}"#.into(),
                         None => "SIWC_CARBON_DONE".into(),
                         _ => return Err("fixture_format"),

@@ -2459,6 +2459,13 @@ impl Workbench {
                                 io,
                                 "ChatGPT did not confirm the strict plan format · Tab Work",
                             );
+                        } else if code == "orchestration_read_folder_not_named" {
+                            self.report(io, "Name the read folder in your request");
+                        } else if code == "orchestration_read_folder_missing" {
+                            self.report(
+                                io,
+                                "Read folder unavailable · check the path in your request",
+                            );
                         } else {
                             self.report(io, &format!("Could not draft plan ({code})"));
                         }

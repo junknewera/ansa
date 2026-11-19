@@ -137,7 +137,12 @@ impl Workbench {
         prompt: Option<&str>,
     ) {
         use crate::orchestration::plan::Access;
-        let mut lines = vec![plan.summary().to_owned(), String::new()];
+        let mut lines = Vec::new();
+        if let Some(folder) = plan.read_folder() {
+            lines.push(format!("Read folder · {folder}"));
+            lines.push(String::new());
+        }
+        lines.extend([plan.summary().to_owned(), String::new()]);
         if let Some(prompt) = prompt {
             lines.push("Original request".into());
             lines.extend(prompt.lines().map(str::to_owned));

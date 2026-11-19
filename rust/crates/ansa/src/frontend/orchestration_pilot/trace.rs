@@ -101,7 +101,11 @@ impl Trace {
 
 pub(super) fn phase(request: &Request) -> &'static str {
     match request.final_format() {
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands) => "plan",
+        Some(
+            FinalFormat::OrchestrationPlan
+            | FinalFormat::OrchestrationPlanWithCommands
+            | FinalFormat::OrchestrationPlanWithReadFolder,
+        ) => "plan",
         Some(FinalFormat::ChildResult) => {
             if request
                 .epoch
