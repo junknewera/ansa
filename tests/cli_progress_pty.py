@@ -78,8 +78,8 @@ def editor(screen, text, since=0):
     deadline=time.monotonic()+4
     while True:
         screen.vt.update(screen.raw)
-        workspace=screen.vt.line(0).startswith('ANSA')
-        row,prefix=(-4,'› ') if workspace else (-2,'> ')
+        workspace=screen.vt.line(0).startswith('  ANSA')
+        row,prefix=(-4,'  › ') if workspace else (-2,'> ')
         if screen.vt.line(row)==(prefix+text).rstrip():return
         assert time.monotonic()<deadline and screen.child.poll() is None, ('editor',text,screen.vt.line(row))
         screen.drain(.01)
@@ -93,7 +93,7 @@ def copied(screen, since):
         screen.drain(.01)
 
 def frozen_body(terminal):
-    begin,end=(3,-5) if terminal.line(0).startswith('ANSA') else (1,-4)
+    begin,end=(3,-5) if terminal.line(0).startswith('  ANSA') else (1,-4)
     return tuple(tuple(row) for row in terminal.cells[begin:end])
 
 
@@ -108,8 +108,8 @@ def footer_phase(terminal, phase):
 
 def workspace_ready(screen):
     """Production Workbench, deliberately distinct from the legacy fixtures."""
-    until(screen, lambda: screen.vt.line(0).startswith('ANSA')
-          and 'gpt-6.1-sol' in screen.vt.line(-2) and screen.vt.line(-4).startswith('›'),
+    until(screen, lambda: screen.vt.line(0).startswith('  ANSA')
+          and 'gpt-6.1-sol' in screen.vt.line(-2) and screen.vt.line(-4).startswith('  ›'),
           'production workspace ready')
 
 
@@ -177,7 +177,7 @@ def recall(binary, output):
             editor(screen, "DRAFT Ж界😀")
             workspace_ready(screen)
             frame='\n'.join(screen.vt.line(i) for i in range(screen.vt.rows))
-            assert all(hint not in frame for hint in ['Ctrl+F','PgUp','PgDn','↑/↓'])
+            assert all(hint not in frame for hint in ['PgUp','PgDn','↑/↓'])
             assert b'\x1b]52;' not in screen.raw
             at=len(screen.raw)
             before=journals(root)
@@ -211,7 +211,10 @@ def recall(binary, output):
                 until(screen,lambda:workspace_reading(screen),'page navigation entered reading')
             screen.send(b'\x06')
             editor(screen,'DRAFT Ж界😀')
-            assert workspace_reading(screen),'removed Ctrl+F binding changed reading mode'
+            until(screen,lambda:'Files' in body_text(screen.vt),'Ctrl+F shows files while reading history')
+            assert workspace_reading(screen),'files panel moved the history anchor'
+            screen.send(b'\x1b')
+            until(screen,lambda:'Files' not in body_text(screen.vt),'Esc closed files before restoring tail')
             screen.send(b'\x1b')
             until(screen,lambda:not workspace_reading(screen),'Esc returned to latest')
             screen.send(b'\x1b')
@@ -360,12 +363,12 @@ def tools(adapter, output, failed=False, plain=True):
             assert elapsed and int(elapsed[-1]) >= 2, elapsed
             if not failed:
                 at = len(screen.raw)
-                screen.send(b"\x14")
+                screen.send(b"\x0f")
                 for _ in range(12):
                     screen.drain(.01)
                 until(screen,lambda:body_text(screen.vt).count('details')>100,'expanded tool output')
                 assert b"\x1b]0;INJECTED" not in screen.raw and b"\x07" not in screen.raw
-                screen.send(b"\x14")
+                screen.send(b"\x0f")
             if plain:
                 assert b"\x1b[38;" not in screen.raw and b"\x1b[0m" not in screen.raw
             screen.send(b"\x04")
@@ -449,7 +452,7 @@ def main():
     body=frozen_body(terminal)
     terminal.update(raw+b'\x1b[2;1H\x1b[2Kmutated')
     assert body!=frozen_body(terminal),'frozen-body checker accepted repaint mutant'
-    terminal=Terminal();raw=b'\x1b[1;1HANSA\x1b[4;1Horiginal';terminal.update(raw)
+    terminal=Terminal();raw=b'\x1b[1;3HANSA\x1b[4;3Horiginal';terminal.update(raw)
     body=frozen_body(terminal)
     terminal.update(raw+b'\x1b[4;1H\x1b[2Kmutated')
     assert body!=frozen_body(terminal),'workspace frozen-body checker accepted repaint mutant'

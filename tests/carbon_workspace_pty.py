@@ -53,7 +53,7 @@ def select_result(screen, label):
     screen.send(b"\x07")
     for _ in range(screen.vt.rows):
         paint_quiet(screen)
-        if any(line.startswith(f"› {label}") for line in visible(screen).splitlines()):
+        if any(line.startswith(f"  › {label}") for line in visible(screen).splitlines()):
             return
         screen.send(b"\x1b[B")
     raise AssertionError((label, visible(screen)))
@@ -104,7 +104,7 @@ def completed(root, message):
 
 
 def ready(screen, model="gpt-6.1-sol"):
-    return model in screen.vt.line(-2) and screen.vt.line(-4).startswith("›")
+    return model in screen.vt.line(-2) and screen.vt.line(-4).startswith("  ›")
 
 
 def local(screen, command):
@@ -123,11 +123,16 @@ def approve_helpers(screen, prompt):
     assert "Синтетический результат проверки" not in visible(screen), "helper report shown as a chat message"
 
 
-def open_helper(screen):
+def open_helper(screen, by_mouse=False):
     local(screen, "/agents")
     until(screen, lambda frame: "Conversation agents" in frame and helper_title(frame), "helper roster")
-    screen.send(b"\r")
-    until(screen, lambda frame: helper_title(screen.vt.line(1)) and ready(screen), "open helper archive")
+    if by_mouse:
+        row = next(row for row in range(screen.vt.rows) if "└─ " in screen.vt.line(row) or "├─ " in screen.vt.line(row))
+        click(screen, screen.vt.line(row).index("─ ") + 2, row)
+    else:
+        screen.send(b"\r")
+    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame
+          and "Синтетический результат проверки" in frame, "read completed helper in the parent session")
 
 
 def helper_title(text):
@@ -187,23 +192,23 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     until(screen, lambda frame: "HISTORY_SEED_19" in frame and ready(screen), "seeded tail")
     draft = "HISTORY_DRAFT Ж界😀 jkgG"
     screen.send(draft)
-    until(screen, lambda frame: screen.vt.line(-4) == f"› {draft}", "history draft")
+    until(screen, lambda frame: screen.vt.line(-4) == f"  › {draft}", "history draft")
     before = journals(root)
     escape(screen)
     until(screen, lambda frame: not reading(screen) and "HISTORY_SEED_19" in body(screen), "root Esc stays at latest")
     escape(screen)
-    assert not reading(screen) and screen.vt.line(-4) == f"› {draft}"
+    assert not reading(screen) and screen.vt.line(-4) == f"  › {draft}"
     for _ in range(180):
         mouse(screen, 64, 2, 5)
         for _ in range(3): screen.drain(.01)
-        if "> HISTORY_FIRST" in body(screen).splitlines(): break
+        if "  > HISTORY_FIRST" in body(screen).splitlines(): break
     else:
         raise AssertionError("mouse cannot reach the first canonical message")
-    assert reading(screen) and screen.vt.line(-4) == f"› {draft}"
+    assert reading(screen) and screen.vt.line(-4) == f"  › {draft}"
     anchor = body(screen)
     screen.send(b"\x1bg\x1bG\x1bk\x1bj\x1b\xd0\x96")
     for _ in range(8): screen.drain(.01)
-    assert reading(screen) and body(screen) == anchor and screen.vt.line(-4) == f"› {draft}", "Alt keys changed conversation or reading anchor"
+    assert reading(screen) and body(screen) == anchor and screen.vt.line(-4) == f"  › {draft}", "Alt keys changed conversation or reading anchor"
     screen.send(" TYPED_WHILE_READING")
     until(screen, lambda frame: screen.vt.line(-4).endswith("TYPED_WHILE_READING"), "typing while reading")
     submitted = draft + " TYPED_WHILE_READING"
@@ -213,23 +218,19 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     until(screen, lambda frame: completed(root, submitted) and ready(screen), "send while reading completed")
     assert sum(row["kind"] == "accepted" and row["text"] == submitted for row in records(root)) == 1
     approve_helpers(screen, "Запусти субагента: CHILD_HISTORY_TASK")
-    open_helper(screen)
+    open_helper(screen, by_mouse=True)
+    before = journals(root)
     screen.send("CHILD_DRAFT Ж")
-    until(screen, lambda frame: screen.vt.line(-4) == "› CHILD_DRAFT Ж", "child draft")
     paint_quiet(screen)
-    until(screen, lambda frame: ready(screen) and helper_title(screen.vt.line(1)),
-          "completed child frame before Ctrl+C")
-    screen.send(b"\x03")
-    until(screen, lambda frame: screen.vt.line(-4) == "›", "Ctrl+C cleared the child draft")
-    screen.send("CHILD_DRAFT Ж")
-    until(screen, lambda frame: screen.vt.line(-4) == "› CHILD_DRAFT Ж", "new child draft")
+    assert screen.vt.line(-4) == "  ›" and "Agent transcript" in visible(screen)
     mouse(screen, 64, 2, 5)
     screen.send(b"\x1bg")
     for _ in range(8): screen.drain(.01)
-    assert helper_title(screen.vt.line(1)), "mouse or Alt navigated out of child"
-    assert screen.vt.line(-4) == "› CHILD_DRAFT Ж"
+    assert "Agent transcript" in visible(screen) and journals(root) == before
     escape(screen)
-    until(screen, lambda frame: not helper_title(screen.vt.line(1)) and ready(screen), "child Esc returns parent")
+    until(screen, lambda frame: "Conversation agents" in frame and ready(screen), "Esc restores roster")
+    escape(screen)
+    until(screen, lambda frame: "Conversation agents" not in frame and ready(screen), "Esc restores parent input")
 
 
 def split_source_scroll(screen, root, cwd):
@@ -264,7 +265,7 @@ def split_source_scroll(screen, root, cwd):
     mouse(screen, 64, 2, 5)
     until(screen, lambda frame: reading(screen) and first_source().startswith("SRC_005"), "mouse targeted the chat")
     screen.send("FOCUS_DRAFT Ж界😀 jkgG")
-    until(screen, lambda frame: screen.vt.line(-4) == "› FOCUS_DRAFT Ж界😀 jkgG", "chat navigation letters remain literal")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › FOCUS_DRAFT Ж界😀 jkgG", "chat navigation letters remain literal")
     assert first_source().startswith("SRC_005"), "typing in chat scrolled Files"
 
 
@@ -313,54 +314,56 @@ def inline_tool_details(screen, root, cwd):
     screen.send("TOOLS_TASK\r")
     until(screen, lambda frame: completed(root, "TOOLS_TASK") and ready(screen) and "get_test_value" in body(screen), "compact completed tool")
     compact = body(screen)
-    headers = [line for line in compact.splitlines() if re.match(r"[>v] get_test_value\b", line)]
+    headers = [line for line in compact.splitlines() if re.match(r"  [>v] get_test_value\b", line)]
     assert len(headers) == 1 and "done" in headers[0], "tool lifecycle was split into duplicate rows"
     assert "prepared" not in compact and "KnownResult" not in compact and "Arguments" not in compact
     screen.send("TOOLS_DRAFT Ж")
-    until(screen, lambda frame: screen.vt.line(-4) == "› TOOLS_DRAFT Ж", "tool draft")
-    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> get_test_value"))
-    click(screen, 0, row)
+    until(screen, lambda frame: screen.vt.line(-4) == "  › TOOLS_DRAFT Ж", "tool draft")
+    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("  > get_test_value"))
+    click(screen, 2, row)
     until(screen, lambda frame: "Arguments" in body(screen) and "Output" in body(screen), "tool row opened inline")
     expanded = body(screen)
     assert "value: OMH_FIXED_VALUE_42" in expanded and "ok: true" in expanded
     assert '{"ok"' not in expanded and "KnownResult" not in expanded, "details exposed the raw protocol instead of readable values"
     assert [row["invocation"]["arguments"] for row in records(root) if row["kind"] == "intent"] == [{}], "display projection changed the invocation arguments"
-    assert len([line for line in expanded.splitlines() if re.match(r"[>v] get_test_value\b", line)]) == 1
-    assert screen.vt.line(-4) == "› TOOLS_DRAFT Ж"
-    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("v get_test_value"))
-    click(screen, 0, row)
+    assert len([line for line in expanded.splitlines() if re.match(r"  [>v] get_test_value\b", line)]) == 1
+    assert screen.vt.line(-4) == "  › TOOLS_DRAFT Ж"
+    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("  v get_test_value"))
+    click(screen, 2, row)
     until(screen, lambda frame: "Arguments" not in body(screen) and "> get_test_value" in body(screen), "tool row collapsed")
 
     # Dragging a tool row selects text rather than activating its click target.
     paint_quiet(screen)
-    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> get_test_value"))
+    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("  > get_test_value"))
     at = len(screen.raw)
-    mouse(screen, 0, 2, row)
-    mouse(screen, 32, 2 + len("get_test_value") - 1, row)
-    mouse(screen, 0, 2 + len("get_test_value") - 1, row, release=True)
+    mouse(screen, 0, 4, row)
+    mouse(screen, 32, 4 + len("get_test_value") - 1, row)
+    mouse(screen, 0, 4 + len("get_test_value") - 1, row, release=True)
     assert copied(screen, at) == "get_test_value", "tool-row drag did not copy the displayed text"
     escape(screen)
-    screen.send(b"\x14")
-    until(screen, lambda frame: "Arguments" in body(screen) and "Output" in body(screen), "Ctrl+T opened tool details")
-    assert screen.vt.line(-4) == "› TOOLS_DRAFT Ж"
+    screen.send(b"\x0f")
+    until(screen, lambda frame: "Arguments" in body(screen) and "Output" in body(screen), "Ctrl+O opened tool details")
+    assert screen.vt.line(-4) == "  › TOOLS_DRAFT Ж"
     before = journals(root)
     row = next(row for row in range(3, screen.vt.rows - 5) if "Full output" in screen.vt.line(row))
     click(screen, screen.vt.line(row).index("Full output"), row)
     until(screen, lambda frame: "value: OMH_FIXED_VALUE_42" in frame and "j/k lines" in frame, "complete readable output inspector")
-    assert screen.vt.line(-4) == "› TOOLS_DRAFT Ж"
+    assert screen.vt.line(-4) == "  › TOOLS_DRAFT Ж"
     output_before = body(screen)
     screen.send("Ж界😀")
     screen.send(b"\x1b[200~" + "Паста Ж界😀\n/exit".encode() + b"\x1b[201~")
     screen.send(b"\x7f\x08\x1b[3~")
     for _ in range(8): screen.drain(.01)
-    assert screen.vt.line(-4) == "› TOOLS_DRAFT Ж", "read-only output accepted Unicode, paste or deletion into the draft"
+    assert screen.vt.line(-4) == "  › TOOLS_DRAFT Ж", "read-only output accepted Unicode, paste or deletion into the draft"
     assert body(screen) == output_before and journals(root) == before, "read-only output input changed the view or canonical journal"
     escape(screen)
     until(screen, lambda frame: "j/k lines" not in frame and "get_test_value" in frame, "output inspector returned to chat")
-    assert journals(root) == before and screen.vt.line(-4) == "› TOOLS_DRAFT Ж"
+    assert journals(root) == before and screen.vt.line(-4) == "  › TOOLS_DRAFT Ж"
 
 
 def input_and_copy(screen, root, cwd):
+    until(screen, lambda frame: "Ctrl+F Files" in frame and "Ctrl+T Terminals" in frame,
+          "available shortcuts on the idle workspace")
     before = journals(root)
     text = "Привет Ж界😀\n/exit is pasted text"
     screen.send(b"\x1b[200~" + text.encode() + b"\x1b[201~")
@@ -372,7 +375,7 @@ def input_and_copy(screen, root, cwd):
     screen.send(b"\x19")
     assert text in copied(screen, at)
     frame = visible(screen)
-    assert all(hint not in frame for hint in ["Ctrl+F", "PgUp", "PgDn", "↑/↓"])
+    assert all(hint not in frame for hint in ["PgUp", "PgDn", "↑/↓"])
     screen.send("draft Ж界😀")
     until(screen, lambda frame: "draft Ж界😀" in frame, "draft")
     mouse(screen, 64, 2, 4)
@@ -391,18 +394,18 @@ def mouse_copy(screen, root, cwd):
     screen.send("MOUSE_COPY Ж界😀\r")
     until(screen, lambda frame: completed(root, "MOUSE_COPY Ж界😀") and ready(screen), "mouse-copy conversation content")
     paint_quiet(screen)
-    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> MOUSE_COPY"))
+    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("  > MOUSE_COPY"))
     before = journals(root)
     at = len(screen.raw)
-    mouse(screen, 0, 2, row)
-    mouse(screen, 32, 2 + len("MOUSE_COPY") - 1, row)
+    mouse(screen, 0, 4, row)
+    mouse(screen, 32, 4 + len("MOUSE_COPY") - 1, row)
     screen.wait(b"\x1b[7mM", at)
     before_resize = len(screen.raw)
     screen.resize(80, 20)
     screen.vt = Terminal(80, 20)
     screen.wait(b"\x1b[7mMOUSE_COPY", before_resize)
     until(screen, lambda frame: model in screen.vt.line(-2) and "Message agent" not in screen.vt.line(-2), "compact status after resize")
-    mouse(screen, 0, 2 + len("MOUSE_COPY") - 1, row, release=True)
+    mouse(screen, 0, 4 + len("MOUSE_COPY") - 1, row, release=True)
     text = copied(screen, at)
     assert text == "MOUSE_COPY" and "\x1b" not in text, repr(text)
     assert journals(root) == before, "selection or resize changed the canonical conversation"
@@ -410,11 +413,11 @@ def mouse_copy(screen, root, cwd):
           "one model in the narrow footer")
     for _ in range(2):
         paint_quiet(screen)
-        row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("> MOUSE_COPY"))
+        row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("  > MOUSE_COPY"))
         at = len(screen.raw)
-        mouse(screen, 0, 2, row)
-        mouse(screen, 32, 2 + len("MOUSE_COPY") - 1, row)
-        mouse(screen, 0, 2 + len("MOUSE_COPY") - 1, row, release=True)
+        mouse(screen, 0, 4, row)
+        mouse(screen, 32, 4 + len("MOUSE_COPY") - 1, row)
+        mouse(screen, 0, 4 + len("MOUSE_COPY") - 1, row, release=True)
         assert copied(screen, at) == "MOUSE_COPY"
     assert journals(root) == before, "copies changed the canonical conversation"
     screen.send("AFTER_SELECT Ж\r")
@@ -447,7 +450,7 @@ def selection_scroll(screen, root, cwd):
     row = next(row for row in range(3, 27) if "HISTORY_SEED_19" in screen.vt.line(row))
     first = body(screen)
     at = len(screen.raw)
-    mouse(screen, 0, len("> HISTORY_SEED_19") - 1, row)
+    mouse(screen, 0, len("  > HISTORY_SEED_19") - 1, row)
     mouse(screen, 32, 10, 3)
     until(screen, lambda frame: body(screen) != first and reading(screen), "drag at the top edge scrolls")
     for _ in range(240):
@@ -459,7 +462,7 @@ def selection_scroll(screen, root, cwd):
         raise AssertionError("selection did not scroll across a journal page")
     row = next(row for row in range(3, 27) if "> HISTORY_FIRST" in screen.vt.line(row))
     paint_quiet(screen)
-    mouse(screen, 0, 2, row, release=True)
+    mouse(screen, 0, 4, row, release=True)
     text = copied(screen, at)
     assert "HISTORY_FIRST" in text and "HISTORY_SEED_19" in text, text[-500:]
     assert "INSPECTOR_NEVER_COPY" not in text and "Files" not in text and "\x1b" not in text
@@ -477,11 +480,53 @@ def branches(screen, root, cwd):
     escape(screen)
     until(screen, lambda frame: "child-marker" not in screen.vt.line(1) and "parent-marker" in frame, "parent return")
     assert "child-marker" not in visible(screen)
+    answer = "OMH_TOOL_OK:OMH_FIXED_VALUE_42"
+
+    def wide_panes():
+        lines = visible(screen).splitlines()
+        return ("\n".join(line.partition("│")[0] for line in lines if "│" in line),
+                "\n".join(line.partition("│")[2] for line in lines if "│" in line))
+
+    def both_conversations_visible(_):
+        main, side = wide_panes()
+        return ("Main conversation" in main and "› Main chat" in main and "parent-marker" in main and answer in main and "/btw · read-only · Esc → main chat" in side
+                and "side-marker" in side and answer in side and completed(root, "side-marker"))
+
     local(screen, "/btw side-marker")
-    until(screen, lambda frame: "side-marker" in screen.vt.line(1) and completed(root, "side-marker"), "side conversation")
+    until(screen, both_conversations_visible, "parent and completed BTW side by side")
+    assert "parent-marker" in screen.vt.line(1) and "side-marker" not in screen.vt.line(1)
+    assert "side-marker" not in wide_panes()[0]
+    row = next(row for row in range(screen.vt.rows) if "│ ›" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index("│") + 4, row)
+    screen.send("side-followup")
+    until(screen, lambda _: "› side-followup" in wide_panes()[1], "draft in the BTW composer")
+    screen.send(b"\r")
+    until(screen, lambda _: completed(root, "side-followup") and wide_panes()[1].count(answer) == 2,
+          "second BTW answer")
+    assert "side-followup" not in wide_panes()[0]
+    side_sessions = []
+    for session in (root / "home/.ansa/sessions").iterdir():
+        info = json.loads((session / "info.json").read_text())
+        if info.get("kind") == "btw":
+            side_sessions.append(session)
+    side, = side_sessions
+    accepted = [record for record in session_cases.decode({
+        path.name: path.read_bytes() for path in side.glob("part-*.log")
+    }) if record["kind"] == "accepted"]
+    assert [(record["text"], record["mode"]) for record in accepted] == [
+        ("side-marker", "plan"), ("side-followup", "plan"),
+    ]
+    screen.resize(54, 30)
+    screen.vt = Terminal(54, 30)
+    until(screen, lambda frame: "/btw · read-only · Esc → main chat" in frame and "side-followup" in frame
+          and "parent-marker" in frame and frame.count(answer) >= 2, "stacked BTW after terminal resize")
     escape(screen)
-    until(screen, lambda frame: "side-marker" not in screen.vt.line(1), "side parent return")
-    assert "side-marker" not in visible(screen)
+    until(screen, lambda frame: "/btw · read-only" not in frame and "parent-marker" in frame
+          and ready(screen), "side parent return")
+    assert "side-marker" not in visible(screen) and "side-followup" not in visible(screen)
+    screen.resize(100, 32)
+    screen.vt = Terminal(100, 32)
+    until(screen, lambda _: ready(screen), "parent ready after terminal resize")
     local(screen, "/sessions")
     until(screen, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame and "child-marker" in frame, "session picker with saved conversation titles")
     assert "parent-marker" in popup_text(screen) and "child-marker" in popup_text(screen)
@@ -560,31 +605,24 @@ def editor_case(screen, root, cwd, cancel):
     (cwd / "notes.md").write_text("original\n")
     local(screen, "/files notes.md")
     until(screen, lambda frame: "read-only" in frame, "editor source")
-    at = len(screen.raw)
+    carbon_modes = termios.tcgetattr(screen.slave)
     screen.send("e")
-    screen.wait("EDITOR_READY", since=at)
-    screen.vt.update(screen.raw)
-    assert screen.vt.alternate and not screen.vt.cursor_visible and screen.vt.sgr == (31,), "editor mode fixture"
-    assert termios.tcgetattr(screen.slave) == screen.original, "editor got noncanonical tty"
+    until(screen, lambda frame: "EDITOR_READY" in frame and "ANSA" in frame
+          and "Editor · notes.md" in frame, "embedded editor visible")
+    assert not screen.vt.alternate, "editor changed the outer alternate screen"
+    assert termios.tcgetattr(screen.slave) == carbon_modes, "editor changed outer tty modes"
     if cancel:
-        resumed = len(screen.raw)
         screen.send(b"\x03")
     else:
-        resumed = len(screen.raw)
         screen.send(b"save\r")
-    screen.wait(b"\x1b[?1002h", since=resumed)
-    screen.wait(b"\x1b[?1049l\x1b[?25h\x1b[0m", since=resumed)
-    until(screen, lambda frame: "ANSA" in frame and "read-only" in frame, "editor terminal restored")
-    assert not screen.vt.alternate and screen.vt.cursor_visible and not screen.vt.sgr, "editor screen modes not restored"
+    until(screen, lambda frame: "ANSA" in frame and "read-only" in frame, "file inspector restored")
+    assert not screen.vt.alternate, "editor screen modes escaped pane"
     if not cancel:
         until(screen, lambda frame: "edited" in frame, "edited file reloaded")
         assert "edited" in (cwd / "notes.md").read_text()
     else:
         assert (cwd / "notes.md").read_text() == "original\n"
-    # The driver is outside the child's controlling session. Linux exposes
-    # its peer's foreground group through the PTY master; slave TIOCGPGRP
-    # correctly returns ENOTTY to this unrelated driver.
-    assert os.tcgetpgrp(screen.master) == screen.child.pid, "foreground group not reclaimed"
+    assert os.tcgetpgrp(screen.master) == screen.child.pid, "editor owned the outer terminal"
     escape(screen)
     screen.send("after-editor")
     until(screen, lambda frame: "after-editor" in frame, "input after editor")
@@ -594,10 +632,9 @@ def editor_early_exit(screen, root, cwd, stopped=False):
     (cwd / "notes.md").write_text("original\n")
     local(screen, "/files notes.md")
     until(screen, lambda frame: "read-only" in frame, "early editor source")
-    at = len(screen.raw)
     screen.send("e")
-    screen.wait(b"\x1b[?1002h", since=at)
-    until(screen, lambda frame: "read-only" in frame and "ANSA" in frame, "early editor return")
+    marker = "editor_stopped" if stopped else "early exit contents"
+    until(screen, lambda frame: "read-only" in frame and marker in frame, "early editor return")
     if stopped:
         assert not (cwd / "after-stop").exists(), "stopped editor was resumed"
     else:
@@ -624,9 +661,7 @@ def editor_missing(screen, root, cwd):
     (cwd / "notes.md").write_text("original\n")
     local(screen, "/files notes.md")
     until(screen, lambda frame: "read-only" in frame, "missing editor source")
-    at = len(screen.raw)
     screen.send("e")
-    screen.wait(b"\x1b[?1002h", since=at)
     until(screen, lambda frame: "Could not open editor" in frame, "missing editor diagnostic")
     assert os.tcgetpgrp(screen.master) == screen.child.pid
     escape(screen)
@@ -700,7 +735,7 @@ def terminal_interrupt_and_app_escape(screen, root, cwd):
     screen.resize(100, 32)
     screen.vt = Terminal(100, 32)
     screen.wait(b"\x1b[H\x1b[2J", since=at)
-    until(screen, lambda frame: screen.vt.line(-4) == "› HIDDEN_SAFE", "Tab at tiny size keeps input in composer")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › HIDDEN_SAFE", "Tab at tiny size keeps input in composer")
     assert journals(root) == before, "hidden terminal input entered the model journal"
     screen.send(b"\x15")
     escape(screen)
@@ -708,7 +743,7 @@ def terminal_interrupt_and_app_escape(screen, root, cwd):
     escape(screen)
     until(screen, lambda frame: "q terminal" not in frame, "Files Escape returns to chat")
     screen.send("SURVIVED_TERMINAL")
-    until(screen, lambda frame: screen.vt.line(-4) == "› SURVIVED_TERMINAL", "composer after foreground interrupt")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › SURVIVED_TERMINAL", "composer after foreground interrupt")
     assert journals(root) == before and not (cwd / "cancel-late").exists()
 
 
@@ -738,7 +773,7 @@ def terminal_eof_and_exit(screen, root, cwd):
     escape(screen)
     until(screen, lambda frame: "q terminal" not in frame, "chat after embedded shell exits")
     screen.send("AFTER_SHELL_EOF")
-    until(screen, lambda frame: screen.vt.line(-4) == "› AFTER_SHELL_EOF", "shell EOF did not close or corrupt composer")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › AFTER_SHELL_EOF", "shell EOF did not close or corrupt composer")
     assert journals(root) == before, "shell EOF/exit mutated the model journal"
 
 
@@ -780,9 +815,14 @@ def native_terminal_panel(screen, root, cwd):
     session, = catalog.glob("*/terminal-host-v1/terminal-v1.json")
     escape(screen)
     until(screen, lambda frame: "Agent terminal" not in frame, "Esc returned to the chat")
+    screen.send("KEEP_FILES_DRAFT\x06")
+    until(screen, lambda frame: "Files" in frame and "KEEP_FILES_DRAFT" in screen.vt.line(-4), "Ctrl+F opens files without submitting a draft")
+    escape(screen)
+    until(screen, lambda _: ready(screen), "Esc returns focus to draft")
+    screen.send(b"\x15")
     screen.send("TERMINAL_DEMO\r")
     until(screen, lambda frame: completed(root, "TERMINAL_DEMO"), "offline terminal tool created a PTY")
-    local(screen, "/terminals")
+    screen.send(b"\x14")
     until(screen, lambda frame: "Demo terminal" in frame and "ANSA_TERMINAL_READY" in body(screen),
           "Carbon renders live PTY output")
     escape(screen)
@@ -883,7 +923,7 @@ def completion_and_help(screen, root, cwd):
     screen.send("/mo")
     until(screen, lambda frame: "/model" in body(screen) and "Tab/→ complete" in frame, "slash prefix suggestions")
     screen.send(b"\t")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Applies to future messages" not in frame, "Tab completes without dispatch")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › /model" and "Applies to future messages" not in frame, "Tab completes without dispatch")
     assert journals(root) == before
     screen.send(b"\r")
     until(screen, lambda frame: "Applies to future messages" in frame, "Enter opens the completed command")
@@ -892,11 +932,11 @@ def completion_and_help(screen, root, cwd):
     screen.send("/")
     until(screen, lambda frame: "/model" in body(screen) and "/effort" in body(screen), "all command suggestions")
     screen.send(b"\x1b[B\x1b[C")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /effort" and "Default" not in frame, "arrows choose and Right inserts only")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › /effort" and "Default" not in frame, "arrows choose and Right inserts only")
     assert journals(root) == before
     screen.send(b"\x15")
     screen.send(b"/exit" + b"\x1b[D" * 4 + b"\r")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /model" and "Applies to future messages" not in frame,
+    until(screen, lambda frame: screen.vt.line(-4) == "  › /model" and "Applies to future messages" not in frame,
           "Enter at a partial token inserts the selected command")
     assert journals(root) == before
     screen.send(b"\x15")
@@ -904,7 +944,7 @@ def completion_and_help(screen, root, cwd):
     screen.send(b"\x1b[D" * len(" потом"))
     until(screen, lambda frame: "/model" in body(screen) and "Tab/→ complete" in frame, "completion at a middle word boundary")
     screen.send(b"\t")
-    until(screen, lambda frame: screen.vt.line(-4) == "› Проверь /model потом", "middle completion preserves prefix and suffix")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › Проверь /model потом", "middle completion preserves prefix and suffix")
     assert journals(root) == before
     screen.send(b"\x05\x15")
     screen.send("?")
@@ -912,35 +952,38 @@ def completion_and_help(screen, root, cwd):
     command_rows = [match for row in range(screen.vt.rows)
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
-    expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions",
-                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit", "/autocompact", "/orchestrate+", "/terminals"}
+    expected = {"/model", "/effort", "/theme", "/files", "/agents", "/sessions",
+                "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact", "/orchestrate+", "/terminals"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
-    assert "/run" not in visible(screen), "removed /run remains advertised"
+    assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"
     screen.send(b"\x1b[B\r")
-    until(screen, lambda frame: screen.vt.line(-4) == "› /effort" and "ANSA commands" not in frame, "help arrows select and Enter only inserts")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › /effort" and "ANSA commands" not in frame, "help arrows select and Enter only inserts")
     assert journals(root) == before
     screen.send(b"\x15")
     screen.send("text?")
-    until(screen, lambda frame: screen.vt.line(-4) == "› text?" and "ANSA commands" not in frame, "question mark inside text stays text")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › text?" and "ANSA commands" not in frame, "question mark inside text stays text")
     assert journals(root) == before
     screen.send(b"\x05\x15")
     # An ordinary whitespace delimiter is also valid for no-argument local
     # commands. It must never turn /exit or a mode switch into a model prompt.
     screen.send("/plan \r")
-    until(screen, lambda frame: "Plan" in screen.vt.line(-2) and screen.vt.line(-4) == "›", "trailing-space /plan routed locally")
+    until(screen, lambda frame: "Plan" in screen.vt.line(-2) and screen.vt.line(-4) == "  ›", "trailing-space /plan routed locally")
     screen.send("/plan \r")
-    until(screen, lambda frame: "Plan" not in screen.vt.line(-2) and screen.vt.line(-4) == "›", "/plan returns to work")
-    local(screen, "/pr main")
-    until(screen, lambda frame: "Opening a draft PR requires network access" in frame,
-          "/pr stays local and refuses publishing offline")
+    until(screen, lambda frame: "Plan" not in screen.vt.line(-2) and screen.vt.line(-4) == "  ›", "/plan returns to work")
+    screen.send("/pr")
+    until(screen, lambda frame: "Commands" not in frame and screen.vt.line(-4) == "  › /pr",
+          "removed /pr is not suggested")
+    screen.send(b" main\r")
+    until(screen, lambda frame: "Ask the agent to open a pull request with gh" in frame,
+          "obsolete /pr stays local without dispatch")
     assert journals(root) == before, "whitespace in local commands dispatched canonical user turns"
     screen.send("/exit \r")
     return "normal"
 
 
 def new_resume_and_exit(screen, root, cwd):
-    assert screen.vt.line(0) == "ANSA" and screen.vt.line(1) == ""
+    assert screen.vt.line(0) == "  ANSA" and screen.vt.line(1) == ""
     assert "ready" not in screen.vt.line(-2) and cwd.name in screen.vt.line(-2)
     screen.send("PREVIOUS_SESSION\r")
     until(screen, lambda frame: completed(root, "PREVIOUS_SESSION") and "OMH_TOOL_OK" in frame,
@@ -981,19 +1024,19 @@ def new_resume_and_exit(screen, root, cwd):
     local(screen, f"/resume {previous.name}")
     until(screen, lambda frame: "PREVIOUS_SESSION" in screen.vt.line(1), "resume with an ID reopened that conversation")
     screen.send("Черновик Ж界")
-    until(screen, lambda frame: screen.vt.line(-4) == "› Черновик Ж界", "draft before interrupt")
+    until(screen, lambda frame: screen.vt.line(-4) == "  › Черновик Ж界", "draft before interrupt")
     screen.send(b"\x03")
-    until(screen, lambda frame: screen.vt.line(-4) == "›", "interrupt clears the draft")
+    until(screen, lambda frame: screen.vt.line(-4) == "  ›", "interrupt clears the draft")
     assert "again to exit" not in visible(screen)
     local(screen, "/status")
     until(screen, lambda frame: "ansa: completed" in frame, "explicit status before exit")
     screen.send(b"\x03")
     until(screen, lambda frame: "Press Ctrl+C again to exit" in screen.vt.line(-1), "first empty interrupt confirms exit")
     screen.send("x")
-    until(screen, lambda frame: screen.vt.line(-4) == "› x" and "again to exit" not in frame,
+    until(screen, lambda frame: screen.vt.line(-4) == "  › x" and "again to exit" not in frame,
           "typing disarms exit")
     screen.send(b"\x03")
-    until(screen, lambda frame: screen.vt.line(-4) == "›", "draft cleared after disarming")
+    until(screen, lambda frame: screen.vt.line(-4) == "  ›", "draft cleared after disarming")
     screen.send(b"\x03")
     until(screen, lambda frame: "Press Ctrl+C again to exit" in screen.vt.line(-1), "exit armed again")
     screen.send(b"\x03")
@@ -1060,12 +1103,12 @@ def plan_agent_inherits(screen, root, cwd):
           and "OMH_TOOL_OK:OMH_FIXED_VALUE_42" in frame, "parent reply rendered")
     local(screen, "/plan")
     until(screen, lambda frame: "Plan" in screen.vt.line(-2), "parent entered plan")
-    before = journals(root)
+    before = records(root)
     screen.send("Запусти субагента: подготовка\r")
     until(screen, lambda frame: "Refine" in frame, "cancel preview")
     escape(screen)
     screen.send(b"\t")
-    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "third Tab mode")
+    until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "third Tab mode")
     screen.send("ORCHESTRATION_BLOCKED_WRITE_FIXTURE\r")
     until(screen, lambda frame: "A manual check is required before starting" in frame and "[Refine]" in frame,
           "write plan explains blocked approval before Enter")
@@ -1078,7 +1121,16 @@ def plan_agent_inherits(screen, root, cwd):
     screen.send(b"\x1b[6~")
     until(screen, lambda frame: "VISIBLE_END_OF_STEP" in frame, "full step accessible before approval")
     escape(screen)
-    assert journals(root) == before, "preview, scroll or cancel executed a helper"
+    after_preview = records(root)
+    assert len(journals(root)) == 1, "drafting a plan created a separate session"
+    assert [row for row in after_preview if row["kind"] == "outcome"] == [
+        row for row in before if row["kind"] == "outcome"
+    ], "preview, scroll or cancel dispatched a tool"
+    drafts = [row for row in after_preview if row.get("draft")]
+    assert len(drafts) == 3 and drafts[0]["mode"] == "plan"
+    assert all(not row["next"]["tools"]["descriptors"] for row in drafts)
+    assert any(item.get("content") == parent for item in drafts[0]["next"]["input"])
+
     approve_helpers(screen, "Запусти субагента: " + child)
     accepted = [row for row in records(root) if row['kind'] == 'accepted']
     helpers = [row for row in accepted if row['command'] == 'assignment']
@@ -1087,12 +1139,12 @@ def plan_agent_inherits(screen, root, cwd):
 
 
 def session_agent_titles_restart(screen, root, cwd):
-    parent = "PARENT_TITLE"
-    screen.send(parent + "\r")
+    parent = "PARENT_TITLE " + "context " * 2800 + "EARLIEST_CONTEXT_END"
+    screen.send("\x1b[200~" + parent + "\x1b[201~\r")
     until(screen, lambda frame: completed(root, parent) and ready(screen) and "OMH_TOOL_OK" in frame
           and "Ctrl+C stop" not in screen.vt.line(-2), "parent turn settled and title committed")
     screen.send(b"\t\t")
-    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "third Tab mode")
+    until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "third Tab mode")
     screen.send("Почему отчёт иногда пустой?\r")
     until(screen, lambda frame: "Refine" in frame, "plan from a vague request")
     before_refine = journals(root)
@@ -1102,16 +1154,16 @@ def session_agent_titles_restart(screen, root, cwd):
     approve_helpers(screen, "Проверить формат входных данных")
     open_helper(screen)
     escape(screen)
-    until(screen, lambda frame: parent in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
+    until(screen, lambda frame: "PARENT_TITLE" in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
     until(screen, lambda frame: "Conversation agents" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "Esc restored roster with both completed helpers")
     assert not re.search(r"\bs_\d+_", screen.vt.line(1)), "agent breadcrumb displays an ID instead of a title"
     escape(screen)
     until(screen, lambda frame: "Conversation agents" not in frame and not helper_title(screen.vt.line(1)), "agent inspector closed before session command")
     local(screen, "/sessions")
-    until(screen, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame and parent in frame, "human-readable root session picker")
+    until(screen, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame and "PARENT_TITLE" in frame, "human-readable root session picker")
     assert not helper_title(popup_text(screen)), "agents leaked into conversation picker"
     escape(screen)
-    until(screen, lambda frame: "Project sessions" not in frame and parent in screen.vt.line(1), "session picker closed before exit")
+    until(screen, lambda frame: "Project sessions" not in frame and "PARENT_TITLE" in screen.vt.line(1), "session picker closed before exit")
     parent_id = next(json.loads((directory / "info.json").read_text())["id"]
                      for directory in (root / "home/.ansa/sessions").iterdir()
                      if any(event["kind"] == "accepted" and event["text"] == parent
@@ -1122,14 +1174,35 @@ def session_agent_titles_restart(screen, root, cwd):
     assert result["exit"] == 0 and result["termios_restored"] and result["flags_restored"], result
     restarted = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--session", parent_id])
     screen.additional_screens = [("restart", restarted)]
-    until(restarted, lambda frame: parent in restarted.vt.line(1) and ready(restarted), "saved parent title restored")
+    until(restarted, lambda frame: "PARENT_TITLE" in restarted.vt.line(1) and ready(restarted), "saved parent title restored")
     local(restarted, "/agents")
     until(restarted, lambda frame: "Conversation agents" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "completed agent tree rebuilt from journals")
     assert "Completed" in visible(restarted), "restarted completed agents lost their observed status"
     assert not re.search(r"\bs_\d+_", restarted.vt.line(1)) and journals(root) == before
+    escape(restarted)
+    escape(restarted)
+    until(restarted, lambda frame: "Conversation agents" not in frame and "Agent transcript" not in frame,
+          "focus returned to conversation")
+    followup = "Use the previous proposed plan in this conversation"
+    restarted.send(followup + "\r")
+    until(restarted, lambda frame: completed(root, followup) and ready(restarted),
+          "ordinary Work turn uses the saved conversation after restart")
+    accepted = [row for row in records(root) if row["kind"] == "accepted"]
+    drafts = [row for row in accepted if row.get("draft")]
+    assert len(drafts) == 2 and all(
+        any(item.get("content") == parent for item in row["next"]["input"])
+        for row in drafts
+    ), "drafts lost the original long message"
+    assert drafts[-1]["text"] == "Проверить формат входных данных"
+    native_plan = lambda item: item.get("role") == "assistant" and "Разобрать запрос" in str(item.get("content"))
+    assert any(map(native_plan, drafts[-1]["next"]["input"])), "refinement omitted the prior plan"
+    last, = [row for row in accepted if row["text"] == followup]
+    history = last["next"]["input"]
+    assert sum(map(native_plan, history)) == 2 and any(
+        "Сводка готова" in str(item.get("content")) for item in history if item.get("role") == "assistant"
+    ), "ordinary Work lost the proposed plans or the synthesis"
     restarted.result = restarted.finish(signal.SIGTERM)
     assert restarted.result["exit"] == 143 and restarted.result["termios_restored"] and restarted.result["flags_restored"], restarted.result
-    assert journals(root) == before, "viewing saved session/agent titles changed canonical journals"
     return "normal"
 
 
@@ -1146,19 +1219,23 @@ def orchestration_candidate(screen, root, cwd):
     check.chmod(0o700)
     git("add", "report.txt", "check.sh")
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "fixture")
+    original = git("rev-parse", "HEAD").strip()
     report.write_text("before fixture\n")
     before = git("status", "--short")
     screen.send(b"\t\t")
-    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "writer plan mode")
+    until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "writer plan mode")
     screen.send("ORCHESTRATION_COMMAND_FIXTURE\r")
     until(screen, lambda frame: "Independent review" in frame or "independent review" in frame,
           "plan discloses verification and fixes")
     assert not (home := root / "home/.ansa/orchestration").exists()
     assert "./check.sh" in visible(screen) and not check_marker.exists()
     screen.send(b"\r")
-    until(screen, lambda frame: "ansa-result готова" in frame and "Verified changes" in frame,
+    until(screen, lambda frame: "Verified changes" in frame and "after fixture" in frame,
           "reviewed isolated candidate and diff", timeout=15)
     checkout, = home.glob("*/*/checkout")
+    release = json.loads((checkout.parent / "release.json").read_text())
+    assert release["candidate"] == git("rev-parse", "ansa-result", path=checkout).strip()
+    assert git("rev-parse", "HEAD").strip() == original
     assert git("show", "ansa-result:report.txt", path=checkout) == "after fixture\n"
     assert report.read_text() == "before fixture\n"
     assert git("show", ":report.txt") == "committed version\n"
@@ -1171,13 +1248,25 @@ def orchestration_candidate(screen, root, cwd):
         screen.vt = Terminal(cols, rows)
         until(screen, lambda frame: "report.txt · +1 −1" in frame, "candidate diff at terminal size")
         screen.send(b"f")
-        until(screen, lambda frame: any(line.startswith("report.txt · +1 −1") for line in frame.splitlines())
+        until(screen, lambda frame: screen.vt.line(4).startswith("report.txt · +1 −1")
               and "after fixture" in frame, "wide diff with its actual comparison base")
         screen.send(b"f")
     screen.resize(100, 32)
     screen.vt = Terminal(100, 32)
     until(screen, lambda frame: "report.txt · +1 −1" in frame, "diff restored after resize")
     escape(screen)
+
+    def candidate_excerpt(frame):
+        rows = frame.splitlines()
+        headings = [index for index, row in enumerate(rows) if "report.txt · +1 −1" in row]
+        if len(headings) != 1 or headings[0] + 2 >= len(rows):
+            return False
+        start = headings[0]
+        return ("- before fixture" in rows[start + 1]
+                and "+ after fixture" in rows[start + 2])
+
+    until(screen, candidate_excerpt, "verified candidate shows the actual change once below its summary")
+    until(screen, lambda frame: "ansa-result готова" in frame, "candidate synthesis in the chat")
     screen.send("review draft")
     until(screen, lambda frame: "./check.sh · passed" in frame, "confirmed command as chat result")
     select_result(screen, "./check.sh · passed")
@@ -1257,7 +1346,7 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     original = git("rev-parse", "HEAD")
     previous_status = git("status", "--short")
     screen.send(b"\t\t")
-    until(screen, lambda _: "Orchestration" in screen.vt.line(-2), "ordinary orchestration mode")
+    until(screen, lambda _: "Orchestrate" in screen.vt.line(-2), "ordinary orchestration mode")
     screen.send("ORCHESTRATION_REVIEW_RESUME_FIXTURE\r")
     until(screen, lambda frame: "./check.sh" in frame and "Verify review-resume fixture" in frame,
           "review and command require approval")
@@ -1289,7 +1378,7 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     local(restarted, "/sessions")
     until(restarted, lambda frame: "Resume orchestration" in frame, "saved run can resume")
     restarted.send(b"\r")
-    expected = "Plan stopped (run_budget)" if exhausted else "ansa-result готова"
+    expected = "Plan stopped (run_budget)" if exhausted else "Verified changes"
     until(restarted, lambda frame: expected in frame or "run_step_unavailable" in frame,
           "explicit reviewer resume", timeout=15)
     assert expected in visible(restarted), visible(restarted)
@@ -1308,6 +1397,7 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     else:
         until(restarted, lambda _: (run / "summary-admitted").is_file(), "durable candidate acceptance")
         assert git("rev-parse", "ansa-result", path=checkout) == frozen
+        assert json.loads((run / "release.json").read_text())["candidate"] == frozen
     assert git("rev-parse", "HEAD") == original and git("status", "--short") == previous_status
     assert report.read_text() == "before fixture review-resume\n"
     assert check_marker.read_text() == "x", "Resume repeated the required command"
@@ -1335,9 +1425,9 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
 
 def openrouter_orchestration(screen, root, cwd):
     until(screen, lambda frame: "deepseek/deepseek-v4.1-flash-1017" in frame
-          and screen.vt.line(-4).startswith("›"), "pinned OpenRouter model")
+          and screen.vt.line(-4).startswith("  ›"), "pinned OpenRouter model")
     screen.send(b"\t\t")
-    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "OpenRouter plan mode")
+    until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "OpenRouter plan mode")
     held_child = root / "hold-orchestration-child"
     held_summary = root / "hold-orchestration-summary"
     held_child.touch()
@@ -1349,6 +1439,10 @@ def openrouter_orchestration(screen, root, cwd):
     assert "Follow-up recommendation" in visible(screen)
     screen.send(b"\r")
     until(screen, lambda frame: "0/1 agents" in frame, "read-only plan starts despite a post-report recommendation")
+    local(screen, "/effort low")
+    until(screen, lambda frame: "Wait for orchestration to finish before switching models" in frame,
+          "the orchestration generation remains fixed while a helper runs")
+    screen.send(b"\x7f" * len("/effort low"))
     screen.send("keep draft")
     until(screen, lambda frame: "keep draft" in screen.vt.line(-4), "draft retained while helper runs")
     assert "Draft · send after the task finishes" not in visible(screen)
@@ -1403,6 +1497,15 @@ def siwc_orchestrate_plus(screen, root, cwd):
               f"{role} selection")
     screen.send(b"\r")
     until(screen, lambda frame: "Orchestrate+ role models saved" in frame, "durable role profile")
+    local(screen, "/model gpt-6.1-sol")
+    until(screen, lambda frame: "Default" in frame and "Enter apply" in frame, "default conversation effort")
+    screen.send(b"\r")
+    until(screen, lambda _: ready(screen, "gpt-6.1-sol"), "different conversation model active")
+    prior = "PLUS_BASE_CONTEXT"
+    screen.send(prior + "\r")
+    until(screen, lambda frame: completed(root, prior) and "PLUS_CONTEXT_READY" in frame
+          and "Ctrl+C stop" not in screen.vt.line(-2),
+          "previous Work turn from a different model settled")
     screen.send(b"\t\t\t")
     until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2), "ordinary Orchestrate+ mode")
     screen.send(b"Exercise quick, fresh, and final review decisions\r")
@@ -1414,7 +1517,85 @@ def siwc_orchestrate_plus(screen, root, cwd):
     assert "./check.sh" in frame and not marker.exists()
     ledgers = root / "home/.ansa/orchestration"
     assert not ledgers.exists()
+    holds = {stage: root / f"hold-plus-{stage}"
+             for stage in ("coordinate", "worker-rejected", "whole-review")}
+    for hold in holds.values():
+        hold.touch()
+
+    def held(stage):
+        trace = root / "plus-requests.jsonl"
+        return f'"stage":"{stage}"' in trace.read_text() if trace.is_file() else False
+
+    def running_role(detail, title):
+        rows = visible(screen).splitlines()
+        return any(detail in row and title in rows[index - 1] and "Running" in rows[index - 1]
+                   for index, row in enumerate(rows) if index)
+
     screen.send(b"\r")
+    until(screen, lambda frame: held("coordinate") and all(label in frame for label in (
+        "Work plan", "□ Set report to after fixture", "0/2 agents done",
+        "Coordinator · gpt-6.1-sol", "Running · planning",
+    )),
+          "coordinator active before any approved step completes")
+    row = next(index for index, line in enumerate(visible(screen).splitlines())
+               if "Coordinator · gpt-6.1-sol" in line)
+    click(screen, screen.vt.line(row).index("Coordinator · gpt-6.1-sol"), row)
+    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
+          "clicking the model row in the chat opens the coordinator's transcript")
+    escape(screen)
+    until(screen, lambda frame: "Conversation agents" in frame, "Escape restores agent roster")
+    escape(screen)
+    until(screen, lambda frame: "Conversation agents" not in frame and "0/2 agents done" in frame,
+          "Escape restores the live chat")
+    select_result(screen, " ■   Set report to after fixture")
+    screen.send(b"\r")
+    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
+          "Enter opens the selected card in the chat")
+    escape(screen)
+    until(screen, lambda frame: "Conversation agents" in frame, "Escape returns to the roster")
+    escape(screen)
+    if reading(screen):
+        escape(screen)
+    until(screen, lambda frame: "Conversation agents" not in frame and "0/2 agents done" in frame,
+          "Return to the coordinator's live chat")
+    row = next(index for index, line in enumerate(visible(screen).splitlines())
+               if "0/2 agents done" in line)
+    click(screen, screen.vt.line(row).index("0/2 agents done"), row)
+    until(screen, lambda frame: "Conversation agents" in frame
+          and running_role("Coordinator · planning · gpt-6.1-sol", "Set report to after fixture"),
+          "clickable live activity opens the running coordinator")
+    escape(screen)
+    until(screen, lambda frame: "Conversation agents" not in frame, "Escape returns to chat")
+    local(screen, "/agents")
+    until(screen, lambda frame: "Conversation agents" in frame
+          and running_role("Coordinator · planning · gpt-6.1-sol", "Set report to after fixture"),
+          "/agents opens the same running coordinator")
+    screen.send(b"\r")
+    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
+          "Enter opens the running coordinator's transcript")
+    escape(screen)
+    until(screen, lambda frame: "Conversation agents" in frame, "Escape returns to live roster")
+    holds["coordinate"].unlink()
+
+    worker = "Worker · gpt-6.1-luna"
+    until(screen, lambda _: held("worker-rejected")
+          and running_role(worker, "Set report to after fixture"),
+          "already-open roster receives the newly created worker")
+    row = next(index - 1 for index, line in enumerate(visible(screen).splitlines()) if worker in line)
+    click(screen, screen.vt.line(row).index("Set report to after fixture"), row)
+    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
+          "mouse opens the running worker's transcript")
+    escape(screen)
+    until(screen, lambda frame: "Conversation agents" in frame, "Escape restores live roster")
+    holds["worker-rejected"].unlink()
+
+    until(screen, lambda frame: held("whole-review") and "Conversation agents" in frame
+          and running_role("Strong reviewer · gpt-6.2-sol", "PLUS_CARBON_PLAN"),
+          "already-open roster receives the running strong reviewer", timeout=35)
+    escape(screen)
+    if reading(screen):
+        escape(screen)
+    holds["whole-review"].unlink()
     until(screen, lambda frame: "PLUS_CARBON_DONE" in frame, "completed Plus synthesis", timeout=45)
 
     checkout, = ledgers.glob("*/*/checkout")
@@ -1425,13 +1606,32 @@ def siwc_orchestrate_plus(screen, root, cwd):
     release = json.loads((checkout.parent / "release.json").read_text())
     assert release["candidate"] == git("rev-parse", "ansa-result", path=checkout).strip()
     assert git("diff", "--name-only", release["baseline"], release["candidate"], path=checkout) == "report.txt\n"
+    local(screen, "/basic")
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol")
+          and all("Orchestrate+" not in screen.vt.line(row) for row in (0, -2)),
+          "return to Work in the same conversation")
+    followup = "PLUS_WORK_FOLLOWUP"
+    screen.send(followup + "\r")
+    until(screen, lambda frame: completed(root, followup) and "PLUS_CONTINUITY_OK" in frame,
+          "the strong model continues the original conversation")
+    accepted = [row for row in records(root) if row["kind"] == "accepted"]
+    draft, = [row for row in accepted if row.get("draft")]
+    summary_turn, = [row for row in accepted if row.get("handoff")]
+    continued, = [row for row in accepted if row["text"] == followup]
+    for row in (draft, summary_turn, continued):
+        request = row["next"]
+        assert request["binding"]["requested_model"] == "gpt-6.2-sol"
+        assert request["effort"] == "high"
+        assert any(item.get("content") == prior for item in request["input"])
+    assert any("PLUS_CARBON_PLAN" in str(item.get("content")) for item in continued["next"]["input"]
+               if item.get("role") == "assistant")
     trace = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert trace == [
-        "strong-plan", "medium-plan", "coordinate", *["worker-rejected", "reject"] * 3,
+        "prior-work", "strong-plan", "coordinate", *["worker-rejected", "reject"] * 3,
         "escalate-quick", "quick-fix", "quick-verify", "coordinate",
         *["worker-rejected", "reject"] * 3, "escalate-fresh", "fresh-coordinate",
         "fresh-worker", "fresh-verify", "whole-review", "review-coordinate",
-        "review-fix", "targeted-review", "summary",
+        "review-fix", "targeted-review", "summary", "later-work",
     ], trace
     reviewers = []
     for directory in (root / "home/.ansa/sessions").iterdir():
@@ -1449,26 +1649,41 @@ def siwc_orchestrate_plus(screen, root, cwd):
 def siwc_orchestration(screen, root, cwd):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "GPT ready without a network call")
     screen.send(b"\t\t")
-    until(screen, lambda _: "Orchestration" in screen.vt.line(-2), "GPT orchestration mode")
+    until(screen, lambda _: "Orchestrate" in screen.vt.line(-2), "GPT orchestration mode")
     for prompt in ("UNCONFIRMED_FORMAT", "UNCONSTRAINED_FORMAT"):
+        def paused_draft():
+            rows = records(root)
+            draft = next((row["turn"] for row in rows if row["kind"] == "accepted"
+                          and row["text"] == prompt), None)
+            return draft and any(
+                row["kind"] == "pause" and row["turn"] == draft
+                and row["diagnostic"] == "siwc_structured_format_unconfirmed"
+                for row in rows
+            )
+
         screen.send(prompt + "\r")
-        until(screen, lambda frame: "ChatGPT did not confirm the strict plan format" in frame
-              and screen.vt.line(-4) == "› " + prompt, "unconfirmed response rejected and draft restored")
+        until(screen, lambda frame: paused_draft()
+              and "ChatGPT did not confirm the strict plan format" in frame
+              and screen.vt.line(-4) == "  › " + prompt, "unconfirmed response rejected and draft restored")
         assert not (root / "home/.ansa/orchestration").exists()
-        assert [row["kind"] for row in records(root)] == ["init"]
+        draft, = [row for row in records(root) if row["kind"] == "accepted" and row["text"] == prompt]
+        assert not any(row["kind"] == "done" and row["turn"] == draft["turn"] for row in records(root))
         screen.send(b"\x03")
-        until(screen, lambda _: screen.vt.line(-4) == "›", "failed draft can be edited")
+        until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear failed draft")
+        local(screen, "/cancel")
+        until(screen, lambda _: any(row["kind"] == "cancel" and row["turn"] == draft["turn"]
+                                    for row in records(root)), "cancel paused unconfirmed draft")
     screen.send(b"UNNAMED_READ_SCOPE\r")
     until(screen, lambda frame: "Name the read folder in your request" in frame
-          and screen.vt.line(-4) == "› UNNAMED_READ_SCOPE", "the model cannot select an unrelated folder")
-    assert [row["kind"] for row in records(root)] == ["init"]
+          and screen.vt.line(-4) == "  › UNNAMED_READ_SCOPE", "the model cannot select an unrelated folder")
+    assert completed(root, "UNNAMED_READ_SCOPE"), "strict response is retained as an unapproved draft"
     screen.send(b"\x03")
-    until(screen, lambda _: screen.vt.line(-4) == "›", "clear the unnamed folder request")
+    until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear the unnamed folder request")
     screen.send(b"Inspect Workspace/pet\r")
     until(screen, lambda frame: "Read folder" in frame and "SIWC_CARBON_PLAN" in frame and "Start" in frame,
           "the read folder and plan are visible before approval")
     selected = str(root / "home/Workspace/pet")
-    assert f"Read folder · {selected}" in visible(screen), "the approval screen must show the canonical read folder"
+    assert selected in visible(screen), "the approval screen must show the canonical read folder"
     assert not (root / "home/.ansa/orchestration").exists()
     screen.send(b"\r")
     until(screen, lambda frame: "SIWC_CARBON_DONE" in frame and ready(screen, "gpt-6.2-sol"),
@@ -1489,12 +1704,18 @@ def siwc_orchestration(screen, root, cwd):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         screen.send(b"Cancel this draft\r")
         until(screen, lambda frame: "Drafting a plan" in frame, "plan waits for the shared account lock")
-        time.sleep(0.1)
         screen.send(b"\x03")
         until(screen, lambda frame: "Drafting a plan" not in frame
-              and screen.vt.line(-4) == "› Cancel this draft", "cancel keeps the pending draft")
+              and screen.vt.line(-4) == "  › Cancel this draft", "cancel keeps the pending draft")
+        def cancelled_draft():
+            rows = records(root)
+            request = next((row["turn"] for row in rows if row["kind"] == "accepted"
+                            and row["text"] == "Cancel this draft"), None)
+            return request and any(row["kind"] == "cancel" and row["turn"] == request for row in rows)
+
+        until(screen, lambda _: cancelled_draft(), "the exact pending draft was cancelled durably")
         screen.send(b"\x03")
-        until(screen, lambda _: screen.vt.line(-4) == "›", "clear the pending draft")
+        until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear the pending draft")
         local(screen, "/exit")
         assert screen.finish()["exit"] == 0, "exit waited for the locked account after cancelling"
     return "normal"
@@ -1545,7 +1766,7 @@ def active_plan_clarification(screen, root, cwd):
     (cwd / "first.txt").write_text("first\n")
     (cwd / "second.txt").write_text("second\n")
     screen.send(b"\t\t")
-    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "orchestration mode")
+    until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "orchestration mode")
     screen.send("ORCHESTRATION_CLARIFICATION_FIXTURE\r")
     until(screen, lambda frame: "Start" in frame and "Refine" in frame, "clarification plan")
     screen.send(b"\r")
@@ -1619,7 +1840,7 @@ def main():
             editor = cwd / "fixture-editor"
             editor.write_text('#!/bin/sh\n[ "$1" = "--" ] && shift\nprintf "\\033[?1049h\\033[?25l\\033[31mEDITOR_READY\\n"\nread answer\nprintf "edited\\n" >> "$1"\n')
             if name == "editor-early-exit":
-                editor.write_text('#!/bin/sh\nsleep 30 &\nprintf "%s\\n" "$!" > editor-child.pid\nexit 0\n')
+                editor.write_text('#!/bin/sh\nsleep 30 &\nprintf "%s\\n" "$!" > editor-child.pid\nprintf "early exit contents\\n" > "$2"\nexit 0\n')
             elif name == "editor-stopped":
                 editor.write_text('#!/bin/sh\nkill -STOP $$\nprintf resumed > after-stop\n')
             editor.chmod(0o700)

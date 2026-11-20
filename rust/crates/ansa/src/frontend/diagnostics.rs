@@ -151,6 +151,7 @@ fn explanation(code: &str) -> &'static str {
         "auth_required" => "Sign in again",
         "provider_policy_denied" => "Provider denied the request",
         "provider_usage_limit" => "Provider usage limit reached",
+        "siwc_structured_format_unconfirmed" => "ChatGPT did not confirm the strict plan format",
         "model_context_limit" => "The request exceeds the model's context window",
         "request_frame_limit" => "The request cannot be stored in a journal record",
         "followup_frame_limit" => {
@@ -181,7 +182,11 @@ pub(crate) fn pause_notice(view: &Snapshot, workspace: bool) -> String {
     let code = safe_code(&view.diagnostic);
     if view.resume_available && view.request.is_some() {
         let command = if workspace { "/sessions" } else { "/resume" };
-        format!("{code} · {command} · Ctrl+C · {}", explanation(code))
+        if code == "siwc_structured_format_unconfirmed" {
+            format!("{} · {command} · Ctrl+C · {code}", explanation(code))
+        } else {
+            format!("{code} · {command} · Ctrl+C · {}", explanation(code))
+        }
     } else {
         format!("{code}: {}", explanation(code))
     }

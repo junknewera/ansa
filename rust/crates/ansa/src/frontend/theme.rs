@@ -985,6 +985,7 @@ mod tests {
                 action: None,
                 edit: None,
                 output: None,
+                agent: None,
                 status: None,
             }],
             b"draft",
@@ -1007,10 +1008,10 @@ mod tests {
         let row = frame
             .plain_lines()
             .iter()
-            .position(|line| line.starts_with("SELECT"))
+            .position(|line| line.starts_with("  SELECT"))
             .unwrap();
-        let mut selection = Selection::new(frame, 0, row);
-        selection.drag(5, row);
+        let mut selection = Selection::new(frame, 2, row);
+        selection.drag(7, row);
         let selected = selection.frame_at((50, 20), true);
         assert!(selected.lines[row].contains("\x1b[48;2;18;52;86m"));
         assert!(selected.lines[row].contains("\x1b[38;2;171;205;239m"));
@@ -1019,7 +1020,7 @@ mod tests {
                 assert_eq!(&selected.lines[index], line);
             }
         }
-        assert_eq!(selection.finish(5, row).as_deref(), Some("SELECT"));
+        assert_eq!(selection.finish(7, row).as_deref(), Some("SELECT"));
         for panel in [
             Inspector {
                 title: "Source".into(),

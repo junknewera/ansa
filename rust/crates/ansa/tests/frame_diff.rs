@@ -24,7 +24,7 @@ fn touched(delta: &str, previous: &carbon::Frame) -> Vec<(usize, usize)> {
     let mut row = previous
         .plain_lines()
         .iter()
-        .position(|line| line.starts_with("› "))
+        .position(|line| line.starts_with("  › "))
         .unwrap();
     let mut column = previous.cursor;
     let mut result = Vec::new();
@@ -77,7 +77,7 @@ fn touched(delta: &str, previous: &carbon::Frame) -> Vec<(usize, usize)> {
     let expected_row = previous
         .plain_lines()
         .iter()
-        .position(|line| line.starts_with("› "))
+        .position(|line| line.starts_with("  › "))
         .unwrap();
     assert_eq!((row, column), (expected_row, previous.cursor));
     result
@@ -103,6 +103,7 @@ fn scrolling_the_split_inspector_never_erases_or_rewrites_stable_chat_cells() {
             action: None,
             edit: None,
             output: None,
+            agent: None,
             status: None,
         }];
         let before = carbon::layout_workspace(
@@ -258,7 +259,7 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
     for cluster in ["❤️", "1️⃣", "👩\u{200d}💻", "🇷🇺"] {
         assert_eq!(cells::graphemes(cluster).count(), 1);
         assert_eq!(cells::width(cluster), 2);
-        for text in [format!("{}{cluster}", "a".repeat(68)), cluster.repeat(69)] {
+        for text in [format!("{}{cluster}", "a".repeat(66)), cluster.repeat(69)] {
             for color in [false, true] {
                 let ui = Workspace {
                     inspector: Some(Inspector {
@@ -274,6 +275,7 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
                     action: None,
                     edit: None,
                     output: None,
+                    agent: None,
                     status: None,
                 }];
                 let frame = carbon::layout_workspace(
@@ -296,12 +298,12 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
                     .collect();
                 assert!(left.iter().all(|line| cells::width(line) == 69));
                 assert_eq!(
-                    left.iter().map(|line| line.trim_end()).collect::<String>(),
+                    left.iter().map(|line| line.trim()).collect::<String>(),
                     text
                 );
                 if text.starts_with('a') {
-                    assert_eq!(left[0].trim_end(), "a".repeat(68));
-                    assert_eq!(left[1].trim_end(), cluster);
+                    assert_eq!(left[0].trim(), "a".repeat(66));
+                    assert_eq!(left[1].trim(), cluster);
                 }
             }
         }
@@ -323,6 +325,7 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
             action: None,
             edit: None,
             output: None,
+            agent: None,
             status: None,
         }],
         b"",
@@ -356,8 +359,8 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
         &Workspace::default(),
     )
     .unwrap();
-    assert!(editor.lines.iter().any(|line| line == "› ??❤️1️⃣"));
-    assert_eq!(editor.cursor, 8);
+    assert!(editor.lines.iter().any(|line| line == "  › ??❤️1️⃣"));
+    assert_eq!(editor.cursor, 10);
     let editor = carbon::layout_workspace(
         &[],
         "❤️".as_bytes(),
@@ -370,7 +373,7 @@ fn repaint_boundaries_keep_combining_marks_and_wide_characters_whole() {
         &Workspace::default(),
     )
     .unwrap();
-    assert_eq!(editor.cursor, 2);
+    assert_eq!(editor.cursor, 4);
 }
 
 #[test]

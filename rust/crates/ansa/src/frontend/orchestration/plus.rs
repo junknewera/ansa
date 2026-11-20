@@ -24,6 +24,11 @@ pub(super) struct PhaseResult {
     pub(super) tool_evidence: ChildToolEvidence,
 }
 
+pub(super) struct PhaseProgress<'a> {
+    sender: &'a watch::Sender<Option<RunView>>,
+    run: &'a str,
+}
+
 pub(super) struct Phase<'a> {
     pub(super) factory: &'a Factory,
     pub(super) storage: &'a Path,
@@ -32,16 +37,46 @@ pub(super) struct Phase<'a> {
     pub(super) workspace: &'a Path,
     pub(super) source: &'a Request,
     pub(super) stop: &'a Cancel,
+    pub(super) progress: &'a PhaseProgress<'a>,
 }
 
 impl Phase<'_> {
+    fn publish(&self, agent: &AgentLine) {
+        self.progress.sender.send_if_modified(|view| {
+            let Some(view) = view.as_mut().filter(|view| view.id == self.progress.run) else {
+                return false;
+            };
+            if view
+                .agents
+                .first()
+                .is_some_and(|(_, previous)| previous == agent)
+            {
+                return false;
+            }
+            update_phase_agent(view, &agent.id, agent.clone());
+            true
+        });
+    }
+
     pub(super) async fn run(
         &self,
         task: Step,
         role: &GenerationSelection,
+        (agent_role, label): (AgentRole, &str),
+        user_task: &str,
         conversation: Conversation<'_>,
     ) -> Result<PhaseResult> {
         self.stop.check()?;
+        let stage = label.split_once(" · ").map_or("", |(_, stage)| stage);
+        let card = |id: &str| AgentLine {
+            id: id.into(),
+            title: user_task.lines().next().unwrap_or_default().into(),
+            state: "Running".into(),
+            detail: format!("{label} · {}", role.model),
+            role: agent_role,
+            model: role.model.clone(),
+            activity: stage.into(),
+        };
         let started_at = now()?;
         if started_at >= self.deadline {
             return Err("orchestration_deadline");
@@ -93,13 +128,19 @@ impl Phase<'_> {
         // The sealed durable outcome of the earlier phase remains its receipt.
         if let Some(result) = phase.recorded_result(&task.id) {
             phase.check_continuation(now()?)?;
+            let session = previous.ok_or("orchestration_plus_phase_identity")?;
+            let tool_evidence = phase
+                .recorded_tool_evidence(&task.id)
+                .ok_or("run_child_evidence_missing")?
+                .clone();
+            let mut agent = card(&session.id);
+            agent.state = child_status(result).into();
+            agent.activity = result.findings.first().unwrap_or(&result.summary).clone();
+            self.publish(&agent);
             return Ok(PhaseResult {
                 result: result.clone(),
-                session: previous.ok_or("orchestration_plus_phase_identity")?,
-                tool_evidence: phase
-                    .recorded_tool_evidence(&task.id)
-                    .ok_or("run_child_evidence_missing")?
-                    .clone(),
+                session,
+                tool_evidence,
             });
         }
         let source = self.factory.role_request(self.source, role)?;
@@ -134,6 +175,10 @@ impl Phase<'_> {
                 self.stop,
             )?
         };
+        let session_id = opened.selected.id;
+        let mut agent = card(&session_id);
+        self.publish(&agent);
+        let mut acted = false;
         let mut child = Child {
             task,
             runtime: opened.runtime,
@@ -207,6 +252,11 @@ impl Phase<'_> {
                     return Err("orchestration_deadline");
                 }
                 let proof = child.receipt().await?;
+                if let Some(action) = latest_action(&proof) {
+                    agent.activity = action;
+                    acted = true;
+                    self.publish(&agent);
+                }
                 phase.observe(&id, &proof)?;
                 if let Some(result) = phase.result(&id) {
                     return Ok(PhaseResult {
@@ -245,25 +295,50 @@ impl Phase<'_> {
             }
         }
         .await;
-        if result
-            .as_ref()
-            .is_err_and(|code| *code == "orchestration_paused")
-        {
-            child.park().await?;
-            if self.stop.cancelled() {
-                return phase.cancel().and(Err("run_cancelled"));
+        let result = async {
+            if result
+                .as_ref()
+                .is_err_and(|code| *code == "orchestration_paused")
+            {
+                child.park().await?;
+                if self.stop.cancelled() {
+                    return phase.cancel().and(Err("run_cancelled"));
+                }
+                if phase.submissions_exhausted() {
+                    return Err("run_budget");
+                }
+            } else if result.is_ok() {
+                child.runtime.shutdown().await?;
+            } else {
+                let cancelled = phase.cancel();
+                let stopped = child.stop(&mut phase).await;
+                cancelled?;
+                stopped?;
             }
-            if phase.submissions_exhausted() {
-                return Err("run_budget");
-            }
-        } else if result.is_ok() {
-            child.runtime.shutdown().await?;
-        } else {
-            let cancelled = phase.cancel();
-            let stopped = child.stop(&mut phase).await;
-            cancelled?;
-            stopped?;
+            result
         }
+        .await;
+        let (status, error) = match &result {
+            Ok(done) => (child_status(&done.result), None),
+            Err(code) if *code == "orchestration_paused" => ("Paused", None),
+            Err(code) if self.stop.cancelled() => ("Stopped", Some(*code)),
+            Err(code) => ("Failed", Some(*code)),
+        };
+        agent.state = status.into();
+        if let Some(error) = error {
+            agent.detail.push_str(&format!(" · {error}"));
+            if !acted {
+                agent.activity = error.into();
+            }
+        } else if !acted && let Ok(done) = &result {
+            agent.activity = done
+                .result
+                .findings
+                .first()
+                .unwrap_or(&done.result.summary)
+                .clone();
+        }
+        self.publish(&agent);
         result
     }
 }
@@ -381,7 +456,13 @@ async fn task_work(
         };
         let draft = assignment(task, phase_id(task, "draft", cycle, 0), Access::Read, draft);
         let medium = phase
-            .run(draft, &profile.medium, Conversation::Start)
+            .run(
+                draft,
+                &profile.medium,
+                (AgentRole::Coordinator, "Coordinator · planning"),
+                &task.task,
+                Conversation::Start,
+            )
             .await?;
         if medium.result.status != ChildStatus::Completed {
             return Err("orchestration_plus_plan_blocked");
@@ -396,7 +477,13 @@ async fn task_work(
                 worker_instruction(task, &instructions),
             );
             let worker = phase
-                .run(work, &profile.weak, Conversation::OneShot)
+                .run(
+                    work,
+                    &profile.weak,
+                    (AgentRole::worker(task.access), "Worker"),
+                    &task.task,
+                    Conversation::OneShot,
+                )
                 .await?;
             let check = assignment(
                 task,
@@ -408,6 +495,8 @@ async fn task_work(
                 .run(
                     check,
                     &profile.medium,
+                    (AgentRole::Coordinator, "Coordinator · verification"),
+                    &task.task,
                     Conversation::Continue(&medium.session),
                 )
                 .await?;
@@ -429,7 +518,13 @@ async fn task_work(
             ),
         );
         let strong = phase
-            .run(escalation, &profile.strong, Conversation::OneShot)
+            .run(
+                escalation,
+                &profile.strong,
+                (AgentRole::Review, "Strong reviewer · escalation"),
+                &task.task,
+                Conversation::OneShot,
+            )
             .await?;
         let quick_fix = match strong.result.status {
             ChildStatus::Blocked => return Err("orchestration_plus_escalation_blocked"),
@@ -442,7 +537,13 @@ async fn task_work(
                     worker_instruction(task, &strong.result),
                 );
                 let worker = phase
-                    .run(fix, &profile.medium, Conversation::OneShot)
+                    .run(
+                        fix,
+                        &profile.medium,
+                        (AgentRole::worker(task.access), "Worker · correction"),
+                        &task.task,
+                        Conversation::OneShot,
+                    )
                     .await?;
                 let check = assignment(
                     task,
@@ -454,6 +555,8 @@ async fn task_work(
                     .run(
                         check,
                         &profile.medium,
+                        (AgentRole::Coordinator, "Coordinator · verification"),
+                        &task.task,
                         Conversation::Continue(&medium.session),
                     )
                     .await?;
@@ -503,6 +606,11 @@ pub(super) async fn schedule(
     let phases = storage.join("plus");
     fs::create_private(&phases).map_err(|_| "orchestration_storage")?;
     let details = BTreeMap::new();
+    let run_id = run.identity().run.clone();
+    let phase_progress = PhaseProgress {
+        sender: &progress,
+        run: &run_id,
+    };
     let result = async {
         loop {
             stop.check()?;
@@ -510,7 +618,7 @@ pub(super) async fn schedule(
                 return Err("orchestration_deadline");
             }
             accept_clarifications(&mut run, &mut inbox);
-            publish_progress(&progress, &run, &prompt, &details, false);
+            publish_progress(&progress, &run, &source, &details, false);
             if run.active_plus_task().is_none() && !run.pending_clarifications().is_empty() {
                 let input = Json::parse(&serde_json::json!({
                     "request": prompt,
@@ -562,6 +670,7 @@ pub(super) async fn schedule(
                 workspace,
                 source: &source,
                 stop,
+                progress: &phase_progress,
             };
             let input = serde_json::json!({
                 "dependencies": task.depends_on.iter().filter_map(|id| {
@@ -584,7 +693,7 @@ pub(super) async fn schedule(
                         result = &mut work => break result?,
                         Some(message) = inbox.recv() => {
                             let _ = message.acknowledgement.send(run.clarify(message.text));
-                            publish_progress(&progress, &run, &prompt, &details, false);
+                            publish_progress(&progress, &run, &source, &details, false);
                         }
                     }
                 }
@@ -600,9 +709,9 @@ pub(super) async fn schedule(
         if run.plan().steps().iter().any(|step| run.result(&step.id).is_none()) {
             return Err("orchestration_candidate_incomplete");
         }
-        publish_progress(&progress, &run, &prompt, &details, true);
+        publish_progress(&progress, &run, &source, &details, true);
         let (release, report_review) = if let Some((worktree, _lease)) = &candidate {
-            (Some(plus_review::review_candidate_plus(factory, &run, worktree, &source, profile, stop).await?), None)
+            (Some(plus_review::review_candidate_plus(factory, &run, worktree, &source, profile, stop, &phase_progress).await?), None)
         } else {
             let phase = Phase {
                 factory,
@@ -612,12 +721,14 @@ pub(super) async fn schedule(
                 workspace: &read_folder,
                 source: &source,
                 stop,
+                progress: &phase_progress,
             };
             (None, review_report(&phase, &run, profile).await?)
         };
         Ok(Completed {
             id: run.identity().run.clone(),
             evidence: evidence(&run, &prompt, release.as_ref(), report_review.as_ref()),
+            generation: Completed::conversation_generation(&run, &source),
             candidate: release,
         })
     }.await;
@@ -677,8 +788,15 @@ async fn review_report(
         depends_on: Vec::new(),
         acceptance: "Verify the report and identify gaps that prevent using it.".into(),
     };
+    let objective = run.plan().summary();
     let verdict = phase
-        .run(task.clone(), &profile.strong, Conversation::Start)
+        .run(
+            task.clone(),
+            &profile.strong,
+            (AgentRole::Review, "Strong reviewer · report"),
+            objective,
+            Conversation::Start,
+        )
         .await?;
     if verdict.result.status == ChildStatus::Completed && !verdict.result.findings.is_empty() {
         return Ok(Some(
@@ -699,7 +817,13 @@ async fn review_report(
         ),
     );
     let repaired = phase
-        .run(repair, &profile.medium, Conversation::OneShot)
+        .run(
+            repair,
+            &profile.medium,
+            (AgentRole::Research, "Worker · report correction"),
+            objective,
+            Conversation::OneShot,
+        )
         .await?;
     if repaired.result.status != ChildStatus::Completed || repaired.result.findings.is_empty() {
         return Err("orchestration_repair_unresolved");
@@ -718,6 +842,8 @@ async fn review_report(
         .run(
             verification,
             &profile.strong,
+            (AgentRole::Review, "Strong reviewer · verification"),
+            objective,
             Conversation::Continue(&verdict.session),
         )
         .await?;

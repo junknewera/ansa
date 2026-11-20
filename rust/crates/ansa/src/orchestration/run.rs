@@ -60,6 +60,8 @@ pub(crate) struct RunContext {
     pub model_window: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub conversation_plan: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plus_profile: Option<String>,
 }
@@ -1047,6 +1049,7 @@ fn plus_reopen_preserves_completed_effects_active_task_and_saved_clarification()
         configuration: "{}".into(),
         model_window: None,
         handoff_tokens: None,
+        conversation_plan: false,
         plus_profile: Some(r#"{"version":1,"strong":{"model":"strong","effort":"high"},"medium":{"model":"medium","effort":null},"weak":{"model":"weak","effort":null}}"#.into()),
     };
     let mut run = Run::create_with_context(

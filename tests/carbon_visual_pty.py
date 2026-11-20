@@ -242,7 +242,7 @@ def start(binary, root, home, cwd, screens, label, adapter=False, size=(112, 40)
     screen.snapshots = {}
     screens.append(screen)
     until(screen, lambda text: 'ANSA' in text and 'gpt-6.1-sol' in screen.vt.line(-2)
-          and screen.vt.line(-4).startswith('›'), 'first color workspace')
+          and screen.vt.line(-4).startswith('  ›'), 'first color workspace')
     return screen
 
 
@@ -334,8 +334,21 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
           and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'release cleared selection and restored composer')
     native_background(screen, 'get_test_value', 'VISUAL_DRAFT Ж')
     assert journals(root) == before, 'color interactions changed canonical journal'
+    screen.send(b'\x15')
+    local(screen, '/btw SIDE_VISUAL')
+    until(screen, lambda text: 'Main conversation' in text and '/btw · read-only' in text
+          and completed(root, 'SIDE_VISUAL'), 'side chat focus visible in two panes')
+    main_fg = screen.vt.attribute('Main conversation')[0]
+    side_fg = screen.vt.attribute('/btw · read-only')[0]
+    assert main_fg is not None and side_fg is not None and main_fg != side_fg
+    assert 'Esc → main chat' in visible(screen)
+    snapshot(screen, 'focused-side-chat')
+    escape(screen)
+    until(screen, lambda text: '/btw · read-only' not in text and 'VISUAL_TASK' in text,
+          'escape returned to the main conversation')
     finish(screen)
-    return {'effective_target_fg': target_fg, 'effective_status_fg': status_fg,
+    return {'effective_main_fg': main_fg, 'effective_side_fg': side_fg,
+            'effective_target_fg': target_fg, 'effective_status_fg': status_fg,
             'effective_user_bg': user_bg, 'effective_input_bg': input_bg,
             'effective_selection_bg': selected_bg, 'effective_body_bg': body_background(screen)}
 
@@ -440,8 +453,8 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         spinners = set('⠋⠙⠹⠸⠼⠴⠦⠧')
 
         def activity():
-            return [(row, screen.vt.line(row)[0]) for row in range(3, screen.vt.rows - 5)
-                    if screen.vt.line(row)[:1] in spinners and 'waiting for model' in screen.vt.line(row)]
+            return [(row, screen.vt.line(row)[2]) for row in range(3, screen.vt.rows - 5)
+                    if screen.vt.line(row)[2:3] in spinners and 'waiting for model' in screen.vt.line(row)]
 
         until(screen, lambda text: 'EDIT_VISUAL_TASK' in screen.vt.line(3) and bool(activity()),
               'accepted user body and generating activity under fixture hold', timeout=3)
@@ -529,7 +542,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
 
             def quiet_activity():
                 return [row for row in range(3, quiet.vt.rows - 5)
-                        if quiet.vt.line(row).startswith('◷ ') and 'waiting for model' in quiet.vt.line(row)]
+                        if quiet.vt.line(row).startswith('  ◷ ') and 'waiting for model' in quiet.vt.line(row)]
 
             until(quiet, lambda text: 'EDIT_REDUCED_MOTION_TASK' in quiet.vt.line(3) and bool(quiet_activity()),
                   'reduced-motion activity under fixture hold', timeout=3)
@@ -579,11 +592,11 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
               'provider failure paused the request')
         assert '/sessions' in paused.vt.line(-1) and 'Ctrl+C' in paused.vt.line(-1)
         paused.send('NEXT_TURN Ж\r')
-        until(paused, lambda text: paused.vt.line(-4) == '› NEXT_TURN Ж', 'paused draft preserved')
+        until(paused, lambda text: paused.vt.line(-4) == '  › NEXT_TURN Ж', 'paused draft preserved')
         assert sum(row['kind'] == 'accepted' for row in records(failed_root)) == 1
         snapshot(paused, 'paused')
         paused.child.send_signal(signal.SIGINT)
-        until(paused, lambda text: paused.vt.line(-4) == '›' and 'paused' in paused.vt.line(-2),
+        until(paused, lambda text: paused.vt.line(-4) == '  ›' and 'paused' in paused.vt.line(-2),
               'Ctrl+C cleared the draft and retained the paused request')
         local(paused, '/resume')
         until(paused, lambda text: 'Project sessions' in text and 'Resume current request' in text,

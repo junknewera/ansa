@@ -6,6 +6,19 @@ pub struct Command {
     pub name: &'static str,
     pub description: &'static str,
 }
+const ALIASES: &[(&str, &str)] = &[
+    ("/thinking", "/effort"),
+    ("/resume", "/sessions"),
+    ("/open", "/files"),
+];
+
+pub(super) fn canonical(name: &str) -> &str {
+    ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map_or(name, |(_, command)| command)
+}
+
 const COMMANDS: &[Command] = &[
     Command {
         name: "/model",
@@ -14,10 +27,6 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "/effort",
         description: "Change reasoning effort",
-    },
-    Command {
-        name: "/thinking",
-        description: "Reasoning effort · alias for /effort",
     },
     Command {
         name: "/theme",
@@ -30,10 +39,6 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "/agents",
         description: "View agents in this conversation",
-    },
-    Command {
-        name: "/pr",
-        description: "Open a draft PR from a verified branch",
     },
     Command {
         name: "/sessions",
@@ -58,10 +63,6 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "/copy",
         description: "Copy the confirmed transcript",
-    },
-    Command {
-        name: "/resume",
-        description: "Open the session list",
     },
     Command {
         name: "/help",
@@ -146,7 +147,7 @@ impl Completion {
             && self.matches.get(self.selected).is_some_and(|&index| {
                 editor
                     .text()
-                    .is_ok_and(|text| COMMANDS[index].name == text.trim())
+                    .is_ok_and(|text| COMMANDS[index].name == canonical(text.trim()))
             })
     }
     pub fn at(editor: &Editor) -> Option<Self> {
@@ -175,7 +176,13 @@ impl Completion {
         let matches: Vec<_> = commands
             .iter()
             .enumerate()
-            .filter_map(|(i, command)| command.name.starts_with(query).then_some(i))
+            .filter_map(|(i, command)| {
+                let matches = command.name.starts_with(query)
+                    || ALIASES
+                        .iter()
+                        .any(|(alias, target)| *target == command.name && alias.starts_with(query));
+                matches.then_some(i)
+            })
             .collect();
         if matches.is_empty() {
             return None;
@@ -230,7 +237,7 @@ pub fn help(selected: usize) -> Popup {
 pub(crate) fn help_with_commands(selected: usize, commands: &[Command]) -> Popup {
     Popup {
         title: "ANSA commands".into(),
-        subtitle: "Ctrl+J newline · Ctrl+C clear draft or stop".into(),
+        subtitle: "Ctrl+F files · Ctrl+T terminals · Ctrl+O tool details".into(),
         items: commands
             .iter()
             .map(|command| Choice {
@@ -296,6 +303,14 @@ mod tests {
         assert!(completion.apply(&mut input));
         assert_eq!(input.text().unwrap(), "/effort");
         assert!(!COMMANDS.iter().any(|command| command.name == "/run"));
+        for (alias, canonical) in ALIASES {
+            let input = editor(alias);
+            let completion = Completion::at(&input).unwrap();
+            assert!(completion.exact_command(&input));
+            let popup = completion.popup(true);
+            assert_eq!(popup.items.len(), 1);
+            assert_eq!(popup.items[0].label, *canonical);
+        }
         let input = editor("/term");
         assert!(Completion::at(&input).is_none());
         assert!(Completion::at_with_commands(&input, available(true)).is_some());

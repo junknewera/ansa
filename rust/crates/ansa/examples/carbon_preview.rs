@@ -12,6 +12,7 @@ fn main() {
         action: action.map(str::to_owned),
         edit: None,
         output: None,
+        agent: None,
         status: text
             .find("готово")
             .map(|start| start..start + "готово".len()),
@@ -76,7 +77,7 @@ fn main() {
         &history,
         "Покажи файлы проекта".as_bytes(),
         "Покажи файлы проекта".len(),
-        "basic  готов  43 с  tools 9/9  Ctrl+T",
+        "basic  готов  43 с  tools 9/9  Ctrl+O",
         0,
         "~/Workspace/pet/ansa  gpt-6.1-sol",
         (104, 34),

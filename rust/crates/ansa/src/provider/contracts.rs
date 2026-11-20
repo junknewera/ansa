@@ -81,12 +81,62 @@ pub struct MessageReceiptInfo {
     pub state_durable: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanDraft {
+    pub(crate) instructions: String,
+    pub(crate) format: crate::provider::structured::FinalFormat,
+    pub(crate) previous_prompt: Option<String>,
+    pub(crate) skill: Option<String>,
+    pub(crate) profile: Option<String>,
+}
+
+impl PlanDraft {
+    pub(crate) fn save(&self) -> Result<Json, &'static str> {
+        let mut fields = vec![
+            ("instructions", Json::string(&self.instructions)?),
+            ("format", Json::string(self.format.name())?),
+        ];
+        if let Some(prompt) = &self.previous_prompt {
+            fields.push(("previous_prompt", Json::string(prompt)?));
+        }
+        if let Some(skill) = &self.skill {
+            fields.push(("skill", Json::string(skill)?));
+        }
+        if let Some(profile) = &self.profile {
+            fields.push(("profile", Json::string(profile)?));
+        }
+        Json::object(fields)
+    }
+
+    pub(crate) fn load(value: &Json) -> Result<Self, &'static str> {
+        use crate::provider::structured::FinalFormat;
+        let format = FinalFormat::parse(value.text_field("format")?)?;
+        if format == FinalFormat::ChildResult {
+            return Err("session_draft_plan");
+        }
+        let optional_text = |name| {
+            value
+                .has(name)
+                .then(|| value.text_field(name).map(str::to_owned))
+                .transpose()
+        };
+        Ok(Self {
+            instructions: value.text_field("instructions")?.to_owned(),
+            format,
+            previous_prompt: optional_text("previous_prompt")?,
+            skill: optional_text("skill")?,
+            profile: optional_text("profile")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandPayload {
     SetAutocompact(u8),
     Submit(Submit),
     /// Native-only synthesis input from the coordinator. Frontend wire
     /// decoders accept ordinary Submit and never construct this variant.
     Handoff(Submit),
+    DraftPlan(Submit, Box<PlanDraft>),
     Steer(Steer),
     SetGeneration(GenerationSelection),
     GetContext,
@@ -203,7 +253,9 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
             Err("request_id")
         }
         CommandPayload::GetMessageReceipt(id) if !valid_id(&id.0) => Err("command_id"),
-        CommandPayload::Submit(submit) | CommandPayload::Handoff(submit) => {
+        CommandPayload::Submit(submit)
+        | CommandPayload::Handoff(submit)
+        | CommandPayload::DraftPlan(submit, _) => {
             if submit.text.is_empty() || !Json::text_fits_frame(&submit.text) {
                 return Err("submit_size");
             }

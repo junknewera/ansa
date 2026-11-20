@@ -253,6 +253,7 @@ fn entry(text: String, action: Option<String>, role: &str) -> Entry {
         action,
         edit: None,
         output: None,
+        agent: None,
         status: None,
     }
 }
@@ -587,7 +588,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         )
     {
         out.push(entry(
-            "  Diff unavailable. Press Ctrl+T for tool details".into(),
+            "  Diff unavailable. Press Ctrl+O for tool details".into(),
             None,
             "tool_diff_notice",
         ));
@@ -678,7 +679,7 @@ pub(super) fn project(
         let Some(detail) = &row.tool else {
             let is_tool = matches!(row.role.as_str(), "tool" | "tool_result");
             // Old fork seeds have plain timeline rows. Their full text remains
-            // available through Ctrl+T without guessing identity from labels.
+            // available through Ctrl+O without guessing identity from labels.
             let text = if !all && (is_tool || row.role == "reasoning") {
                 row.text.lines().next().unwrap_or_default().into()
             } else {
@@ -690,9 +691,10 @@ pub(super) fn project(
                 action: None,
                 edit: None,
                 output: None,
+                agent: None,
                 status: None,
             }));
-            if row.role == "user"
+            if row.role == "assistant"
                 && let Some(run) = row.turn.0.strip_prefix("summary-")
                 && crate::provider::contracts::valid_id(run)
             {

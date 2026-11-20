@@ -1,5 +1,9 @@
 //! Connect an approved Carbon proposal to owned native child runtimes.
-use super::{Result, sessions::Factory};
+use super::{
+    Result,
+    carbon::{AgentLine, AgentRole},
+    sessions::Factory,
+};
 use crate::{
     orchestration::{
         plan::{Access, Plan, Step},
@@ -21,7 +25,7 @@ use crate::{
 };
 use ansa_linux::{fs, local};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -43,6 +47,7 @@ pub(super) struct Proposal {
 }
 
 impl Proposal {
+    #[cfg(feature = "orchestration-pilot")]
     pub(super) fn generate(
         factory: &Factory,
         seed: ForkSeed,
@@ -51,55 +56,22 @@ impl Proposal {
         skill: Option<&str>,
         stop: &Cancel,
     ) -> Result<Self> {
-        Self::generate_with_profile(factory, seed, prompt, read_only, skill, stop, None)
+        let plan = factory.plan_orchestration(seed.clone(), &prompt, read_only, skill, stop)?;
+        Self::from_plan(factory, seed, prompt, plan, read_only, None, None)
     }
 
-    pub(super) fn generate_plus(
+    pub(super) fn from_plan(
         factory: &Factory,
         seed: ForkSeed,
         prompt: String,
+        mut plan: Plan,
         read_only: bool,
-        skill: Option<&str>,
-        stop: &Cancel,
-        profile: RoleProfile,
-    ) -> Result<Self> {
-        Self::generate_with_profile(factory, seed, prompt, read_only, skill, stop, Some(profile))
-    }
-
-    fn generate_with_profile(
-        factory: &Factory,
-        seed: ForkSeed,
-        prompt: String,
-        read_only: bool,
-        skill: Option<&str>,
-        stop: &Cancel,
+        skill: Option<String>,
         profile: Option<RoleProfile>,
     ) -> Result<Self> {
-        let instructions = skill
-            .map(|name| {
-                factory
-                    .delegation_skill(name)
-                    .ok_or("orchestration_skill_grant")
-            })
-            .transpose()?;
-        let mut plan = if let Some(profile) = &profile {
-            factory.plan_orchestration_plus(
-                seed.clone(),
-                &prompt,
-                read_only,
-                instructions.as_deref(),
-                profile,
-                stop,
-            )?
-        } else {
-            factory.plan_orchestration(
-                seed.clone(),
-                &prompt,
-                read_only,
-                instructions.as_deref(),
-                stop,
-            )?
-        };
+        if read_only && !plan.is_read_only() {
+            return Err("plan_mode_read_only");
+        }
         if let Some(folder) = plan.read_folder() {
             if !named_folder(&prompt, folder) {
                 return Err("orchestration_read_folder_not_named");
@@ -114,7 +86,7 @@ impl Proposal {
             plan,
             digest,
             read_only,
-            skill: skill.map(str::to_owned),
+            skill,
             profile,
         })
     }
@@ -235,7 +207,22 @@ impl Child {
 pub(super) struct Completed {
     pub id: String,
     pub evidence: Option<String>,
+    pub generation: Option<crate::runtime::GenerationSelection>,
     pub candidate: Option<Candidate>,
+}
+
+impl Completed {
+    fn conversation_generation(
+        run: &Run,
+        source: &Request,
+    ) -> Option<crate::runtime::GenerationSelection> {
+        run.context()
+            .filter(|context| context.conversation_plan)
+            .map(|_| crate::runtime::GenerationSelection {
+                model: source.binding.requested_model.clone(),
+                effort: source.effort.clone(),
+            })
+    }
 }
 
 pub(super) struct Candidate {
@@ -250,11 +237,10 @@ pub(super) struct Candidate {
 pub(super) struct RunView {
     pub id: String,
     pub plan: Plan,
-    pub title: String,
-    pub done: usize,
+    pub completed_steps: BTreeSet<String>,
     pub reviewing: bool,
     pub clarification_pending: bool,
-    pub agents: Vec<(String, super::carbon::AgentLine)>,
+    pub agents: Vec<(String, AgentLine)>,
 }
 
 pub(super) struct Clarification {
@@ -269,67 +255,136 @@ fn accept_clarifications(run: &mut Run, inbox: &mut Clarifications) {
     }
 }
 
+fn latest_action(receipt: &ChildAttempt) -> Option<String> {
+    let (name, target) = receipt.latest_tool()?;
+    let label = match name {
+        "list_directory" => "List",
+        "read_file" => "Read",
+        "search_files" => "Search",
+        "edit_file" => "Edit",
+        _ => name,
+    };
+    Some(target.map_or_else(|| label.into(), |path| format!("{label} {path}")))
+}
+
+fn child_status(result: &ChildResult) -> &'static str {
+    match result.status {
+        ChildStatus::Completed => "Completed",
+        ChildStatus::ChangesRequested => "Needs changes",
+        ChildStatus::Blocked => "Blocked",
+    }
+}
+
+#[derive(Default)]
+struct Observation {
+    action: String,
+    paused: bool,
+}
+
 fn publish_progress(
     progress: &watch::Sender<Option<RunView>>,
     run: &Run,
-    prompt: &str,
-    details: &BTreeMap<String, String>,
+    source: &Request,
+    observations: &BTreeMap<String, Observation>,
     reviewing: bool,
 ) {
-    let mut done = 0;
-    let agents = run
+    let completed_steps = run
+        .plan()
+        .steps()
+        .iter()
+        .filter(|step| {
+            run.result(&step.id)
+                .is_some_and(|result| result.status == ChildStatus::Completed)
+        })
+        .map(|step| step.id.clone())
+        .collect();
+    let plus = run
+        .context()
+        .is_some_and(|context| context.plus_profile.is_some());
+    let agents: Vec<_> = run
         .original_children()
         .map(|(id, session, _)| (id, session))
         .chain(run.plus_results())
         .filter_map(|(id, session)| {
             let task = run.plan().steps().iter().find(|step| step.id == id)?;
-            let result = run.result(id);
-            done += usize::from(result.is_some());
-            let (state, detail) = if let Some(result) = result {
+            let observation = observations.get(id);
+            let action = observation.map_or("", |seen| seen.action.as_str());
+            let (state, detail) = if let Some(result) = run.result(id) {
                 (
-                    if result.status == ChildStatus::Completed {
-                        "Completed"
-                    } else {
-                        "Stopped"
-                    },
+                    child_status(result),
                     result.findings.first().unwrap_or(&result.summary).clone(),
                 )
             } else {
-                ("Running", details.get(id).cloned().unwrap_or_default())
+                let state = if run.child_cancelled(id) {
+                    "Stopped"
+                } else if observation.is_some_and(|seen| seen.paused) {
+                    "Paused"
+                } else if run.active().any(|running| running == id) {
+                    "Running"
+                } else {
+                    "Unresolved"
+                };
+                (state, action.into())
             };
             Some((
                 session.to_owned(),
-                super::carbon::AgentLine {
+                AgentLine {
+                    id: session.to_owned(),
                     title: task.task.lines().next().unwrap_or(&task.id).to_owned(),
                     state: state.into(),
+                    role: AgentRole::worker(task.access),
+                    model: if plus {
+                        String::new()
+                    } else {
+                        source.binding.requested_model.clone()
+                    },
+                    activity: if action.is_empty() {
+                        detail.clone()
+                    } else {
+                        action.into()
+                    },
                     detail,
                 },
             ))
         })
         .collect();
-    let view = RunView {
+    let mut view = RunView {
         id: run.identity().run.clone(),
         plan: run.plan().clone(),
-        title: prompt
-            .split_whitespace()
-            .take(10)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(72)
-            .collect(),
-        done,
+        completed_steps,
         reviewing,
         clarification_pending: !run.pending_clarifications().is_empty(),
         agents,
     };
     progress.send_if_modified(|previous| {
+        if let Some(previous) = previous.as_ref().filter(|previous| previous.id == view.id) {
+            if plus {
+                for (id, agent) in previous.agents.iter().rev() {
+                    update_phase_agent(&mut view, id, agent.clone());
+                }
+            } else {
+                view.agents.sort_by_key(|(id, agent)| {
+                    previous
+                        .agents
+                        .iter()
+                        .position(|(old_id, old)| id == old_id && agent.state == old.state)
+                        .map_or(0, |index| index + 1)
+                });
+            }
+        }
         if previous.as_ref() == Some(&view) {
             return false;
         }
         *previous = Some(view);
         true
     });
+}
+
+fn update_phase_agent(view: &mut RunView, id: &str, agent: AgentLine) {
+    const MAX_PHASE_AGENTS: usize = 64;
+    view.agents.retain(|(session, _)| session != id);
+    view.agents.insert(0, (id.to_owned(), agent));
+    view.agents.truncate(MAX_PHASE_AGENTS);
 }
 
 pub(super) fn execute(
@@ -339,10 +394,11 @@ pub(super) fn execute(
     progress: watch::Sender<Option<RunView>>,
     inbox: Clarifications,
 ) -> Result<Completed> {
-    factory.check_orchestration_context(&proposal.seed.request()?)?;
+    let source = proposal.seed.request()?;
+    factory.check_orchestration_context(&source)?;
     proposal.plan.execution_ready()?;
     if proposal.profile.is_none() {
-        factory.require_orchestration_route(stop)?;
+        factory.require_orchestration_route(&source, stop)?;
     }
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -363,7 +419,10 @@ async fn execute_owned(
     let parent = &proposal.seed.source_session().0;
     let source = proposal.seed.request()?;
     let model_window = proposal.seed.model_window();
-    let handoff_tokens = model_window.map(|window| {
+    // The parent runtime accounts for its current context and can compact before
+    // synthesis. A reservation taken before execution can be stale on resume.
+    let conversation_plan = proposal.seed.draft_plan().is_some();
+    let handoff_tokens = model_window.filter(|_| !conversation_plan).map(|window| {
         let mut parent = source.clone();
         parent.tools.descriptors.clear();
         crate::context::input_capacity(window)
@@ -385,6 +444,7 @@ async fn execute_owned(
             configuration: source.with_input(Vec::new())?.save()?.dump(),
             model_window,
             handoff_tokens,
+            conversation_plan,
             plus_profile: proposal
                 .profile
                 .as_ref()
@@ -473,7 +533,7 @@ async fn schedule(
         .plan()
         .read_folder()
         .map_or_else(|| factory.settings.cwd.clone(), PathBuf::from);
-    let mut details = BTreeMap::new();
+    let mut details = BTreeMap::<String, Observation>::new();
     let result = async {
         loop {
             stop.check()?;
@@ -485,19 +545,19 @@ async fn schedule(
             for index in (0..active.len()).rev() {
                 let receipt = active[index].receipt().await?;
                 let id = &active[index].task.id;
-                if let Some((name, target)) = receipt.latest_tool() {
-                    let label = match name {
-                        "list_directory" => "List",
-                        "read_file" => "Read",
-                        "search_files" => "Search",
-                        "edit_file" => "Edit",
-                        _ => "Tool",
-                    };
-                    details.insert(
-                        id.clone(),
-                        target.map_or_else(|| label.into(), |path| format!("{label} {path}")),
-                    );
+                let observation = details.entry(id.clone()).or_default();
+                if let Some(action) = latest_action(&receipt) {
+                    observation.action = action;
                 }
+                observation.paused = matches!(
+                    receipt.state(),
+                    ChildAttemptState::Durable {
+                        quiescent: true,
+                        resume_required: true,
+                        recovery_required: false,
+                        ..
+                    }
+                );
                 run.observe(id, &receipt)?;
                 if matches!(receipt.state(), ChildAttemptState::Durable {
                     quiescent: true, recovery_required: true, ..
@@ -506,20 +566,12 @@ async fn schedule(
                 }
                 if !run.active().any(|active_id| active_id == id) {
                     active.swap_remove(index).runtime.shutdown().await?;
-                } else if matches!(
-                    receipt.state(),
-                    ChildAttemptState::Durable {
-                        quiescent: true,
-                        resume_required: true,
-                        recovery_required: false,
-                        ..
-                    }
-                ) {
+                } else if observation.paused {
                     paused += 1;
                 }
             }
             accept_clarifications(&mut run, &mut inbox);
-            publish_progress(&progress, &run, &prompt, &details, false);
+            publish_progress(&progress, &run, &source, &details, false);
             if paused > 0 {
                 if paused == active.len() {
                     return Err("orchestration_paused");
@@ -551,7 +603,7 @@ async fn schedule(
                     if !approved {
                         return Err("orchestration_scope_confirmation");
                     }
-                    publish_progress(&progress, &run, &prompt, &details, false);
+                    publish_progress(&progress, &run, &source, &details, false);
                 }
             }
             let slots = factory.orchestration_slots().saturating_sub(active.len());
@@ -581,7 +633,7 @@ async fn schedule(
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         let release = if let Some((worktree, _lease)) = &candidate {
-            publish_progress(&progress, &run, &prompt, &details, true);
+            publish_progress(&progress, &run, &source, &details, true);
             if run.plan().steps().iter().any(|step| {
                 !run.result(&step.id)
                     .is_some_and(|result| result.status == ChildStatus::Completed)
@@ -595,6 +647,7 @@ async fn schedule(
         Ok(Completed {
             id: identity.run,
             evidence: evidence(&run, &prompt, release.as_ref(), None),
+            generation: Completed::conversation_generation(&run, &source),
             candidate: release,
         })
     }
@@ -1056,6 +1109,13 @@ fn evidence(
         "user_request": prompt,
         "results": results,
     });
+    if run
+        .context()
+        .is_some_and(|context| context.conversation_plan)
+    {
+        evidence["plan_in_conversation"] = serde_json::json!(true);
+        evidence["approved_plan"] = serde_json::from_str(&run.plan().encode().ok()?).ok()?;
+    }
     if !run.clarifications().is_empty() {
         evidence["user_clarifications"] = serde_json::json!(run.clarifications());
         evidence["coordinator_decisions"] = serde_json::json!(run.decisions());
@@ -1398,7 +1458,8 @@ async fn resume_owned(
         return Err("orchestration_continuation_unavailable");
     }
     let context = run.context().ok_or("orchestration_context")?;
-    factory.check_orchestration_context(&Request::load(&Json::parse(&context.configuration)?)?)?;
+    let source = Request::load(&Json::parse(&context.configuration)?)?;
+    factory.check_orchestration_context(&source)?;
     if let Some(profile) = &context.plus_profile {
         let profile = RoleProfile::decode(&Json::parse(profile)?)?;
         let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
@@ -1408,7 +1469,7 @@ async fn resume_owned(
         )
         .await;
     }
-    factory.require_orchestration_route(stop)?;
+    factory.require_orchestration_route(&source, stop)?;
     let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
     let active = restore_active(factory, &mut run, stop).await?;
     schedule(factory, run, candidate, active, stop, progress, inbox).await

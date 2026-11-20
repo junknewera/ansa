@@ -29,6 +29,49 @@ pub struct Step {
     pub acceptance: String,
 }
 
+/// Visible label for typed helper assignments, including journals written before Carbon had a roster.
+pub(crate) fn assignment_title(text: &str) -> String {
+    let first = text.lines().next().unwrap_or(text);
+    let Some((prompt, metadata)) = text.rsplit_once("\n\nШаг ") else {
+        return first.into();
+    };
+    let stage = metadata.lines().next().unwrap_or_default();
+    if !stage.starts_with("plus-") {
+        return first.into();
+    }
+    if stage.starts_with("plus-review") {
+        return if stage.contains("-repair-") {
+            "Review fixes"
+        } else if stage.contains("-coordinate-") {
+            "Plan review fixes"
+        } else {
+            "Code and security review"
+        }
+        .into();
+    }
+    let role =
+        if stage.contains("-draft-") || stage.contains("-check-") || stage.contains("-verify-") {
+            "Coordinator"
+        } else if stage.contains("-escalate-") {
+            "Escalation"
+        } else {
+            "Worker"
+        };
+    let task = prompt
+        .lines()
+        .skip_while(|line| *line != "Task" && !line.starts_with("Task "))
+        .nth(1)
+        .or_else(|| {
+            prompt
+                .strip_prefix("Assigned task ")
+                .and_then(|rest| rest.lines().nth(1))
+        });
+    match task.filter(|task| !task.trim().is_empty()) {
+        Some(task) => format!("{role} · {task}"),
+        None => role.to_owned(),
+    }
+}
+
 impl Step {
     pub fn assignment(&self) -> Submit {
         let scope = if self.paths.is_empty() {
@@ -265,6 +308,70 @@ impl Plan {
         false
     }
 
+    pub fn markdown(&self) -> String {
+        self.markdown_sections().join("\n\n")
+    }
+
+    /// Parse these separately in approval views so model-authored Markdown cannot
+    /// change how a subsequent permission, path or command appears.
+    pub(crate) fn markdown_sections(&self) -> Vec<String> {
+        let mut sections = vec![self.summary().to_owned()];
+        if let Some(folder) = self.read_folder() {
+            sections.push(format!(
+                "**Read folder**\n\n{}",
+                literal_json(serde_json::json!(folder))
+            ));
+        }
+        if !self.command_checks().is_empty() {
+            sections.push("**Command runs in the project copy with your permissions**".into());
+            for check in self.command_checks() {
+                sections.push(literal_json(serde_json::json!(check.argv)));
+            }
+        }
+        for (index, step) in self.steps().iter().enumerate() {
+            let access = if step.access == Access::Read {
+                "read"
+            } else {
+                "write"
+            };
+            sections.push(format!("### {}. {} ({access})", index + 1, step.id));
+            sections.push(step.task.clone());
+            if step.paths.is_empty() {
+                sections.push("**Read scope** · entire workspace".into());
+            } else {
+                sections.push(format!(
+                    "**Paths**\n\n{}",
+                    literal_json(serde_json::json!(step.paths))
+                ));
+            }
+            if !step.depends_on.is_empty() {
+                sections.push(format!("**Requires** · {}", step.depends_on.join(", ")));
+            }
+            sections.push(format!("**Expected result** · {}", step.acceptance));
+        }
+        if !self.is_read_only() {
+            sections
+                .push("**Verification**\n\nThe final changes require independent review.".into());
+        }
+        for check in self.checks() {
+            sections.push(literal_json(
+                serde_json::json!({"path": check.path, "contains": check.contains}),
+            ));
+        }
+        if !self.manual_checks().is_empty() {
+            sections.push(
+                if self.is_read_only() {
+                    "**Follow-up recommendation**"
+                } else {
+                    "**Manual checks**"
+                }
+                .into(),
+            );
+            sections.extend(self.manual_checks().iter().cloned());
+        }
+        sections
+    }
+
     pub fn encode(&self) -> Result<String> {
         serde_json::to_string(&self.0).map_err(|_| "plan_schema")
     }
@@ -310,6 +417,23 @@ impl Plan {
         }
         Ok(ready)
     }
+}
+
+/// ASCII JSON preserves argument boundaries and exposes invisible and bidi characters.
+fn literal_json(value: serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let mut literal = String::from("```\n");
+    for ch in value.to_string().chars() {
+        if ch.is_ascii_graphic() || ch == ' ' {
+            literal.push(ch);
+        } else {
+            for unit in ch.encode_utf16(&mut [0; 2]) {
+                let _ = write!(literal, "\\u{unit:04x}");
+            }
+        }
+    }
+    literal.push_str("\n```");
+    literal
 }
 
 fn valid_text(text: &str) -> bool {

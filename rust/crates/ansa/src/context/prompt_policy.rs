@@ -78,7 +78,7 @@ impl PromptPolicy {
                     && (state.text_field("mode") == Ok("plan")
                         || matches!(
                             state.text_field("purpose"),
-                            Ok("orchestration_summary" | "readonly_child")
+                            Ok("orchestration_summary" | "orchestration_plan" | "readonly_child")
                         )
                         || state.text_field("previous_epoch").is_ok())
             }

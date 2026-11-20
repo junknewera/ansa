@@ -57,7 +57,9 @@ fn command(c: &RuntimeCommand) -> Result<Json> {
         ("command_id", s(&c.command.0)),
     ];
     match &c.payload {
-        CommandPayload::Handoff(_) => return Err("internal_command"),
+        CommandPayload::Handoff(_) | CommandPayload::DraftPlan(_, _) => {
+            return Err("internal_command");
+        }
         CommandPayload::Submit(v) => f.extend([
             ("type", s("submit")),
             ("text", s(&v.text)),
@@ -162,6 +164,7 @@ fn run(row: &Json) -> Result<Json> {
                             action: None,
                             edit: None,
                             output: None,
+                            agent: None,
                             status: None,
                             role: v.text_field("role")?.into(),
                             text: v.text_field("text")?.into(),

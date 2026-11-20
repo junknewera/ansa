@@ -3,7 +3,7 @@
 use super::{
     Result,
     catalog::CatalogEntry,
-    codec_v1::{Invocation, SavedResult, load_response, next_request, response_text},
+    codec_v1::{Invocation, SavedResult, load_response, next_request},
     journal_v1::inspect_read_only,
     need,
     state::State,
@@ -252,17 +252,17 @@ pub(crate) fn read(
                 };
                 if let Some(question) = &question {
                     let text = question.as_str();
-                    if summary.title.is_none() {
-                        let title = if saved.final_format()
-                            == Some(crate::provider::structured::FinalFormat::ChildResult)
-                        {
-                            text.lines().next().unwrap_or(text)
-                        } else {
-                            text
-                        };
-                        summary.title = Some(excerpt(title, 96));
+                    if saved.final_format()
+                        == Some(crate::provider::structured::FinalFormat::ChildResult)
+                    {
+                        summary.title.get_or_insert_with(|| {
+                            excerpt(&crate::orchestration::plan::assignment_title(text), 96)
+                        });
+                        summary.preview = Some(excerpt(&saved.binding.requested_model, 192));
+                    } else {
+                        summary.title.get_or_insert_with(|| excerpt(text, 96));
+                        summary.preview = Some(excerpt(text, 192));
                     }
-                    summary.preview = Some(excerpt(text, 192));
                 }
                 summary.status = SummaryStatus::Interrupted;
                 turn = Some(event.text_field("turn")?.into());
@@ -291,7 +291,7 @@ pub(crate) fn read(
                         "session_response_request",
                     )?;
                     final_text = if admitted.calls().is_empty() {
-                        Some(response_text(&admitted)?)
+                        Some(super::state::display_response(&admitted)?)
                     } else {
                         None
                     };

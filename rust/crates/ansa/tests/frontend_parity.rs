@@ -137,7 +137,7 @@ fn editor_preserves_utf8_boundaries_and_consumes_alt_prefix() {
     }
     assert_eq!(editor.text(), Ok("bc"));
     assert_eq!(editor.feed(9, true), Some(Action::FocusNext));
-    assert_eq!(editor.feed(6, true), None);
+    assert_eq!(editor.feed(6, true), Some(Action::OpenFiles));
     for (sequence, expected) in [
         (b"\x1b[A", Action::HistoryOlder),
         (b"\x1b[B", Action::HistoryNewer),
@@ -147,7 +147,8 @@ fn editor_preserves_utf8_boundaries_and_consumes_alt_prefix() {
         }
         assert_eq!(editor.feed(sequence[2], true), Some(expected));
     }
-    assert_eq!(editor.feed(20, true), Some(Action::ToggleTools));
+    assert_eq!(editor.feed(20, true), Some(Action::OpenTerminals));
+    assert_eq!(editor.feed(15, true), Some(Action::ToggleTools));
 }
 #[test]
 fn editor_overflow_cannot_be_healed_by_backspaces() {
@@ -168,6 +169,7 @@ fn entry(role: &str, text: &str) -> Entry {
         action: None,
         edit: None,
         output: None,
+        agent: None,
         status: None,
         role: role.into(),
         text: text.into(),

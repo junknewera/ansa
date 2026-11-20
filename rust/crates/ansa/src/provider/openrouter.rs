@@ -187,9 +187,14 @@ impl OpenRouter {
         read_reply(reply)
     }
 
-    pub(crate) fn require_strict(&self, stop: &Cancel) -> Result<()> {
-        self.prepare_route(MODEL, None, RouteCheck::RequireStrict, stop)
-            .map(|_| ())
+    pub(crate) fn require_strict(&self, request: &Request, stop: &Cancel) -> Result<()> {
+        self.prepare_route(
+            &request.binding.requested_model,
+            request.effort.as_deref(),
+            RouteCheck::RequireStrict,
+            stop,
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn validate_role(

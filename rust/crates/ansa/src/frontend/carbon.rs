@@ -18,6 +18,7 @@ pub struct Entry {
     pub status: Option<std::ops::Range<usize>>,
     pub edit: Option<std::sync::Arc<super::diff::EditView>>,
     pub output: Option<std::sync::Arc<OutputView>>,
+    pub agent: Option<std::sync::Arc<AgentLine>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -27,7 +28,9 @@ pub struct Frame {
     pub tool_actions: Vec<(usize, String)>,
     /// Chat row range and right column, all zero based and exclusive at end.
     pub chat_bounds: Option<(usize, usize, usize)>,
+    chat_inset: usize,
     chat_rows: ChatRows,
+    agent_rows: Vec<String>,
     suggestion_bounds: Option<(usize, usize)>,
     pub(super) timeline_range: Option<(usize, usize)>,
     pub(super) timeline_total: usize,
@@ -75,6 +78,11 @@ impl Frame {
             || self.lines.len() != previous.lines.len()
     }
 
+    pub(super) fn agent_at(&self, x: usize, y: usize) -> Option<&str> {
+        let (left, top, width, _) = self.inspector_bounds?;
+        (left..left + width).contains(&x).then_some(())?;
+        self.agent_rows.get(y.checked_sub(top)?).map(String::as_str)
+    }
     pub fn output_view(&self, key: &str) -> Option<std::sync::Arc<OutputView>> {
         self.output_views.get(key).cloned()
     }
@@ -547,6 +555,15 @@ fn layout_impl(
             wrapped.push(ChatRow::default());
         }
         previous_tool = tool;
+        if let Some(agent) = &entry.agent {
+            for text in agent_card(agent, cols, color) {
+                if let Some(action) = &entry.action {
+                    tool_actions.push((wrapped.len(), action.clone()));
+                }
+                wrapped.push(ChatRow { text, join: None });
+            }
+            continue;
+        }
         if let Some(action) = &entry.action {
             tool_actions.push((wrapped.len(), action.clone()));
             if let Some(edit) = &entry.edit {
@@ -847,6 +864,8 @@ fn layout_impl(
         inspector_bounds: None,
         terminal_rows: Default::default(),
         chat_bounds: Some((1, available + 1, cols)),
+        chat_inset: 0,
+        agent_rows: Vec::new(),
         chat_rows: ChatRows {
             wrapped: wrapped.into(),
             first: begin,
@@ -885,6 +904,7 @@ pub enum InspectorKind {
     Diff,
     Markdown,
     Command,
+    Editor,
     Image,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -899,6 +919,7 @@ pub struct Inspector {
     pub footer: String,
     pub kind: InspectorKind,
     pub agents: Vec<AgentLine>,
+    pub document: Option<super::markdown::Document>,
     pub markdown: Option<std::sync::Arc<Vec<super::markdown::Row>>>,
     pub diff: Option<std::sync::Arc<Vec<super::diff::Row>>>,
     pub diff_column: usize,
@@ -909,9 +930,77 @@ pub struct Inspector {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLine {
+    pub id: String,
     pub title: String,
     pub state: String,
     pub detail: String,
+    pub role: AgentRole,
+    pub model: String,
+    pub activity: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    Research,
+    Implementation,
+    Coordinator,
+    Review,
+}
+
+impl AgentRole {
+    pub(super) fn worker(access: crate::orchestration::plan::Access) -> Self {
+        use crate::orchestration::plan::Access;
+        match access {
+            Access::Read => Self::Research,
+            Access::Write => Self::Implementation,
+        }
+    }
+}
+
+fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
+    let (role, ink, avatar) = match agent.role {
+        AgentRole::Research => ("Research", MINT, ["■■■", "■ ■", "■■■"]),
+        AgentRole::Implementation => ("Implementation", VIOLET, ["■ ■", "■■■", "■ ■"]),
+        AgentRole::Coordinator => ("Coordinator", SKY, [" ■ ", "■■■", " ■ "]),
+        AgentRole::Review => ("Review", AMBER, ["  ■", "■ ■", " ■ "]),
+    };
+    let compact = width < 25;
+    let content = width - if compact { 0 } else { 5 };
+    let title = styled(&clipped(&agent.title, content), "\x1b[1m", color);
+    let meta = if agent.model.is_empty() {
+        role.to_owned()
+    } else if width < 42 {
+        format!("{} · {role}", agent.model)
+    } else {
+        format!("{role} · {}", agent.model)
+    };
+    let meta = styled(&clipped(&meta, content), ink, color);
+    let (symbol, status_ink) = match agent.state.as_str() {
+        "Completed" => ("✓", MINT),
+        "Running" => ("●", VIOLET),
+        "Paused" => ("◷", AMBER),
+        _ => ("×", RED),
+    };
+    let status = format!("{symbol} {}", agent.state);
+    let remaining = content.saturating_sub(cells(&status));
+    let mut status = styled(&clipped(&status, content), status_ink, color);
+    if !agent.activity.is_empty() && remaining > 3 {
+        status.push_str(" · ");
+        status.push_str(&styled(
+            &clipped(&agent.activity, remaining - 3),
+            MUTED,
+            color,
+        ));
+    }
+    let lines = [title, meta, status];
+    if compact {
+        return lines.into_iter().collect();
+    }
+    avatar
+        .into_iter()
+        .zip(lines)
+        .map(|(pixels, text)| format!("{}  {text}", styled(pixels, ink, color)))
+        .collect()
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Choice {
@@ -945,12 +1034,22 @@ pub struct Workspace {
     pub interrupt_hint: &'static str,
     pub result_selected: Option<String>,
     pub wide_diff: bool,
+    pub terminal_shortcut: bool,
+    pub side_chat: Option<SideChat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideChat {
+    pub parent_history: Vec<Entry>,
+    pub parent_scroll: usize,
+    pub title: String,
 }
 const MINT: &str = "\x1b[38;2;133;220;177m";
 const TEXT: &str = "\x1b[38;2;215;223;235m";
 const MUTED: &str = "\x1b[38;2;145;157;177m";
 const SKY: &str = "\x1b[38;2;125;183;245m";
 const LAVENDER: &str = "\x1b[38;2;188;166;242m";
+const VIOLET: &str = "\x1b[38;2;192;166;255m";
 const AMBER: &str = "\x1b[38;2;232;189;117m";
 const CODE: &str = "\x1b[38;2;229;193;137m";
 const RED: &str = "\x1b[38;2;241;142;150m";
@@ -1153,6 +1252,36 @@ fn heading(left: &str, right: &str, columns: usize, color: bool) -> String {
 fn rule(columns: usize, color: bool) -> String {
     styled(&"─".repeat(columns), RULE, color)
 }
+fn ruled_title(title: &str, width: usize, accent: &str, color: bool) -> String {
+    let title = clipped(title, width);
+    let remaining = width.saturating_sub(cells(&title));
+    let rule = if remaining > 2 {
+        styled(&format!("  {}", "─".repeat(remaining - 2)), accent, color)
+    } else {
+        String::new()
+    };
+    format!(
+        "{}{rule}",
+        styled(&title, &format!("{accent}\x1b[1m"), color)
+    )
+}
+
+fn shortcuts(terminals: bool, color: bool) -> String {
+    let label = |key, action| {
+        format!(
+            "{} {}",
+            styled(key, AMBER, color),
+            styled(action, MUTED, color)
+        )
+    };
+    let mut text = label("Ctrl+F", "Files");
+    if terminals {
+        text.push_str("   ");
+        text.push_str(&label("Ctrl+T", "Terminals"));
+    }
+    text
+}
+
 fn visible_composer(input: &[u8], cursor: usize, columns: usize, rows: usize) -> (&[u8], usize) {
     let cursor = cursor.min(input.len());
     let margin = columns
@@ -1175,6 +1304,7 @@ fn editor_rows(
     cursor: usize,
     columns: usize,
     maximum: usize,
+    accent: &str,
     color: bool,
 ) -> (Vec<String>, usize, usize) {
     let (input, cursor) = visible_composer(input, cursor, columns, maximum);
@@ -1219,7 +1349,7 @@ fn editor_rows(
         lines.push(if color {
             format!(
                 "{}{}",
-                styled(prefix, &format!("{LAVENDER}\x1b[1m"), true),
+                styled(prefix, &format!("{accent}\x1b[1m"), true),
                 styled(&padded(text, columns.saturating_sub(2)), TEXT, true)
             )
         } else {
@@ -1232,6 +1362,16 @@ fn editor_rows(
         cursor_at.1.min(columns.saturating_sub(1)),
     )
 }
+fn agent_window(panel: &Inspector, available: usize) -> (usize, usize, usize) {
+    let stride = if available >= 4 { 2 } else { 1 };
+    let count = available / stride;
+    let first = panel
+        .selected
+        .unwrap_or_default()
+        .saturating_sub(count.saturating_sub(1));
+    (first, count, stride)
+}
+
 fn inspector_rows(
     panel: &Inspector,
     width: usize,
@@ -1275,13 +1415,16 @@ fn inspector_rows(
     }
     let footer = usize::from(!panel.footer.is_empty());
     let available = height.saturating_sub(rows.len() + footer);
+    let document_rows = panel.document.as_ref().map(|doc| doc.viewport_rows(width));
     if panel.kind == InspectorKind::Agents {
-        let stride = if available >= 4 { 2 } else { 1 };
-        let count = available / stride;
-        let first = panel
-            .selected
-            .unwrap_or_default()
-            .saturating_sub(count.saturating_sub(1));
+        let (first, count, stride) = agent_window(panel, available);
+        if panel.agents.is_empty() && available > 0 {
+            rows.push(styled(
+                &clipped("No agents in this conversation", width),
+                MUTED,
+                color,
+            ));
+        }
         for (index, agent) in panel.agents.iter().enumerate().skip(first).take(count) {
             let label = heading(&agent.title, &agent.state, width, color);
             rows.push(if panel.selected == Some(index) && focused {
@@ -1325,7 +1468,7 @@ fn inspector_rows(
             };
             rows.push(diff_line(&text, row.kind, width, color));
         }
-    } else if let Some(markdown) = &panel.markdown {
+    } else if let Some(markdown) = document_rows.as_deref().or(panel.markdown.as_deref()) {
         for line in markdown.iter().skip(panel.offset).take(available) {
             let mut rendered = String::new();
             for span in &line.spans {
@@ -1410,19 +1553,31 @@ pub fn layout_workspace(
     ui: &Workspace,
 ) -> Option<Frame> {
     let (columns, height) = size;
-    if columns < 12 || height < 8 {
+    if columns < 12 || height < 8 || (ui.side_chat.is_some() && height < 10) {
         let status = if ui.exit_confirmation {
             EXIT_HINT
+        } else if ui.side_chat.is_some() {
+            "BTW · Esc return"
         } else {
             status
         };
         return layout_full(history, input, cursor, status, scroll, context, size, color);
     }
+    let side = ui.side_chat.as_ref();
     let width = columns - 1;
-    let (editor, editor_cursor_row, editor_cursor) =
-        editor_rows(input, cursor, width, (height / 4).clamp(1, 4), color);
-    let body_height = height.saturating_sub(7 + editor.len()).max(1);
-    let mut rows = vec![heading("ANSA", "", width, color)];
+    let inset = if columns >= 20 { "  " } else { "" };
+    let inner_width = width - inset.len();
+    let title = if !matches!(ui.activity.as_str(), "Orchestrate" | "Orchestrate+") {
+        heading("ANSA", "", inner_width, color)
+    } else {
+        let mode = clipped(&ui.activity, inner_width / 2);
+        format!(
+            "{}{}",
+            heading("ANSA", "", inner_width - cells(&mode), color),
+            styled(&mode, &format!("\x1b[1m{VIOLET}"), color),
+        )
+    };
+    let mut rows = vec![format!("{inset}{title}")];
     let mut breadcrumb = ui.breadcrumb.clone();
     if ui.reading {
         if !breadcrumb.is_empty() {
@@ -1433,10 +1588,13 @@ pub fn layout_workspace(
             breadcrumb.push_str(&format!(" ↓ {}", ui.new_events));
         }
     }
-    rows.push(styled(
-        &clipped(&breadcrumb, width),
-        if ui.reading { MINT } else { MUTED },
-        color,
+    rows.push(format!(
+        "{inset}{}",
+        styled(
+            &clipped(&breadcrumb, inner_width),
+            if ui.reading { MINT } else { MUTED },
+            color,
+        ),
     ));
     rows.push(rule(width, color));
     let picture = ui
@@ -1447,12 +1605,13 @@ pub fn layout_workspace(
         .inspector
         .as_ref()
         .is_some_and(|panel| panel.kind == InspectorKind::Plan);
-    let side_by_side = ui.inspector.is_some()
+    let has_panel = ui.inspector.is_some() || side.is_some();
+    let side_by_side = has_panel
         && !plan
         && !ui.wide_diff
-        && (width >= 100 || picture && width >= 63);
+        && (width >= 100 || (picture || side.is_some()) && width >= 63);
     let panel_width = if side_by_side {
-        if picture {
+        if picture || side.is_some() {
             width / 2
         } else {
             (width * 2 / 5).max(34)
@@ -1465,11 +1624,33 @@ pub fn layout_workspace(
     } else {
         width
     };
-    let stacked = ui.inspector.is_some() && !side_by_side;
+    let editor_width = if side.is_some() && side_by_side {
+        panel_width
+    } else {
+        inner_width
+    };
+    let editor_maximum = if side.is_some() {
+        (height / 4).clamp(1, 4).min(height - 9)
+    } else {
+        (height / 4).clamp(1, 4)
+    };
+    let prompt_accent = if side.is_some() { VIOLET } else { MINT };
+    let (editor, editor_cursor_row, editor_cursor) = editor_rows(
+        input,
+        cursor,
+        editor_width,
+        editor_maximum,
+        prompt_accent,
+        color,
+    );
+    let body_height = height.saturating_sub(7 + editor.len()).max(1);
+    let stacked = has_panel && !side_by_side;
     let chat_height = if ui.wide_diff {
         0
     } else if plan {
         1
+    } else if stacked && side.is_some() {
+        (body_height / 2).min(body_height.saturating_sub(2))
     } else if stacked {
         (body_height / 3).max(1)
     } else {
@@ -1505,32 +1686,88 @@ pub fn layout_workspace(
     } else {
         history
     };
+    let side_headings = side.is_some() && chat_height > 0;
+    let chat_rows_count = chat_height - usize::from(side_headings);
     let chat = layout_impl(
-        history,
+        side.map_or(history, |side| side.parent_history.as_slice()),
         b"",
         0,
         "",
         true,
-        scroll,
+        side.map_or(scroll, |side| side.parent_scroll),
         "",
-        (chat_width + 1, chat_height + 5),
+        (chat_width - inset.len() + 1, chat_rows_count + 5),
         color,
         true,
     )?;
-    let mut chat_rows = chat.lines[1..chat_height + 1].to_vec();
+    let mut chat_rows = chat.lines[1..1 + chat_rows_count].to_vec();
     if let Some(selected) = &ui.result_selected
         && let Some((row, _)) = chat.tool_actions.iter().find(|(_, key)| key == selected)
         && let Some(line) = row.checked_sub(1).and_then(|row| chat_rows.get_mut(row))
     {
         *line = if color {
-            styled(&padded(&plain(line), chat_width), SELECTED, true)
+            styled(
+                &padded(&plain(line), chat_width - inset.len()),
+                SELECTED,
+                true,
+            )
         } else {
-            clipped(&format!("› {}", plain(line)), chat_width)
+            clipped(&format!("› {}", plain(line)), chat_width - inset.len())
         };
+    }
+    if side_headings {
+        chat_rows.insert(
+            0,
+            ruled_title("Main conversation", chat_width - inset.len(), MINT, color),
+        );
+    }
+    for line in &mut chat_rows {
+        line.insert_str(0, inset);
     }
     let mut inspector_bounds = None;
     let mut panes = vec![None; height];
-    if let Some(panel) = &ui.inspector {
+    let mut side_scroll_limit = None;
+    if let Some(side) = side {
+        let side_history_height = panel_height.saturating_sub(1);
+        let reply = layout_impl(
+            history,
+            b"",
+            0,
+            "",
+            true,
+            scroll,
+            "",
+            (panel_width + 1, side_history_height + 5),
+            color,
+            true,
+        )?;
+        side_scroll_limit = Some(reply.scroll_limit);
+        let title = ruled_title(&side.title, panel_width, VIOLET, color);
+        let panel_rows = std::iter::once(title)
+            .chain(reply.lines.into_iter().skip(1))
+            .take(panel_height);
+        inspector_bounds = Some((
+            if side_by_side { chat_width + 3 } else { 0 },
+            3 + if stacked { chat_height + 1 } else { 0 },
+            panel_width,
+            panel_height,
+        ));
+        if side_by_side {
+            for (left, right) in chat_rows.iter().zip(panel_rows) {
+                let pane = PaneRow {
+                    column: chat_width,
+                    left: padded(left, chat_width),
+                    right: format!(" {} {}", styled("│", VIOLET, color), right),
+                };
+                rows.push(pane.line());
+                panes[rows.len() - 1] = Some(pane);
+            }
+        } else {
+            rows.extend_from_slice(&chat_rows);
+            rows.push(styled(&"─".repeat(width), VIOLET, color));
+            rows.extend(panel_rows);
+        }
+    } else if let Some(panel) = &ui.inspector {
         let panel_rows = inspector_rows(
             panel,
             panel_width,
@@ -1547,12 +1784,17 @@ pub fn layout_workspace(
             panel_width,
             panel_height.saturating_sub(chrome + usize::from(!panel.footer.is_empty())),
         ));
+        let border = if panel.kind == InspectorKind::Editor && ui.focus == Focus::Inspector {
+            MINT
+        } else {
+            RULE
+        };
         if side_by_side {
             for (left, right) in chat_rows.iter().zip(panel_rows) {
                 let pane = PaneRow {
                     column: chat_width,
                     left: padded(left, chat_width),
-                    right: format!(" {} {}", styled("│", RULE, color), right),
+                    right: format!(" {} {}", styled("│", border, color), right),
                 };
                 let line = pane.line();
                 panes[rows.len()] = Some(pane);
@@ -1560,7 +1802,7 @@ pub fn layout_workspace(
             }
         } else {
             rows.extend_from_slice(&chat_rows);
-            rows.push(rule(width, color));
+            rows.push(styled(&"─".repeat(width), border, color));
             rows.extend(panel_rows);
         }
     } else {
@@ -1569,7 +1811,25 @@ pub fn layout_workspace(
     rows.push(rule(width, color));
     let mut cursor_row = rows.len() + editor_cursor_row;
     let mut cursor_column = editor_cursor;
-    rows.extend(editor);
+    if side.is_some() && side_by_side {
+        cursor_column += chat_width + 3;
+        for (index, line) in editor.into_iter().enumerate() {
+            let parent = if index == 0 { "› Main chat" } else { "" };
+            let pane = PaneRow {
+                column: chat_width,
+                left: format!(
+                    "{inset}{}",
+                    styled(&padded(parent, chat_width - inset.len()), MUTED, color)
+                ),
+                right: format!(" {} {}", styled("│", VIOLET, color), line),
+            };
+            rows.push(pane.line());
+            panes[rows.len() - 1] = Some(pane);
+        }
+    } else {
+        cursor_column += inset.len();
+        rows.extend(editor.into_iter().map(|line| format!("{inset}{line}")));
+    }
     rows.push(rule(width, color));
     let detail = status.lines().next().unwrap_or_default();
     let project = std::path::Path::new(context)
@@ -1582,12 +1842,15 @@ pub fn layout_workspace(
         .collect::<Vec<_>>()
         .join(" · ");
     let narrow = columns <= NARROW_WORKSPACE_COLUMNS;
-    let terminal = ui.focus == Focus::Inspector
-        && ui.popup.is_none()
-        && ui
-            .inspector
-            .as_ref()
-            .is_some_and(|panel| panel.kind == InspectorKind::Command);
+    let terminal_kind = ui
+        .inspector
+        .as_ref()
+        .filter(|_| ui.focus == Focus::Inspector && ui.popup.is_none())
+        .map(|panel| panel.kind);
+    let terminal = matches!(
+        terminal_kind,
+        Some(InspectorKind::Command | InspectorKind::Editor)
+    );
     let navigation = if ui.result_selected.is_some() {
         if narrow {
             "↑/↓ · Enter · Esc"
@@ -1598,8 +1861,12 @@ pub fn layout_workspace(
         ""
     } else if ui.suggestions.is_some() {
         "Tab complete"
-    } else if terminal {
+    } else if side.is_some() {
+        "Esc → main chat"
+    } else if terminal_kind == Some(InspectorKind::Command) {
         "Click chat"
+    } else if terminal {
+        ""
     } else if ui.focus == Focus::Inspector || ui.wide_diff {
         "Tab → chat"
     } else if let Some(panel) = &ui.inspector {
@@ -1612,8 +1879,10 @@ pub fn layout_workspace(
     } else {
         "Tab mode"
     };
-    let results =
-        !chat.tool_actions.is_empty() && ui.result_selected.is_none() && ui.focus == Focus::Chat;
+    let results = side.is_none()
+        && !chat.tool_actions.is_empty()
+        && ui.result_selected.is_none()
+        && ui.focus == Focus::Chat;
     let interrupt = if terminal {
         "Ctrl+C to program"
     } else {
@@ -1636,12 +1905,15 @@ pub fn layout_workspace(
     let mut hint = String::new();
     for next in hints.into_iter().filter(|hint| !hint.is_empty()) {
         let gap = if hint.is_empty() { "" } else { " · " };
-        if cells(&hint) + cells(gap) + cells(next) <= width / 2 {
+        if cells(&hint) + cells(gap) + cells(next) <= inner_width / 2 {
             hint.push_str(gap);
             hint.push_str(next);
         }
     }
-    rows.push(heading(&metadata, &hint, width, color));
+    rows.push(format!(
+        "{inset}{}",
+        heading(&metadata, &hint, inner_width, color)
+    ));
     // Diagnostics are separate from frozen transcript rows.
     let notice = status.lines().nth(1).unwrap_or_default();
     let notice = if notice.is_empty() {
@@ -1654,11 +1926,25 @@ pub fn layout_workspace(
     } else {
         notice
     };
-    rows.push(styled(&clipped(notice, width), MUTED, color));
+    let notice_line = if notice.is_empty()
+        && ui.focus == Focus::Chat
+        && ui.popup.is_none()
+        && ui.suggestions.is_none()
+        && side.is_none()
+        && inner_width >= 36
+    {
+        shortcuts(ui.terminal_shortcut, color)
+    } else {
+        styled(&clipped(notice, inner_width), MUTED, color)
+    };
+    rows.push(format!("{inset}{notice_line}"));
     rows.resize(height, String::new());
     rows.truncate(height);
     if ui.exit_confirmation {
-        rows[height - 1] = styled(&clipped(EXIT_HINT, width), MUTED, color);
+        rows[height - 1] = format!(
+            "{inset}{}",
+            styled(&clipped(EXIT_HINT, inner_width), MUTED, color)
+        );
     }
     if let Some(popup) = &ui.popup {
         paint_popup(&mut rows, popup, width, color);
@@ -1668,13 +1954,20 @@ pub fn layout_workspace(
         .as_ref()
         .filter(|_| ui.popup.is_none())
         .and_then(|popup| {
+            let on_right = side.is_some() && side_by_side;
+            let (margin, width, top, bottom) = if side.is_some() {
+                let (_, row, width, height) = inspector_bounds?;
+                ("", width, row + 1, row + height)
+            } else {
+                (inset, chat_width, 3, 3 + chat_height)
+            };
             paint_suggestions(
                 &mut rows,
                 &mut panes,
                 popup,
-                chat_width,
-                3,
-                3 + chat_height,
+                (margin, width, on_right),
+                top,
+                bottom,
                 color,
             )
         });
@@ -1708,7 +2001,7 @@ pub fn layout_workspace(
         selection_style: None,
         cursor: cursor_column,
         cursor_row: cursor_row.min(height - 1),
-        scroll_limit: chat.scroll_limit,
+        scroll_limit: side_scroll_limit.unwrap_or(chat.scroll_limit),
         inspector_content_rows: ui.inspector.as_ref().map_or(0, |panel| {
             panel_height.saturating_sub(
                 1 + usize::from(!panel.tabs.is_empty() && panel_height > 2)
@@ -1719,17 +2012,17 @@ pub fn layout_workspace(
         viewport: Some(size),
         inspector_bounds,
         terminal_rows,
-        output_views: if ui.popup.is_none() {
+        output_views: if ui.popup.is_none() && side.is_none() {
             chat.output_views
         } else {
             Default::default()
         },
-        edit_views: if ui.popup.is_none() {
+        edit_views: if ui.popup.is_none() && side.is_none() {
             chat.edit_views
         } else {
             Default::default()
         },
-        tool_actions: if ui.popup.is_none() {
+        tool_actions: if ui.popup.is_none() && side.is_none() {
             chat.tool_actions
                 .into_iter()
                 .map(|(row, key)| (row + 2, key))
@@ -1740,10 +2033,27 @@ pub fn layout_workspace(
         } else {
             Vec::new()
         },
-        chat_bounds: ui
-            .popup
-            .is_none()
-            .then_some((3, 3 + chat_height, chat_width)),
+        chat_bounds: (ui.popup.is_none() && side.is_none()).then_some((
+            3,
+            3 + chat_height,
+            chat_width,
+        )),
+        chat_inset: inset.len(),
+        agent_rows: ui
+            .inspector
+            .as_ref()
+            .filter(|_| ui.popup.is_none())
+            .map_or_else(Vec::new, |panel| {
+                let available = inspector_bounds.map_or(0, |(_, _, _, rows)| rows);
+                let (first, count, stride) = agent_window(panel, available);
+                panel
+                    .agents
+                    .iter()
+                    .skip(first)
+                    .take(count)
+                    .flat_map(|agent| std::iter::repeat_n(agent.id.clone(), stride))
+                    .collect()
+            }),
         chat_rows: chat.chat_rows,
         timeline_range: None,
         timeline_total: 0,
@@ -1754,11 +2064,13 @@ fn paint_suggestions(
     rows: &mut [String],
     panes: &mut [Option<PaneRow>],
     popup: &Popup,
-    width: usize,
+    span: (&str, usize, bool),
     top: usize,
     bottom: usize,
     color: bool,
 ) -> Option<(usize, usize)> {
+    let (inset, width, on_right) = span;
+    let width = width - inset.len();
     let available = bottom.saturating_sub(top);
     if available == 0 || popup.items.is_empty() {
         return None;
@@ -1793,8 +2105,13 @@ fn paint_suggestions(
     }
     let start = bottom.saturating_sub(menu.len());
     for (row, line) in (start..bottom).zip(menu) {
+        let line = format!("{inset}{line}");
         if let Some(pane) = panes.get_mut(row).and_then(Option::as_mut) {
-            pane.left = padded(&line, pane.column);
+            if on_right {
+                pane.right = format!(" {} {line}", styled("│", RULE, color));
+            } else {
+                pane.left = padded(&line, pane.column);
+            }
             rows[row] = pane.line();
         } else {
             rows[row] = line;
@@ -2075,6 +2392,11 @@ impl Frame {
         };
         for row in begin.0..=end.0.min(frame.lines.len().saturating_sub(1)) {
             let first = if row == begin.0 { begin.1 } else { 0 };
+            let first = if chat_only {
+                first.max(frame.chat_inset)
+            } else {
+                first
+            };
             let last = if row == end.0 {
                 end.1.saturating_add(1)
             } else {
@@ -2147,7 +2469,11 @@ impl ChatSelection {
         if let Some((first, _)) = frame.suggestion_bounds {
             bottom = bottom.min(first);
         }
-        (top < bottom && width > 0).then_some((top, bottom, width))
+        (top < bottom && width > frame.chat_inset).then_some((
+            top,
+            bottom,
+            width - frame.chat_inset,
+        ))
     }
     fn point(frame: &Frame, column: usize, row: usize) -> Option<ChatPoint> {
         let page = frame.timeline_range?;
@@ -2160,7 +2486,7 @@ impl ChatSelection {
         let column = if line >= total {
             width - 1
         } else {
-            column.min(width - 1)
+            column.saturating_sub(frame.chat_inset).min(width - 1)
         };
         Some((page, line.min(total - 1), column))
     }
@@ -2203,7 +2529,12 @@ impl ChatSelection {
         } else {
             (top + to.0 - first, to.1)
         };
-        frame.highlight(from, to, color, true)
+        frame.highlight(
+            (from.0, from.1 + frame.chat_inset),
+            (to.0, to.1 + frame.chat_inset),
+            color,
+            true,
+        )
     }
 
     fn text(&self) -> String {
@@ -2341,11 +2672,12 @@ impl Selection {
                 let text = rows
                     .get(first + index - top)
                     .map_or("", |row| row.text.as_str());
+                let text = format!("{}{text}", " ".repeat(frame.chat_inset));
                 if let Some(pane) = &mut frame.panes[index] {
-                    pane.left = padded(text, width);
+                    pane.left = padded(&text, width);
                     frame.lines[index] = pane.line();
                 } else {
-                    frame.lines[index] = text.into();
+                    frame.lines[index] = text;
                 }
             }
             frame.chat_rows = ChatRows {
@@ -2535,4 +2867,53 @@ fn source_line(text: &str, color: bool) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_chat_selection_omits_the_workspace_gutter() {
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india omega";
+        let history = [Entry {
+            role: "assistant".into(),
+            text: text.into(),
+            action: None,
+            status: None,
+            edit: None,
+            output: None,
+            agent: None,
+        }];
+        let mut frame = layout_workspace(
+            &history,
+            b"",
+            0,
+            "",
+            0,
+            "workspace",
+            (24, 20),
+            false,
+            &Workspace::default(),
+        )
+        .unwrap();
+        frame.timeline_range = Some((0, 1));
+        frame.timeline_total = 1;
+        let (first, start) = frame
+            .lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find("alpha").map(|column| (row, column)))
+            .unwrap();
+        let (last, end) = frame
+            .lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find("omega").map(|column| (row, column + 4)))
+            .unwrap();
+        assert_eq!(start, 2);
+        assert!(last > first);
+        let mut selection = Selection::chat(frame, start, first).unwrap();
+        assert_eq!(selection.finish(end, last).as_deref(), Some(text));
+    }
 }

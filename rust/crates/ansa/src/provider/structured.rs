@@ -42,7 +42,7 @@ impl ChildResult {
 }
 
 impl FinalFormat {
-    pub(super) fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::ChildResult => "ansa_child_result_v1",
             Self::OrchestrationPlan => "ansa_orchestration_plan_v1",
@@ -51,7 +51,7 @@ impl FinalFormat {
         }
     }
 
-    pub(super) fn parse(name: &str) -> Result<Self> {
+    pub(crate) fn parse(name: &str) -> Result<Self> {
         match name {
             "ansa_child_result_v1" => Ok(Self::ChildResult),
             "ansa_orchestration_plan_v1" => Ok(Self::OrchestrationPlan),

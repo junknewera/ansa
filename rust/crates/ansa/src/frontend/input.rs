@@ -24,7 +24,7 @@ pub enum Action {
     Overflow,
     /// Kept for consumers of the old typed input API; no key emits it.
     ToggleMode,
-    /// Kept for consumers of the old typed input API; Ctrl+F is unbound.
+    /// Kept for consumers of the old typed input API.
     ToggleHistory,
     FocusNext,
     FocusPrevious,
@@ -34,6 +34,8 @@ pub enum Action {
     PageDown,
     HistoryOlder,
     HistoryNewer,
+    OpenFiles,
+    OpenTerminals,
     ToggleTools,
     CopyHistory,
     Complete,
@@ -307,7 +309,9 @@ impl Editor {
                 return if complete { self.sequence() } else { None };
             }
             match ch {
-                20 => return Some(Action::ToggleTools),
+                6 => return Some(Action::OpenFiles),
+                20 => return Some(Action::OpenTerminals),
+                15 => return Some(Action::ToggleTools),
                 25 => return Some(Action::CopyHistory),
                 9 => return Some(Action::FocusNext),
                 4 if self.bytes.is_empty() => return Some(Action::Eof),

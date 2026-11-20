@@ -58,10 +58,18 @@ struct Line {
     source_line: usize,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+type WrappedRows = (usize, Arc<Vec<Row>>);
+#[derive(Clone, Debug, Default)]
 pub struct Document {
     lines: Arc<Vec<Line>>,
+    viewport: Arc<std::sync::Mutex<Option<WrappedRows>>>,
 }
+impl PartialEq for Document {
+    fn eq(&self, other: &Self) -> bool {
+        self.lines == other.lines
+    }
+}
+impl Eq for Document {}
 impl Document {
     pub fn parse(source: &str) -> Self {
         let mut builder = Builder::default();
@@ -86,6 +94,24 @@ impl Document {
         }
         Self {
             lines: Arc::new(builder.lines),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn sections(sections: &[String]) -> Self {
+        let mut lines = Vec::new();
+        for section in sections {
+            let parsed = Self::parse(section);
+            if !parsed.lines.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(Line::default());
+                }
+                lines.extend(Arc::unwrap_or_clone(parsed.lines));
+            }
+        }
+        Self {
+            lines: Arc::new(lines),
+            ..Self::default()
         }
     }
 
@@ -107,6 +133,22 @@ impl Document {
     pub fn rows(&self, columns: usize) -> Vec<Row> {
         let mut rows = Vec::new();
         self.fill_rows(columns, &mut rows, &mut || false);
+        rows
+    }
+
+    /// Keep a single layout for repeated Carbon paints. Resizing replaces it.
+    pub(crate) fn viewport_rows(&self, columns: usize) -> Arc<Vec<Row>> {
+        let mut cached = self
+            .viewport
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((width, rows)) = cached.as_ref()
+            && *width == columns
+        {
+            return rows.clone();
+        }
+        let rows = Arc::new(self.rows(columns));
+        *cached = Some((columns, rows.clone()));
         rows
     }
 
@@ -604,6 +646,33 @@ fn wrap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_keeps_commands_and_scopes_visible_across_markdown_boundaries() {
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "summary": "[hide]: / \"unclosed title",
+            "steps": [
+                {"id":"scan", "task":"[open]: <elsewhere> 'unclosed", "access":"read", "paths":[],
+                 "depends_on":[], "acceptance":"inspect files"},
+                {"id":"change", "task":"**make change**", "access":"write", "paths":["a\u{200b}b"],
+                 "depends_on":["scan"], "acceptance":"confirm the write"}
+            ],
+            "command_checks":[{"argv":["tool","<hidden>","two words","a\u{200b}b"]}]
+        });
+        let plan = crate::orchestration::plan::Plan::parse(&input.to_string()).unwrap();
+        let document = Document::sections(&plan.markdown_sections());
+        let rows = document.viewport_rows(96);
+        assert!(rows.iter().any(|row| {
+            row.plain() == r#"  ["tool","<hidden>","two words","a\u200bb"]"#
+                && row.spans.iter().skip(1).all(|span| span.style.code)
+        }));
+        let text = document.plain();
+        assert!(text.contains("Command runs in the project copy with your permissions"));
+        assert!(text.contains("entire workspace"));
+        assert!(text.contains(r#"["a\u200bb"]"#));
+        assert!(Arc::ptr_eq(&rows, &document.viewport_rows(96)));
+    }
 
     #[test]
     fn cancelled_wrapping_discards_partial_rows() {
