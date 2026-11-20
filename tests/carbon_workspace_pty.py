@@ -795,8 +795,12 @@ def native_terminal_panel(screen, root, cwd):
     screen.additional_screens.append(("resumed", resumed))
     local(resumed, "/plan")
     resumed.send("SEALED_PLAN\r")
-    until(resumed, lambda frame: completed(root, "SEALED_PLAN"), "Plan admitted after a clean restart")
+    until(resumed, lambda frame: completed(root, "SEALED_PLAN") and "OMH_TOOL_OK" in frame
+          and "Plan" in resumed.vt.line(-2) and "Ctrl+C stop" not in resumed.vt.line(-2),
+          "reopened Plan turn settled")
     local(resumed, "/plan")
+    until(resumed, lambda frame: ready(resumed) and "Plan" not in resumed.vt.line(-2),
+          "reopened conversation returned to Work")
     resumed.send("TERMINAL_DEMO\r")
     restarted_host = session.parents[1] / "terminal-host-v1-2"
     until(resumed, lambda frame: (restarted_host / "0001.json").is_file(),
@@ -906,10 +910,10 @@ def completion_and_help(screen, root, cwd):
     screen.send("?")
     until(screen, lambda frame: "ANSA commands" in frame, "empty composer question mark opens help")
     command_rows = [match for row in range(screen.vt.rows)
-                    if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+)\s+(.*?)\s*│", screen.vt.line(row)))]
+                    if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions",
-                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit", "/terminals"}
+                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit", "/autocompact", "/orchestrate+", "/terminals"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert "/run" not in visible(screen), "removed /run remains advertised"
