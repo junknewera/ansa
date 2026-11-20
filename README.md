@@ -496,3 +496,9 @@ CLI предоставляет self-check, offline round trip и live SIWC. Mock
 Архитектура и ограничения: [docs/architecture.md](docs/architecture.md). Фактические gates: [docs/implementation-report.md](docs/implementation-report.md).
 
 Request profile следует [официальному SIWC Preview contract](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) и [models/inference contract](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference), сверенным 2026-11-11.
+
+## Исходные проекты и исследования
+
+Согласованные требования по каждому предложению и результаты проверки собраны в [сводке реализации](docs/PROJECT_STATE.md#реализация-пяти-proposal-после-разбора-требований).
+
+- Нативная оркестрация через вход ChatGPT. [Исследование](docs/ORCHESTRATION_RESEARCH.md), [ADR 0002](docs/adr/0002-self-hosted-orchestration.md), [промпты](docs/ORCHESTRATION_PROMPTS.md).
