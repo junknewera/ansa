@@ -544,7 +544,13 @@ fn text_with_providers(
                 terminals::register(registry, owner, &selected.directory)
             })?;
             if !parsed.resume && parsed.session.is_empty() {
-                crate::mcp::register(registry, &settings.directory, &settings.cwd, None, &Cancel::default())?;
+                crate::mcp::register(
+                    registry,
+                    &settings.directory,
+                    &settings.cwd,
+                    None,
+                    &Cancel::default(),
+                )?;
             }
             Ok(())
         },

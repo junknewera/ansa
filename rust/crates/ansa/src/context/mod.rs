@@ -41,11 +41,31 @@ pub(crate) fn estimate_input_tokens(items: &[Json]) -> usize {
 }
 
 pub(crate) fn require_response_room(tokens: usize, window: usize) -> Result<(), &'static str> {
-    let reserve = (window / 4).clamp(1, 4096);
-    if tokens > window.saturating_sub(reserve) {
+    if tokens > input_capacity(window) {
         return Err("model_context_limit");
     }
     Ok(())
+}
+
+pub(crate) fn input_capacity(window: usize) -> usize {
+    window.saturating_sub((window / 4).clamp(1, 4096))
+}
+
+pub(crate) fn token_prefix(text: &str, budget: usize) -> &str {
+    if estimate_text_tokens(text) <= budget {
+        return text;
+    }
+    let mut lower = 0;
+    let mut upper = text.len();
+    while upper - lower > 1 {
+        let middle = lower + (upper - lower) / 2;
+        if estimate_text_tokens(&text[..text.floor_char_boundary(middle)]) <= budget {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    &text[..text.floor_char_boundary(lower)]
 }
 
 fn estimate_item_tokens(item: &Json) -> usize {

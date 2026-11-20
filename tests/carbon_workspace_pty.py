@@ -1298,29 +1298,68 @@ def siwc_orchestration(screen, root, cwd):
 
 def matugen_palette(screen, root, cwd):
     prefs = cwd.parent / ".ansa" / "ui.json"
+    import struct
+    import zlib
 
-    def preview():
+    def chunk(name, payload):
+        return struct.pack(">I", len(payload)) + name + payload + struct.pack(">I", zlib.crc32(name + payload))
+
+    (cwd / "palette.png").write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress((b"\0" + b"\x26\x7e\xb9" * 16) * 16))
+        + chunk(b"IEND", b"")
+    )
+
+    def preview(source):
         local(screen, "/theme")
         until(screen, lambda _: "Generate with Matugen" in popup_text(screen), "Matugen in theme picker")
         screen.send(b"\x1b[B" * 12 + b"\r")
         until(screen, lambda _: "Image path or HEX color" in popup_text(screen), "Matugen source")
-        screen.send(b"#c67ca9\r")
+        screen.send(source + "\r")
         until(screen, lambda _: "Expressive" in popup_text(screen), "Matugen schemes")
         screen.send(b"\x1b[B" * 3 + b"\r")
         until(screen, lambda _: "Contrast from -100" in popup_text(screen), "Matugen contrast")
         screen.send(b"25\r")
         until(screen, lambda _: "Palette preview" in popup_text(screen), "Generated palette")
 
-    preview()
+    preview("#c67ca9")
     assert not prefs.exists()
     escape(screen)
     assert not prefs.exists()
-    preview()
+    preview("palette.png")
     screen.send(b"\r")
     until(screen, lambda frame: "Theme Matugen saved" in frame, "Saved Matugen palette")
     saved = json.loads(prefs.read_text())
     assert saved["theme"] == "matugen"
     assert saved["generated"]["colors"]["accent"].startswith("#")
+    local(screen, "/exit")
+    return "normal"
+
+
+def active_plan_clarification(screen, root, cwd):
+    (cwd / "first.txt").write_text("first\n")
+    (cwd / "second.txt").write_text("second\n")
+    screen.send(b"\t\t")
+    until(screen, lambda frame: "Orchestration" in screen.vt.line(-2), "orchestration mode")
+    screen.send("ORCHESTRATION_CLARIFICATION_FIXTURE\r")
+    until(screen, lambda frame: "Start" in frame and "Refine" in frame, "clarification plan")
+    screen.send(b"\r")
+    ledgers = root / "home/.ansa/orchestration"
+    def events():
+        return [json.loads(path.read_text())["body"]["event"] for path in sorted(ledgers.glob("*/*/ledger/event-*.json"))]
+
+    until(screen, lambda _: any(event.get("event") == "post" and event["step"] == "first" for event in events()), "first step running")
+    clarification = "Focus the comparison on the first line"
+    screen.send(clarification + "\r")
+    until(screen, lambda frame: "Coordinator receives the clarification" in frame, "durable clarification")
+    until(screen, lambda frame: "Оба помощника завершили проверку" in frame, "parent summary")
+    records = events()
+    accepted, = [i for i, event in enumerate(records) if event.get("event") == "clarification" and event["text"] == clarification]
+    finished, = [i for i, event in enumerate(records) if event.get("event") == "finished" and event["step"] == "first"]
+    decided, = [i for i, event in enumerate(records) if event.get("event") == "coordinator_decision"]
+    second, = [i for i, event in enumerate(records) if event.get("event") == "bound" and event["step"] == "second"]
+    assert accepted < finished < decided < second
     local(screen, "/exit")
     return "normal"
 
@@ -1341,6 +1380,7 @@ def main():
              ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),
              ("orchestration-candidate", orchestration_candidate),
+             ("active-plan-clarification", active_plan_clarification),
              ("terminal-interrupt-app-escape", terminal_interrupt_and_app_escape),
              ("terminal-eof-exit", terminal_eof_and_exit),
              ("outer-eof-cleans-terminal", outer_eof_cleans_terminal),

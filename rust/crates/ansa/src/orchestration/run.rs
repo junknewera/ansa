@@ -49,6 +49,10 @@ struct Header {
 pub(crate) struct RunContext {
     pub prompt: String,
     pub configuration: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_window: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_tokens: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,8 +139,13 @@ enum Event {
         request: String,
         outcome: Outcome,
     },
-    Clarification { text: String },
-    CoordinatorDecision { through: usize, result: ChildResult },
+    Clarification {
+        text: String,
+    },
+    CoordinatorDecision {
+        through: usize,
+        result: ChildResult,
+    },
     Cancelled,
     Continued,
 }
@@ -193,7 +202,11 @@ impl State {
     }
 
     fn can_dispatch(&self) -> Result<()> {
-        if self.decisions.last().is_some_and(|decision| decision.status != ChildStatus::Completed) {
+        if self
+            .decisions
+            .last()
+            .is_some_and(|decision| decision.status != ChildStatus::Completed)
+        {
             return Err("run_scope_confirmation");
         }
         if !self.approved || self.cancelled || self.expired || self.unresolved {
@@ -428,7 +441,10 @@ impl Run {
         &self.state.clarifications
     }
     pub(crate) fn record_decision(&mut self, result: ChildResult) -> Result<()> {
-        self.commit(Event::CoordinatorDecision { through: self.state.clarifications.len(), result })
+        self.commit(Event::CoordinatorDecision {
+            through: self.state.clarifications.len(),
+            result,
+        })
     }
     pub(crate) fn decisions(&self) -> &[ChildResult] {
         &self.state.decisions
@@ -725,7 +741,7 @@ impl Run {
         let mut next = self.state.clone();
         next.apply(&self.header.identity.parent_session, &event)?;
         if let Err(error) = self.journal.append(&event) {
-            self.storage_failed = true;
+            self.storage_failed = error != "store_record_size";
             return Err(error);
         }
         self.state = next;

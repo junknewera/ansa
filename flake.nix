@@ -42,6 +42,7 @@
           ANSA_SESSION_FIXTURES = ./tests/fixtures/sessions;
           ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
           ANSA_MATUGEN = "${pkgs.matugen}/bin/matugen";
+          ANSA_TEST_BASH = "${pkgs.bashInteractive}/bin/bash";
           preBuild = ''
             python3 ${./tests/parity/check_toolchain.py} --workspace .
           '';
@@ -75,6 +76,7 @@
             packages = [ (pkgs.callPackage ./nix/quality-toolchain.nix {}) (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh ];
             ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
             ANSA_MATUGEN = "${pkgs.matugen}/bin/matugen";
+            ANSA_TEST_BASH = "${pkgs.bashInteractive}/bin/bash";
           };
         });
     };

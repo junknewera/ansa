@@ -215,6 +215,7 @@ fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
             } else {
                 StreamAdmission::Strict
             },
+            mcp: None,
         },
     )
     .and_then(|_| decoder.finish())
@@ -303,6 +304,7 @@ fn strict_headers_and_failed_eof_never_dispatch() {
             RoutePolicy {
                 local_only: true,
                 admission: StreamAdmission::SiwcResponses(&value),
+                mcp: None,
             },
         );
         assert_eq!(result.err(), Some(expected));

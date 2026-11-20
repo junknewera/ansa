@@ -113,7 +113,8 @@ impl Host {
         if let Some(scope) = &self.scope
             && (!path.starts_with(&scope.root)
                 || writing && !scope.writes.iter().any(|allowed| path.starts_with(allowed))
-                || !writing && !scope.reads.is_empty()
+                || !writing
+                    && !scope.reads.is_empty()
                     && !scope.reads.iter().any(|allowed| path.starts_with(allowed)))
         {
             return Err("task_path_scope");
@@ -135,7 +136,7 @@ impl Host {
                 && scope.reads.iter().any(|allowed| allowed.starts_with(path))
         })
     }
-    fn resolve_path(&self, path: &Path, traverse: bool) -> Result<PathBuf> {
+    pub(super) fn resolve_path(&self, path: &Path, traverse: bool) -> Result<PathBuf> {
         let bytes = path.as_os_str().as_encoded_bytes();
         if bytes.is_empty() || bytes.len() > 4096 || bytes.contains(&0) {
             return Err("file_path");

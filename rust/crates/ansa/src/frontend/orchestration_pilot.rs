@@ -745,7 +745,7 @@ fn run_synthetic(
                 .post(command(
                     "summary",
                     CommandPayload::Handoff(Submit {
-                        text: completed.evidence,
+                        text: completed.evidence.ok_or("pilot_parent_handoff")?,
                         mode: AgentMode::Plan,
                     }),
                 ))

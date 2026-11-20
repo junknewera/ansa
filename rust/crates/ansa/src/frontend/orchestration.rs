@@ -45,8 +45,20 @@ impl Proposal {
         skill: Option<&str>,
         stop: &Cancel,
     ) -> Result<Self> {
-        let instructions = skill.map(|name| factory.delegation_skill(name).ok_or("orchestration_skill_grant")).transpose()?;
-        let mut plan = factory.plan_orchestration(seed.clone(), &prompt, read_only, instructions.as_deref(), stop)?;
+        let instructions = skill
+            .map(|name| {
+                factory
+                    .delegation_skill(name)
+                    .ok_or("orchestration_skill_grant")
+            })
+            .transpose()?;
+        let mut plan = factory.plan_orchestration(
+            seed.clone(),
+            &prompt,
+            read_only,
+            instructions.as_deref(),
+            stop,
+        )?;
         if let Some(folder) = plan.read_folder() {
             if !named_folder(&prompt, folder) {
                 return Err("orchestration_read_folder_not_named");
@@ -161,7 +173,7 @@ impl Child {
 
 pub(super) struct Completed {
     pub id: String,
-    pub evidence: String,
+    pub evidence: Option<String>,
     pub candidate: Option<Candidate>,
 }
 
@@ -285,6 +297,13 @@ async fn execute_owned(
     let deadline = started + 15 * 60;
     let parent = &proposal.seed.source_session().0;
     let source = proposal.seed.request()?;
+    let model_window = proposal.seed.model_window();
+    let handoff_tokens = model_window.map(|window| {
+        let mut parent = source.clone();
+        parent.tools.descriptors.clear();
+        crate::context::input_capacity(window)
+            .saturating_sub(crate::context::estimate_request_tokens(&parent))
+    });
     let (storage, identity) = run_directory(factory, parent)?;
     let submissions = (proposal.plan.steps().len() * 2).max(1) as u8;
     let mut run = Run::create_with_context(
@@ -299,6 +318,8 @@ async fn execute_owned(
         Some(RunContext {
             prompt: proposal.prompt,
             configuration: source.with_input(Vec::new())?.save()?.dump(),
+            model_window,
+            handoff_tokens,
         }),
     )?;
     run.approve(&proposal.digest)?;
@@ -432,7 +453,7 @@ async fn schedule(
                     tokio::time::sleep(Duration::from_millis(40)).await;
                     continue;
                 }
-                if !active.is_empty() || !run.ready()?.is_empty() {
+                {
                     let input = Json::parse(&serde_json::json!({
                         "request": prompt,
                         "approved_plan": run.plan().encode()?,
@@ -456,6 +477,9 @@ async fn schedule(
             if ready.is_empty() && active.is_empty() {
                 inbox.close();
                 accept_clarifications(&mut run, &mut inbox);
+                if !run.pending_clarifications().is_empty() {
+                    continue;
+                }
                 break;
             }
             for task in ready {
@@ -906,7 +930,7 @@ async fn start_child(
     Ok(child)
 }
 
-fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> String {
+fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> Option<String> {
     let results: Vec<_> = run
         .plan()
         .steps()
@@ -931,7 +955,50 @@ fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> String {
             "command_checks_passed": run.plan().command_checks().len(),
         });
     }
-    evidence.to_string()
+    let serialized = evidence.to_string();
+    let budget = run.context().and_then(|context| context.handoff_tokens);
+    let fits = |value: &str| {
+        Json::text_fits_frame(value)
+            && budget
+                .is_none_or(|remaining| crate::context::estimate_text_tokens(value) <= remaining)
+    };
+    if fits(&serialized) {
+        return Some(serialized);
+    }
+    // Results and clarifications remain in the run and child journals. Give
+    // each report a share of the available input and keep its archive identity.
+    let tokens = budget.unwrap_or_else(|| crate::context::estimate_text_tokens(&serialized) / 2);
+    let mut share = tokens / (run.plan().steps().len() + 2);
+    evidence
+        .as_object_mut()
+        .expect("orchestration evidence")
+        .remove("coordinator_decisions");
+    evidence["reports_are_excerpts"] = serde_json::json!(true);
+    loop {
+        evidence["user_request"] = serde_json::json!(crate::context::token_prefix(prompt, share));
+        evidence["user_clarifications"] = serde_json::json!(
+            run.clarifications()
+                .last()
+                .map(|text| crate::context::token_prefix(text, share))
+        );
+        evidence["results"] = serde_json::json!(run.plan().steps().iter().map(|step| {
+            let archive = run.original_children().find_map(|(id, session, _)| (id == step.id).then_some(session));
+            serde_json::json!({
+                "step": step.id,
+                "child_session": archive,
+                "summary_excerpt": run.result(&step.id).map(|result| crate::context::token_prefix(&result.summary, share)),
+                "status": run.result(&step.id).map(|result| result.status),
+            })
+        }).collect::<Vec<_>>());
+        let projected = evidence.to_string();
+        if fits(&projected) {
+            return Some(projected);
+        }
+        if share == 0 {
+            return None;
+        }
+        share /= 2;
+    }
 }
 
 fn now() -> Result<u64> {
@@ -965,16 +1032,19 @@ fn run_directory(factory: &Factory, parent: &str) -> Result<(PathBuf, RunId)> {
     ))
 }
 
-pub(super) fn latest_continuation(
-    factory: &Factory,
-    parent: &str,
-) -> Result<Option<(RunId, String)>> {
+#[derive(Default)]
+pub(super) struct PlanLinks {
+    pub continuation: Option<(RunId, String)>,
+    pub clarification: Option<RunId>,
+}
+
+pub(super) fn recent_plan_links(factory: &Factory, parent: &str) -> Result<PlanLinks> {
     if factory.orchestration_route().is_err() {
-        return Ok(None);
+        return Ok(PlanLinks::default());
     }
     let root = run_root(factory, parent);
     if !root.exists() {
-        return Ok(None);
+        return Ok(PlanLinks::default());
     }
     let directory = fs::private_directory(&root).map_err(|_| "orchestration_storage")?;
     let (names, more) = local::names(&directory, 128).map_err(|_| "orchestration_inventory")?;
@@ -982,7 +1052,8 @@ pub(super) fn latest_continuation(
         return Err("orchestration_inventory_limit");
     }
     let time = now()?;
-    let mut latest = None;
+    let mut continuation = None;
+    let mut clarification = None;
     for name in names {
         let Some(id) = name
             .to_str()
@@ -1008,17 +1079,29 @@ pub(super) fn latest_continuation(
         let Ok(run) = Run::open(&storage.join("ledger"), &identity) else {
             continue;
         };
-        if !continuable(&run, time) {
-            continue;
-        }
         let modified = std::fs::metadata(storage.join("ledger"))
             .and_then(|metadata| metadata.modified())
             .map_err(|_| "orchestration_storage")?;
-        if latest.as_ref().is_none_or(|(old, _, _)| *old < modified) {
-            latest = Some((modified, identity, run.plan().summary().to_owned()));
+        if !run.clarifications().is_empty()
+            && clarification
+                .as_ref()
+                .is_none_or(|(old, _)| *old < modified)
+        {
+            clarification = Some((modified, identity.clone()));
+        }
+        if run.pending_clarifications().is_empty()
+            && continuable(&run, time)
+            && continuation
+                .as_ref()
+                .is_none_or(|(old, _, _)| *old < modified)
+        {
+            continuation = Some((modified, identity, run.plan().summary().to_owned()));
         }
     }
-    Ok(latest.map(|(_, id, title)| (id, title)))
+    Ok(PlanLinks {
+        continuation: continuation.map(|(_, id, title)| (id, title)),
+        clarification: clarification.map(|(_, id)| id),
+    })
 }
 
 fn continuable(run: &Run, time: u64) -> bool {
@@ -1148,6 +1231,7 @@ fn archived_candidate(
 pub(super) fn resume(
     factory: &Factory,
     identity: RunId,
+    read_only: bool,
     stop: &Cancel,
     progress: watch::Sender<Option<RunView>>,
     inbox: Clarifications,
@@ -1158,18 +1242,27 @@ pub(super) fn resume(
         .enable_time()
         .build()
         .map_err(|_| "orchestration_reactor")?;
-    reactor.block_on(resume_owned(factory, identity, stop, progress, inbox))
+    reactor.block_on(resume_owned(
+        factory, identity, read_only, stop, progress, inbox,
+    ))
 }
 
 async fn resume_owned(
     factory: &Factory,
     identity: RunId,
+    read_only: bool,
     stop: &Cancel,
     progress: watch::Sender<Option<RunView>>,
     inbox: Clarifications,
 ) -> Result<Completed> {
     let storage = run_root(factory, &identity.parent_session).join(&identity.run);
     let mut run = Run::open(&storage.join("ledger"), &identity)?;
+    if read_only && !run.plan().is_read_only() {
+        return Err("plan_mode_read_only");
+    }
+    if !run.pending_clarifications().is_empty() {
+        return Err("orchestration_clarification_needs_review");
+    }
     if !continuable(&run, now()?) {
         return Err("orchestration_continuation_unavailable");
     }

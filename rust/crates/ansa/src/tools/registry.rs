@@ -85,6 +85,7 @@ pub struct Definition {
 pub struct Registry {
     definitions: Vec<Definition>,
     policies: Vec<Policy>,
+    records: Vec<Json>,
     owner: Option<BoundOwner>,
 }
 #[derive(Clone)]
@@ -119,6 +120,7 @@ impl Registry {
         Self {
             definitions: vec![],
             policies: vec![],
+            records: vec![],
             owner: None,
         }
     }
@@ -176,6 +178,28 @@ impl Registry {
         if d.descriptor.schema.field("type")?.text()? != "object" {
             return Err("tool_schema_root");
         };
+        let descriptor = Json::object(vec![
+            ("name", Json::string(&d.descriptor.name)?),
+            ("description", Json::string(&d.descriptor.description)?),
+            (
+                "implementation_revision",
+                Json::string(&d.descriptor.revision)?,
+            ),
+            ("schema", d.descriptor.schema.clone()),
+        ])?;
+        let record = if policy.requires_journal {
+            Json::object(vec![
+                ("descriptor", descriptor),
+                ("requires_journal", Json::parse("true")?),
+            ])?
+        } else {
+            descriptor
+        };
+        self.records.push(record);
+        if let Err(code) = Json::array(self.records.clone()) {
+            self.records.pop();
+            return Err(code);
+        }
         self.definitions.push(d);
         self.policies.push(policy);
         Ok(())
@@ -186,39 +210,9 @@ impl Registry {
             .iter()
             .map(|d| d.descriptor.clone())
             .collect();
-        let records = self
-            .definitions
-            .iter()
-            .zip(&self.policies)
-            .map(|(d, policy)| {
-                let descriptor = Json::object(vec![
-                    (
-                        "name",
-                        Json::string(&d.descriptor.name).expect("validated descriptor"),
-                    ),
-                    (
-                        "description",
-                        Json::string(&d.descriptor.description).expect("valid descriptor"),
-                    ),
-                    (
-                        "implementation_revision",
-                        Json::string(&d.descriptor.revision).expect("validated revision"),
-                    ),
-                    ("schema", d.descriptor.schema.clone()),
-                ])
-                .expect("validated descriptor");
-                if policy.requires_journal {
-                    Json::object(vec![
-                        ("descriptor", descriptor),
-                        ("requires_journal", Json::parse("true").expect("boolean")),
-                    ])
-                    .expect("bounded descriptor")
-                } else {
-                    descriptor
-                }
-            })
-            .collect();
-        let serialized = Json::array(records).expect("bounded registry").dump();
+        let serialized = Json::array(self.records.clone())
+            .expect("bounded registry")
+            .dump();
         let revision = crate::protocol::legacy_json_v1::sha256(serialized.as_bytes());
         Arc::new(Snapshot {
             definitions: self.definitions.clone(),
@@ -305,8 +299,9 @@ impl Snapshot {
         registry.owner = self.owner.clone();
         for (definition, policy) in self.definitions.iter().zip(&self.policies) {
             if include(definition, policy) {
-                registry.definitions.push(definition.clone());
-                registry.policies.push(policy.clone());
+                registry
+                    .register_with_policy(definition.clone(), policy.clone())
+                    .expect("subset of validated registry");
             }
         }
         registry.snapshot()

@@ -99,10 +99,17 @@ pub(super) fn agent_task(text: &str) -> Option<&str> {
 }
 
 pub(super) fn skill_request(text: &str) -> Option<(&str, &str)> {
-    let (name, task) = text.trim().strip_prefix('$')?.split_once(char::is_whitespace)?;
-    (!name.is_empty() && name.len() <= 64
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-        && !task.trim().is_empty()).then(|| (name, task.trim()))
+    let (name, task) = text
+        .trim()
+        .strip_prefix('$')?
+        .split_once(char::is_whitespace)?;
+    (!name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        && !task.trim().is_empty())
+    .then(|| (name, task.trim()))
 }
 
 #[derive(Clone)]

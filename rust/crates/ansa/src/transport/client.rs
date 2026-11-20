@@ -21,7 +21,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 type Sink<'a> = dyn FnMut(&[u8]) -> Result<()> + 'a;
 #[derive(Clone, Copy)]
@@ -189,6 +189,7 @@ fn perform_route(
         .build()
         .map_err(|_| "http_runtime")?;
     reactor.block_on(async {
+        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
         let mut driver:Option<tokio::task::JoinHandle<()>>=None;
         let transfer=async {
             use tower_service::Service;
@@ -259,10 +260,14 @@ fn perform_route(
                         for event in parser.take() {
                             if event.data.is_empty() { continue; }
                             let message = Json::parse(&event.data)?;
-                            if message.usize_field("id").ok() == Some(*id) {
+                            if message.usize_field("id").ok() == Some(*id) && !message.has("method") {
                                 return Ok(HttpReply {head, body: event.data});
                             }
-                            if message.has("method") && message.has("id") { return Err("mcp_server_request"); }
+                            if message.has("method") && message.has("id") {
+                                mcp_server_reply(
+                                    request, mcp.as_deref().ok_or("mcp_server_request")?, &message, stop, deadline,
+                                )?;
+                            }
                             if message.text_field("method").ok() == Some("notifications/tools/list_changed") {
                                 return Err("mcp_tools_changed");
                             }
@@ -371,25 +376,99 @@ pub(crate) fn mcp_exchange(
     let uri: Uri = request.url.parse().map_err(|_| "mcp_endpoint")?;
     let host = uri.host().ok_or("mcp_endpoint")?;
     let local = matches!(host, "127.0.0.1" | "[::1]");
-    if uri.authority().is_none_or(|authority| authority.as_str().contains('@'))
+    if uri
+        .authority()
+        .is_none_or(|authority| authority.as_str().contains('@'))
         || !matches!(uri.scheme_str(), Some("https"))
-            && !(local && uri.scheme_str() == Some("http")) {
+            && !(local && uri.scheme_str() == Some("http"))
+    {
         return Err("mcp_endpoint");
     }
     let tls = if uri.scheme_str() == Some("http") {
-        rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(|_| "tls_configuration")?
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth()
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|_| "tls_configuration")?
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth()
     } else {
         tls()?
     };
-    perform_route(request, stop, None, uri, tls, None, RoutePolicy {
-        local_only: local,
-        admission: StreamAdmission::Strict,
-        mcp: Some(fields),
-    })
+    perform_route(
+        request,
+        stop,
+        None,
+        uri,
+        tls,
+        None,
+        RoutePolicy {
+            local_only: local,
+            admission: StreamAdmission::Strict,
+            mcp: Some(fields),
+        },
+    )
+}
+fn mcp_server_reply(
+    current: &HttpRequest,
+    fields: &McpExchange,
+    message: &Json,
+    stop: &Cancel,
+    deadline: Instant,
+) -> Result<()> {
+    stop.check()?;
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis();
+    if remaining == 0 {
+        return Err("http_timeout");
+    }
+    let id = message.field("id")?;
+    if message.text_field("jsonrpc")? != "2.0" || !(id.is_string() || id.is_integer()) {
+        return Err("mcp_server_request");
+    }
+    let (member, value) = if message.text_field("method")? == "ping" {
+        ("result", Json::parse("{}")?)
+    } else {
+        (
+            "error",
+            Json::parse(r#"{"code":-32601,"message":"Method not found"}"#)?,
+        )
+    };
+    let response = Json::object(vec![
+        ("jsonrpc", Json::string("2.0")?),
+        ("id", id.clone()),
+        (member, value),
+    ])?;
+    let mut fields = McpExchange {
+        version: fields.version.clone(),
+        session: fields
+            .session
+            .clone()
+            .or_else(|| fields.response_session.clone()),
+        response_session: None,
+        response_id: None,
+    };
+    let exchange = HttpRequest {
+        method: "POST",
+        url: current.url,
+        content_type: "application/json",
+        body: Secret::new(response.dump()),
+        bearer: current.bearer.clone(),
+        body_limit: 4096,
+        timeout_ms: remaining.min(1000) as u64,
+    };
+    // The request that yielded this SSE event still owns its reactor.
+    let reply = std::thread::scope(|scope| {
+        scope
+            .spawn(|| mcp_exchange(&exchange, stop, &mut fields))
+            .join()
+            .map_err(|_| "mcp_worker")?
+    })?;
+    if reply.head.status != 202 || !reply.body.is_empty() {
+        return Err("mcp_server_request");
+    }
+    Ok(())
 }
 pub fn stream(
     value: &Json,

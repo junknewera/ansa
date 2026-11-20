@@ -615,7 +615,7 @@ enum Job {
         owner: String,
         token: u64,
         result: Result<Vec<SessionSummary>>,
-        continuation: Option<(RunId, String)>,
+        plans: orchestration::PlanLinks,
     },
     CachedModels {
         result: Result<Option<Json>>,
@@ -678,6 +678,7 @@ enum Menu {
         selected: usize,
         resume_target: Option<RequestId>,
         continuation: Option<(RunId, String)>,
+        clarification: Option<RunId>,
     },
     Models {
         models: Vec<(String, String, Vec<String>)>,
@@ -1720,9 +1721,7 @@ impl Workbench {
         let owner = self.slots[self.current].id.clone();
         self.menu = Some(Menu::Loading("Project sessions".into()));
         self.jobs.spawn_blocking(move || Job::Sessions {
-            continuation: orchestration::latest_continuation(&factory, &owner)
-                .ok()
-                .flatten(),
+            plans: orchestration::recent_plan_links(&factory, &owner).unwrap_or_default(),
             owner,
             token,
             result: factory.summaries(&Cancel::default()),
@@ -1865,10 +1864,20 @@ impl Workbench {
             return false;
         }
         let (prompt, read_only, skill) = self.refinement.as_ref().map_or_else(
-            || (text.to_owned(), self.slots[self.current].state.mode == AgentMode::Plan, skill),
-            |(previous, read_only, skill)| (
-                format!("{previous}\n\nClarification: {text}"), *read_only, skill.clone()
-            ),
+            || {
+                (
+                    text.to_owned(),
+                    self.slots[self.current].state.mode == AgentMode::Plan,
+                    skill,
+                )
+            },
+            |(previous, read_only, skill)| {
+                (
+                    format!("{previous}\n\nClarification: {text}"),
+                    *read_only || self.slots[self.current].state.mode == AgentMode::Plan,
+                    skill.clone(),
+                )
+            },
         );
         self.cancel_modal();
         let token = self.modal_token;
@@ -1883,8 +1892,12 @@ impl Workbench {
             return false;
         }
         self.planning_context = Some(PlanningContext {
-            command: id, owner: slot.id.clone(), prompt, token,
-            read_only, skill,
+            command: id,
+            owner: slot.id.clone(),
+            prompt,
+            token,
+            read_only,
+            skill,
         });
         slot.state.status.clear();
         self.menu = Some(Menu::DraftingPlan);
@@ -1893,6 +1906,10 @@ impl Workbench {
 
     fn approve_orchestration(&mut self, proposal: Proposal, io: &Io) {
         let slot = &self.slots[self.current];
+        if slot.state.mode == AgentMode::Plan && !proposal.plan.is_read_only() {
+            self.report(io, "Plan mode only allows read-only steps");
+            return;
+        }
         if self.orchestration_stop.is_some()
             || slot.active()
             || slot.id != proposal.seed.source_session().0
@@ -1922,6 +1939,7 @@ impl Workbench {
 
     fn resume_orchestration(&mut self, identity: RunId, io: &Io) {
         let slot = &self.slots[self.current];
+        let read_only = slot.state.mode == AgentMode::Plan;
         if self.orchestration_stop.is_some()
             || slot.active()
             || slot.id != identity.parent_session
@@ -1942,7 +1960,7 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            result: orchestration::resume(&factory, identity, &stop, progress, commands),
+            result: orchestration::resume(&factory, identity, read_only, &stop, progress, commands),
         });
     }
 
@@ -1977,9 +1995,19 @@ impl Workbench {
             return;
         }
         let (acknowledgement, reply) = tokio::sync::oneshot::channel();
-        let message = orchestration::Clarification { text: text.into(), acknowledgement };
-        if self.orchestration_inbox.as_ref().is_none_or(|inbox| inbox.try_send(message).is_err()) {
-            self.report(io, "The coordinator is finishing · your draft is still here");
+        let message = orchestration::Clarification {
+            text: text.into(),
+            acknowledgement,
+        };
+        if self
+            .orchestration_inbox
+            .as_ref()
+            .is_none_or(|inbox| inbox.try_send(message).is_err())
+        {
+            self.report(
+                io,
+                "The coordinator is finishing · your draft is still here",
+            );
             return;
         }
         self.clarification_pending = true;
@@ -1987,8 +2015,11 @@ impl Workbench {
         let text = text.to_owned();
         self.jobs.spawn(async move {
             Job::ClarificationSaved {
-                owner, text,
-                result: reply.await.unwrap_or(Err("orchestration_clarification_closed")),
+                owner,
+                text,
+                result: reply
+                    .await
+                    .unwrap_or(Err("orchestration_clarification_closed")),
             }
         });
     }
@@ -2002,16 +2033,23 @@ impl Workbench {
             return (false, false);
         }
         if !text.trim_start().starts_with('/')
-            && self.orchestration_summary.contains_key(&self.slots[self.current].id)
+            && self
+                .orchestration_summary
+                .contains_key(&self.slots[self.current].id)
         {
-            self.report(io, "The coordinator is writing the summary · your draft is still here");
+            self.report(
+                io,
+                "The coordinator is writing the summary · your draft is still here",
+            );
             return (false, false);
         }
         let delegation = commands::skill_request(text).map(|(name, _)| name.to_owned());
         if !text.trim().is_empty()
             && !text.trim_start().starts_with('/')
-            && (self.orchestration_mode || self.refinement.is_some()
-                || commands::agent_task(text).is_some() || delegation.is_some())
+            && (self.orchestration_mode
+                || self.refinement.is_some()
+                || commands::agent_task(text).is_some()
+                || delegation.is_some())
         {
             return (self.start_orchestration_plan(text, delegation, io), false);
         }
@@ -2297,7 +2335,14 @@ impl Workbench {
                 .planning_context
                 .as_ref()
                 .is_some_and(|intent| &intent.command == command && intent.owner == id)
-            && let Some(PlanningContext { owner, prompt, token, read_only, skill, .. }) = self.planning_context.take()
+            && let Some(PlanningContext {
+                owner,
+                prompt,
+                token,
+                read_only,
+                skill,
+                ..
+            }) = self.planning_context.take()
         {
             let factory = self.factory.clone();
             let seed = seed.clone();
@@ -2306,7 +2351,14 @@ impl Workbench {
             self.jobs.spawn_blocking(move || Job::OrchestrationPlan {
                 owner,
                 token,
-                result: Proposal::generate(&factory, seed, prompt, read_only, skill.as_deref(), &stop),
+                result: Proposal::generate(
+                    &factory,
+                    seed,
+                    prompt,
+                    read_only,
+                    skill.as_deref(),
+                    &stop,
+                ),
             });
         }
         if let EventPayload::ContextSnapshot { command, seed } = &event.payload
@@ -2638,7 +2690,11 @@ impl Workbench {
                     }
                 }
             }
-            Job::ClarificationSaved { owner, text, result } => {
+            Job::ClarificationSaved {
+                owner,
+                text,
+                result,
+            } => {
                 self.clarification_pending = false;
                 if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
                     match result {
@@ -2648,9 +2704,12 @@ impl Workbench {
                                 slot.state.input_history.reset();
                             }
                             slot.show_latest();
-                            slot.state.report(io, "Clarification saved for the coordinator");
+                            slot.state
+                                .report(io, "Clarification saved for the coordinator");
                         }
-                        Err(code) => slot.state.report(io, &format!("Could not save clarification ({code})")),
+                        Err(code) => slot
+                            .state
+                            .report(io, &format!("Could not save clarification ({code})")),
                     }
                 }
             }
@@ -2659,14 +2718,15 @@ impl Workbench {
                 self.orchestration_progress = None;
                 self.orchestration_stop = None;
                 self.orchestration_inbox = None;
-                if result.is_err() {
-                    if matches!(self.panel, Some(Panel::Agents { .. })) && self.can_job(io) {
-                        let factory = self.factory.clone();
-                        let stop = Cancel::linked(&self.stop);
-                        self.jobs.spawn_blocking(move || Job::CachedSummaries {
-                            result: factory.summaries(&stop),
-                        });
-                    }
+                if result.is_err()
+                    && matches!(self.panel, Some(Panel::Agents { .. }))
+                    && self.can_job(io)
+                {
+                    let factory = self.factory.clone();
+                    let stop = Cancel::linked(&self.stop);
+                    self.jobs.spawn_blocking(move || Job::CachedSummaries {
+                        result: factory.summaries(&stop),
+                    });
                 }
                 let foreground = self.slots[self.current].id == owner;
                 let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner) else {
@@ -2681,10 +2741,14 @@ impl Workbench {
                             }
                             parent.remember_candidate(review);
                         }
+                        let Some(evidence) = completed.evidence else {
+                            parent.state.report(io, "The model context is full · reports are in /agents");
+                            return;
+                        };
                         let mut command = parent.state.command(
                             &parent.handle,
                             CommandPayload::Handoff(Submit {
-                                text: completed.evidence,
+                                text: evidence,
                                 mode: AgentMode::Plan,
                             }),
                         );
@@ -2885,11 +2949,7 @@ impl Workbench {
                 }
                 Err(code) => self.report(io, &format!("Could not open session: {code}")),
             },
-            Job::Sessions {
-                result,
-                continuation,
-                ..
-            } => match result {
+            Job::Sessions { result, plans, .. } => match result {
                 Ok(entries) => {
                     self.summaries = entries.clone();
                     self.menu = Some(Menu::Sessions {
@@ -2899,7 +2959,8 @@ impl Workbench {
                             .collect(),
                         selected: 0,
                         resume_target: self.resume_target(),
-                        continuation,
+                        continuation: plans.continuation,
+                        clarification: plans.clarification,
                     })
                 }
                 Err(code) => self.report(io, &format!("Could not load sessions: {code}")),
@@ -3309,11 +3370,13 @@ impl Workbench {
                 selected,
                 resume_target,
                 continuation,
+                clarification,
             }) => delta(
                 selected,
                 entries.len()
                     + usize::from(resume_target.is_some())
-                    + usize::from(continuation.is_some()),
+                    + usize::from(continuation.is_some())
+                    + usize::from(clarification.is_some()),
             ),
             Some(Menu::Models { models, selected }) => delta(selected, models.len()),
             Some(Menu::Efforts {
@@ -3399,7 +3462,8 @@ impl Workbench {
                     match selected {
                         0 => self.approve_orchestration(*proposal, io),
                         1 => {
-                            self.refinement = Some((proposal.prompt, proposal.read_only, proposal.skill));
+                            self.refinement =
+                                Some((proposal.prompt, proposal.read_only, proposal.skill));
                             self.report(io, "Enter a clarification for the plan");
                         }
                         _ => self.report(io, "Plan cancelled"),
@@ -3421,9 +3485,11 @@ impl Workbench {
                     selected,
                     resume_target,
                     continuation,
+                    clarification,
                 } => {
                     let native = usize::from(resume_target.is_some());
                     let orchestration = usize::from(continuation.is_some());
+                    let archived = usize::from(clarification.is_some());
                     if let Some(target) = resume_target.as_ref().filter(|_| selected == 0) {
                         if self.resume_target().as_ref() == Some(target) {
                             let slot = &mut self.slots[self.current];
@@ -3435,7 +3501,13 @@ impl Workbench {
                         }
                     } else if let Some((id, _)) = continuation.filter(|_| selected == native) {
                         self.resume_orchestration(id, io);
-                    } else if let Some(entry) = entries.get(selected - native - orchestration) {
+                    } else if let Some(id) =
+                        clarification.filter(|_| selected == native + orchestration)
+                    {
+                        self.activate_result(format!("plan:{}", id.run), None, None, io);
+                    } else if let Some(entry) =
+                        entries.get(selected - native - orchestration - archived)
+                    {
                         self.resume(entry.entry.id.clone(), io);
                     }
                 }
@@ -3847,6 +3919,7 @@ impl Workbench {
                 selected,
                 resume_target,
                 continuation,
+                clarification,
             } => Popup {
                 title: "Project sessions".into(),
                 subtitle: "Choose a conversation".into(),
@@ -3859,6 +3932,10 @@ impl Workbench {
                     .chain(continuation.iter().map(|(_, title)| Choice {
                         label: "Resume orchestration".into(),
                         detail: title.clone(),
+                    }))
+                    .chain(clarification.iter().map(|_| Choice {
+                        label: "Open plan and saved clarifications".into(),
+                        detail: String::new(),
                     }))
                     .chain(entries.iter().map(|e| Choice {
                         label: e.title.clone().unwrap_or_else(|| "New conversation".into()),

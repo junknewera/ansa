@@ -77,6 +77,9 @@ impl ForkSeed {
     pub fn request(&self) -> Result<Request> {
         Ok((*self.request).clone())
     }
+    pub(crate) fn model_window(&self) -> Option<usize> {
+        self.context.budget.map(|budget| budget.window)
+    }
     /// Narrowing is explicit in the child epoch and cannot introduce a tool
     /// descriptor that the verified source context did not advertise.
     pub fn restricted_tools(&self, tools: &Advertisement) -> Result<Self> {
