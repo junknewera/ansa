@@ -563,6 +563,9 @@ fn text_with_providers(
     let configuration =
         Request::new(bound, epoch, tools.advertisement().clone(), vec![])?.with_effort(effort)?;
     options.directory = Some(selected.directory.clone());
+    if !parsed.resume && parsed.session.is_empty() {
+        options.autocompact_percent = factory.saved_autocompact();
+    }
     options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&settings));
     if parsed.offline {
         let model = settings.model.clone();
@@ -721,6 +724,9 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
     }
     let cwd = fixture_home.join("workspace");
     ansa_linux::fs::private_directory(&cwd).map_err(|_| "fixture_workspace")?;
+    let plus = root.join("orchestration-plus").is_file();
+    let trace = root.join("plus-requests.jsonl");
+    let sequence = std::sync::atomic::AtomicUsize::new(0);
     let auth_path = fixture_home.join(".ansa/auth");
     let mut args = vec!["--model".into(), MODEL.into()];
     for (flag, path) in [("--cwd", &cwd), ("--auth-dir", &auth_path)] {
@@ -732,13 +738,13 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
     text_with_providers(
         &args,
         |_| Err("fixture_provider"),
-        |path| {
+        move |path| {
             if path != auth_path {
                 return Err("fixture_provider");
             }
             Ok(Arc::new(AuthManager::new(
                 path,
-                Arc::new(|request, _| {
+                Arc::new(move |request, _| {
                     if request.url != "https://api.openai.com/v1/models" {
                         return Err("fixture_unexpected_exchange");
                     }
@@ -747,7 +753,15 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                             status: 200,
                             content_types: vec!["application/json".into()],
                         },
-                        body: json!({"models":[{"slug":MODEL,"visibility":"list"}]}).to_string(),
+                        body: if plus {
+                            json!({"models":[
+                                {"slug":MODEL,"visibility":"list","supported_reasoning_levels":["high"]},
+                                {"slug":"gpt-6.1-sol","visibility":"list","supported_reasoning_levels":["medium"]},
+                                {"slug":"gpt-6.1-luna","visibility":"list","supported_reasoning_levels":["low"]},
+                            ]})
+                        } else {
+                            json!({"models":[{"slug":MODEL,"visibility":"list"}]})
+                        }.to_string(),
                     })
                 }),
                 Arc::new(|| 2_000_000_000),
@@ -758,7 +772,7 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                     }
                     let request: Value =
                         serde_json::from_str(&request.dump()).map_err(|_| "fixture_body")?;
-                    if request["model"] != MODEL
+                    if (!plus && request["model"] != MODEL)
                         || request["store"] != false
                         || request["stream"] != true
                     {
@@ -773,6 +787,33 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                         && (format["strict"] != true || format["type"] != "json_schema")
                     {
                         return Err("fixture_format");
+                    }
+                    if plus {
+                        let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let item = plus_fixture_response(&request, input, &trace, index)?;
+                        let mut added = item.clone();
+                        added["status"] = json!("in_progress");
+                        if item["type"] == "function_call" {
+                            added["arguments"] = json!("");
+                        }
+                        let model = &request["model"];
+                        let id = format!("plus-response-{index}");
+                        let mut completed =
+                            json!({"id":id,"model":model,"status":"completed","output":[item]});
+                        if let Some(text) = text {
+                            completed["text"] = text.clone();
+                        }
+                        let events = [
+                            json!({"type":"response.created","sequence_number":0,"response":{"id":id,"model":model,"status":"in_progress","output":[]}}),
+                            json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":added}),
+                            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":item}),
+                            json!({"type":"response.completed","sequence_number":3,"response":completed}),
+                        ];
+                        for event in events {
+                            stop.check()?;
+                            feed(format!("data: {event}\n\n").as_bytes())?;
+                        }
+                        return Ok(());
                     }
                     let output: Value = last["output"]
                         .as_str()
@@ -857,6 +898,154 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                 })),
             )?))
         },
+    )
+}
+
+#[cfg(feature = "frontend-test-adapter")]
+fn plus_fixture_response(
+    request: &serde_json::Value,
+    input: &[serde_json::Value],
+    trace: &Path,
+    index: usize,
+) -> Result<serde_json::Value> {
+    use serde_json::{Value, json};
+    let prompt = |item: &Value| {
+        if item["role"] == "user" {
+            item["content"].as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    };
+    let task = input.iter().rev().find_map(prompt).ok_or("fixture_input")?;
+    let format = request["text"]["format"]["name"].as_str();
+    let desired = |status, summary, findings: &[&str]| {
+        json!({"status":status,"summary":summary,"findings":findings}).to_string()
+    };
+    let completed = |summary| desired("completed", summary, &["fixture evidence"]);
+    let strong = ("gpt-6.2-sol", "high");
+    let medium = ("gpt-6.1-sol", "medium");
+    let weak = ("gpt-6.1-luna", "low");
+    let model = request["model"].as_str().ok_or("fixture_request")?;
+    let checks_passed = task
+        .contains(r#""passed_command_checks":[{"command":"./check.sh","status":"passed"}]"#)
+        && task.contains(r#""failed_checks":[]"#)
+        && !task.contains("fixture-check-output");
+    let seen = |marker: &str| {
+        input
+            .iter()
+            .any(|item| item["role"] == "assistant" && item.to_string().contains(marker))
+    };
+    let mut edit = None;
+    let (stage, role, text) = match format {
+        Some("ansa_orchestration_plan_v3") => (
+            if model == strong.0 { "strong-plan" } else { "medium-plan" },
+            if model == strong.0 { strong } else { medium },
+            json!({
+                "schema_version":1,"summary":"PLUS_CARBON_PLAN","steps":[
+                    {"id":"quick","task":"Set report to after fixture","access":"write","paths":["report.txt"],"depends_on":[],"acceptance":"Report starts with after fixture"},
+                    {"id":"fresh","task":"Confirm report preserves the fixture","access":"read","paths":["report.txt"],"depends_on":["quick"],"acceptance":"Report preserves the fixture"},
+                ],"checks":[{"path":"report.txt","contains":"after fixture"}],"manual_checks":[],
+                "command_checks":[{"argv":["./check.sh"]}],"read_folder":null
+            }).to_string(),
+        ),
+        Some("ansa_child_result_v1") if task.starts_with("You are the coordinator") =>
+            ("coordinate", medium, completed("ORIGINAL_COORDINATOR")),
+        Some("ansa_child_result_v1") if task.starts_with("You are a fresh coordinator") => {
+            if seen("ORIGINAL_COORDINATOR") || !task.contains("FRESH_DECISION") {
+                return Err("fixture_replan_context");
+            }
+            ("fresh-coordinate", medium, completed("FRESH_COORDINATOR"))
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Assigned task") => {
+            if task.contains("QUICK_DECISION") {
+                edit = Some(("before fixture", "after fixture"));
+                ("quick-fix", medium, completed("QUICK_FIX_APPLIED"))
+            } else if task.contains("FRESH_COORDINATOR") {
+                ("fresh-worker", weak, completed("FRESH_EVIDENCE"))
+            } else {
+                ("worker-rejected", weak, desired("completed", "WORKER_WITHOUT_EVIDENCE", &[]))
+            }
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Evaluate the worker") => {
+            if task.contains("QUICK_FIX_APPLIED") && seen("ORIGINAL_COORDINATOR") {
+                ("quick-verify", medium, completed("QUICK_VERIFIED"))
+            } else if task.contains("FRESH_EVIDENCE") && seen("FRESH_COORDINATOR") {
+                ("fresh-verify", medium, completed("FRESH_VERIFIED"))
+            } else if task.contains("WORKER_WITHOUT_EVIDENCE") && seen("ORIGINAL_COORDINATOR") {
+                ("reject", medium, desired("changes_requested", "Use another method", &["Missing evidence"]))
+            } else {
+                return Err("fixture_coordinator_context");
+            }
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Resolve a failed approved task") => {
+            if task.matches("WORKER_WITHOUT_EVIDENCE").count() != 3 {
+                return Err("fixture_escalation_context");
+            }
+            if task.contains("\nTask quick\n") {
+                ("escalate-quick", strong, completed("QUICK_DECISION"))
+            } else {
+                ("escalate-fresh", strong, desired("changes_requested", "FRESH_DECISION", &["Start independent context"]))
+            }
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Perform the whole candidate's") => {
+            if !checks_passed {
+                return Err("fixture_review_checks");
+            }
+            ("whole-review", strong, desired("changes_requested", "INITIAL_STRONG_REVIEW", &["Append reviewed to the report."]))
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Recheck the preceding findings") => {
+            if !seen("INITIAL_STRONG_REVIEW") || !task.contains("candidate-1/ansa-candidate.diff")
+                || !checks_passed
+            {
+                return Err("fixture_reviewer_context");
+            }
+            ("targeted-review", strong, completed("TARGETED_STRONG_REVIEW"))
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Coordinate a focused correction") =>
+            ("review-coordinate", medium, completed("Append reviewed to the report.")),
+        Some("ansa_child_result_v1") if task.starts_with("Apply the focused correction") => {
+            edit = Some(("after fixture", "after fixture reviewed"));
+            ("review-fix", weak, completed("REVIEW_FIX_APPLIED"))
+        }
+        None => ("summary", (model, ""), "PLUS_CARBON_DONE".into()),
+        _ => return Err("fixture_format"),
+    };
+    if !role.1.is_empty() && (model != role.0 || request["reasoning"]["effort"] != role.1) {
+        return Err("fixture_roles");
+    }
+    let id = format!("plus-item-{index}");
+    let last = input.last().ok_or("fixture_input")?;
+    if let Some((old, new)) = edit {
+        if last["type"] != "function_call_output" {
+            let token = request["instructions"]
+                .as_str()
+                .and_then(|instructions| instructions.split_once("instruction_token is "))
+                .and_then(|(_, suffix)| suffix.split_once('.'))
+                .map(|(token, _)| token)
+                .ok_or("fixture_instruction_token")?;
+            if !request["tools"].to_string().contains("edit_file") {
+                return Err("fixture_tools");
+            }
+            let arguments = json!({"path":"report.txt","old_text":old,"new_text":new,"instruction_token":token}).to_string();
+            return Ok(
+                json!({"type":"function_call","id":id,"call_id":format!("plus-call-{index}"),"namespace":"omh","name":"edit_file","arguments":arguments,"status":"completed"}),
+            );
+        }
+        let result: Value = serde_json::from_str(last["output"].as_str().ok_or("fixture_edit")?)
+            .map_err(|_| "fixture_edit")?;
+        if result["applied"] != true {
+            return Err("fixture_edit");
+        }
+    }
+    let line = json!({"stage":stage,"model":model,"effort":request["reasoning"]["effort"]});
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace)
+        .and_then(|mut file| writeln!(file, "{line}"))
+        .map_err(|_| "fixture_trace")?;
+    Ok(
+        json!({"type":"message","id":id,"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}),
     )
 }
 

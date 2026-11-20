@@ -14,6 +14,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     sync::{Mutex, TryLockError},
     time::{Duration, Instant},
 };
@@ -25,7 +26,20 @@ pub(crate) const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const ENDPOINT: &str = "fireworks/us";
 pub(crate) const PROVIDER: &str = "Fireworks";
+pub(crate) const ROLE_CATALOG: &str = "https://openrouter.ai/api/v1/models?providers=fireworks&supported_parameters=structured_outputs,tools,tool_choice";
+fn endpoint_tag(model: &str) -> &'static str {
+    if model == MODEL {
+        ENDPOINT
+    } else {
+        "fireworks"
+    }
+}
 pub(crate) const API: &str = "https://openrouter.ai/api/v1/chat/completions";
+#[cfg(any(
+    test,
+    feature = "orchestration-pilot",
+    feature = "frontend-test-adapter"
+))]
 pub(crate) const CATALOG: &str =
     "https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints";
 #[cfg(feature = "orchestration-pilot")]
@@ -35,7 +49,14 @@ pub(crate) struct OpenRouter {
     key: Secret,
     binding: Binding,
     exchange: Exchange,
-    route: Mutex<Route>,
+    route: Mutex<BTreeMap<String, Route>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RouteCheck {
+    BestEffortCatalog,
+    RequireCatalog,
+    RequireStrict,
 }
 
 #[derive(Default)]
@@ -44,6 +65,7 @@ struct Route {
     catalog_verified: bool,
     window: Option<usize>,
     strict_verified: bool,
+    accepts_effort: bool,
 }
 
 impl OpenRouter {
@@ -68,7 +90,7 @@ impl OpenRouter {
                 returned_model: MODEL.into(),
             },
             exchange,
-            route: Mutex::new(Route::default()),
+            route: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -76,17 +98,71 @@ impl OpenRouter {
         &self.binding
     }
 
+    pub(crate) fn accepts_binding(&self, binding: &Binding) -> bool {
+        binding.provider == self.binding.provider
+            && binding.account == self.binding.account
+            && crate::provider::request::openrouter_model_id(&binding.requested_model)
+            && binding.requested_model == binding.returned_model
+    }
+
+    pub(crate) fn role_models(&self, stop: &Cancel) -> Result<Vec<(String, String, Vec<String>)>> {
+        let response = self.send("GET", ROLE_CATALOG, None, 10_000, stop)?;
+        let rows = response["data"].as_array().ok_or("openrouter_catalog")?;
+        let mut models = BTreeMap::new();
+        for row in rows {
+            let Some(id) = row["id"]
+                .as_str()
+                .filter(|id| crate::provider::request::openrouter_model_id(id))
+            else {
+                continue;
+            };
+            let Some(parameters) = row["supported_parameters"].as_array() else {
+                continue;
+            };
+            if !["structured_outputs", "tools", "tool_choice"]
+                .iter()
+                .all(|p| parameters.iter().any(|v| v == *p))
+            {
+                continue;
+            }
+            let label = row["name"].as_str().unwrap_or(id);
+            if label.len() > 256 || label.chars().any(char::is_control) {
+                return Err("openrouter_catalog");
+            }
+            let efforts = if parameters.iter().any(|v| v == "reasoning_effort") {
+                ["low", "medium", "high"].map(str::to_owned).to_vec()
+            } else {
+                Vec::new()
+            };
+            if models
+                .insert(id.to_owned(), (id.to_owned(), label.to_owned(), efforts))
+                .is_some()
+                || models.len() > 256
+            {
+                return Err("openrouter_catalog");
+            }
+        }
+        if models.is_empty() {
+            return Err("openrouter_catalog_empty");
+        }
+        Ok(models.into_values().collect())
+    }
+
     pub(crate) fn cached_window(&self, request: &Request) -> Option<usize> {
-        if request.binding != self.binding {
+        if !self.accepts_binding(&request.binding) {
             return None;
         }
-        self.route.try_lock().ok()?.window
+        self.route
+            .try_lock()
+            .ok()?
+            .get(&request.binding.requested_model)?
+            .window
     }
 
     fn send(
         &self,
         method: &'static str,
-        url: &'static str,
+        url: &str,
         body: Option<Value>,
         timeout_ms: u64,
         stop: &Cancel,
@@ -112,11 +188,36 @@ impl OpenRouter {
     }
 
     pub(crate) fn require_strict(&self, stop: &Cancel) -> Result<()> {
-        self.prepare_route(true, stop).map(|_| ())
+        self.prepare_route(MODEL, None, RouteCheck::RequireStrict, stop)
+            .map(|_| ())
     }
 
-    fn prepare_route(&self, strict: bool, stop: &Cancel) -> Result<Option<usize>> {
-        let mut route = loop {
+    pub(crate) fn validate_role(
+        &self,
+        selection: &crate::provider::contracts::GenerationSelection,
+        stop: &Cancel,
+    ) -> Result<()> {
+        if !crate::provider::request::openrouter_model_id(&selection.model) {
+            return Err("openrouter_model");
+        }
+        self.prepare_route(
+            &selection.model,
+            selection.effort.as_deref(),
+            RouteCheck::RequireCatalog,
+            stop,
+        )
+        .map(|_| ())
+    }
+
+    fn prepare_route(
+        &self,
+        model: &str,
+        effort: Option<&str>,
+        check: RouteCheck,
+        stop: &Cancel,
+    ) -> Result<Option<usize>> {
+        let require_catalog = check != RouteCheck::BestEffortCatalog;
+        let mut routes = loop {
             stop.check()?;
             match self.route.try_lock() {
                 Ok(state) => break state,
@@ -124,17 +225,29 @@ impl OpenRouter {
                 Err(TryLockError::Poisoned(_)) => return Err("openrouter_route_state"),
             }
         };
+        if routes.len() >= 256 && !routes.contains_key(model) {
+            return Err("openrouter_catalog_limit");
+        }
+        let route = routes.entry(model.to_owned()).or_default();
         if !route.catalog_verified
-            && (strict
+            && (require_catalog
                 || route
                     .catalog_retry_at
                     .is_none_or(|retry| Instant::now() >= retry))
         {
-            let timeout = if strict { REQUEST_TIMEOUT_MS } else { 10_000 };
+            let timeout = if require_catalog {
+                REQUEST_TIMEOUT_MS
+            } else {
+                10_000
+            };
+            let url = format!("https://openrouter.ai/api/v1/models/{model}/endpoints");
             let catalog = self
-                .send("GET", CATALOG, None, timeout, stop)
+                .send("GET", &url, None, timeout, stop)
                 .and_then(|response| {
-                    let endpoint = catalog_endpoint(&response)?;
+                    let endpoint = catalog_endpoint(&response, model)?;
+                    route.accepts_effort = endpoint["supported_parameters"]
+                        .as_array()
+                        .is_some_and(|v| v.iter().any(|p| p == "reasoning_effort"));
                     Ok(endpoint["context_length"]
                         .as_u64()
                         .and_then(|window| usize::try_from(window).ok())
@@ -148,24 +261,40 @@ impl OpenRouter {
                 }
                 Err(error) => {
                     route.catalog_retry_at = Some(Instant::now() + Duration::from_secs(30));
-                    if strict {
+                    if require_catalog {
                         return Err(error);
                     }
                 }
             }
         }
-        if strict && !route.strict_verified {
-            verify_probe(&self.send("POST", API, Some(probe_body()), REQUEST_TIMEOUT_MS, stop)?)?;
+        if effort.is_some_and(|v| !route.accepts_effort || !matches!(v, "low" | "medium" | "high"))
+        {
+            return Err("openrouter_effort");
+        }
+        if check == RouteCheck::RequireStrict && !route.strict_verified {
+            let mut probe = probe_body();
+            probe["model"] = json!(model);
+            probe["provider"] = route_for(model);
+            verify_probe_for(
+                &self.send("POST", API, Some(probe), REQUEST_TIMEOUT_MS, stop)?,
+                model,
+            )?;
             route.strict_verified = true;
         }
         Ok(route.window)
     }
 
     pub(crate) fn generate(&self, request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
-        if request.binding != self.binding || request.effort.is_some() {
+        if !self.accepts_binding(&request.binding) {
             return Err("openrouter_binding");
         }
-        let window = self.prepare_route(request.final_format().is_some(), stop)?;
+        let model = &request.binding.requested_model;
+        let check = if request.final_format().is_some() {
+            RouteCheck::RequireStrict
+        } else {
+            RouteCheck::BestEffortCatalog
+        };
+        let window = self.prepare_route(model, request.effort.as_deref(), check, stop)?;
         if let Some(window) = window {
             let tokens = request
                 .estimated_tokens()
@@ -189,11 +318,11 @@ impl OpenRouter {
             && !request.tools.descriptors.is_empty()
         {
             let response = self.send("POST", API, Some(body.clone()), REQUEST_TIMEOUT_MS, stop)?;
-            if choice(&response)?["finish_reason"] == "tool_calls" {
+            if choice(&response, model)?["finish_reason"] == "tool_calls" {
                 return decode(request, &response)
                     .map(|response| response.with_context_window(window));
             }
-            final_choice(&response)?;
+            final_choice_for(&response, model)?;
         }
         if request.final_format().is_some() {
             apply_final_format(request, &mut body)?;
@@ -242,12 +371,12 @@ pub(crate) fn apply_final_format(request: &Request, body: &mut Value) -> Result<
 
 #[cfg(feature = "orchestration-pilot")]
 pub(crate) fn verify_catalog(response: &Value) -> Result<()> {
-    catalog_endpoint(response).map(|_| ())
+    catalog_endpoint(response, MODEL).map(|_| ())
 }
 
-fn catalog_endpoint(response: &Value) -> Result<&Value> {
+fn catalog_endpoint<'a>(response: &'a Value, model: &str) -> Result<&'a Value> {
     let data = response.get("data").ok_or("openrouter_catalog")?;
-    if data.get("id").and_then(Value::as_str) != Some(MODEL) {
+    if data.get("id").and_then(Value::as_str) != Some(model) {
         return Err("openrouter_catalog");
     }
     let endpoints = data
@@ -256,7 +385,7 @@ fn catalog_endpoint(response: &Value) -> Result<&Value> {
         .ok_or("openrouter_catalog")?;
     let mut matches = endpoints
         .iter()
-        .filter(|endpoint| endpoint["tag"] == ENDPOINT);
+        .filter(|endpoint| endpoint["tag"] == endpoint_tag(model));
     let endpoint = matches.next().ok_or("openrouter_catalog_endpoint")?;
     let parameters = endpoint["supported_parameters"]
         .as_array()
@@ -278,7 +407,11 @@ fn catalog_endpoint(response: &Value) -> Result<&Value> {
 }
 
 pub(crate) fn route() -> Value {
-    json!({"only":[ENDPOINT],"order":[ENDPOINT],"allow_fallbacks":false,"require_parameters":true})
+    route_for(MODEL)
+}
+fn route_for(model: &str) -> Value {
+    let endpoint = endpoint_tag(model);
+    json!({"only":[endpoint],"order":[endpoint],"allow_fallbacks":false,"require_parameters":true})
 }
 
 pub(crate) fn probe_body() -> Value {
@@ -293,8 +426,13 @@ pub(crate) fn probe_body() -> Value {
     })
 }
 
+#[cfg(any(test, feature = "orchestration-pilot"))]
 pub(crate) fn verify_probe(value: &Value) -> Result<()> {
-    let message = final_choice(value)?;
+    verify_probe_for(value, MODEL)
+}
+
+fn verify_probe_for(value: &Value, model: &str) -> Result<()> {
+    let message = final_choice_for(value, model)?;
     let answer = Json::parse(message["content"].as_str().ok_or("openrouter_probe")?)
         .map_err(|_| "openrouter_probe")?;
     if answer != Json::parse(r#"{"value":"schema-enforced"}"#)? {
@@ -338,16 +476,16 @@ pub(crate) fn base_body(request: &Request, instructions: &str) -> Result<Value> 
         return Err("openrouter_input");
     }
     Ok(
-        json!({"model":MODEL, "provider":route(), "messages":messages, "max_tokens":4096, "reasoning":{"enabled":false}}),
+        json!({"model":request.binding.requested_model, "provider":route_for(&request.binding.requested_model), "messages":messages, "max_tokens":4096, "reasoning":request.effort.as_ref().map_or_else(|| json!({"enabled":false}), |effort| json!({"effort":effort,"exclude":true}))}),
     )
 }
 
-fn choice(response: &Value) -> Result<&Value> {
+fn choice<'a>(response: &'a Value, expected: &str) -> Result<&'a Value> {
     let model = response
         .get("model")
         .and_then(Value::as_str)
         .ok_or("openrouter_model")?;
-    if model != MODEL {
+    if model != expected {
         return Err("openrouter_model");
     }
     if response["provider"] != PROVIDER || !response["error"].is_null() {
@@ -367,8 +505,8 @@ fn choice(response: &Value) -> Result<&Value> {
     Ok(&choices[0])
 }
 
-pub(crate) fn final_choice(response: &Value) -> Result<&Value> {
-    let choice = choice(response)?;
+fn final_choice_for<'a>(response: &'a Value, expected: &str) -> Result<&'a Value> {
+    let choice = choice(response, expected)?;
     let calls = &choice["message"]["tool_calls"];
     if choice["finish_reason"] != "stop"
         || !(calls.is_null() || calls.as_array().is_some_and(Vec::is_empty))
@@ -379,14 +517,14 @@ pub(crate) fn final_choice(response: &Value) -> Result<&Value> {
 }
 
 pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResponse> {
-    let choice = choice(response)?;
+    let choice = choice(response, &request.binding.returned_model)?;
     let id = response["id"]
         .as_str()
         .filter(|id| crate::provider::contracts::valid_id(id))
         .ok_or("openrouter_identity")?;
     let mut items = Vec::new();
     if choice["finish_reason"] == "stop" {
-        let text = final_choice(response)?["content"]
+        let text = final_choice_for(response, &request.binding.returned_model)?["content"]
             .as_str()
             .ok_or("openrouter_content")?;
         items.push(json!({"type":"message","id":format!("msg_{id}"),"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}));
@@ -420,7 +558,7 @@ pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResp
     let envelope = Json::object(vec![
         ("request", request.save()?),
         ("id", Json::string(id)?),
-        ("model", Json::string(MODEL)?),
+        ("model", Json::string(&request.binding.returned_model)?),
         ("items", Json::parse(&Value::Array(items).to_string())?),
     ])?;
     let usage = &response["usage"];
@@ -475,6 +613,70 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn selected_role_keeps_model_account_provider_and_effort_bound() {
+        let model = "author/worker";
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = count.clone();
+        let router = OpenRouter::new(Secret::new("synthetic-fixture-key-0123456789".into()), Arc::new(move |req, _| {
+            let index = calls.fetch_add(1, Ordering::SeqCst);
+            let data = match index {
+                0 => {
+                    assert_eq!(req.url, ROLE_CATALOG);
+                    assert!(req.bearer.is_none());
+                    json!({"data":[{"id":model, "name":"Worker", "supported_parameters":["structured_outputs","response_format","tools","tool_choice","reasoning_effort"]}]})
+                }
+                1 => {
+                    assert!(req.url.ends_with("/author/worker/endpoints") && req.bearer.is_none());
+                    json!({"data":{"id":model,"endpoints":[{"tag":"fireworks","provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice","reasoning_effort"]}]}})
+                }
+                2..=4 => {
+                    let body: Value = serde_json::from_str(req.body.expose()).unwrap();
+                    assert_eq!(body["model"], model);
+                    assert_eq!(body["provider"], route_for(model));
+                    let mut value = if index == 2 {
+                        response(r#"{"value":"schema-enforced"}"#)
+                    } else {
+                        assert_eq!(body["reasoning"], json!({"effort":"medium","exclude":true}));
+                        response(r#"{"status":"completed","summary":"ok","findings":[]}"#)
+                    };
+                    if index != 4 { value["model"] = json!(model); }
+                    value
+                }
+                _ => panic!("unexpected call"),
+            };
+            Ok(reply(data))
+        })).unwrap();
+        let stop = Cancel::default();
+        assert_eq!(router.role_models(&stop).unwrap()[0].0, model);
+        let mut req = request(&router)
+            .with_effort(Some("medium".into()))
+            .unwrap()
+            .with_final_format(Some(FinalFormat::ChildResult));
+        req.tools.descriptors.clear();
+        req.binding.requested_model = model.into();
+        req.binding.returned_model = model.into();
+        assert_eq!(
+            router
+                .generate(&req, &stop)
+                .unwrap()
+                .child_result()
+                .unwrap()
+                .status,
+            crate::provider::structured::ChildStatus::Completed
+        );
+        assert!(matches!(
+            router.generate(&req, &stop),
+            Err("openrouter_model")
+        ));
+        req.binding.account.push('x');
+        assert!(matches!(
+            router.generate(&req, &stop),
+            Err("openrouter_binding")
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 5);
     }
 
     #[test]

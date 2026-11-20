@@ -1,6 +1,7 @@
 //! Task planning and native orchestration.
 mod journal;
 pub mod plan;
+pub mod profile;
 pub mod run;
 pub mod worktree;
 

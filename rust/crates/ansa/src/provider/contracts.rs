@@ -82,6 +82,7 @@ pub struct MessageReceiptInfo {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandPayload {
+    SetAutocompact(u8),
     Submit(Submit),
     /// Native-only synthesis input from the coordinator. Frontend wire
     /// decoders accept ordinary Submit and never construct this variant.
@@ -120,6 +121,10 @@ pub enum EventPayload {
     },
     FollowupDelivered {
         commands: Vec<CommandId>,
+    },
+    AutocompactSelected {
+        command: CommandId,
+        percent: u8,
     },
     GenerationSelected {
         command: CommandId,
@@ -220,6 +225,9 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
                 return Err("steer_contract");
             }
             Ok(())
+        }
+        CommandPayload::SetAutocompact(percent) if !(1..=100).contains(percent) => {
+            Err("autocompact_range")
         }
         CommandPayload::SetGeneration(selection) => {
             if selection.model.is_empty()

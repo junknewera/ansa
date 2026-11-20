@@ -43,6 +43,7 @@ pub(crate) enum Kind {
     Queued,
     Steered,
     GenerationSelected,
+    AutocompactSelected,
     Accepted,
     Response,
     Intent,
@@ -294,6 +295,7 @@ impl Workers {
                                 init_options.journal.clone(),
                                 init_options.fork_seed.as_ref(),
                                 init_options.existing_journal,
+                                init_options.autocompact_percent,
                             )?;
                             let ready = Ready {
                                 state: store.state().clone(),
@@ -304,9 +306,10 @@ impl Workers {
                             Ok((Some(store), ready))
                         } else {
                             let mut state = initial;
-                            state.apply(
-                                &state.initialization_with_seed(init_options.fork_seed.as_ref())?,
-                            )?;
+                            state.apply(&state.initialization_with_seed(
+                                init_options.fork_seed.as_ref(),
+                                init_options.autocompact_percent,
+                            )?)?;
                             Ok((
                                 None,
                                 Ready {

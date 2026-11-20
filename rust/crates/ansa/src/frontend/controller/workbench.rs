@@ -9,14 +9,14 @@ use crate::{
         graphics,
         input::{MouseEvent, MouseKind},
         orchestration::{self, Proposal},
-        sessions::{Created, Factory, Kind},
+        sessions::{Created, Factory, Kind, model_choices},
         theme::{
             self, Catalog as ThemeCatalog, PaletteSource, Preview as ThemePreview,
             Store as ThemeStore, Theme,
         },
         workspace::{DiffStatus, EditorCommand, FileDocument, FileHost, FileListing},
     },
-    orchestration::run::RunId,
+    orchestration::{profile::RoleProfile, run::RunId},
     protocol::json::Json,
     session::catalog::SessionSummary,
 };
@@ -26,6 +26,7 @@ use std::{
     time::SystemTime,
 };
 use tokio::sync::mpsc;
+mod roles;
 mod ux;
 
 const MAX_SESSIONS: usize = 16;
@@ -548,7 +549,14 @@ struct CreateIntent {
     foreground: bool,
     plan_only: bool,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrchestrationMode {
+    Standard,
+    Plus,
+}
+
 struct PlanningContext {
+    plus: bool,
     command: CommandId,
     owner: String,
     prompt: String,
@@ -620,6 +628,10 @@ enum Job {
     CachedModels {
         result: Result<Option<Json>>,
     },
+    AutocompactSaved {
+        owner: String,
+        result: Result<()>,
+    },
     GenerationSaved {
         owner: String,
         result: Result<()>,
@@ -629,6 +641,16 @@ enum Job {
         token: u64,
         effort: bool,
         result: Result<Json>,
+    },
+    RoleModels {
+        owner: String,
+        token: u64,
+        result: Result<Box<roles::RolePicker>>,
+    },
+    RoleModelsSaved {
+        owner: String,
+        token: u64,
+        result: Result<()>,
     },
     CachedSummaries {
         result: Result<Vec<SessionSummary>>,
@@ -662,6 +684,7 @@ enum ThemeLoad {
     },
 }
 enum Menu {
+    Roles(Box<roles::RolePicker>),
     Orchestration {
         proposal: Box<Proposal>,
         selected: usize,
@@ -848,7 +871,7 @@ struct Workbench {
     orchestration_views: BTreeMap<String, orchestration::RunView>,
     orchestration_handoffs: BTreeMap<String, String>,
     orchestration_summary: BTreeMap<String, CommandId>,
-    orchestration_mode: bool,
+    orchestration_mode: Option<OrchestrationMode>,
     refinement: Option<(String, bool, Option<String>)>,
     menu: Option<Menu>,
     completion: Option<Completion>,
@@ -973,7 +996,7 @@ impl Workbench {
             orchestration_views: BTreeMap::new(),
             orchestration_handoffs: BTreeMap::new(),
             orchestration_summary: BTreeMap::new(),
-            orchestration_mode: false,
+            orchestration_mode: None,
             refinement: None,
             menu: None,
             completion: None,
@@ -1055,7 +1078,9 @@ impl Workbench {
         self.exit_deadline.take().is_some()
     }
     fn interrupt(&mut self, io: &Io, now: Instant) -> bool {
-        if matches!(self.menu, Some(Menu::DraftingPlan)) {
+        if matches!(self.menu, Some(Menu::DraftingPlan | Menu::Roles(_)))
+            || matches!(&self.menu, Some(Menu::Loading(title)) if title == "Orchestrate+ role models")
+        {
             self.disarm_exit();
             self.escape(io);
             return false;
@@ -1131,7 +1156,7 @@ impl Workbench {
         self.cancel_modal();
         self.cancel_editor_request();
         self.current = index;
-        self.orchestration_mode = false;
+        self.orchestration_mode = None;
         self.refinement = None;
         self.slots[index].refresh = Instant::now();
         self.slots[index].resync = true;
@@ -1206,9 +1231,15 @@ impl Workbench {
                 .as_ref()
                 .map(|view| view.generation.clone());
             let generation = generation.filter(|_| slot.kind != Kind::Console);
+            let autocompact_percent = slot
+                .state
+                .snapshot
+                .as_ref()
+                .filter(|_| slot.kind != Kind::Console)
+                .map(|view| view.autocompact_percent);
             let factory = self.factory.clone();
             self.jobs.spawn_blocking(move || Job::Created {
-                result: factory.create_main(generation),
+                result: factory.create_main(generation, autocompact_percent),
                 source,
                 prompt: None,
                 foreground,
@@ -1816,30 +1847,31 @@ impl Workbench {
         if !matches!(slot.kind, Kind::Main | Kind::Fork) || slot.active() {
             return;
         }
-        if self.orchestration_mode
-            || (slot.state.mode == AgentMode::Plan && self.factory.orchestration_route().is_err())
-        {
-            self.orchestration_mode = false;
-            self.refinement = None;
-            slot.state.mode = AgentMode::Basic;
-        } else if slot.state.mode == AgentMode::Plan {
-            self.orchestration_mode = true;
-            slot.state.mode = AgentMode::Basic;
-        } else {
-            slot.state.mode = AgentMode::Plan;
-        }
+        self.refinement = None;
+        (self.orchestration_mode, slot.state.mode) =
+            match (self.orchestration_mode, slot.state.mode) {
+                (Some(OrchestrationMode::Standard), _) => {
+                    (Some(OrchestrationMode::Plus), AgentMode::Basic)
+                }
+                (Some(OrchestrationMode::Plus), _) => (None, AgentMode::Basic),
+                (None, AgentMode::Plan) if self.factory.orchestration_route().is_ok() => {
+                    (Some(OrchestrationMode::Standard), AgentMode::Basic)
+                }
+                (None, AgentMode::Plan) => (None, AgentMode::Basic),
+                (None, AgentMode::Basic) => (None, AgentMode::Plan),
+            };
         slot.state.mode_ready = true;
-        self.factory.set_editor_mode(if self.orchestration_mode {
-            AgentMode::Plan
-        } else {
-            slot.state.mode
-        });
-        let mode = if self.orchestration_mode {
-            "Orchestration"
-        } else if slot.state.mode == AgentMode::Plan {
-            "Planning"
-        } else {
-            "Work"
+        self.factory
+            .set_editor_mode(if self.orchestration_mode.is_some() {
+                AgentMode::Plan
+            } else {
+                slot.state.mode
+            });
+        let mode = match self.orchestration_mode {
+            Some(OrchestrationMode::Standard) => "Orchestration",
+            Some(OrchestrationMode::Plus) => "Orchestrate+",
+            None if slot.state.mode == AgentMode::Plan => "Planning",
+            None => "Work",
         };
         self.report(io, mode);
     }
@@ -1892,6 +1924,7 @@ impl Workbench {
             return false;
         }
         self.planning_context = Some(PlanningContext {
+            plus: self.orchestration_mode == Some(OrchestrationMode::Plus),
             command: id,
             owner: slot.id.clone(),
             prompt,
@@ -2046,7 +2079,7 @@ impl Workbench {
         let delegation = commands::skill_request(text).map(|(name, _)| name.to_owned());
         if !text.trim().is_empty()
             && !text.trim_start().starts_with('/')
-            && (self.orchestration_mode
+            && (self.orchestration_mode.is_some()
                 || self.refinement.is_some()
                 || commands::agent_task(text).is_some()
                 || delegation.is_some())
@@ -2150,6 +2183,21 @@ impl Workbench {
                 self.send_result(io);
                 (true, false)
             }
+            "/autocompact" if self.slots[self.current].kind == Kind::Console => {
+                self.report(io, "The command panel has no conversation context");
+                (false, false)
+            }
+            "/autocompact" if !argument.is_empty() => {
+                match super::super::commands::autocompact_percent(argument) {
+                    Ok(Some(percent)) => (self.apply_autocompact(percent, io), false),
+                    Ok(None) => (false, false),
+                    Err(message) => {
+                        self.report(io, message);
+                        (false, false)
+                    }
+                }
+            }
+            "/orchestrate+" if argument.is_empty() => (self.open_role_picker(io), false),
             "/model" => {
                 self.requested_model = (!argument.is_empty()).then(|| argument.to_string());
                 self.open_models(false, io);
@@ -2199,7 +2247,7 @@ impl Workbench {
                     return (false, false);
                 }
                 if matches!(command, "/basic" | "/plan") && argument.is_empty() {
-                    self.orchestration_mode = false;
+                    self.orchestration_mode = None;
                     self.refinement = None;
                 }
                 let slot = &mut self.slots[self.current];
@@ -2336,6 +2384,7 @@ impl Workbench {
                 .as_ref()
                 .is_some_and(|intent| &intent.command == command && intent.owner == id)
             && let Some(PlanningContext {
+                plus,
                 owner,
                 prompt,
                 token,
@@ -2351,14 +2400,31 @@ impl Workbench {
             self.jobs.spawn_blocking(move || Job::OrchestrationPlan {
                 owner,
                 token,
-                result: Proposal::generate(
-                    &factory,
-                    seed,
-                    prompt,
-                    read_only,
-                    skill.as_deref(),
-                    &stop,
-                ),
+                result: (|| {
+                    if plus {
+                        let profile = factory
+                            .role_profile()?
+                            .ok_or("orchestration_profile_required")?;
+                        Proposal::generate_plus(
+                            &factory,
+                            seed,
+                            prompt,
+                            read_only,
+                            skill.as_deref(),
+                            &stop,
+                            profile,
+                        )
+                    } else {
+                        Proposal::generate(
+                            &factory,
+                            seed,
+                            prompt,
+                            read_only,
+                            skill.as_deref(),
+                            &stop,
+                        )
+                    }
+                })(),
             });
         }
         if let EventPayload::ContextSnapshot { command, seed } = &event.payload
@@ -2554,7 +2620,10 @@ impl Workbench {
                     && *owner == self.slots[self.current].id
                     && *token == self.modal_token
             }
-            Job::Sessions { owner, token, .. } | Job::Models { owner, token, .. } => {
+            Job::Sessions { owner, token, .. }
+            | Job::Models { owner, token, .. }
+            | Job::RoleModels { owner, token, .. }
+            | Job::RoleModelsSaved { owner, token, .. } => {
                 !self.input_closed
                     && !self.terminating
                     && *owner == self.slots[self.current].id
@@ -2662,6 +2731,11 @@ impl Workbench {
                         self.refinement = None;
                         let blocked = proposal.plan.execution_ready().err();
                         self.show_orchestration_plan(&proposal.plan, None);
+                        if let Some(profile) = &proposal.profile
+                            && let Some(Panel::Orchestration { lines, .. }) = &mut self.panel
+                        {
+                            lines.splice(0..0, roles::profile_lines(profile));
+                        }
                         self.frames.clear();
                         self.displayed = None;
                         self.operational_frame = None;
@@ -2672,7 +2746,13 @@ impl Workbench {
                         });
                     }
                     Err(code) => {
-                        if code == "siwc_structured_format_unconfirmed" {
+                        if code == "orchestration_profile_required" {
+                            self.report(
+                                io,
+                                "Choose Orchestrate+ role models, then submit the draft again",
+                            );
+                            self.open_role_picker(io);
+                        } else if code == "siwc_structured_format_unconfirmed" {
                             self.report(
                                 io,
                                 "ChatGPT did not confirm the strict plan format · Tab Work",
@@ -2876,6 +2956,20 @@ impl Workbench {
                     self.menu = Some(Menu::Palette { original, stage });
                 }
             }
+            Job::AutocompactSaved { owner, result } => {
+                if let Err(code) = result
+                    && let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner)
+                {
+                    if code.starts_with("autocompact_preferences_") {
+                        slot.state
+                            .report(io, "Could not save default autocompact for new sessions");
+                    } else {
+                        slot.state.exit = 1;
+                        slot.state
+                            .report(io, &format!("ansa: {}", diagnostics::error(code)));
+                    }
+                }
+            }
             Job::GenerationSaved { owner, result } => {
                 if let Err(code) = result
                     && let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner)
@@ -2978,6 +3072,34 @@ impl Workbench {
                     self.summaries = summaries;
                 }
             }
+            Job::RoleModels { result, .. } => {
+                self.modal_stop = None;
+                match result {
+                    Ok(picker) => self.menu = Some(Menu::Roles(picker)),
+                    Err(code) => {
+                        self.menu = None;
+                        self.report(
+                            io,
+                            &format!("Could not load Orchestrate+ role models: {code}"),
+                        );
+                    }
+                }
+            }
+            Job::RoleModelsSaved { result, .. } => match result {
+                Ok(()) => {
+                    self.menu = None;
+                    self.report(io, "Orchestrate+ role models saved");
+                }
+                Err(code) => {
+                    if let Some(Menu::Roles(picker)) = &mut self.menu {
+                        picker.save_failed();
+                    }
+                    self.report(
+                        io,
+                        &format!("Could not save Orchestrate+ role models: {code}"),
+                    );
+                }
+            },
             Job::CachedModels { result } => {
                 if self.models_cache.is_none()
                     && let Ok(Some(raw)) = result
@@ -3069,6 +3191,9 @@ impl Workbench {
         }
     }
     fn escape(&mut self, io: &Io) {
+        if matches!(&self.menu, Some(Menu::Roles(picker)) if picker.saving()) {
+            return;
+        }
         self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
         self.cancel_modal();
@@ -3077,6 +3202,11 @@ impl Workbench {
         if self.completion.take().is_some() {
             let editor = &self.slots[self.current].state.editor;
             self.completion_closed = Some((editor.bytes.clone(), editor.cursor));
+            return;
+        }
+        if let Some(Menu::Roles(picker)) = &mut self.menu
+            && picker.back()
+        {
             return;
         }
         if let Some(menu) = self.menu.take() {
@@ -3351,6 +3481,7 @@ impl Workbench {
             }
         };
         match &mut self.menu {
+            Some(Menu::Roles(picker)) => picker.navigate(delta),
             Some(Menu::Orchestration { selected, .. }) => delta(selected, 3),
             Some(Menu::Themes(preview)) => {
                 preview.navigate(older);
@@ -3439,6 +3570,7 @@ impl Workbench {
         }
         if let Some(menu) = self.menu.take() {
             match menu {
+                Menu::Roles(picker) => self.enter_role_picker(picker, io),
                 Menu::Orchestration { proposal, selected } => {
                     if selected == 0
                         && (proposal.plan.execution_ready().is_err()
@@ -3807,6 +3939,7 @@ impl Workbench {
     fn popup(&self) -> Option<Popup> {
         let menu = self.menu.as_ref()?;
         Some(match menu {
+            Menu::Roles(picker) => picker.popup(),
             Menu::Orchestration { .. } => return None,
             Menu::Themes(preview) => Popup {
                 title: "/theme".into(),
@@ -4295,10 +4428,10 @@ impl Workbench {
             effort: generation
                 .and_then(|g| g.effort.clone())
                 .unwrap_or_default(),
-            activity: if self.orchestration_mode {
-                "Orchestration".into()
-            } else {
-                String::new()
+            activity: match self.orchestration_mode {
+                Some(OrchestrationMode::Standard) => "Orchestration".into(),
+                Some(OrchestrationMode::Plus) => "Orchestrate+".into(),
+                None => String::new(),
             },
             exit_confirmation: self.exit_deadline.is_some(),
             reading: !slot.state.follow_tail,
@@ -4631,14 +4764,6 @@ fn sync_displayed(
     {
         *displayed = candidates.pop_front().map(|(_, frame)| frame);
     }
-}
-
-fn model_choices(value: Json) -> Result<Vec<(String, String, Vec<String>)>> {
-    Ok(crate::auth::dispatch::model_capabilities(&value)?
-        .into_iter()
-        .take(256)
-        .map(|model| (model.model, model.display_name, model.efforts))
-        .collect())
 }
 
 pub async fn run(
@@ -5085,6 +5210,11 @@ pub async fn run_attached(
                 }
                 work.saved_theme(revision, theme, result, io);
             }
+            Ok(Job::AutocompactSaved {
+                result: Err(code), ..
+            }) if code.starts_with("autocompact_preferences_") => {
+                failure.get_or_insert(code);
+            }
             Ok(Job::GenerationSaved {
                 result: Err(code), ..
             }) if code.starts_with("model_preferences_") => {
@@ -5340,6 +5470,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn delayed_autocompact_save_preserves_newer_choice_per_account() {
+        let root = TestDirectory(std::env::temp_dir().join(format!(
+            "ansa-autocompact-preferences-{}",
+            crate::auth::pkce::random_token(16).unwrap()
+        )));
+        ansa_linux::fs::create_private(&root.0).unwrap();
+        let settings = crate::config::load_agent_settings(&root.0, &root.0).unwrap();
+        let first = Factory::new(
+            settings.clone(),
+            root.0.join("auth"),
+            false,
+            "first".into(),
+            None,
+        );
+        let second = Factory::new(settings, root.0.join("auth"), false, "second".into(), None);
+        let selected = SystemTime::now();
+        first
+            .save_autocompact(selected + Duration::from_secs(1), 80)
+            .unwrap();
+        first.save_autocompact(selected, 20).unwrap();
+        assert_eq!(first.saved_autocompact(), Some(80));
+        assert_eq!(second.saved_autocompact(), None);
     }
 
     #[test]

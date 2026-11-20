@@ -52,6 +52,7 @@ pub struct TranscriptPage {
 pub struct Snapshot {
     pub timeline_size: usize,
     pub generation: GenerationSelection,
+    pub autocompact_percent: u8,
     pub followups: Vec<Followup>,
     pub through_sequence: u64,
     pub state: String,

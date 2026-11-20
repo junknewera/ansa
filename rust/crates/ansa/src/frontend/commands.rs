@@ -72,6 +72,14 @@ const COMMANDS: &[Command] = &[
         description: "Exit ANSA",
     },
     Command {
+        name: "/autocompact",
+        description: "Show or set the context compaction percentage",
+    },
+    Command {
+        name: "/orchestrate+",
+        description: "Configure Orchestrate+ role models and reasoning effort",
+    },
+    Command {
         name: "/terminals",
         description: "View the agent terminal",
     },
@@ -79,6 +87,18 @@ const COMMANDS: &[Command] = &[
 
 pub fn available(native_terminals: bool) -> &'static [Command] {
     &COMMANDS[..COMMANDS.len() - usize::from(!native_terminals)]
+}
+
+pub(super) fn autocompact_percent(argument: &str) -> Result<Option<u8>, &'static str> {
+    if argument.is_empty() {
+        return Ok(None);
+    }
+    if argument.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(percent @ 1..=100) = argument.parse::<u8>()
+    {
+        return Ok(Some(percent));
+    }
+    Err("Use /autocompact with a percentage from 1 to 100")
 }
 
 pub(super) fn agent_task(text: &str) -> Option<&str> {
@@ -225,6 +245,16 @@ pub(crate) fn help_with_commands(selected: usize, commands: &[Command]) -> Popup
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autocompact_accepts_only_percentages_in_range() {
+        assert_eq!(super::autocompact_percent(""), Ok(None));
+        assert_eq!(super::autocompact_percent("1"), Ok(Some(1)));
+        assert_eq!(super::autocompact_percent("100"), Ok(Some(100)));
+        for invalid in ["0", "101", "256", "+10", "20%", "-1", "60 70"] {
+            assert!(super::autocompact_percent(invalid).is_err());
+        }
+    }
+
     use super::*;
     fn editor(text: &str) -> Editor {
         let mut editor = Editor::default();

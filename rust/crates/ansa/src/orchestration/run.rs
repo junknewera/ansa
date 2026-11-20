@@ -2,17 +2,18 @@
 use super::{
     journal::{Journal, Result},
     plan::{Access, Plan, Progress, Step},
+    profile::RoleProfile,
 };
 use crate::{
-    protocol::legacy_json_v1::sha256,
+    protocol::{json::Json, legacy_json_v1::sha256},
     provider::{
         contracts::valid_id,
         native,
         structured::{ChildResult, ChildStatus},
     },
     runtime::{
-        AgentMode, Cancel, ChildAttempt, ChildAttemptState, CommandId, CommandPayload,
-        DirectoryIdentity, Handle, PostStatus, RuntimeCommand,
+        AgentMode, Cancel, ChildAttempt, ChildAttemptState, ChildToolEvidence, CommandId,
+        CommandPayload, DirectoryIdentity, Handle, PostStatus, RuntimeCommand,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,12 @@ struct Header {
     budget: DispatchBudget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context: Option<RunContext>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    phase_evidence: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize, Deserialize)]
@@ -53,6 +60,17 @@ pub(crate) struct RunContext {
     pub model_window: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plus_profile: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlusAcceptance {
+    pub(crate) session: String,
+    pub(crate) command: String,
+    pub(crate) request: String,
+    pub(crate) result: ChildResult,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +113,12 @@ impl Binding {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum Outcome {
-    Result { digest: String, value: ChildResult },
+    Result {
+        digest: String,
+        value: ChildResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_evidence: Option<ChildToolEvidence>,
+    },
     Cancelled,
     Unresolved,
 }
@@ -146,6 +169,19 @@ enum Event {
         through: usize,
         result: ChildResult,
     },
+    PlusStarted {
+        step: String,
+    },
+    PlusResult {
+        step: String,
+        session: String,
+        result: ChildResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replan: Option<ChildResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_evidence: Option<ChildToolEvidence>,
+        acceptance: PlusAcceptance,
+    },
     Cancelled,
     Continued,
 }
@@ -165,6 +201,10 @@ struct State {
     decisions: Vec<ChildResult>,
     clarified: usize,
     children: BTreeMap<String, Child>,
+    plus: bool,
+    plus_active: Option<String>,
+    plus_results: BTreeMap<String, (String, ChildResult, Option<ChildToolEvidence>)>,
+    plus_replan: Option<ChildResult>,
 }
 
 impl State {
@@ -184,6 +224,13 @@ impl State {
         }
         let plan = Plan::parse(&header.plan)?;
         let digest = sha256(plan.encode()?.as_bytes());
+        let profile = header
+            .context
+            .as_ref()
+            .and_then(|context| context.plus_profile.as_deref());
+        if let Some(profile) = profile {
+            RoleProfile::decode(&Json::parse(profile)?)?;
+        }
         Ok(Self {
             plan,
             digest,
@@ -198,6 +245,10 @@ impl State {
             decisions: Vec::new(),
             clarified: 0,
             children: BTreeMap::new(),
+            plus: profile.is_some(),
+            plus_active: None,
+            plus_results: BTreeMap::new(),
+            plus_replan: None,
         })
     }
 
@@ -230,6 +281,11 @@ impl State {
                 };
                 (id.clone(), progress)
             })
+            .chain(
+                self.plus_results
+                    .keys()
+                    .map(|id| (id.clone(), Progress::Succeeded)),
+            )
             .collect()
     }
 
@@ -242,6 +298,9 @@ impl State {
             }
             Event::Bound { step, binding } => {
                 self.can_dispatch()?;
+                if self.plus {
+                    return Err("run_transition");
+                }
                 if self.clarified != self.clarifications.len() {
                     return Err("run_clarification_pending");
                 }
@@ -317,9 +376,22 @@ impl State {
                 if child.request.as_ref() != Some(request) || child.outcome.is_some() {
                     return Err("run_child_outcome");
                 }
-                if let Outcome::Result { digest, value } = outcome {
+                if let Outcome::Result {
+                    digest,
+                    value,
+                    tool_evidence,
+                } = outcome
+                {
                     if !valid_digest(digest) {
                         return Err("run_child_outcome_digest");
+                    }
+                    if tool_evidence.as_ref().is_some_and(|evidence| {
+                        evidence.command != child.binding.command
+                            || &evidence.request != request
+                            || evidence.dispatched > evidence.outcomes
+                            || evidence.receipts.len() > evidence.outcomes.min(12)
+                    }) {
+                        return Err("run_child_evidence_identity");
                     }
                     value.validate()?;
                 }
@@ -338,12 +410,73 @@ impl State {
             }
             Event::CoordinatorDecision { through, result } => {
                 self.can_dispatch()?;
-                if *through <= self.clarified || *through > self.clarifications.len() {
+                if self.plus_active.is_some()
+                    || *through <= self.clarified
+                    || *through > self.clarifications.len()
+                {
                     return Err("run_clarification");
                 }
                 result.validate()?;
                 self.clarified = *through;
                 self.decisions.push(result.clone());
+            }
+            Event::PlusStarted { step } => {
+                self.can_dispatch()?;
+                if !self.plus
+                    || self.plus_active.is_some()
+                    || self.clarified != self.clarifications.len()
+                    || !self
+                        .plan
+                        .ready(&self.progress())?
+                        .iter()
+                        .any(|task| task.id == *step)
+                {
+                    return Err("run_plus_step");
+                }
+                self.plus_active = Some(step.clone());
+            }
+            Event::PlusResult {
+                step,
+                session,
+                result,
+                replan,
+                tool_evidence,
+                acceptance,
+            } => {
+                self.can_dispatch()?;
+                if !self.plus
+                    || self.plus_active.as_ref() != Some(step)
+                    || result.status != ChildStatus::Completed
+                    || result.findings.is_empty()
+                    || !valid_id(session)
+                    || session == parent
+                    || &acceptance.session == session
+                    || acceptance.session == parent
+                    || !valid_id(&acceptance.session)
+                    || !valid_id(&acceptance.command)
+                    || !valid_id(&acceptance.request)
+                    || acceptance.result.status != ChildStatus::Completed
+                    || self
+                        .plus_results
+                        .values()
+                        .any(|(previous, _, _)| previous == session)
+                {
+                    return Err("run_plus_result");
+                }
+                result.validate()?;
+                acceptance.result.validate()?;
+                if let Some(replan) = replan {
+                    if replan.status != ChildStatus::Completed {
+                        return Err("run_plus_result");
+                    }
+                    replan.validate()?;
+                    self.plus_replan = Some(replan.clone());
+                }
+                self.plus_results.insert(
+                    step.clone(),
+                    (session.clone(), result.clone(), tool_evidence.clone()),
+                );
+                self.plus_active = None;
             }
             Event::Cancelled if !self.cancelled => self.cancelled = true,
             Event::Continued => self.can_dispatch()?,
@@ -380,12 +513,45 @@ impl Run {
         budget: DispatchBudget,
         context: Option<RunContext>,
     ) -> Result<Self> {
+        Self::create_journal(path, identity, plan, budget, context, false)
+    }
+
+    pub(crate) fn create_phase(
+        storage: &Path,
+        identity: RunId,
+        plan: Plan,
+        budget: DispatchBudget,
+    ) -> Result<Self> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let directory = ansa_linux::fs::private_directory(storage).map_err(|_| "store_create")?;
+        let mut nonce = [0; 16];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| "orchestration_random")?;
+        let pending = format!(".phase-{}", sha256(&nonce));
+        let name = identity.run.clone();
+        let phase =
+            Self::create_journal(&storage.join(&pending), identity, plan, budget, None, true)?;
+        ansa_linux::local::publish_directory(&directory, &pending, &name)
+            .map_err(|_| "store_publish")?;
+        Ok(phase)
+    }
+
+    fn create_journal(
+        path: &Path,
+        identity: RunId,
+        plan: Plan,
+        budget: DispatchBudget,
+        context: Option<RunContext>,
+        phase_evidence: bool,
+    ) -> Result<Self> {
         let header = Header {
             version: 1,
             identity,
             plan: plan.encode()?,
             budget,
             context,
+            phase_evidence,
         };
         let state = State::new(&header)?;
         let (journal, header) = Journal::create(path, |_| Ok(header))?;
@@ -448,6 +614,46 @@ impl Run {
     }
     pub(crate) fn decisions(&self) -> &[ChildResult] {
         &self.state.decisions
+    }
+
+    pub(crate) fn plus_results(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.state
+            .plus_results
+            .iter()
+            .map(|(step, (session, _, _))| (step.as_str(), session.as_str()))
+    }
+
+    pub(crate) fn active_plus_task(&self) -> Option<&str> {
+        self.state.plus_active.as_deref()
+    }
+
+    pub(crate) fn plus_replan(&self) -> Option<&ChildResult> {
+        self.state.plus_replan.as_ref()
+    }
+
+    pub(crate) fn begin_plus_task(&mut self, step: String) -> Result<()> {
+        self.can_dispatch()?;
+        self.commit(Event::PlusStarted { step })
+    }
+
+    pub(crate) fn record_plus_result(
+        &mut self,
+        step: String,
+        session: String,
+        result: ChildResult,
+        replan: Option<ChildResult>,
+        tool_evidence: Option<ChildToolEvidence>,
+        acceptance: PlusAcceptance,
+    ) -> Result<()> {
+        self.can_dispatch()?;
+        self.commit(Event::PlusResult {
+            step,
+            session,
+            result,
+            replan,
+            tool_evidence,
+            acceptance,
+        })
     }
 
     pub(crate) fn may_continue(&self, now: u64) -> bool {
@@ -647,8 +853,21 @@ impl Run {
     /// Archived presentation of the result sealed by this ledger. Dispatch
     /// and continuation must still use `result` after child reconciliation.
     pub(crate) fn recorded_result(&self, step: &str) -> Option<&ChildResult> {
+        if let Some((_, result, _)) = self.state.plus_results.get(step) {
+            return Some(result);
+        }
         match self.state.children.get(step)?.outcome.as_ref()? {
             Outcome::Result { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn recorded_tool_evidence(&self, step: &str) -> Option<&ChildToolEvidence> {
+        if let Some((_, _, evidence)) = self.state.plus_results.get(step) {
+            return evidence.as_ref();
+        }
+        match self.state.children.get(step)?.outcome.as_ref()? {
+            Outcome::Result { tool_evidence, .. } => tool_evidence.as_ref(),
             _ => None,
         }
     }
@@ -679,6 +898,16 @@ impl Run {
             Some(Outcome::Result {
                 digest: sha256(native::save(response)?.dump().as_bytes()),
                 value: response.child_result()?,
+                tool_evidence: if self.header.phase_evidence {
+                    Some(
+                        receipt
+                            .tool_evidence()
+                            .ok_or("run_child_evidence_missing")?
+                            .clone(),
+                    )
+                } else {
+                    None
+                },
             })
         } else {
             None
@@ -754,4 +983,172 @@ fn valid_digest(text: &str) -> bool {
         && text
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+#[test]
+fn plus_reopen_preserves_completed_effects_active_task_and_saved_clarification() {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    struct Temporary(std::path::PathBuf);
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    let mut nonce = [0; 16];
+    SystemRandom::new().fill(&mut nonce).unwrap();
+    let root = std::env::temp_dir().join(sha256(&nonce));
+    ansa_linux::fs::create_private_leaf(&root).unwrap();
+    let root = Temporary(root);
+    let path = root.0.join("run");
+    let identity = RunId {
+        parent_session: "parent".into(),
+        run: "plus-example".into(),
+    };
+    let plan = Plan::parse(r#"{
+        "schema_version": 1, "summary": "Write then verify",
+        "steps": [
+            {"id":"one","task":"Write output","access":"write","paths":["result"],"depends_on":[],"acceptance":"Output updated"},
+            {"id":"two","task":"Check output","access":"read","paths":["result"],"depends_on":["one"],"acceptance":"Output verified"},
+            {"id":"three","task":"Explain output","access":"read","paths":["result"],"depends_on":["two"],"acceptance":"Output explained"}
+        ]
+    }"#).unwrap();
+    let context = RunContext {
+        prompt: "Create a result and verify it".into(),
+        configuration: "{}".into(),
+        model_window: None,
+        handoff_tokens: None,
+        plus_profile: Some(r#"{"version":1,"strong":{"model":"strong","effort":"high"},"medium":{"model":"medium","effort":null},"weak":{"model":"weak","effort":null}}"#.into()),
+    };
+    let mut run = Run::create_with_context(
+        &path,
+        identity.clone(),
+        plan,
+        DispatchBudget {
+            started_at: 1,
+            deadline: 200,
+            submissions: 2,
+        },
+        Some(context),
+    )
+    .unwrap();
+    let completed = ChildResult {
+        status: ChildStatus::Completed,
+        summary: "Verified output".into(),
+        findings: vec!["Output is present once".into()],
+    };
+    let replan = ChildResult {
+        status: ChildStatus::Completed,
+        summary: "Preserve the existing output while verifying".into(),
+        findings: vec!["Use the output already written".into()],
+    };
+    let no_tools = ChildToolEvidence {
+        command: "worker-operation".into(),
+        request: "worker-request".into(),
+        outcomes: 0,
+        dispatched: 0,
+        receipts: Vec::new(),
+    };
+    let acceptance = PlusAcceptance {
+        session: "coordinator".into(),
+        command: "verify-worker".into(),
+        request: "verify-request".into(),
+        result: completed.clone(),
+    };
+    let digest = run.plan_digest().to_owned();
+    run.approve(&digest).unwrap();
+    assert!(run.begin_plus_task("two".into()).is_err());
+    run.begin_plus_task("one".into()).unwrap();
+    run.record_plus_result(
+        "one".into(),
+        "worker-one".into(),
+        completed.clone(),
+        Some(replan.clone()),
+        Some(no_tools.clone()),
+        acceptance.clone(),
+    )
+    .unwrap();
+    run.begin_plus_task("two".into()).unwrap();
+    run.clarify("Also explain the output".into()).unwrap();
+    assert!(run.record_decision(completed.clone()).is_err());
+    drop(run);
+
+    let mut run = Run::open(&path, &identity).unwrap();
+    assert!(run.ready().is_err());
+    run.continue_run(&[]).unwrap();
+    assert_eq!(run.active_plus_task(), Some("two"));
+    assert_eq!(
+        run.ready()
+            .unwrap()
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        ["two"]
+    );
+    assert_eq!(run.result("one"), Some(&completed));
+    assert_eq!(run.recorded_tool_evidence("one"), Some(&no_tools));
+    assert_eq!(run.plus_replan(), Some(&replan));
+    assert_eq!(run.pending_clarifications(), &["Also explain the output"]);
+    assert!(
+        run.record_plus_result(
+            "one".into(),
+            "worker-again".into(),
+            completed.clone(),
+            None,
+            Some(no_tools.clone()),
+            acceptance.clone(),
+        )
+        .is_err()
+    );
+    run.record_plus_result(
+        "two".into(),
+        "worker-two".into(),
+        completed.clone(),
+        None,
+        Some(no_tools),
+        acceptance,
+    )
+    .unwrap();
+    assert!(run.begin_plus_task("three".into()).is_err());
+    run.record_decision(completed).unwrap();
+    run.begin_plus_task("three".into()).unwrap();
+    assert_eq!(run.plus_replan(), Some(&replan));
+}
+
+#[cfg(test)]
+#[test]
+fn incomplete_phase_staging_does_not_publish_or_replace_a_phase() {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let mut nonce = [0; 16];
+    SystemRandom::new().fill(&mut nonce).unwrap();
+    let root = std::env::temp_dir().join(sha256(&nonce));
+    let directory = ansa_linux::fs::create_private_leaf(&root).unwrap();
+    let identity = RunId {
+        parent_session: "parent".into(),
+        run: "test-phase".into(),
+    };
+    let staged = root.join(".phase-interrupted");
+    ansa_linux::fs::create_private_leaf(&staged).unwrap();
+    std::fs::write(staged.join("init.json.pending"), b"interrupted write").unwrap();
+    assert!(!ansa_linux::local::entry_exists(&directory, &identity.run).unwrap());
+
+    let plan = Plan::parse(r#"{"schema_version":1,"summary":"phase","steps":[]}"#).unwrap();
+    let budget = DispatchBudget {
+        started_at: 1,
+        deadline: 100,
+        submissions: 2,
+    };
+    let mut phase = Run::create_phase(&root, identity.clone(), plan.clone(), budget).unwrap();
+    let digest = phase.plan_digest().to_owned();
+    phase.approve(&digest).unwrap();
+    drop(phase);
+    assert!(Run::create_phase(&root, identity.clone(), plan, budget).is_err());
+    let mut reopened = Run::open(&root.join(&identity.run), &identity).unwrap();
+    reopened.continue_run(&[]).unwrap();
+    assert!(reopened.may_continue(2));
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
 }

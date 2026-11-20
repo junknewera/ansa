@@ -3,6 +3,7 @@ use super::{Result, sessions::Factory};
 use crate::{
     orchestration::{
         plan::{Access, Plan, Step},
+        profile::RoleProfile,
         run::{DispatchBudget, Run, RunContext, RunId},
         worktree::{Frozen, Worktree},
     },
@@ -10,8 +11,8 @@ use crate::{
     provider::request::Request,
     provider::structured::{ChildResult, ChildStatus},
     runtime::{
-        Cancel, ChildAttempt, ChildAttemptState, CommandPayload, ForkSeed, PostStatus, Runtime,
-        RuntimeCommand,
+        Cancel, ChildAttempt, ChildAttemptState, CommandId, CommandPayload, ForkSeed, PostStatus,
+        Runtime, RuntimeCommand, TurnId,
     },
     tools::{
         command::{ProcessOptions, ProcessRunner},
@@ -27,6 +28,10 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+mod plus;
+mod plus_review;
+pub(super) use plus_review::PLUS_REVIEW_SKILL;
+
 pub(super) struct Proposal {
     pub prompt: String,
     pub seed: ForkSeed,
@@ -34,6 +39,7 @@ pub(super) struct Proposal {
     pub digest: String,
     pub read_only: bool,
     pub skill: Option<String>,
+    pub profile: Option<RoleProfile>,
 }
 
 impl Proposal {
@@ -45,6 +51,30 @@ impl Proposal {
         skill: Option<&str>,
         stop: &Cancel,
     ) -> Result<Self> {
+        Self::generate_with_profile(factory, seed, prompt, read_only, skill, stop, None)
+    }
+
+    pub(super) fn generate_plus(
+        factory: &Factory,
+        seed: ForkSeed,
+        prompt: String,
+        read_only: bool,
+        skill: Option<&str>,
+        stop: &Cancel,
+        profile: RoleProfile,
+    ) -> Result<Self> {
+        Self::generate_with_profile(factory, seed, prompt, read_only, skill, stop, Some(profile))
+    }
+
+    fn generate_with_profile(
+        factory: &Factory,
+        seed: ForkSeed,
+        prompt: String,
+        read_only: bool,
+        skill: Option<&str>,
+        stop: &Cancel,
+        profile: Option<RoleProfile>,
+    ) -> Result<Self> {
         let instructions = skill
             .map(|name| {
                 factory
@@ -52,13 +82,24 @@ impl Proposal {
                     .ok_or("orchestration_skill_grant")
             })
             .transpose()?;
-        let mut plan = factory.plan_orchestration(
-            seed.clone(),
-            &prompt,
-            read_only,
-            instructions.as_deref(),
-            stop,
-        )?;
+        let mut plan = if let Some(profile) = &profile {
+            factory.plan_orchestration_plus(
+                seed.clone(),
+                &prompt,
+                read_only,
+                instructions.as_deref(),
+                profile,
+                stop,
+            )?
+        } else {
+            factory.plan_orchestration(
+                seed.clone(),
+                &prompt,
+                read_only,
+                instructions.as_deref(),
+                stop,
+            )?
+        };
         if let Some(folder) = plan.read_folder() {
             if !named_folder(&prompt, folder) {
                 return Err("orchestration_read_folder_not_named");
@@ -74,6 +115,7 @@ impl Proposal {
             digest,
             read_only,
             skill: skill.map(str::to_owned),
+            profile,
         })
     }
 }
@@ -121,13 +163,19 @@ fn read_folder_consent_matches_complete_paths() {
 struct Child {
     task: Step,
     runtime: Runtime,
+    distinct_turns: bool,
 }
 
 impl Child {
     async fn receipt(&self) -> Result<ChildAttempt> {
+        let (command, turn) = if self.distinct_turns {
+            (self.task.id.clone(), self.task.id.clone())
+        } else {
+            ("assignment".into(), "task".into())
+        };
         self.runtime
             .handle()
-            .child_attempt("assignment".into(), "task".into(), self.task.assignment())
+            .child_attempt(CommandId(command), TurnId(turn), self.task.assignment())
             .await
     }
 
@@ -145,13 +193,18 @@ impl Child {
                     schema_version: 1,
                     session: handle.session().clone(),
                     incarnation: handle.incarnation().clone(),
-                    command: "stop-assignment".into(),
+                    command: if self.distinct_turns {
+                        CommandId(format!("stop-{}", self.task.id))
+                    } else {
+                        "stop-assignment".into()
+                    },
                     turn: receipt.turn().clone(),
                     payload: CommandPayload::Cancel(request.clone()),
                 })
                 .await;
         }
         // Retain ownership until the runtime has stopped and joined.
+        let mut observed = Ok(());
         for _ in 0..100 {
             if let Ok(proof) = self.receipt().await
                 && matches!(
@@ -162,12 +215,13 @@ impl Child {
                     }
                 )
             {
-                run.observe(&self.task.id, &proof)?;
+                observed = run.observe(&self.task.id, &proof);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        self.runtime.shutdown().await
+        let stopped = self.runtime.shutdown().await;
+        observed.and(stopped)
     }
 }
 
@@ -218,7 +272,9 @@ fn publish_progress(
     let mut done = 0;
     let agents = run
         .original_children()
-        .filter_map(|(id, session, _)| {
+        .map(|(id, session, _)| (id, session))
+        .chain(run.plus_results())
+        .filter_map(|(id, session)| {
             let task = run.plan().steps().iter().find(|step| step.id == id)?;
             let result = run.result(id);
             done += usize::from(result.is_some());
@@ -278,7 +334,9 @@ pub(super) fn execute(
 ) -> Result<Completed> {
     factory.check_orchestration_context(&proposal.seed.request()?)?;
     proposal.plan.execution_ready()?;
-    factory.require_orchestration_route(stop)?;
+    if proposal.profile.is_none() {
+        factory.require_orchestration_route(stop)?;
+    }
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -320,6 +378,12 @@ async fn execute_owned(
             configuration: source.with_input(Vec::new())?.save()?.dump(),
             model_window,
             handoff_tokens,
+            plus_profile: proposal
+                .profile
+                .as_ref()
+                .map(RoleProfile::encode)
+                .transpose()?
+                .map(|value| value.dump()),
         }),
     )?;
     run.approve(&proposal.digest)?;
@@ -330,6 +394,12 @@ async fn execute_owned(
             return Err(code);
         }
     };
+    if let Some(profile) = proposal.profile {
+        return plus::schedule(
+            factory, run, &storage, candidate, &profile, stop, progress, inbox,
+        )
+        .await;
+    }
     schedule(factory, run, candidate, Vec::new(), stop, progress, inbox).await
 }
 
@@ -357,7 +427,7 @@ fn writer_workspace(
     let worktree = if restore && storage.join("snapshot.json").exists() {
         Worktree::reopen(&root, storage, stop)?
     } else {
-        if restore && run.original_children().next().is_some() {
+        if restore && (run.original_children().next().is_some() || storage.join("plus").exists()) {
             return Err("worktree_snapshot_missing");
         }
         let partial = storage.join("checkout");
@@ -512,7 +582,7 @@ async fn schedule(
         };
         Ok(Completed {
             id: identity.run,
-            evidence: evidence(&run, &prompt, release.as_ref()),
+            evidence: evidence(&run, &prompt, release.as_ref(), None),
             candidate: release,
         })
     }
@@ -911,6 +981,7 @@ async fn start_child(
     let mut child = Child {
         task,
         runtime: created.runtime,
+        distinct_turns: false,
     };
     let proof = child.receipt().await?;
     run.bind(&child.task.id, &proof)?;
@@ -930,7 +1001,12 @@ async fn start_child(
     Ok(child)
 }
 
-fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> Option<String> {
+fn evidence(
+    run: &Run,
+    prompt: &str,
+    candidate: Option<&Candidate>,
+    report_review: Option<&serde_json::Value>,
+) -> Option<String> {
     let results: Vec<_> = run
         .plan()
         .steps()
@@ -954,6 +1030,9 @@ fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> Option<St
             "verification": "git diff --check, approved checks and independent review",
             "command_checks_passed": run.plan().command_checks().len(),
         });
+    }
+    if let Some(review) = report_review {
+        evidence["report_review"] = review.clone();
     }
     let serialized = evidence.to_string();
     let budget = run.context().and_then(|context| context.handoff_tokens);
@@ -981,8 +1060,13 @@ fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> Option<St
                 .last()
                 .map(|text| crate::context::token_prefix(text, share))
         );
+        if let Some(review) = report_review {
+            evidence["report_review"] = serde_json::json!({
+                "excerpt": crate::context::token_prefix(&review.to_string(), share),
+            });
+        }
         evidence["results"] = serde_json::json!(run.plan().steps().iter().map(|step| {
-            let archive = run.original_children().find_map(|(id, session, _)| (id == step.id).then_some(session));
+            let archive = run.original_children().map(|(id, session, _)| (id, session)).chain(run.plus_results()).find_map(|(id, session)| (id == step.id).then_some(session));
             serde_json::json!({
                 "step": step.id,
                 "child_session": archive,
@@ -1089,7 +1173,7 @@ pub(super) fn recent_plan_links(factory: &Factory, parent: &str) -> Result<PlanL
         {
             clarification = Some((modified, identity.clone()));
         }
-        if run.pending_clarifications().is_empty()
+        if (run.pending_clarifications().is_empty() || run.active_plus_task().is_some())
             && continuable(&run, time)
             && continuation
                 .as_ref()
@@ -1208,17 +1292,25 @@ fn archived_candidate(
             passed_check(&check.argv, &outcome, &output).ok_or("orchestration_check_result")?,
         );
     }
-    let phase = format!("review-{attempt}");
-    let id = RunId {
-        parent_session: run.identity().parent_session.clone(),
-        run: phase.clone(),
+    let verdict = if run
+        .context()
+        .is_some_and(|context| context.plus_profile.is_some())
+    {
+        plus_review::archived_review(storage, run, attempt, &candidate, &checks)?
+    } else {
+        let phase = format!("review-{attempt}");
+        let id = RunId {
+            parent_session: run.identity().parent_session.clone(),
+            run: phase.clone(),
+        };
+        let reviewer = Run::open(&storage.join(&phase), &id)?;
+        reviewer
+            .recorded_result(&phase)
+            .filter(|result| result.status == ChildStatus::Completed)
+            .cloned()
+            .ok_or("orchestration_review_unresolved")?
     };
-    let reviewer = Run::open(&storage.join(&phase), &id)?;
-    let verdict = reviewer
-        .recorded_result(&phase)
-        .filter(|result| result.status == ChildStatus::Completed)
-        .ok_or("orchestration_review_unresolved")?;
-    append_review_checks(&mut checks, run.plan(), verdict);
+    append_review_checks(&mut checks, run.plan(), &verdict);
     Ok(Candidate {
         commit,
         workspace: worktree.path().into(),
@@ -1260,7 +1352,7 @@ async fn resume_owned(
     if read_only && !run.plan().is_read_only() {
         return Err("plan_mode_read_only");
     }
-    if !run.pending_clarifications().is_empty() {
+    if !run.pending_clarifications().is_empty() && run.active_plus_task().is_none() {
         return Err("orchestration_clarification_needs_review");
     }
     if !continuable(&run, now()?) {
@@ -1268,6 +1360,15 @@ async fn resume_owned(
     }
     let context = run.context().ok_or("orchestration_context")?;
     factory.check_orchestration_context(&Request::load(&Json::parse(&context.configuration)?)?)?;
+    if let Some(profile) = &context.plus_profile {
+        let profile = RoleProfile::decode(&Json::parse(profile)?)?;
+        let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
+        run.continue_run(&[])?;
+        return plus::schedule(
+            factory, run, &storage, candidate, &profile, stop, progress, inbox,
+        )
+        .await;
+    }
     factory.require_orchestration_route(stop)?;
     let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
     let active = restore_active(factory, &mut run, stop).await?;
@@ -1300,6 +1401,7 @@ async fn restore_active(factory: &Factory, run: &mut Run, stop: &Cancel) -> Resu
             runtime: factory
                 .restore_orchestration_child(&session, store, false, stop)?
                 .runtime,
+            distinct_turns: false,
         };
         child.runtime.ready().await?;
         receipts.push((step, child.receipt().await?));

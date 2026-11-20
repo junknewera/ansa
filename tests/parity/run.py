@@ -52,7 +52,7 @@ def source_info():
         path = ROOT / name
         if (path.is_file() and not path.is_symlink()
                 and not any(part == ".env" or part.startswith(".env.") for part in path.parts)
-                and (path.suffix in suffixes or path.name == "CMakeLists.txt")):
+                and (path.suffix in suffixes or path.name in {"CMakeLists.txt", "SKILL.md"})):
             files[name] = sha(path)
     return {"head": git("rev-parse", "HEAD").decode().strip(),
             "worktree_status": git("status", "--short").decode(), "files": files}

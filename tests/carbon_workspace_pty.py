@@ -795,8 +795,12 @@ def native_terminal_panel(screen, root, cwd):
     screen.additional_screens.append(("resumed", resumed))
     local(resumed, "/plan")
     resumed.send("SEALED_PLAN\r")
-    until(resumed, lambda frame: completed(root, "SEALED_PLAN"), "Plan admitted after a clean restart")
+    until(resumed, lambda frame: completed(root, "SEALED_PLAN") and "OMH_TOOL_OK" in frame
+          and "Plan" in resumed.vt.line(-2) and "Ctrl+C stop" not in resumed.vt.line(-2),
+          "reopened Plan turn settled")
     local(resumed, "/plan")
+    until(resumed, lambda frame: ready(resumed) and "Plan" not in resumed.vt.line(-2),
+          "reopened conversation returned to Work")
     resumed.send("TERMINAL_DEMO\r")
     restarted_host = session.parents[1] / "terminal-host-v1-2"
     until(resumed, lambda frame: (restarted_host / "0001.json").is_file(),
@@ -906,10 +910,10 @@ def completion_and_help(screen, root, cwd):
     screen.send("?")
     until(screen, lambda frame: "ANSA commands" in frame, "empty composer question mark opens help")
     command_rows = [match for row in range(screen.vt.rows)
-                    if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+)\s+(.*?)\s*│", screen.vt.line(row)))]
+                    if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions",
-                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit", "/terminals"}
+                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit", "/autocompact", "/orchestrate+", "/terminals"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert "/run" not in visible(screen), "removed /run remains advertised"
@@ -1243,6 +1247,81 @@ def openrouter_orchestration(screen, root, cwd):
     return "normal"
 
 
+def siwc_orchestrate_plus(screen, root, cwd):
+    def git(*args, path=cwd):
+        return subprocess.check_output(["git", *args], cwd=path, text=True)
+
+    report = cwd / "report.txt"
+    report.write_text("before fixture\n")
+    check = cwd / "check.sh"
+    marker = root / "check-ran"
+    check.write_text(f'#!/bin/sh\nset -eu\ngrep -q "^after fixture" report.txt\ncat report.txt >> "{marker}"\nprintf "fixture-check-output\\n"\n')
+    check.chmod(0o700)
+    git("init", "-q")
+    git("add", "report.txt", "check.sh")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "fixture")
+    original = git("rev-parse", "HEAD")
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "SIWC adapter starts Carbon")
+    local(screen, "/orchestrate+")
+    until(screen, lambda frame: "Save role models" in frame, "all three role selectors")
+    for role, model, model_offset, effort in [
+        ("Strong", "gpt-6.2-sol", 0, "high"),
+        ("Medium", "gpt-6.1-sol", 1, "medium"),
+        ("Weak", "gpt-6.1-luna", 2, "low"),
+    ]:
+        screen.send(b"\r")
+        until(screen, lambda frame: f"{role} · model" in frame, f"{role} model chooser")
+        screen.send(b"\x1b[B" * model_offset + b"\r")
+        until(screen, lambda frame: f"{role} · {model}" in frame and effort in frame,
+              f"{role} model's supported effort")
+        screen.send(b"\x1b[B\r")
+        until(screen, lambda frame: "Save role models" in frame and f"{model} · {effort}" in frame,
+              f"{role} selection")
+    screen.send(b"\r")
+    until(screen, lambda frame: "Orchestrate+ role models saved" in frame, "durable role profile")
+    screen.send(b"\t\t\t")
+    until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2), "ordinary Orchestrate+ mode")
+    screen.send(b"Exercise quick, fresh, and final review decisions\r")
+    until(screen, lambda frame: all(label in frame for label in ("PLUS_CARBON_PLAN", "Start", "Refine", "Cancel")),
+          "approval shows plan and role models")
+    frame = visible(screen)
+    assert all(f"{model} · {effort}" in frame for model, effort in [
+        ("gpt-6.2-sol", "high"), ("gpt-6.1-sol", "medium"), ("gpt-6.1-luna", "low")])
+    assert "./check.sh" in frame and not marker.exists()
+    ledgers = root / "home/.ansa/orchestration"
+    assert not ledgers.exists()
+    screen.send(b"\r")
+    until(screen, lambda frame: "PLUS_CARBON_DONE" in frame, "completed Plus synthesis", timeout=45)
+
+    checkout, = ledgers.glob("*/*/checkout")
+    assert git("show", "ansa-result:report.txt", path=checkout) == "after fixture reviewed\n"
+    assert git("rev-parse", "HEAD") == original and report.read_text() == "before fixture\n"
+    assert not git("status", "--short", "--untracked-files=no")
+    assert marker.read_text() == "after fixture\nafter fixture reviewed\n"
+    release = json.loads((checkout.parent / "release.json").read_text())
+    assert release["candidate"] == git("rev-parse", "ansa-result", path=checkout).strip()
+    assert git("diff", "--name-only", release["baseline"], release["candidate"], path=checkout) == "report.txt\n"
+    trace = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
+    assert trace == [
+        "strong-plan", "medium-plan", "coordinate", *["worker-rejected", "reject"] * 3,
+        "escalate-quick", "quick-fix", "quick-verify", "coordinate",
+        *["worker-rejected", "reject"] * 3, "escalate-fresh", "fresh-coordinate",
+        "fresh-worker", "fresh-verify", "whole-review", "review-coordinate",
+        "review-fix", "targeted-review", "summary",
+    ], trace
+    reviewers = []
+    for directory in (root / "home/.ansa/sessions").iterdir():
+        if directory.is_dir() and not directory.is_symlink():
+            rows = session_cases.decode({path.name: path.read_bytes() for path in directory.glob("part-*.log")})
+            turns = [row["turn"] for row in rows if row["kind"] == "accepted" and
+                     row["text"].startswith(("Perform the whole candidate's", "Recheck the preceding findings"))]
+            if turns:
+                reviewers.append(turns)
+    assert reviewers == [["plus-review-0", "plus-review-1"]], reviewers
+    local(screen, "/exit")
+    return "normal"
+
+
 def siwc_orchestration(screen, root, cwd):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "GPT ready without a network call")
     screen.send(b"\t\t")
@@ -1391,7 +1470,9 @@ def main():
              ("editor-stopped", lambda *a: editor_early_exit(*a, True)),
              ("editor-missing", editor_missing), ("normal-exit", normal_exit),
              ("openrouter-orchestration", openrouter_orchestration),
-             ("siwc-orchestration", siwc_orchestration)]
+             ("siwc-orchestration", siwc_orchestration),
+             ("siwc-orchestrate-plus", siwc_orchestrate_plus)]
+    transport_cases = {"openrouter-orchestration", "siwc-orchestration", "siwc-orchestrate-plus"}
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -1401,7 +1482,7 @@ def main():
     if args.selected_cases:
         cases = [(name, case) for name, case in cases if name in args.selected_cases]
     else:
-        cases = [(name, case) for name, case in cases if name not in ("openrouter-orchestration", "siwc-orchestration")]
+        cases = [(name, case) for name, case in cases if name not in transport_cases]
     results = []
     for name, case in cases:
         started = time.monotonic()
@@ -1417,18 +1498,22 @@ def main():
                 editor.write_text('#!/bin/sh\nkill -STOP $$\nprintf resumed > after-stop\n')
             editor.chmod(0o700)
             editor_path = cwd / "does-not-exist" if name == "editor-missing" else editor
-            if name in ("openrouter-orchestration", "siwc-orchestration"):
+            if name in transport_cases:
                 home.chmod(0o700)
                 cwd.chmod(0o700)
-                if name == "siwc-orchestration":
+                if name.startswith("siwc-"):
                     seed_siwc(home)
+                if name == "siwc-orchestration":
                     nested = home / "Workspace/pet/ansa"
                     nested.mkdir(parents=True)
                     (nested / "AGENTS.md").write_text("Follow the fixture instructions.\n" * 600 + "END_NESTED_INSTRUCTIONS\n")
-                adapter = name.replace("-orchestration", "-carbon")
-                screen = Pty(str(args.binary.resolve()), root, home, cwd, "", True, size=(100, 32),
+                if name == "siwc-orchestrate-plus":
+                    (root / "orchestration-plus").touch()
+                adapter = "openrouter-carbon" if name.startswith("openrouter-") else "siwc-carbon"
+                size = (110, 44) if name == "siwc-orchestrate-plus" else (100, 32)
+                screen = Pty(str(args.binary.resolve()), root, home, cwd, "", True, size=size,
                              argv=["--frontend-fixture", str(root), adapter])
-                screen.vt = Terminal(100, 32)
+                screen.vt = Terminal(*size)
             else:
                 screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)})
             try:
@@ -1441,11 +1526,28 @@ def main():
                                 "duration": time.monotonic() - started})
             except Exception as error:
                 results.append({"case": name, "passed": False, "error": repr(error), "duration": time.monotonic() - started})
+                if name == "siwc-orchestrate-plus":
+                    store = home / ".ansa/orchestration"
+                    events = {str(path.relative_to(store)): json.loads(path.read_text())
+                              for path in sorted(store.glob("**/event-*.json"))}
+                    marker = root / "check-ran"
+                    diagnostic = {
+                        "ledger_events": events,
+                        "check_runs": marker.read_text().splitlines() if marker.is_file() else [],
+                    }
+                    try:
+                        diagnostic["pauses"] = [row for row in records(root) if row["kind"] == "pause"]
+                    except (AssertionError, OSError, ValueError) as capture_error:
+                        diagnostic["pause_capture_error"] = repr(capture_error)
+                    (args.output / (name + ".failure.json")).write_text(
+                        json.dumps(diagnostic, ensure_ascii=False, indent=2) + "\n")
                 raise
             finally:
                 (args.output / (name + ".pty")).write_bytes(screen.raw)
                 (args.output / (name + ".journals.json")).write_text(json.dumps(journals(root)) + "\n")
                 (args.output / (name + ".screen.txt")).write_text(visible(screen))
+                if (trace := root / "plus-requests.jsonl").is_file():
+                    (args.output / (name + ".requests.jsonl")).write_bytes(trace.read_bytes())
                 (args.output / (name + ".observations.json")).write_text(json.dumps(screen.observations, ensure_ascii=False, indent=2) + "\n")
                 (args.output / "report.json").write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n")
                 screen.close()
