@@ -28,6 +28,7 @@ const INPUT_LIMIT: usize = 64 * 1024;
 const INPUT_CHUNK: usize = 4096;
 const MAX_ROWS: u16 = 128;
 const MAX_COLS: u16 = 256;
+const CLEANUP_UNKNOWN: &str = "terminal_cleanup_unknown";
 
 #[derive(Clone, Debug)]
 pub struct TerminalSnapshot {
@@ -40,6 +41,7 @@ pub struct TerminalSnapshot {
     pub supports_directory_change: bool,
     pub exited: bool,
     pub error: Option<String>,
+    pub exit_status: Option<std::process::ExitStatus>,
     pub revision: u64,
     pub application_cursor: bool,
     pub application_keypad: bool,
@@ -47,6 +49,7 @@ pub struct TerminalSnapshot {
     pub alternate_screen: bool,
     pub mouse_protocol: MouseProtocolMode,
     pub mouse_encoding: MouseProtocolEncoding,
+    startup_failed: bool,
 }
 impl TerminalSnapshot {
     fn empty(cwd: PathBuf) -> Self {
@@ -58,6 +61,7 @@ impl TerminalSnapshot {
             supports_directory_change: false,
             exited: false,
             error: None,
+            exit_status: None,
             revision: 0,
             application_cursor: false,
             application_keypad: false,
@@ -65,7 +69,14 @@ impl TerminalSnapshot {
             alternate_screen: false,
             mouse_protocol: MouseProtocolMode::None,
             mouse_encoding: MouseProtocolEncoding::Default,
+            startup_failed: false,
         }
+    }
+    pub fn cleanup_known(&self, outcome: &CleanupOutcome) -> bool {
+        (outcome.shell_reaped && outcome.session_empty)
+            || (self.startup_failed
+                && self.error.as_deref() != Some(CLEANUP_UNKNOWN)
+                && outcome.error.is_none())
     }
 }
 #[derive(Default)]
@@ -83,7 +94,17 @@ pub struct TerminalPane {
     control: Arc<Mutex<Control>>,
     latest: Arc<Mutex<Arc<TerminalSnapshot>>>,
     worker: Option<JoinHandle<CleanupOutcome>>,
+    editor: bool,
 }
+
+enum Launch {
+    Shell {
+        path: PathBuf,
+        home: Option<PathBuf>,
+    },
+    Editor(Command),
+}
+
 impl TerminalPane {
     pub fn spawn(cwd: &Path, rows: u16, cols: u16) -> io::Result<Self> {
         let selected = std::env::var_os("SHELL")
@@ -102,9 +123,30 @@ impl TerminalPane {
         cols: u16,
         home: Option<PathBuf>,
     ) -> io::Result<Self> {
+        Self::start(
+            Launch::Shell {
+                path: shell.to_owned(),
+                home,
+            },
+            cwd,
+            rows,
+            cols,
+        )
+    }
+
+    pub fn spawn_editor(argv: &[String], cwd: &Path, rows: u16, cols: u16) -> io::Result<Self> {
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| io::Error::other("workspace_editor_command"))?;
+        let mut command = Command::new(program);
+        command.args(args);
+        Self::start(Launch::Editor(command), cwd, rows, cols)
+    }
+
+    fn start(launch: Launch, cwd: &Path, rows: u16, cols: u16) -> io::Result<Self> {
         let size = checked_size(rows, cols)?;
-        let shell = shell.to_owned();
         let cwd = cwd.to_owned();
+        let editor = matches!(launch, Launch::Editor(_));
         let (input, receiver) = mpsc::sync_channel::<Vec<u8>>(32);
         let queued = Arc::new(AtomicUsize::new(0));
         let interrupt = Arc::new(AtomicBool::new(false));
@@ -120,20 +162,20 @@ impl TerminalPane {
             thread::Builder::new()
                 .name("ansa-terminal".into())
                 .spawn(move || {
-                    let mut init = match ShellInit::new(&shell, home.as_deref()) {
-                        Ok(init) => init,
+                    if stop.load(Ordering::Acquire) {
+                        return stopped_before_spawn();
+                    }
+                    let (mut command, mut init) = match launch.prepare() {
+                        Ok(prepared) => prepared,
                         Err(error) => {
                             startup_failure(&latest, error);
                             return CleanupOutcome::default();
                         }
                     };
-                    let mut command = init.command(&shell);
-                    if let Some(home) = home {
-                        command
-                            .env("HOME", &home)
-                            .env("XDG_CONFIG_HOME", home.join(".config"));
-                    }
                     command.current_dir(&cwd).env("TERM", "xterm-256color");
+                    if stop.load(Ordering::Acquire) {
+                        return stopped_before_spawn();
+                    }
                     let mut pty = match PtySession::spawn(command, size.0, size.1) {
                         Ok(pty) => pty,
                         Err(error) => {
@@ -279,14 +321,23 @@ impl TerminalPane {
                             && !parser.screen().alternate_screen();
                         dirty |= state.shell_ready != ready;
                         state.shell_ready = ready;
-                        if let Ok(cwd) = pty.cwd() {
+                        if !editor && let Ok(cwd) = pty.cwd() {
                             dirty |= state.cwd != cwd;
                             state.cwd = cwd;
                         }
-                        let exited = pty.exited().unwrap_or_else(|error| {
-                            state.error = Some(error.to_string());
-                            true
-                        });
+                        let exited = pty
+                            .exited()
+                            .and_then(|exited| {
+                                if editor && !exited && pty.leader_stopped()? {
+                                    state.error = Some("editor_stopped".into());
+                                    return Ok(true);
+                                }
+                                Ok(exited)
+                            })
+                            .unwrap_or_else(|error| {
+                                state.error = Some(error.to_string());
+                                true
+                            });
                         unpublished |= dirty;
                         if unpublished && last_publish.elapsed() >= Duration::from_millis(16)
                             || exited
@@ -316,9 +367,10 @@ impl TerminalPane {
                         final_state.exited = true;
                         final_state.shell_ready = false;
                         final_state.cursor = None;
+                        final_state.exit_status = pty.exit_status();
                         final_state.revision = final_state.revision.saturating_add(1);
                         if !outcome.shell_reaped || !outcome.session_empty {
-                            final_state.error = Some("terminal_cleanup_unknown".into());
+                            final_state.error = Some(CLEANUP_UNKNOWN.into());
                         }
                         *latest = Arc::new(final_state);
                     }
@@ -334,6 +386,7 @@ impl TerminalPane {
             control,
             latest,
             worker: Some(worker),
+            editor,
         })
     }
 
@@ -354,7 +407,7 @@ impl TerminalPane {
         if self.snapshot().exited {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "terminal_exited"));
         }
-        if bytes == [3] {
+        if !self.editor && bytes == [3] {
             self.interrupt.store(true, Ordering::Release);
             return Ok(());
         }
@@ -426,6 +479,9 @@ impl TerminalPane {
             })
             .unwrap_or_default()
     }
+    pub fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
     pub fn cancel_directory_change(&self) {
         if let Ok(mut control) = self.control.try_lock() {
             control.directory = None;
@@ -433,13 +489,44 @@ impl TerminalPane {
         }
     }
 }
+
+impl Launch {
+    fn prepare(self) -> io::Result<(Command, ShellInit)> {
+        match self {
+            Self::Editor(command) => Ok((command, ShellInit::default())),
+            Self::Shell { path, home } => {
+                let init = ShellInit::new(&path, home.as_deref())?;
+                let mut command = init.command(&path);
+                if let Some(home) = home {
+                    command
+                        .env("HOME", &home)
+                        .env("XDG_CONFIG_HOME", home.join(".config"));
+                }
+                Ok((command, init))
+            }
+        }
+    }
+}
 fn startup_failure(latest: &Mutex<Arc<TerminalSnapshot>>, error: io::Error) {
     if let Ok(mut latest) = latest.lock() {
         let mut state = (**latest).clone();
-        state.error = Some(error.to_string());
+        let error = error.to_string();
+        state.error = Some(if error == "pty_startup_cleanup_unknown" {
+            CLEANUP_UNKNOWN.into()
+        } else {
+            error
+        });
+        state.startup_failed = true;
         state.exited = true;
         state.revision += 1;
         *latest = Arc::new(state);
+    }
+}
+fn stopped_before_spawn() -> CleanupOutcome {
+    CleanupOutcome {
+        shell_reaped: true,
+        session_empty: true,
+        error: None,
     }
 }
 impl Drop for TerminalPane {
@@ -761,6 +848,7 @@ impl BashInput {
     }
 }
 
+#[derive(Default)]
 struct ShellInit {
     directory: Option<PathBuf>,
     marker: Vec<u8>,
@@ -774,15 +862,7 @@ impl ShellInit {
     fn new(shell: &Path, home: Option<&Path>) -> io::Result<Self> {
         let name = shell.file_name().and_then(OsStr::to_str).unwrap_or("");
         if !matches!(name, "bash" | "zsh") {
-            return Ok(Self {
-                directory: None,
-                marker: Vec::new(),
-                zsh: false,
-                user_zdotdir: None,
-                notify: None,
-                request: None,
-                next_request: 0,
-            });
+            return Ok(Self::default());
         }
         let mut random = [0; 16];
         SystemRandom::new()

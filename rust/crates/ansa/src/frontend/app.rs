@@ -177,18 +177,13 @@ fn save_openrouter(path: &Path) -> Result<i32> {
 
 pub(super) fn openrouter_runtime(route: Arc<OpenRouter>) -> (Generate, RuntimeOptions) {
     let catalog = route.clone();
+    let select = route.clone();
     let generate: Generate = Arc::new(move |request, stop, _| route.generate(request, stop));
     let options = RuntimeOptions {
         compact: Some(summarizer(generate.clone())),
         model_window: Arc::new(move |request| catalog.cached_window(request)),
         keep_recent_turns: 2,
-        select_generation: Arc::new(|selection, stop| {
-            stop.check()?;
-            if selection.model != OPENROUTER_MODEL || selection.effort.is_some() {
-                return Err("model_not_available");
-            }
-            Ok(())
-        }),
+        select_generation: Arc::new(move |selection, stop| select.validate_role(selection, stop)),
         ..RuntimeOptions::default()
     };
     (generate, options)
@@ -806,7 +801,7 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                     }
                     if plus {
                         let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let item = plus_fixture_response(&request, input, &trace, index)?;
+                        let item = plus_fixture_response(&request, input, &trace, index, stop)?;
                         let mut added = item.clone();
                         added["status"] = json!("in_progress");
                         if item["type"] == "function_call" {
@@ -923,6 +918,7 @@ fn plus_fixture_response(
     input: &[serde_json::Value],
     trace: &Path,
     index: usize,
+    stop: &Cancel,
 ) -> Result<serde_json::Value> {
     use serde_json::{Value, json};
     let prompt = |item: &Value| {
@@ -1023,7 +1019,16 @@ fn plus_fixture_response(
             edit = Some(("after fixture", "after fixture reviewed"));
             ("review-fix", weak, completed("REVIEW_FIX_APPLIED"))
         }
-        None => ("summary", (model, ""), "PLUS_CARBON_DONE".into()),
+        None if task == "PLUS_BASE_CONTEXT" => {
+            ("prior-work", (model, ""), "PLUS_CONTEXT_READY".into())
+        }
+        None if task == "PLUS_WORK_FOLLOWUP" => {
+            if !seen("PLUS_CARBON_PLAN") || !seen("PLUS_CARBON_DONE") {
+                return Err("fixture_parent_context");
+            }
+            ("later-work", strong, "PLUS_CONTINUITY_OK".into())
+        }
+        None => ("summary", strong, "PLUS_CARBON_DONE".into()),
         _ => return Err("fixture_format"),
     };
     if !role.1.is_empty() && (model != role.0 || request["reasoning"]["effort"] != role.1) {
@@ -1060,6 +1065,15 @@ fn plus_fixture_response(
         .open(trace)
         .and_then(|mut file| writeln!(file, "{line}"))
         .map_err(|_| "fixture_trace")?;
+    let hold = trace.with_file_name(format!("hold-plus-{stage}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while hold.exists() {
+        stop.check()?;
+        if std::time::Instant::now() >= deadline {
+            return Err("fixture_hold_timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     Ok(
         json!({"type":"message","id":id,"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}),
     )

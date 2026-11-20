@@ -224,9 +224,10 @@ impl Progress {
                 action: None,
                 edit: None,
                 output: None,
+                agent: None,
                 status: None,
                 role: "tool".into(),
-                text: format!("{begin} more calls · Ctrl+T details"),
+                text: format!("{begin} more calls · Ctrl+O details"),
             });
         }
         for activity in &view.tools[begin..] {
@@ -287,6 +288,7 @@ impl Progress {
                 action: None,
                 edit: None,
                 output: None,
+                agent: None,
                 status: None,
                 role: "tool".into(),
                 text,

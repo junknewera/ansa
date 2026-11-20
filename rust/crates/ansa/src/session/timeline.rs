@@ -338,7 +338,7 @@ impl Timeline {
                         )
                     })
                     .collect();
-                self.final_text = codec_v1::response_text(&response)?;
+                self.final_text = super::state::display_response(&response)?;
                 for item in response.items() {
                     let item = item.value();
                     if item.text_field("type")? == "reasoning" && item.has("summary") {

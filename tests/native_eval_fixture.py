@@ -119,14 +119,14 @@ def capture(binary, directory, arm, receipt):
         try:
             if arm != "N0":
                 screen.send(b"\t\t")
-                until(screen, lambda _: "Orchestration" in screen.vt.line(-2), "orchestration mode")
+                until(screen, lambda _: "Orchestrate" in screen.vt.line(-2), "orchestration mode")
             screen.send(PROMPT.rstrip(b"\n") + b"\r")
             if arm == "N0":
                 until(screen, lambda _: completed(root, PROMPT.decode().strip()), "ordinary Work turn")
             else:
                 until(screen, lambda frame: "./check.sh" in frame and "Refine" in frame, "plan confirmation")
                 screen.send(b"\r")
-                marker = "offline_eval_verified" if arm == "N1" else "ansa-result готова"
+                marker = "offline_eval_verified" if arm == "N1" else "Verified changes"
                 until(screen, lambda frame: marker in frame, "frozen candidate", timeout=15)
                 if arm == "N2":
                     until(screen, lambda _: any((home / ".ansa/orchestration").glob(
@@ -159,7 +159,20 @@ def capture(binary, directory, arm, receipt):
             approved = evaluation.decode(evaluation.read(run / "verification-0/approved-plan.json"))
             require(approved["command_checks"] == [{"argv": ["./check.sh"]}], "wrong approved plan")
             builder = one_trace(sessions, "Синтетическая правка отчёта", "edit_file")
-            stages = {"planner": (run.parent.name, approved), "builder": builder,
+            parent_id = run.parent.name
+            parent_rows = sessions[parent_id]
+            draft_at, = [index for index, row in enumerate(parent_rows)
+                         if row["kind"] == "accepted" and row["text"] == PROMPT.decode().strip()]
+            draft = []
+            for row in parent_rows[draft_at + 1:]:
+                if row["kind"] == "accepted":
+                    break
+                draft.append(row)
+            require([row["kind"] for row in draft].count("response") == 1
+                    and any(row["kind"] == "done" for row in draft)
+                    and not any(row["kind"] in ("intent", "outcome") for row in draft),
+                    "planner did not complete a native tool-free turn in the parent")
+            stages = {"planner": (parent_id, {"plan": approved, "journal": draft}), "builder": builder,
                       "verification": (None, command_evidence(run, candidate))}
             if arm == "N1":
                 require(not (run / "review-0").exists() and not (run / "release.json").exists()
@@ -184,7 +197,7 @@ def capture(binary, directory, arm, receipt):
             {"base": original, "base_tree": base_tree.decode(), "candidate": candidate}))
         events = [event for rows in sessions.values() for event in rows]
         receipt["usage"] = {
-            "calls": sum(event["kind"] == "response" for event in events) + int(arm != "N0"),
+            "calls": sum(event["kind"] == "response" for event in events),
             "tools": sum(event["kind"] == "outcome" for event in events),
             "retries": 0, "checks": int(arm != "N0"),
             "compacts": sum(event["kind"] == "compacted" for event in events),

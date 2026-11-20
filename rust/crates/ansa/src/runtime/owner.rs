@@ -10,8 +10,8 @@ use crate::{
     protocol::json::Json,
     provider::replay::Effects,
     session::{
-        codec_v1::{Invocation, SavedResult, response_text, save_response},
-        state::{Receipt as SubmitReceipt, State},
+        codec_v1::{Invocation, SavedResult, save_response},
+        state::{Receipt as SubmitReceipt, State, display_response},
         transcript::ToolDetail,
     },
     tools::registry::Snapshot as Tools,
@@ -279,7 +279,7 @@ impl Owner {
                 .turn
                 .as_ref()
                 .and_then(|t| t.response.as_ref())
-                .and_then(|r| response_text(r).ok())
+                .and_then(|r| display_response(r).ok())
                 .unwrap_or_default()
         } else {
             String::new()
@@ -527,6 +527,7 @@ impl Owner {
 
     fn match_child_submit(receipt: &SubmitReceipt, lookup: &ChildLookup) -> Result<()> {
         if receipt.internal
+            || receipt.draft.is_some()
             || receipt.turn != lookup.turn
             || receipt.mode != lookup.submit.mode
             || *receipt.text != lookup.submit.text
@@ -542,7 +543,7 @@ impl Owner {
             if final_text
                 && let Some(response) = self.state.turn.as_ref().and_then(|t| t.response.as_ref())
             {
-                preview.text = response_text(response).unwrap_or_default();
+                preview.text = display_response(response).unwrap_or_default();
             }
             preview.state = state.into();
             let value = preview.clone();
@@ -760,7 +761,13 @@ impl Owner {
     fn provider(&mut self, workers: &Workers, task: ProviderTask) -> Result<()> {
         let identity = self.identity()?;
         self.gate.allow(&identity)?;
-        let preview_generation = if self.options.streaming && matches!(task, ProviderTask::Generate)
+        let preview_generation = if self.options.streaming
+            && matches!(task, ProviderTask::Generate)
+            && self
+                .state
+                .turn
+                .as_ref()
+                .is_none_or(|turn| turn.receipt.draft.is_none())
         {
             self.preview_sequence += 1;
             self.preview = Some(Preview {
@@ -1081,8 +1088,14 @@ impl Owner {
                     query: page.query,
                 }));
             }
-            CommandPayload::Submit(submitted) | CommandPayload::Handoff(submitted) => {
+            CommandPayload::Submit(submitted)
+            | CommandPayload::Handoff(submitted)
+            | CommandPayload::DraftPlan(submitted, _) => {
                 let internal = matches!(command.payload, CommandPayload::Handoff(_));
+                let draft = match &command.payload {
+                    CommandPayload::DraftPlan(_, draft) => Some(draft.as_ref()),
+                    _ => None,
+                };
                 if self
                     .state
                     .generation_commands
@@ -1105,6 +1118,7 @@ impl Owner {
                         || receipt.turn != command.turn
                         || receipt.mode != submitted.mode
                         || receipt.internal != internal
+                        || receipt.draft.as_ref() != draft
                     {
                         return Ok(PostStatus::CommandConflict);
                     }
@@ -1149,6 +1163,7 @@ impl Owner {
                         state: "queued".into(),
                         mode: submitted.mode,
                         internal,
+                        draft: draft.cloned(),
                     },
                 );
                 self.queued.push_back(command.clone());
@@ -1243,8 +1258,16 @@ impl Owner {
             self.reject_plan(&command, "terminal_workspace_busy");
             return Ok(());
         }
+        if matches!(&command.payload, CommandPayload::DraftPlan(_, draft)
+            if !draft.accepts_generation(&self.state.generation))
+        {
+            self.reject(&command, "orchestration_generation_changed");
+            return Ok(());
+        }
         let (submitted, internal) = match command.payload {
-            CommandPayload::Submit(submitted) => (submitted, false),
+            CommandPayload::Submit(submitted) | CommandPayload::DraftPlan(submitted, _) => {
+                (submitted, false)
+            }
             CommandPayload::Handoff(submitted) => (submitted, true),
             _ => return Err("submit_contract"),
         };
@@ -1279,7 +1302,12 @@ impl Owner {
             workers,
             Kind::Accepted,
             Box::new(move |state| {
-                let next = state.request_for_input(&submitted.text, submitted.mode, internal)?;
+                let next = state.request_for_input(
+                    &submitted.text,
+                    submitted.mode,
+                    internal,
+                    receipt.draft.as_ref(),
+                )?;
                 let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;
                 let compact = can_compact
                     && !inherited_incomplete_turn
@@ -1317,6 +1345,9 @@ impl Owner {
                 ];
                 if internal {
                     fields.push(("handoff", Json::parse("true")?));
+                }
+                if let Some(draft) = receipt.draft {
+                    fields.push(("draft", draft.save()?));
                 }
                 Json::object_with_limits(fields, crate::session::journal_v1::MAX_RECORD)
             }),
@@ -1474,11 +1505,9 @@ impl Owner {
             if self.phase != "paused" || self.recovery.is_some() {
                 return Ok(());
             }
-            let plan_mode = self
-                .state
-                .turn
-                .as_ref()
-                .is_some_and(|turn| turn.receipt.mode == AgentMode::Plan);
+            let plan_mode = self.state.turn.as_ref().is_some_and(|turn| {
+                turn.receipt.mode == AgentMode::Plan && turn.receipt.draft.is_none()
+            });
             if plan_mode && !self.tools.plan_ready() {
                 self.emit(EventPayload::RuntimeError {
                     command: Some(command),
@@ -1799,7 +1828,7 @@ impl Owner {
                 self.phase = "completed".into();
                 self.finish_preview("committed", true);
                 if let Some(response) = self.state.turn.as_ref().and_then(|t| t.response.as_ref()) {
-                    let text = response_text(response)?;
+                    let text = display_response(response)?;
                     if !text.is_empty() {
                         self.emit(EventPayload::TextDelta { text });
                     }
@@ -1944,6 +1973,13 @@ impl Owner {
                     Err(code) => self.pause(code),
                     Ok(ProviderValue::Response(response)) => {
                         let current = self.state.turn.as_ref().ok_or("runtime_turn")?;
+                        if current.receipt.draft.is_some()
+                            && current.receipt.mode == AgentMode::Plan
+                            && !response.orchestration_plan()?.is_read_only()
+                        {
+                            self.pause("plan_mode_read_only");
+                            return Ok(());
+                        }
                         let completed = current.operation_offset + current.results.len();
                         if !response.calls().is_empty()
                             && (current.rounds >= 64
@@ -2450,4 +2486,249 @@ fn child_receipts_preserve_scoped_read_evidence_and_omit_command_output() {
     assert_eq!(shell.output_bytes, 300);
     assert!(shell.output_excerpt.is_empty());
     assert!(shell.target.is_empty());
+}
+
+#[cfg(test)]
+#[tokio::test(flavor = "current_thread")]
+async fn native_draft_keeps_compacted_context_and_cancels_with_submit_queue_full() {
+    use crate::{
+        frontend::{app, offline},
+        provider::{
+            contracts::PlanDraft,
+            request::{Epoch, Request},
+            structured::FinalFormat,
+        },
+    };
+    use std::time::Duration;
+
+    let tools = app::pure_tools().unwrap();
+    let configuration = Request::new(
+        app::binding(),
+        Epoch {
+            id: "test".into(),
+            instructions: "test".into(),
+            exact_state: Json::parse("{}").unwrap(),
+        },
+        tools.advertisement().clone(),
+        vec![],
+    )
+    .unwrap();
+    let (observed, mut drafts) = mpsc::unbounded_channel();
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    let generate: Generate = Arc::new(move |request, stop, _| {
+        if request.final_format().is_some() {
+            observed.send(request.clone()).unwrap();
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("fixture_draft_retry");
+            }
+            while !stop.cancelled() {
+                stop.wait(Duration::from_millis(10));
+            }
+            return Err("fixture_draft_cancelled");
+        }
+        offline::generate(request, stop)
+    });
+    let mut runtime = Runtime::new(
+        "draft_test".into(),
+        configuration,
+        tools,
+        generate,
+        Limits {
+            commands: 1,
+            ..Limits::default()
+        },
+        Options {
+            compact: Some(Arc::new(offline::compact_retained)),
+            model_window: Arc::new(|_| Some(100_000)),
+            keep_recent_turns: 2,
+            autocompact_percent: Some(100),
+            plan_guard: Some(Arc::new(|| Err("fixture_busy_workspace"))),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    runtime.ready().await.unwrap();
+    let handle = runtime.handle();
+    let command = |id: &str, payload| RuntimeCommand {
+        schema_version: 1,
+        session: handle.session().clone(),
+        incarnation: handle.incarnation().clone(),
+        turn: id.into(),
+        command: id.into(),
+        payload,
+    };
+    let for_draft = |id: &str, payload| RuntimeCommand {
+        turn: "planner".into(),
+        ..command(id, payload)
+    };
+    let next = |stage: &'static str| {
+        let handle = &handle;
+        async move {
+            let event = tokio::time::timeout(Duration::from_secs(3), handle.next_event())
+                .await
+                .unwrap_or_else(|_| panic!("no event while {stage}"))
+                .unwrap();
+            if let EventPayload::RuntimeError { diagnostic, .. } = &event.payload {
+                assert_eq!(diagnostic, "fixture_draft_retry", "error while {stage}");
+            }
+            event
+        }
+    };
+    let done = |id: &'static str| async move {
+        loop {
+            let event = next(id).await;
+            if event.turn.0 == id && matches!(event.payload, EventPayload::Done) {
+                break;
+            }
+        }
+    };
+    let basic = |text: &str| {
+        CommandPayload::Submit(Submit {
+            text: text.into(),
+            mode: AgentMode::Basic,
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let earliest = format!("prior-{}", "context ".repeat(1700));
+        for (id, text) in [
+            ("early", earliest.as_str()),
+            ("later", "retained exact text"),
+            ("latest", "most recent turn"),
+        ] {
+            assert_eq!(
+                handle.post(command(id, basic(text))).await.unwrap(),
+                PostStatus::Accepted
+            );
+            done(id).await;
+        }
+        assert_eq!(
+            handle
+                .post(command(
+                    "compact_threshold",
+                    CommandPayload::SetAutocompact(1)
+                ))
+                .await
+                .unwrap(),
+            PostStatus::Accepted
+        );
+        let draft = CommandPayload::DraftPlan(
+            Submit {
+                text: "revise our plan".into(),
+                mode: AgentMode::Plan,
+            },
+            Box::new(PlanDraft {
+                instructions: "Draft a read-only plan.".into(),
+                format: FinalFormat::OrchestrationPlanWithReadFolder,
+                previous_prompt: None,
+                skill: None,
+                profile: None,
+            }),
+        );
+        assert_eq!(
+            handle.post(command("planner", draft)).await.unwrap(),
+            PostStatus::Accepted
+        );
+        let request = loop {
+            let event = next("accepting the draft").await;
+            if let EventPayload::CommandAccepted {
+                command,
+                request: Some(request),
+            } = event.payload
+                && command.0 == "planner"
+            {
+                break request;
+            }
+        };
+        let input = loop {
+            tokio::select! {
+                biased;
+                input = drafts.recv() => break input.unwrap(),
+                _ = next("compacting and generating the draft") => {}
+            }
+        };
+        assert!(input.tools.descriptors.is_empty());
+        assert_eq!(
+            input.input.last().unwrap().text_field("content"),
+            Ok("revise our plan")
+        );
+        assert!(
+            input
+                .input
+                .iter()
+                .any(|item| item.text_field("content") == Ok("retained exact text"))
+        );
+        assert!(input.input.iter().any(|item| {
+            item.dump()
+                .contains("Earlier fixture turns were summarized.")
+        }));
+        assert!(
+            !input
+                .input
+                .iter()
+                .any(|item| item.text_field("content") == Ok(earliest.as_str()))
+        );
+
+        loop {
+            let event = next("waiting for the synthetic pause").await;
+            if matches!(event.payload, EventPayload::RuntimeError { diagnostic, .. }
+                if diagnostic == "fixture_draft_retry")
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            handle
+                .post(for_draft(
+                    "resume_draft",
+                    CommandPayload::Resume(request.clone())
+                ))
+                .await
+                .unwrap(),
+            PostStatus::Accepted
+        );
+        let resumed = loop {
+            tokio::select! {
+                biased;
+                input = drafts.recv() => break input.unwrap(),
+                _ = next("resuming the draft") => {}
+            }
+        };
+        assert_eq!(resumed.save().unwrap(), input.save().unwrap());
+        assert_eq!(
+            handle
+                .post(command("waiting", basic("queued Work")))
+                .await
+                .unwrap(),
+            PostStatus::Accepted
+        );
+        assert_eq!(
+            handle
+                .post(command("overflow", basic("must stay out")))
+                .await
+                .unwrap(),
+            PostStatus::QueueFull
+        );
+        assert_eq!(
+            handle
+                .post(for_draft(
+                    "cancel_draft",
+                    CommandPayload::Cancel(request.clone())
+                ))
+                .await
+                .unwrap(),
+            PostStatus::Accepted
+        );
+        loop {
+            let event = next("cancelling the draft").await;
+            if matches!(event.payload, EventPayload::Cancelled { .. }) {
+                assert_eq!(event.turn.0, "planner");
+                assert_eq!(event.request, Some(request));
+                break;
+            }
+        }
+        done("waiting").await;
+    })
+    .await
+    .expect("native draft, compaction and cancellation completed");
+    runtime.shutdown().await.unwrap();
 }

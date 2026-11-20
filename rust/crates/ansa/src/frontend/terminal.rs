@@ -3,7 +3,6 @@ use super::{Result, carbon::Frame};
 use ansa_linux::terminal::{Descriptor, Nonblocking, RawMode, Signals};
 use std::{
     collections::VecDeque,
-    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -316,7 +315,6 @@ pub struct Io {
     pub size: (usize, usize),
     pub color: bool,
     _nonblocking: Nonblocking,
-    editor_active: bool,
     reporting_enabled: bool,
     pub signals: Signals,
 }
@@ -351,7 +349,6 @@ impl Io {
             size,
             color,
             _nonblocking: nonblocking,
-            editor_active: false,
             reporting_enabled: terminal,
             signals,
         })
@@ -364,9 +361,6 @@ impl Io {
         if let Ok(output) = Descriptor::new(1) {
             self.size = output.size();
         }
-    }
-    pub fn editor_active(&self) -> bool {
-        self.editor_active
     }
     /// Queue reporting cleanup before the controller's final output drain and
     /// Writer::finish. A finished writer cannot deliver cleanup from Io::drop.
@@ -383,9 +377,6 @@ impl Io {
         Ok(())
     }
     pub fn resume_terminal(&mut self) -> Result<()> {
-        if self.editor_active {
-            return Ok(());
-        }
         self._nonblocking.resume().map_err(|_| "cli_output")?;
         if let Some(raw) = &mut self.raw {
             raw.resume().map_err(|_| "cli_termios")?;
@@ -401,9 +392,6 @@ impl Io {
     /// Return modes and aliased file flags before shell job control, then
     /// re-enter the frontend after SIGCONT. Waiting yields to the reactor.
     pub async fn suspend(&mut self) -> Result<()> {
-        if self.editor_active {
-            return Err("editor_active");
-        }
         self.stop_reporting()?;
         let deadline = Instant::now() + Duration::from_millis(250);
         while !self.writer.idle() {
@@ -420,40 +408,6 @@ impl Io {
         let restored = self.resume_terminal();
         result.and(restored)
     }
-    pub fn start_editor(&mut self, argv: &[String], directory: &Path) -> Result<EditorJob> {
-        if self.raw.is_none() {
-            return Err("editor_requires_terminal");
-        }
-        if self.editor_active {
-            return Err("editor_active");
-        }
-        if !self.writer.idle() || self.writer.failed() {
-            return Err("editor_output_pending");
-        }
-        if argv.is_empty() || argv[0].is_empty() || argv.iter().any(|arg| arg.contains('\0')) {
-            return Err("workspace_editor_command");
-        }
-        self.stop_reporting()?;
-        self.editor_active = true;
-        Ok(EditorJob {
-            argv: argv.to_vec(),
-            directory: directory.into(),
-            child: None,
-            cancelled: false,
-            done: false,
-            setup: EditorSetup::new(Instant::now()),
-        })
-    }
-    fn restore_editor(&mut self) -> Result<()> {
-        self.editor_active = false;
-        self.resume_terminal()?;
-        // An interrupted editor cannot run its own screen/cursor cleanup.
-        // Resume NONBLOCK before waking Writer, then reset before any frame.
-        if self.raw.is_some() && !self.writer.text("\x1b[?1049l\x1b[?25h\x1b[0m".into()) {
-            return Err("cli_output");
-        }
-        Ok(())
-    }
 }
 impl Drop for Io {
     fn drop(&mut self) {
@@ -461,161 +415,6 @@ impl Drop for Io {
         self.writer.finish();
         if let Some(raw) = &mut self.raw {
             raw.restore();
-        }
-    }
-}
-
-pub use ansa_linux::terminal::EditorExit;
-/// The frontend keeps polling this owner while an external editor controls the
-/// terminal. No other reader or repaint may use `Io` during that handoff.
-pub struct EditorJob {
-    argv: Vec<String>,
-    directory: PathBuf,
-    child: Option<ansa_linux::terminal::ForegroundEditor>,
-    cancelled: bool,
-    done: bool,
-    setup: EditorSetup,
-}
-enum EditorSetupPoll {
-    Cancelled,
-    Failed(&'static str),
-    Waiting,
-    Ready,
-}
-struct EditorSetup {
-    drain: Drain,
-    deadline: Instant,
-}
-impl EditorSetup {
-    fn new(now: Instant) -> Self {
-        Self {
-            drain: Drain::default(),
-            deadline: now + Duration::from_secs(1),
-        }
-    }
-    fn poll(
-        &mut self,
-        cancelled: bool,
-        failed: bool,
-        idle: bool,
-        written: u64,
-        now: Instant,
-    ) -> EditorSetupPoll {
-        // Cancellation cannot wait for stdout: no process has been launched,
-        // so the handoff can be abandoned immediately even under flow control.
-        if cancelled {
-            return EditorSetupPoll::Cancelled;
-        }
-        if failed {
-            return EditorSetupPoll::Failed("editor_setup_output_failed");
-        }
-        if now >= self.deadline || self.drain.stalled(written, idle, now) {
-            return EditorSetupPoll::Failed("editor_setup_output_stalled");
-        }
-        if idle {
-            EditorSetupPoll::Ready
-        } else {
-            EditorSetupPoll::Waiting
-        }
-    }
-}
-impl EditorJob {
-    pub fn cancel(&mut self) -> Result<()> {
-        self.cancelled = true;
-        if let Some(child) = &mut self.child {
-            child.cancel().map_err(|_| "editor_cancel")?;
-        }
-        Ok(())
-    }
-    /// Emergency cleanup after the caller's cancellation budget. The caller
-    /// must terminate the harness after this call, including when it returns
-    /// an error. Returning to a model or tool dispatch is not permitted.
-    pub fn abort_for_exit(&mut self, io: &mut Io) -> Result<EditorExit> {
-        self.cancelled = true;
-        self.done = true;
-        let result = self.child.take().map_or_else(
-            || {
-                Ok(EditorExit {
-                    code: 130,
-                    cleanup_unknown: false,
-                })
-            },
-            |mut child| {
-                child
-                    .abandon_for_exit()
-                    .map_err(|_| "editor_cleanup_unknown")
-            },
-        );
-        let restored = io.restore_editor();
-        match (result, restored) {
-            (Err(code), _) | (_, Err(code)) => Err(code),
-            (Ok(exit), Ok(())) => Ok(exit),
-        }
-    }
-    pub fn poll(&mut self, io: &mut Io) -> Result<Option<EditorExit>> {
-        if self.done {
-            return Ok(None);
-        }
-        if self.child.is_none() {
-            match self.setup.poll(
-                self.cancelled,
-                io.writer.failed(),
-                io.writer.idle(),
-                io.writer.written(),
-                Instant::now(),
-            ) {
-                EditorSetupPoll::Cancelled => {
-                    self.done = true;
-                    io.restore_editor()?;
-                    return Ok(Some(EditorExit {
-                        code: 130,
-                        cleanup_unknown: false,
-                    }));
-                }
-                EditorSetupPoll::Failed(code) => {
-                    self.done = true;
-                    io.restore_editor()?;
-                    return Err(code);
-                }
-                EditorSetupPoll::Waiting => return Ok(None),
-                EditorSetupPoll::Ready => {}
-            }
-            let prepared = (|| {
-                io.raw
-                    .as_mut()
-                    .ok_or("editor_requires_terminal")?
-                    .restore_checked()
-                    .map_err(|_| "cli_termios")?;
-                io._nonblocking.restore().map_err(|_| "cli_output")?;
-                let mut command = std::process::Command::new(&self.argv[0]);
-                command.args(&self.argv[1..]).current_dir(&self.directory);
-                ansa_linux::terminal::ForegroundEditor::spawn(command, &io.input)
-                    .map_err(|_| "editor_spawn")
-            })();
-            match prepared {
-                Ok(child) => self.child = Some(child),
-                Err(code) => {
-                    self.done = true;
-                    io.restore_editor()?;
-                    return Err(code);
-                }
-            }
-        }
-        match self.child.as_mut().expect("started editor").poll() {
-            Ok(Some(exit)) => {
-                self.child = None;
-                self.done = true;
-                io.restore_editor()?;
-                Ok(Some(exit))
-            }
-            Ok(None) => Ok(None),
-            Err(_) => {
-                // A failed wait cannot establish primary cleanup. Do not
-                // drop into a blocking wait or return to dispatch: reclaim
-                // what we can nonblockingly, then require harness shutdown.
-                let _ = self.abort_for_exit(io);
-                Err("editor_cleanup_unknown")
-            }
         }
     }
 }
@@ -640,56 +439,5 @@ mod tests {
         assert!(!drain.stalled(4096, false, enqueued + Duration::from_millis(200)));
         assert!(!drain.stalled(4096, false, enqueued + Duration::from_millis(449)));
         assert!(drain.stalled(4096, false, enqueued + Duration::from_millis(450)));
-    }
-    #[test]
-    fn editor_setup_cancel_preempts_blocked_output_and_expired_deadlines() {
-        let now = Instant::now();
-        let mut setup = EditorSetup::new(now);
-        assert!(matches!(
-            setup.poll(false, false, false, 0, now),
-            EditorSetupPoll::Waiting
-        ));
-        assert!(matches!(
-            setup.poll(true, false, false, 0, now + Duration::from_secs(2)),
-            EditorSetupPoll::Cancelled
-        ));
-        assert!(matches!(
-            setup.poll(true, true, true, 0, now + Duration::from_secs(2)),
-            EditorSetupPoll::Cancelled
-        ));
-    }
-    #[test]
-    fn editor_setup_bounds_idle_drain_and_slow_progress_before_launch() {
-        let now = Instant::now();
-        let mut setup = EditorSetup::new(now);
-        assert!(matches!(
-            setup.poll(false, false, false, 0, now),
-            EditorSetupPoll::Waiting
-        ));
-        assert!(matches!(
-            setup.poll(false, false, false, 1, now + Duration::from_millis(200)),
-            EditorSetupPoll::Waiting
-        ));
-        assert!(matches!(
-            setup.poll(false, false, false, 1, now + Duration::from_millis(450)),
-            EditorSetupPoll::Failed("editor_setup_output_stalled")
-        ));
-        let mut setup = EditorSetup::new(now);
-        for millis in [0, 200, 400, 600, 800] {
-            assert!(matches!(
-                setup.poll(
-                    false,
-                    false,
-                    false,
-                    millis,
-                    now + Duration::from_millis(millis)
-                ),
-                EditorSetupPoll::Waiting
-            ));
-        }
-        assert!(matches!(
-            setup.poll(false, false, true, 1000, now + Duration::from_secs(1)),
-            EditorSetupPoll::Failed("editor_setup_output_stalled")
-        ));
     }
 }

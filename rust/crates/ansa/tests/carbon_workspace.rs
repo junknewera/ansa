@@ -13,6 +13,7 @@ fn entry(role: &str, text: &str) -> Entry {
         action: None,
         edit: None,
         output: None,
+        agent: None,
         status: None,
         role: role.into(),
         text: text.into(),
@@ -138,8 +139,8 @@ fn selection_and_resize_preserve_unselected_colors_and_backgrounds() {
         .iter()
         .position(|line| line.contains("Color inline"))
         .unwrap();
-    let mut selection = Selection::new(frame.clone(), 0, row);
-    selection.drag(4, row);
+    let mut selection = Selection::new(frame.clone(), 2, row);
+    selection.drag(6, row);
     let selected = selection.frame_at((60, 24), true);
     for (index, line) in frame.lines.iter().enumerate() {
         if index != row {
@@ -159,7 +160,7 @@ fn selection_and_resize_preserve_unselected_colors_and_backgrounds() {
         "clipping dropped user accent"
     );
     only_user_background(&frame, "USER COLOR");
-    assert_eq!(selection.finish(4, row).as_deref(), Some("Color"));
+    assert_eq!(selection.finish(6, row).as_deref(), Some("Color"));
     assert!(!selection.text().unwrap().contains('\x1b'));
 }
 
@@ -264,10 +265,10 @@ fn every_theme_keeps_the_terminal_background_and_local_selection() {
         let row = frame
             .plain_lines()
             .iter()
-            .position(|line| line.starts_with("THEMED"))
+            .position(|line| line.starts_with("  THEMED"))
             .unwrap();
-        let mut selection = Selection::new(frame, 0, row);
-        selection.drag(3, row);
+        let mut selection = Selection::new(frame, 2, row);
+        selection.drag(5, row);
         assert!(selection.frame(true).lines[row].contains("\x1b[48;"));
         assert_eq!(selection.text().as_deref(), Some("THEM"));
     }
@@ -276,7 +277,7 @@ fn every_theme_keeps_the_terminal_background_and_local_selection() {
 fn only_user_background(frame: &carbon::Frame, message: &str) {
     let mut highlighted = 0;
     for (rendered, plain) in frame.lines.iter().zip(frame.plain_lines()) {
-        let user = plain.starts_with('›') && plain.contains(message);
+        let user = plain.starts_with("  ›") && plain.contains(message);
         assert_eq!(
             rendered.contains("\x1b[48;2;"),
             user,
@@ -382,7 +383,7 @@ fn slash_suggestions_stay_above_composer_and_leave_right_panel_unchanged() {
         .unwrap();
     let composer = lines
         .iter()
-        .position(|line| line.starts_with("› /mo"))
+        .position(|line| line.starts_with("  › /mo"))
         .unwrap();
     assert!(menu < composer);
     assert!(!lines[menu].contains("ANSA"));
@@ -447,8 +448,8 @@ fn selection_keeps_copy_bytes_while_runtime_diagnostics_update() {
         .iter()
         .position(|line| line.contains("ORIGINAL_COPY"))
         .unwrap();
-    let mut selection = Selection::new(before, 0, row);
-    selection.drag(12, row);
+    let mut selection = Selection::new(before, 2, row);
+    selection.drag(14, row);
     let live = carbon::layout_workspace(
         &[entry("assistant", "NEW_CONTENT")],
         b"draft",
@@ -466,7 +467,7 @@ fn selection_keeps_copy_bytes_while_runtime_diagnostics_update() {
     let lines = frame.plain_lines().join("\n");
     assert!(lines.contains("ORIGINAL_COPY") && !lines.contains("NEW_CONTENT"));
     assert!(lines.contains("save error") && lines.contains("effect_unknown"));
-    assert_eq!(selection.finish(12, row).as_deref(), Some("ORIGINAL_COPY"));
+    assert_eq!(selection.finish(14, row).as_deref(), Some("ORIGINAL_COPY"));
     for size in [(10, 12), (80, 7)] {
         let before = carbon::layout_workspace(
             &[entry("assistant", "copy")],
@@ -536,7 +537,8 @@ fn escape_disambiguation_mouse_and_focus_work_with_fragmented_sequences() {
     assert_eq!(feed(&mut editor, b"\x1b[A"), [Action::HistoryOlder]);
     assert_eq!(feed(&mut editor, b"\x1b[Z"), [Action::FocusPrevious]);
     assert_eq!(editor.feed(9, true), Some(Action::FocusNext));
-    assert_eq!(editor.feed(6, true), None);
+    assert_eq!(editor.feed(6, true), Some(Action::OpenFiles));
+    assert_eq!(editor.feed(20, true), Some(Action::OpenTerminals));
     assert_eq!(
         feed(&mut editor, b"\x1b[<0;4;7M"),
         [Action::Mouse(MouseEvent {
@@ -629,7 +631,7 @@ fn workspace_shows_real_data_and_adapts_inspector_to_narrow_screen() {
     let text = wide.plain_lines().join("\n");
     assert!(text.contains("ANSA") && text.contains("CHAT_MARKER") && text.contains("src/retry.rs"));
     assert!(text.contains("Source") && text.contains("Diff") && text.contains("fixture-model"));
-    assert_eq!(wide.plain_lines()[0].trim(), "ANSA");
+    assert_eq!(wide.plain_lines()[0].trim_end(), "  ANSA");
     let footer = &wide.plain_lines()[30];
     assert!(footer.contains("fixture-model") && footer.contains("project"));
     assert!(!text.contains("context 18%") && !text.contains("Ctrl+F") && !text.contains("PgUp"));
@@ -696,9 +698,9 @@ fn selection_copies_the_frozen_visible_text_with_utf8_and_without_sgr() {
         .iter()
         .position(|line| line.contains("Ae\u{301}😀B"))
         .unwrap();
-    let mut selection = Selection::new(first, 0, row);
+    let mut selection = Selection::new(first, 2, row);
     assert_eq!(selection.text(), None);
-    selection.drag(5, row);
+    selection.drag(7, row);
     // Building a new streaming frame cannot modify the owned selection.
     let _later = carbon::layout_workspace(
         &[entry("assistant", "replaced")],
@@ -712,7 +714,7 @@ fn selection_copies_the_frozen_visible_text_with_utf8_and_without_sgr() {
         &Workspace::default(),
     )
     .unwrap();
-    let selected = selection.finish(5, row).unwrap();
+    let selected = selection.finish(7, row).unwrap();
     assert_eq!(selected, "Ae\u{301}😀B");
     assert!(!selected.contains('\x1b'));
     assert!(selection.frame(true).lines[row].contains("\x1b[48;2;46;63;88m"));
@@ -733,8 +735,8 @@ fn multiline_input_retains_cursor_row_and_status_ticks_leave_chat_untouched() {
         &ui,
     )
     .unwrap();
-    assert!(first.lines.iter().any(|row| row == "› first"));
-    assert!(first.lines.iter().any(|row| row == "  second"));
+    assert!(first.lines.iter().any(|row| row == "  › first"));
+    assert!(first.lines.iter().any(|row| row == "    second"));
     ui.activity = "LIVE · 00:02".into();
     let next = carbon::layout_workspace(
         &history,

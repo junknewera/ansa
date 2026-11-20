@@ -225,11 +225,16 @@ impl State {
         .then(|| self.read_lane.clone());
         let new_turn = matches!(
             command.payload,
-            CommandPayload::Submit(_) | CommandPayload::Handoff(_)
+            CommandPayload::Submit(_)
+                | CommandPayload::Handoff(_)
+                | CommandPayload::DraftPlan(_, _)
         );
         let submit = matches!(
             command.payload,
-            CommandPayload::Submit(_) | CommandPayload::Handoff(_) | CommandPayload::Steer(_)
+            CommandPayload::Submit(_)
+                | CommandPayload::Handoff(_)
+                | CommandPayload::DraftPlan(_, _)
+                | CommandPayload::Steer(_)
         );
         if new_turn {
             self.pending = Some(command.command.clone());
@@ -775,6 +780,7 @@ impl State {
                 action: None,
                 edit: None,
                 output: None,
+                agent: None,
                 status: None,
                 role: e.role.clone(),
                 text: e.text.clone(),
@@ -803,6 +809,7 @@ impl State {
                 action: None,
                 edit: None,
                 output: None,
+                agent: None,
                 status: None,
                 role: "assistant".into(),
                 text: format!(
@@ -858,7 +865,7 @@ impl State {
         }
         if ui.is_none() && !view.tools.is_empty() {
             status.push_str(&format!(
-                "  tools {}/{}  Ctrl+T",
+                "  tools {}/{}  Ctrl+O",
                 view.completed_tools,
                 view.tools.len()
             ));
@@ -1336,7 +1343,9 @@ pub async fn run(
                                     );
                                 }
                                 Action::CopyHistory => state.start_copy(io),
-                                Action::Complete
+                                Action::OpenFiles
+                                | Action::OpenTerminals
+                                | Action::Complete
                                 | Action::FocusNext
                                 | Action::FocusPrevious
                                 | Action::Mouse(_) => {}

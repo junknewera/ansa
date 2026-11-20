@@ -1,8 +1,8 @@
 //! Review an immutable candidate in one read-only native conversation.
 use super::{
-    Access, Cancel, Candidate, ChildResult, ChildStatus, Factory, Frozen, Path, Request, Result,
-    RoleProfile, Run, RunId, Step, Worktree, append_review_checks, fs, local,
-    plus::{Conversation, Phase},
+    Access, AgentRole, Cancel, Candidate, ChildResult, ChildStatus, Factory, Frozen, Path, Request,
+    Result, RoleProfile, Run, RunId, Step, Worktree, append_review_checks, fs, local,
+    plus::{Conversation, Phase, PhaseProgress},
     run_command_checks,
 };
 use crate::{
@@ -81,6 +81,7 @@ pub(super) async fn review_candidate_plus(
     source: &Request,
     profile: &RoleProfile,
     stop: &Cancel,
+    progress: &PhaseProgress<'_>,
 ) -> Result<Candidate> {
     let scope: Vec<_> = run
         .plan()
@@ -105,12 +106,14 @@ pub(super) async fn review_candidate_plus(
         workspace: &views,
         source,
         stop,
+        progress,
     };
     let repair_phase = Phase {
         workspace: worktree.path(),
         ..reviewer
     };
     let plan = run.plan().encode()?;
+    let objective = run.plan().summary();
     let mut session = None;
     let mut repair_report = None;
     for attempt in 0..=LAST_ATTEMPT {
@@ -159,7 +162,15 @@ pub(super) async fn review_candidate_plus(
         let conversation = session
             .as_ref()
             .map_or(Conversation::Start, Conversation::Continue);
-        let decision = reviewer.run(task, &profile.strong, conversation).await?;
+        let decision = reviewer
+            .run(
+                task,
+                &profile.strong,
+                (AgentRole::Review, "Strong reviewer"),
+                objective,
+                conversation,
+            )
+            .await?;
         session = Some(decision.session);
         if failed.is_empty() && decision.result.status == ChildStatus::Completed {
             stop.check()?;
@@ -189,7 +200,13 @@ pub(super) async fn review_candidate_plus(
             acceptance: "Return completed with a scoped correction plan, or blocked if approval is insufficient.".into(),
         };
         let planned = repair_phase
-            .run(coordination, &profile.medium, Conversation::OneShot)
+            .run(
+                coordination,
+                &profile.medium,
+                (AgentRole::Coordinator, "Coordinator · review correction"),
+                objective,
+                Conversation::OneShot,
+            )
             .await?;
         if planned.result.status != ChildStatus::Completed {
             return Err("orchestration_repair_unresolved");
@@ -209,7 +226,13 @@ pub(super) async fn review_candidate_plus(
                     .into(),
         };
         let repaired = repair_phase
-            .run(fix, &profile.weak, Conversation::OneShot)
+            .run(
+                fix,
+                &profile.weak,
+                (AgentRole::Implementation, "Worker · review correction"),
+                objective,
+                Conversation::OneShot,
+            )
             .await?;
         if repaired.result.status != ChildStatus::Completed {
             return Err("orchestration_repair_unresolved");

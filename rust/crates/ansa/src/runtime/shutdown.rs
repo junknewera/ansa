@@ -119,6 +119,7 @@ impl Handle {
             | CommandPayload::GetContext => &self.transcript,
             CommandPayload::Submit(_)
             | CommandPayload::Handoff(_)
+            | CommandPayload::DraftPlan(_, _)
             | CommandPayload::Steer(_)
             | CommandPayload::SetGeneration(_)
             | CommandPayload::SetAutocompact(_) => &self.submits,

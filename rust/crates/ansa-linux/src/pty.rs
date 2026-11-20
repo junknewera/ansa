@@ -150,8 +150,12 @@ impl PtySession {
             .wait_owned()
             .and_then(|_| crate::managed::nonblocking(&value.master))
         {
-            let _ = value.shutdown();
-            return Err(error);
+            let cleanup = value.shutdown();
+            return Err(if cleanup.shell_reaped && cleanup.session_empty {
+                error
+            } else {
+                io::Error::other("pty_startup_cleanup_unknown")
+            });
         }
         Ok(value)
     }
@@ -217,6 +221,14 @@ impl PtySession {
 
     pub fn exit_status(&self) -> Option<ExitStatus> {
         self.reaped
+    }
+
+    pub fn leader_stopped(&self) -> io::Result<bool> {
+        if self.wait_owned()? {
+            return Ok(false);
+        }
+        // wait_owned() pins the leader until the session owner reaps it.
+        Ok(matches!(proc_stat(self.id())?.state, 'T' | 't'))
     }
     fn wait_owned(&self) -> io::Result<bool> {
         if self.ownership_unknown.get() {

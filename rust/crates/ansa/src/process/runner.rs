@@ -226,38 +226,11 @@ fn supervise(
         ));
     }
     linux::nonblocking_stdin().map_err(|_| "process_nonblocking")?;
-    let mut command = Command::new(&options.argv[0]);
+    // Historical GitHub jobs remain readable as evidence and cannot start again.
     if spec.has("environment") {
-        if spec.text_field("environment")? != "github"
-            || !matches!(options.argv[0].as_str(), "git" | "gh")
-        {
-            return Err("process_environment_policy");
-        }
-        command.env_clear();
-        for name in [
-            "PATH",
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "GH_CONFIG_DIR",
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "SSH_AUTH_SOCK",
-            "SSL_CERT_FILE",
-            "SSL_CERT_DIR",
-            "NIX_SSL_CERT_FILE",
-        ] {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
-        command
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GH_HOST", "github.com");
+        return Err("process_environment_policy");
     }
+    let mut command = Command::new(&options.argv[0]);
     command
         .args(&options.argv[1..])
         .stdin(Stdio::null())

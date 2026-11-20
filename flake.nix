@@ -42,6 +42,7 @@
           ANSA_SESSION_FIXTURES = ./tests/fixtures/sessions;
           ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
           ANSA_MATUGEN = "${pkgs.matugen}/bin/matugen";
+          ANSA_PANEL_EDITOR = "${pkgs.neovim}/bin/nvim";
           ANSA_TEST_BASH = "${pkgs.bashInteractive}/bin/bash";
           preBuild = ''
             python3 ${./tests/parity/check_toolchain.py} --workspace .
@@ -63,7 +64,7 @@
       devShells = each (system:
         let pkgs = import nixpkgs { inherit system; }; in {
           default = pkgs.mkShell {
-            packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh ];
+            packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh pkgs.neovim ];
             ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
             ANSA_MATUGEN = "${pkgs.matugen}/bin/matugen";
             ANSA_TEST_BASH = "${pkgs.bashInteractive}/bin/bash";

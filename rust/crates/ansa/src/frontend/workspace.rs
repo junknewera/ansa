@@ -397,8 +397,8 @@ pub struct EditorCommand {
 }
 impl EditorCommand {
     /// Parse EDITOR as argv, with quotes/backslashes but without shell expansion.
-    /// The caller validates the path through FileHost immediately before launch
-    /// and owns terminal suspension, the idle gate, process wait and repaint.
+    /// The caller validates the path through FileHost before launch and owns
+    /// the idle gate, terminal process and repaint.
     pub fn parse(editor: &str, path: &Path) -> Result<Self> {
         if !path.is_absolute()
             || ansa_linux::fs::protected_path(path)

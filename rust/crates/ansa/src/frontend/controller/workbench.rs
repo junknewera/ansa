@@ -480,6 +480,7 @@ impl Slot {
                     action: Some(format!("image:{operation}")),
                     edit: None,
                     output: None,
+                    agent: None,
                     status: None,
                     role: "tool_success".into(),
                     text: format!("> Open chart · {}", png.name()),
@@ -496,6 +497,7 @@ impl Slot {
                     action: None,
                     edit: None,
                     output: None,
+                    agent: None,
                     status: None,
                     role: "queued_user".into(),
                     text: message.text.clone(),
@@ -510,6 +512,7 @@ impl Slot {
                     action: None,
                     edit: None,
                     output: None,
+                    agent: None,
                     status: None,
                     role: "assistant".into(),
                     text: format!(
@@ -532,6 +535,7 @@ impl Slot {
                 action: None,
                 edit: None,
                 output: None,
+                agent: None,
                 status: None,
                 role: "activity".into(),
                 text: format!(
@@ -559,20 +563,32 @@ enum OrchestrationMode {
 }
 
 struct PlanningContext {
-    plus: bool,
+    profile: Option<RoleProfile>,
+    pending_draft: Option<RuntimeCommand>,
+    resume: Option<CommandId>,
+    awaiting_context: bool,
+    submit: CommandId,
+    turn: TurnId,
     command: CommandId,
     owner: String,
-    prompt: String,
     token: u64,
-    read_only: bool,
-    skill: Option<String>,
 }
+struct DraftCancellation {
+    submit: CommandId,
+    request: Option<RequestId>,
+    posting: bool,
+}
+
 enum FileValue {
     Listing(FileListing),
     Document(FileDocument),
     Image(graphics::Image),
 }
 enum Job {
+    AgentTranscript {
+        token: u64,
+        result: Result<crate::frontend::sessions::AgentTranscript>,
+    },
     OrchestrationPlan {
         owner: String,
         token: u64,
@@ -580,7 +596,13 @@ enum Job {
     },
     OrchestrationDone {
         owner: String,
+        generation_checked: bool,
         result: Result<orchestration::Completed>,
+    },
+    DraftCancel {
+        owner: String,
+        submit: CommandId,
+        result: Result<PostStatus>,
     },
     ClarificationSaved {
         owner: String,
@@ -593,10 +615,6 @@ enum Job {
     ArchivedPlan {
         token: u64,
         result: Result<orchestration::ArchivedPlan>,
-    },
-    DraftPullRequest {
-        owner: String,
-        result: Result<String>,
     },
     Themes {
         request: ThemeLoad,
@@ -823,14 +841,26 @@ impl Files {
         })
     }
 }
+struct AgentReader {
+    id: String,
+    parent: String,
+    title: String,
+    pending: bool,
+    requested: Option<u8>,
+    offset: usize,
+    page: Option<crate::frontend::sessions::AgentTranscript>,
+    notice: String,
+}
+
 enum Panel {
+    AgentTranscript(AgentReader),
     Orchestration {
-        lines: Vec<String>,
+        document: crate::frontend::markdown::Document,
         offset: usize,
     },
     Files(Box<Files>),
     Agents {
-        selected: usize,
+        selected: Option<String>,
     },
     Terminal,
     NativeTerminal {
@@ -887,6 +917,7 @@ struct Workbench {
     stop: Cancel,
     pending_context: BTreeMap<String, CreateIntent>,
     planning_context: Option<PlanningContext>,
+    draft_cancellations: BTreeMap<String, DraftCancellation>,
     orchestration_stop: Option<(String, Cancel)>,
     orchestration_inbox: Option<tokio::sync::mpsc::Sender<orchestration::Clarification>>,
     clarification_pending: bool,
@@ -920,7 +951,6 @@ struct Workbench {
     next_drag_scroll: Option<Instant>,
     tool_press: Option<ToolPress>,
     result_selected: Option<String>,
-    agents_return: Option<(String, usize)>,
     result_scroll: Option<usize>,
     result_tail: bool,
     review_redraw: bool,
@@ -932,21 +962,20 @@ struct Workbench {
     file_token: u64,
     graphics_id: Option<u32>,
     preview_job: Option<PreviewJob>,
-    editor: Option<super::super::terminal::EditorJob>,
+    editor: Option<PanelEditor>,
     pending_editor: Option<EditorCommand>,
     editor_preparing: bool,
     editor_request: u64,
-    editor_wait: Option<EditorWait>,
     modal_token: u64,
     modal_stop: Option<Cancel>,
     exit_deadline: Option<Instant>,
     input_closed: bool,
     terminating: bool,
 }
-struct EditorWait {
-    began: Instant,
-    progress: Instant,
-    written: u64,
+struct PanelEditor {
+    pane: super::super::terminal_pane::TerminalPane,
+    size: (u16, u16),
+    revision: u64,
 }
 enum SessionEvent {
     Ready(Result<()>),
@@ -1012,6 +1041,7 @@ impl Workbench {
             stop,
             pending_context: BTreeMap::new(),
             planning_context: None,
+            draft_cancellations: BTreeMap::new(),
             orchestration_stop: None,
             orchestration_inbox: None,
             clarification_pending: false,
@@ -1045,7 +1075,6 @@ impl Workbench {
             next_drag_scroll: None,
             tool_press: None,
             result_selected: None,
-            agents_return: None,
             result_scroll: None,
             result_tail: false,
             review_redraw: false,
@@ -1061,7 +1090,6 @@ impl Workbench {
             pending_editor: None,
             editor_preparing: false,
             editor_request: 0,
-            editor_wait: None,
             modal_token: 0,
             modal_stop: None,
             input_closed: false,
@@ -1196,15 +1224,6 @@ impl Workbench {
         self.result_scroll = None;
         self.result_tail = false;
         self.review_redraw = false;
-        if self
-            .agents_return
-            .as_ref()
-            .is_some_and(|(id, _)| id == &self.slots[index].id)
-            && let Some((_, selected)) = self.agents_return.take()
-        {
-            self.panel = Some(Panel::Agents { selected });
-            self.focus = Focus::Inspector;
-        }
         self.wide_diff = false;
         self.tool_press = None;
         self.last_frame = None;
@@ -1375,6 +1394,99 @@ impl Workbench {
         });
     }
 
+    fn open_agents(&mut self, io: &Io) {
+        self.panel = Some(Panel::Agents { selected: None });
+        self.focus = Focus::Inspector;
+        if self.can_job(io) {
+            let factory = self.factory.clone();
+            let stop = Cancel::linked(&self.stop);
+            self.jobs.spawn_blocking(move || Job::CachedSummaries {
+                result: factory.summaries(&stop),
+            });
+        }
+    }
+
+    fn open_agent(&mut self, id: &str) {
+        let rows = self.agent_rows();
+        let Some((_, line)) = rows.iter().find(|(key, _)| key == id) else {
+            return;
+        };
+        let parent = self
+            .slots
+            .iter()
+            .find(|slot| slot.id == id)
+            .and_then(|slot| slot.parent.clone())
+            .or_else(|| {
+                self.summaries
+                    .iter()
+                    .find(|s| s.entry.id == id)
+                    .and_then(|s| s.entry.parent.clone())
+            })
+            .unwrap_or_else(|| self.conversation_root());
+        self.panel = Some(Panel::AgentTranscript(AgentReader {
+            id: id.into(),
+            parent,
+            title: line.title.clone(),
+            pending: false,
+            requested: Some(b'r'),
+            offset: 0,
+            page: None,
+            notice: "Opening transcript…".into(),
+        }));
+        self.focus = Focus::Inspector;
+        self.refresh_agent_reader();
+    }
+
+    fn refresh_agent_reader(&mut self) {
+        if self.input_closed
+            || self.terminating
+            || self.jobs.len() + self.pending_context.len() >= MAX_JOBS
+        {
+            return;
+        }
+        let Some(Panel::AgentTranscript(reader)) = &mut self.panel else {
+            return;
+        };
+        if reader.pending {
+            return;
+        }
+        let Some(key) = reader.requested.take() else {
+            return;
+        };
+        let (before, forward) = match (key, &reader.page) {
+            (b'[', Some(page)) if page.begin > 0 => (page.begin, false),
+            (b']', Some(page)) if page.end < page.total => (page.end, true),
+            (b'r', _) => (0, false),
+            _ => return,
+        };
+        self.file_token = self.file_token.wrapping_add(1);
+        let token = self.file_token;
+        reader.pending = true;
+        let cached = reader
+            .page
+            .as_ref()
+            .filter(|_| key != b'r')
+            .map(|page| page.archive.clone());
+        let id = reader.id.clone();
+        let parent = reader.parent.clone();
+        let factory = self.factory.clone();
+        let stop = Cancel::linked(&self.stop);
+        self.jobs.spawn_blocking(move || Job::AgentTranscript {
+            token,
+            result: {
+                let query = GetTranscript {
+                    before,
+                    forward,
+                    limit: 64,
+                };
+                match cached {
+                    Some(archive) => Ok(archive.page(query)),
+                    None => factory.agent_transcript(&id, &parent, query, &stop),
+                }
+            },
+        });
+    }
+
     fn inspect_terminal(&mut self, name: &str, io: &Io) {
         if self
             .factory
@@ -1491,6 +1603,9 @@ impl Workbench {
         let Some(document) = &files.document else {
             return;
         };
+        if files.tab != 0 || self.terminal_dimensions().is_none() {
+            return;
+        }
         let path = document.path.clone();
         let token = files.token;
         let owner = self.slots[self.current].id.clone();
@@ -1505,15 +1620,10 @@ impl Workbench {
                     .ok()
                     .filter(|value| !value.is_empty())
             })
-            .unwrap_or_else(|| "vi".into());
+            .unwrap_or_else(|| option_env!("ANSA_PANEL_EDITOR").unwrap_or("nvim").into());
         let host = self.files.clone();
         self.editor_request = self.editor_request.wrapping_add(1);
         let request = self.editor_request;
-        self.editor_wait = Some(EditorWait {
-            began: Instant::now(),
-            progress: Instant::now(),
-            written: io.writer.written(),
-        });
         self.editor_preparing = true;
         self.jobs.spawn_blocking(move || Job::EditorReady {
             owner,
@@ -1528,7 +1638,36 @@ impl Workbench {
         self.editor_request = self.editor_request.wrapping_add(1);
         self.editor_preparing = false;
         self.pending_editor = None;
-        self.editor_wait = None;
+    }
+    fn launch_panel_editor(&mut self, io: &Io) {
+        let command = self.pending_editor.take().expect("validated editor");
+        let Some((rows, columns)) = self.terminal_dimensions() else {
+            self.report(io, "Widen the window to open the editor");
+            return;
+        };
+        match super::super::terminal_pane::TerminalPane::spawn_editor(
+            &command.argv,
+            &self.factory.settings.cwd,
+            rows,
+            columns,
+        ) {
+            Ok(pane) => {
+                self.editor = Some(PanelEditor {
+                    pane,
+                    size: (rows, columns),
+                    revision: 0,
+                });
+                self.terminal_pending_input.clear();
+                self.terminal_decoder = Default::default();
+                self.terminal_escape_at = None;
+                self.navigation_editor.clear();
+                self.focus = Focus::Inspector;
+                self.selection = None;
+                self.tool_press = None;
+                self.completion = None;
+            }
+            Err(error) => self.report(io, &format!("Could not open editor: {error}")),
+        }
     }
     fn eof(&mut self, io: &Io, flush_draft: bool) -> bool {
         let mut finished = false;
@@ -1927,7 +2066,7 @@ impl Workbench {
                 slot.state.mode
             });
         let mode = match self.orchestration_mode {
-            Some(OrchestrationMode::Standard) => "Orchestration",
+            Some(OrchestrationMode::Standard) => "Orchestrate",
             Some(OrchestrationMode::Plus) => "Orchestrate+",
             None if slot.state.mode == AgentMode::Plan => "Planning",
             None => "Work",
@@ -1943,7 +2082,7 @@ impl Workbench {
         if self.factory.orchestration_route().is_err() {
             self.report(
                 io,
-                "Orchestration requires a route with verified structured outputs",
+                "Orchestrate requires a route with verified structured outputs",
             );
             return false;
         }
@@ -1954,46 +2093,181 @@ impl Workbench {
         if !self.can_job(io) {
             return false;
         }
-        let (prompt, read_only, skill) = self.refinement.as_ref().map_or_else(
+        let profile = if self.orchestration_mode == Some(OrchestrationMode::Plus) {
+            match self.factory.role_profile() {
+                Ok(Some(profile)) => Some(profile),
+                Ok(None) => {
+                    self.open_role_picker(io);
+                    return false;
+                }
+                Err(code) => {
+                    self.report(
+                        io,
+                        &format!("Could not read Orchestrate+ role models ({code})"),
+                    );
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        let (previous_prompt, read_only, skill) = self.refinement.as_ref().map_or_else(
             || {
                 (
-                    text.to_owned(),
+                    None,
                     self.slots[self.current].state.mode == AgentMode::Plan,
                     skill,
                 )
             },
             |(previous, read_only, skill)| {
                 (
-                    format!("{previous}\n\nClarification: {text}"),
+                    Some(previous.clone()),
                     *read_only || self.slots[self.current].state.mode == AgentMode::Plan,
                     skill.clone(),
                 )
             },
         );
+        let instructions = match skill.as_deref() {
+            Some(name) => match self.factory.delegation_skill(name) {
+                Some(instructions) => Some(instructions),
+                None => {
+                    self.report(io, "The selected skill is unavailable");
+                    return false;
+                }
+            },
+            None => None,
+        };
+        let mut draft = self.factory.plan_draft(read_only, instructions.as_deref());
+        draft.previous_prompt = previous_prompt;
+        draft.profile = match profile.as_ref().map(RoleProfile::encode).transpose() {
+            Ok(profile) => profile.map(|value| value.dump()),
+            Err(code) => {
+                self.report(
+                    io,
+                    &format!("Could not capture Orchestrate+ role models ({code})"),
+                );
+                return false;
+            }
+        };
+        draft.skill = skill;
         self.cancel_modal();
         let token = self.modal_token;
         let slot = &mut self.slots[self.current];
-        let command = slot.state.command(&slot.handle, CommandPayload::GetContext);
-        let id = command.command.clone();
+        let mut command = slot.state.command(
+            &slot.handle,
+            CommandPayload::DraftPlan(
+                Submit {
+                    text: text.to_owned(),
+                    mode: if read_only {
+                        AgentMode::Plan
+                    } else {
+                        AgentMode::Basic
+                    },
+                },
+                Box::new(draft),
+            ),
+        );
+        let id = CommandId(format!("draft-{}", command.command.0));
+        command.command = id.clone();
+        let turn = TurnId(id.0.clone());
+        command.turn = turn.clone();
+        let selection = profile
+            .as_ref()
+            .filter(|profile| {
+                slot.state
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.generation != profile.strong)
+            })
+            .map(|profile| profile.strong.clone());
+        let (next, pending_draft) = if let Some(selection) = selection {
+            let select = slot
+                .state
+                .command(&slot.handle, CommandPayload::SetGeneration(selection));
+            (select, Some(command))
+        } else {
+            (command, None)
+        };
+        let command = next.command.clone();
         if !slot
             .state
-            .post_command(&slot.handle, command, &mut slot.replies, false)
+            .post_command(&slot.handle, next, &mut slot.replies, false)
         {
             self.report(io, "Wait for the current requests");
             return false;
         }
+        if slot.title.is_none() {
+            slot.title = Some(display_title(text));
+        }
         self.planning_context = Some(PlanningContext {
-            plus: self.orchestration_mode == Some(OrchestrationMode::Plus),
-            command: id,
+            profile,
+            pending_draft,
+            resume: None,
+            awaiting_context: false,
+            submit: id.clone(),
+            turn,
+            command,
             owner: slot.id.clone(),
-            prompt,
             token,
-            read_only,
-            skill,
         });
         slot.state.status.clear();
         self.menu = Some(Menu::DraftingPlan);
         true
+    }
+
+    fn cancel_drafting_plan(&mut self) {
+        let Some(intent) = &self.planning_context else {
+            return;
+        };
+        if intent.pending_draft.is_some() || intent.awaiting_context {
+            return;
+        }
+        let slot = &mut self.slots[self.current];
+        if slot.id != intent.owner {
+            return;
+        }
+        let request = slot
+            .state
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.submit.as_ref() == Some(&intent.submit))
+            .and_then(|snapshot| snapshot.request.clone());
+        self.draft_cancellations.insert(
+            intent.owner.clone(),
+            DraftCancellation {
+                submit: intent.submit.clone(),
+                request,
+                posting: false,
+            },
+        );
+        self.dispatch_draft_cancel(self.current);
+    }
+
+    fn dispatch_draft_cancel(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        let Some(draft) = self
+            .draft_cancellations
+            .get_mut(&slot.id)
+            .filter(|draft| !draft.posting)
+        else {
+            return;
+        };
+        let Some(request) = draft.request.clone() else {
+            return;
+        };
+        draft.posting = true;
+        let owner = slot.id.clone();
+        let submit = draft.submit.clone();
+        let handle = slot.handle.clone();
+        let mut cancel = slot.state.command(&handle, CommandPayload::Cancel(request));
+        cancel.turn = TurnId(submit.0.clone());
+        self.jobs.spawn(async move {
+            Job::DraftCancel {
+                owner,
+                submit,
+                result: handle.post(cancel).await,
+            }
+        });
     }
 
     fn approve_orchestration(&mut self, proposal: Proposal, io: &Io) {
@@ -2025,6 +2299,7 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
+            generation_checked: false,
             result: orchestration::execute(&factory, proposal, &stop, progress, commands),
         });
     }
@@ -2052,6 +2327,7 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
+            generation_checked: false,
             result: orchestration::resume(&factory, identity, read_only, &stop, progress, commands),
         });
     }
@@ -2149,7 +2425,7 @@ impl Workbench {
             .trim()
             .split_once(char::is_whitespace)
             .map_or((text.trim(), ""), |(c, a)| (c, a.trim()));
-        match command {
+        match commands::canonical(command) {
             "/terminals" => {
                 self.inspect_terminal(argument, io);
                 (true, false)
@@ -2176,20 +2452,12 @@ impl Workbench {
             "/agent" => {
                 self.report(
                     io,
-                    "Ask the main agent to delegate or switch to Orchestration with Tab",
+                    "Ask the main agent to delegate or switch to Orchestrate with Tab",
                 );
                 (true, false)
             }
             "/agents" => {
-                self.panel = Some(Panel::Agents { selected: 0 });
-                self.focus = Focus::Inspector;
-                if self.can_job(io) {
-                    let factory = self.factory.clone();
-                    let stop = Cancel::linked(&self.stop);
-                    self.jobs.spawn_blocking(move || Job::CachedSummaries {
-                        result: factory.summaries(&stop),
-                    });
-                }
+                self.open_agents(io);
                 (true, false)
             }
             "/sessions" if argument == "search" => {
@@ -2200,7 +2468,7 @@ impl Workbench {
                 self.search_sessions(argument["search".len()..].trim(), io);
                 (true, false)
             }
-            "/sessions" | "/resume" => {
+            "/sessions" => {
                 if argument.is_empty() {
                     self.open_sessions(io);
                 } else {
@@ -2209,25 +2477,10 @@ impl Workbench {
                 (true, false)
             }
             "/pr" => {
-                if argument.is_empty() {
-                    self.report(io, "Specify a base branch, for example /pr main");
-                } else if self.orchestration_stop.is_some() || self.slots[self.current].active() {
-                    self.report(io, "Wait for the current task to finish");
-                } else if self.can_job(io) {
-                    let owner = self.slots[self.current].id.clone();
-                    let factory = self.factory.clone();
-                    let base = argument.to_owned();
-                    let stop = Cancel::linked(&self.stop);
-                    self.orchestration_stop = Some((owner.clone(), stop.clone()));
-                    self.jobs.spawn_blocking(move || Job::DraftPullRequest {
-                        result: super::super::publish::draft(&factory, &owner, &base, &stop),
-                        owner,
-                    });
-                    self.report(io, "Preparing a draft PR · Ctrl+C stop");
-                }
+                self.report(io, "Ask the agent to open a pull request with gh");
                 (true, false)
             }
-            "/files" | "/open" => {
+            "/files" => {
                 self.open_file(
                     if argument.is_empty() {
                         self.factory.settings.cwd.clone()
@@ -2270,11 +2523,11 @@ impl Workbench {
                 self.open_models(false, io);
                 (true, false)
             }
-            "/effort" | "/thinking" if argument.is_empty() => {
+            "/effort" if argument.is_empty() => {
                 self.open_models(true, io);
                 (true, false)
             }
-            "/effort" | "/thinking" => {
+            "/effort" => {
                 if argument.split_whitespace().count() != 1 {
                     self.report(io, "Expected one value");
                     return (false, false);
@@ -2423,6 +2676,7 @@ impl Workbench {
             return;
         };
         let Some(event) = event else {
+            self.draft_cancellations.remove(id);
             let lost = self.discard_contexts(id);
             self.slots[index].closed = true;
             if lost || self.slots[index].pending_prompt.take().is_some() {
@@ -2433,31 +2687,97 @@ impl Workbench {
             }
             return;
         };
+        if let Some(draft) = self.draft_cancellations.get_mut(id) {
+            match &event.payload {
+                EventPayload::CommandAccepted { command, request } if command == &draft.submit => {
+                    draft.request.clone_from(request);
+                }
+                EventPayload::FrontendSnapshot(snapshot)
+                    if snapshot.submit.as_ref() == Some(&draft.submit) =>
+                {
+                    draft.request.clone_from(&snapshot.request);
+                }
+                EventPayload::RuntimeError {
+                    command: Some(command),
+                    ..
+                } if command == &draft.submit => {
+                    self.draft_cancellations.remove(id);
+                }
+                _ => {}
+            }
+            self.dispatch_draft_cancel(index);
+        }
         let lost_context = matches!(event.payload, EventPayload::ResyncRequired { .. })
             && self.discard_contexts(id);
-        if matches!(event.payload, EventPayload::ResyncRequired { .. })
-            && self
-                .planning_context
-                .as_ref()
-                .is_some_and(|intent| intent.owner == id)
+        if let Some(intent) = &mut self.planning_context
+            && intent.owner == id
         {
-            self.cancel_modal();
-            self.menu = None;
-            self.report(io, "Could not load plan context. Retry the request");
+            let selected = intent.pending_draft.is_some()
+                && intent
+                    .profile
+                    .as_ref()
+                    .is_some_and(|profile| match &event.payload {
+                        EventPayload::GenerationSelected { command, selection } => {
+                            command == &intent.command && selection == &profile.strong
+                        }
+                        EventPayload::FrontendSnapshot(snapshot) => {
+                            snapshot.durable && snapshot.generation == profile.strong
+                        }
+                        _ => false,
+                    });
+            if selected && let Some(command) = intent.pending_draft.take() {
+                let slot = &mut self.slots[index];
+                intent.command = intent.submit.clone();
+                if !slot
+                    .state
+                    .post_command(&slot.handle, command, &mut slot.replies, false)
+                {
+                    self.cancel_modal();
+                    self.menu = None;
+                    self.report(io, "Could not submit the plan request");
+                }
+            }
+        }
+        if let Some(intent) = &mut self.planning_context
+            && intent.owner == id
+            && intent.pending_draft.is_none()
+        {
+            let complete = match &event.payload {
+                EventPayload::Done => event.turn == intent.turn,
+                EventPayload::FrontendSnapshot(snapshot) => {
+                    snapshot.submit.as_ref() == Some(&intent.command)
+                        && snapshot.durable
+                        && snapshot.state == "completed"
+                }
+                _ => false,
+            };
+            if !intent.awaiting_context && complete {
+                let slot = &mut self.slots[index];
+                let command = slot.state.command(&slot.handle, CommandPayload::GetContext);
+                intent.command = command.command.clone();
+                intent.awaiting_context = true;
+                if !slot
+                    .state
+                    .post_command(&slot.handle, command, &mut slot.replies, false)
+                {
+                    self.cancel_modal();
+                    self.menu = None;
+                    self.report(io, "Could not load the completed plan");
+                }
+            } else if matches!(event.payload, EventPayload::ResyncRequired { .. })
+                && intent.awaiting_context
+            {
+                // The next durable snapshot lets us request the context again.
+                intent.command = intent.submit.clone();
+                intent.awaiting_context = false;
+            }
         }
         if let EventPayload::ContextSnapshot { command, seed } = &event.payload
-            && self
-                .planning_context
-                .as_ref()
-                .is_some_and(|intent| &intent.command == command && intent.owner == id)
+            && self.planning_context.as_ref().is_some_and(|intent| {
+                intent.awaiting_context && &intent.command == command && intent.owner == id
+            })
             && let Some(PlanningContext {
-                plus,
-                owner,
-                prompt,
-                token,
-                read_only,
-                skill,
-                ..
+                owner, turn, token, ..
             }) = self.planning_context.take()
         {
             let factory = self.factory.clone();
@@ -2468,29 +2788,29 @@ impl Workbench {
                 owner,
                 token,
                 result: (|| {
-                    if plus {
-                        let profile = factory
-                            .role_profile()?
-                            .ok_or("orchestration_profile_required")?;
-                        Proposal::generate_plus(
-                            &factory,
-                            seed,
-                            prompt,
-                            read_only,
-                            skill.as_deref(),
-                            &stop,
-                            profile,
-                        )
-                    } else {
-                        Proposal::generate(
-                            &factory,
-                            seed,
-                            prompt,
-                            read_only,
-                            skill.as_deref(),
-                            &stop,
-                        )
+                    stop.check()?;
+                    let draft = seed
+                        .draft_plan()
+                        .filter(|_| seed.source_turn() == &turn)
+                        .cloned()
+                        .ok_or("orchestration_plan_unavailable")?;
+                    if let Some(profile) = &draft.profile {
+                        let source = seed.request()?;
+                        if source.binding.requested_model != profile.strong.model
+                            || source.effort != profile.strong.effort
+                        {
+                            return Err("orchestration_generation_changed");
+                        }
                     }
+                    Proposal::from_plan(
+                        &factory,
+                        seed,
+                        draft.prompt,
+                        draft.plan,
+                        draft.read_only,
+                        draft.skill,
+                        draft.profile,
+                    )
                 })(),
             });
         }
@@ -2514,14 +2834,19 @@ impl Workbench {
         } = &event.payload
         {
             self.pending_context.remove(&command.0);
-            if self
-                .planning_context
-                .as_ref()
-                .is_some_and(|intent| &intent.command == command)
-            {
+            if self.planning_context.as_ref().is_some_and(|intent| {
+                &intent.command == command || intent.resume.as_ref() == Some(command)
+            }) {
                 self.cancel_modal();
                 self.menu = None;
             }
+        }
+        if matches!(&event.payload, EventPayload::FrontendSnapshot(snapshot)
+            if snapshot.state == "cancelled" && snapshot.submit.as_ref().is_some_and(|command|
+                self.planning_context.as_ref().is_some_and(|intent| &intent.submit == command)))
+        {
+            self.cancel_modal();
+            self.menu = None;
         }
         let slot = &mut self.slots[index];
         if let EventPayload::FrontendSnapshot(snapshot) = &event.payload
@@ -2735,18 +3060,21 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
-            Job::DraftPullRequest { owner, result } => {
-                self.orchestration_stop = None;
-                let message = match result {
-                    Ok(url) => format!("Draft PR · {url}"),
-                    Err("draft_release_missing") => "This conversation has no verified branch yet".into(),
-                    Err("draft_snapshot_private_changes") => "The snapshot contains local changes. Publishing requires a candidate verified on a clean base".into(),
-                    Err("draft_base_changed") => "The GitHub base branch has changed".into(),
-                    Err("draft_requires_network") => "Opening a draft PR requires network access".into(),
-                    Err(code) => format!("Could not open draft PR ({code})"),
-                };
-                if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
-                    slot.state.report(io, &message);
+            Job::AgentTranscript { token, result } => {
+                if token == self.file_token
+                    && let Some(Panel::AgentTranscript(reader)) = &mut self.panel
+                {
+                    reader.pending = false;
+                    match result {
+                        Ok(page) => {
+                            reader.page = Some(page);
+                            reader.offset = 0;
+                            reader.notice.clear();
+                        }
+                        Err(code) => {
+                            reader.notice = format!("Transcript unavailable ({code}) · r retry")
+                        }
+                    }
                 }
             }
             Job::OrchestrationReceipt { result } => {
@@ -2761,7 +3089,11 @@ impl Workbench {
                 {
                     match result {
                         Ok(archive) => {
-                            self.show_orchestration_plan(&archive.plan, Some(&archive.prompt));
+                            self.show_orchestration_plan(
+                                &archive.plan,
+                                Some(&archive.prompt),
+                                None,
+                            );
                             match archive.candidate {
                                 Ok(Some(candidate)) => {
                                     let view = ux::CandidateView::new(archive.run, candidate);
@@ -2801,12 +3133,11 @@ impl Workbench {
                         slot.state.input_history.reset();
                         self.refinement = None;
                         let blocked = proposal.plan.execution_ready().err();
-                        self.show_orchestration_plan(&proposal.plan, None);
-                        if let Some(profile) = &proposal.profile
-                            && let Some(Panel::Orchestration { lines, .. }) = &mut self.panel
-                        {
-                            lines.splice(0..0, roles::profile_lines(profile));
-                        }
+                        self.show_orchestration_plan(
+                            &proposal.plan,
+                            None,
+                            proposal.profile.as_ref(),
+                        );
                         self.frames.clear();
                         self.displayed = None;
                         self.operational_frame = None;
@@ -2823,11 +3154,6 @@ impl Workbench {
                                 "Choose Orchestrate+ role models, then submit the draft again",
                             );
                             self.open_role_picker(io);
-                        } else if code == "siwc_structured_format_unconfirmed" {
-                            self.report(
-                                io,
-                                "ChatGPT did not confirm the strict plan format · Tab Work",
-                            );
                         } else if code == "orchestration_read_folder_not_named" {
                             self.report(io, "Name the read folder in your request");
                         } else if code == "orchestration_read_folder_missing" {
@@ -2837,6 +3163,27 @@ impl Workbench {
                             );
                         } else {
                             self.report(io, &format!("Could not draft plan ({code})"));
+                        }
+                    }
+                }
+            }
+            Job::DraftCancel {
+                owner,
+                submit,
+                result,
+            } => {
+                if let Some(draft) = self.draft_cancellations.get_mut(&owner)
+                    && draft.submit == submit
+                {
+                    if result == Ok(PostStatus::QueueFull) {
+                        draft.posting = false;
+                    } else {
+                        self.draft_cancellations.remove(&owner);
+                        if let Err(code) = result
+                            && let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner)
+                        {
+                            slot.state
+                                .report(io, &format!("Could not cancel plan ({code})"));
                         }
                     }
                 }
@@ -2864,11 +3211,49 @@ impl Workbench {
                     }
                 }
             }
-            Job::OrchestrationDone { owner, result } => {
+            Job::OrchestrationDone {
+                owner,
+                generation_checked,
+                result,
+            } => {
                 self.update_orchestration_progress();
                 self.orchestration_progress = None;
-                self.orchestration_stop = None;
                 self.orchestration_inbox = None;
+                if !generation_checked
+                    && !self.input_closed
+                    && let Ok(completed) = &result
+                    && completed.evidence.is_some()
+                    && let Some(generation) = &completed.generation
+                    && let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner)
+                    && !parent.active()
+                    && parent
+                        .state
+                        .snapshot
+                        .as_ref()
+                        .is_none_or(|view| &view.generation != generation)
+                    && let Some((_, stop)) = &self.orchestration_stop
+                {
+                    let stop = stop.clone();
+                    let handle = parent.handle.clone();
+                    let command = parent
+                        .state
+                        .command(&handle, CommandPayload::SetGeneration(generation.clone()));
+                    self.jobs.spawn(async move {
+                        let selection = handle.post(command).await;
+                        let result = stop.check().and(match selection {
+                            Ok(PostStatus::Accepted | PostStatus::Duplicate) => result,
+                            Err(code) => Err(code),
+                            _ => Err("orchestration_generation_unavailable"),
+                        });
+                        Job::OrchestrationDone {
+                            owner,
+                            generation_checked: true,
+                            result,
+                        }
+                    });
+                    return;
+                }
+                self.orchestration_stop = None;
                 if result.is_err()
                     && matches!(self.panel, Some(Panel::Agents { .. }))
                     && self.can_job(io)
@@ -3298,6 +3683,9 @@ impl Workbench {
         }
         self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
+        if matches!(self.menu, Some(Menu::DraftingPlan)) {
+            self.cancel_drafting_plan();
+        }
         self.cancel_modal();
         self.requested_model = None;
         self.cancel_editor_request();
@@ -3349,10 +3737,21 @@ impl Workbench {
             return;
         }
         self.pending_editor = None;
+        if let Some(Panel::AgentTranscript(reader)) = &self.panel {
+            self.panel = Some(Panel::Agents {
+                selected: Some(reader.id.clone()),
+            });
+            self.focus = Focus::Inspector;
+            return;
+        }
         if self.panel.take().is_some() {
             self.focus = Focus::Chat;
             self.wide_diff = false;
             self.restore_result_scroll();
+            return;
+        }
+        if let Some(parent) = self.side_chat_parent() {
+            self.switch(parent);
             return;
         }
         if self.result_selected.take().is_some() {
@@ -3384,13 +3783,21 @@ impl Workbench {
         self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
         if self.focus == Focus::Inspector {
-            if let Some(Panel::Orchestration { lines, offset }) = &mut self.panel {
+            let reading = match &mut self.panel {
+                Some(Panel::Orchestration { document, offset }) => Some((&*document, offset)),
+                Some(Panel::AgentTranscript(reader)) => reader
+                    .page
+                    .as_ref()
+                    .map(|page| (&page.document, &mut reader.offset)),
+                _ => None,
+            };
+            if let Some((document, offset)) = reading {
                 let viewport = self
                     .displayed
                     .as_ref()
                     .and_then(|frame| frame.inspector_bounds());
                 let (_, _, width, height) = viewport.unwrap_or((0, 0, 80, 6));
-                let size = crate::frontend::cells::wrap_lines(lines, width.max(1)).len();
+                let size = document.viewport_rows(width.max(1)).len();
                 let step = height.saturating_sub(1).max(1);
                 *offset = if older {
                     offset.saturating_sub(step)
@@ -3565,7 +3972,11 @@ impl Workbench {
             completion.navigate(older);
             return;
         }
-        let agent_count = self.agent_rows().len();
+        let agent_rows = if matches!(self.panel, Some(Panel::Agents { .. })) {
+            self.agent_rows()
+        } else {
+            Vec::new()
+        };
         let output_count = match &self.panel {
             Some(Panel::Output { view, .. }) => self.output_lines(&view.text).len(),
             _ => 0,
@@ -3633,9 +4044,26 @@ impl Workbench {
                         files.offset.saturating_add(1).min(files.last_line())
                     };
                 }
-                Some(Panel::Agents { selected }) => delta(selected, agent_count),
+                Some(Panel::Agents { selected }) => {
+                    let mut index = agent_rows
+                        .iter()
+                        .position(|(id, _)| Some(id) == selected.as_ref())
+                        .unwrap_or(0);
+                    delta(&mut index, agent_rows.len());
+                    *selected = agent_rows.get(index).map(|(id, _)| id.clone());
+                }
                 Some(Panel::Output { offset, .. }) => delta(offset, output_count),
                 Some(Panel::Terminal | Panel::Image { .. } | Panel::NativeTerminal { .. }) => {}
+                Some(Panel::AgentTranscript(reader)) => {
+                    if let Some(page) = &reader.page {
+                        let width = self
+                            .displayed
+                            .as_ref()
+                            .and_then(|frame| frame.inspector_bounds())
+                            .map_or(72, |bounds| bounds.2);
+                        delta(&mut reader.offset, page.document.viewport_rows(width).len());
+                    }
+                }
                 Some(Panel::Orchestration { .. }) => {}
                 None => {}
             },
@@ -3731,11 +4159,37 @@ impl Workbench {
                     if let Some(target) = resume_target.as_ref().filter(|_| selected == 0) {
                         if self.resume_target().as_ref() == Some(target) {
                             let slot = &mut self.slots[self.current];
-                            slot.state.post(
+                            let draft = slot
+                                .state
+                                .snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.submit.as_ref())
+                                .filter(|submit| submit.0.starts_with("draft-"))
+                                .cloned();
+                            let resume = slot
+                                .state
+                                .command(&slot.handle, CommandPayload::Resume(target.clone()));
+                            let resume_id = resume.command.clone();
+                            if slot.state.post_command(
                                 &slot.handle,
-                                CommandPayload::Resume(target.clone()),
+                                resume,
                                 &mut slot.replies,
-                            );
+                                false,
+                            ) && let Some(submit) = draft
+                            {
+                                self.planning_context = Some(PlanningContext {
+                                    profile: None,
+                                    pending_draft: None,
+                                    resume: Some(resume_id),
+                                    awaiting_context: false,
+                                    command: submit.clone(),
+                                    turn: TurnId(submit.0.clone()),
+                                    submit,
+                                    owner: slot.id.clone(),
+                                    token: self.modal_token,
+                                });
+                                self.menu = Some(Menu::DraftingPlan);
+                            }
                         }
                     } else if let Some((id, _)) = continuation.filter(|_| selected == native) {
                         self.resume_orchestration(id, io);
@@ -3809,14 +4263,8 @@ impl Workbench {
                     }
                 }
                 Some(Panel::Agents { selected }) => {
-                    if let Some((id, agent)) = self.agent_rows().get(*selected) {
-                        if agent.state == "Running" && self.collecting_orchestration() {
-                            self.report(io, "The transcript is available once the agent finishes");
-                            return None;
-                        }
-                        let id = id.clone();
-                        self.agents_return = Some((self.slots[self.current].id.clone(), *selected));
-                        self.resume(id, io);
+                    if let Some(id) = selected.clone() {
+                        self.open_agent(&id);
                     }
                 }
                 Some(Panel::Image { .. }) => self.copy_image_path(io),
@@ -3847,6 +4295,22 @@ impl Workbench {
         }
         if matches!(&self.menu, Some(Menu::Orchestration { .. })) {
             if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
+                self.page(mouse.kind == MouseKind::WheelUp);
+            }
+            return;
+        }
+        if self.side_chat_parent().is_some() {
+            self.update_displayed(io);
+            if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown)
+                && self.displayed.as_ref().is_some_and(|frame| {
+                    frame
+                        .inspector_bounds()
+                        .is_some_and(|(column, row, width, height)| {
+                            (column..column + width).contains(&mouse.column)
+                                && (row..row + height).contains(&mouse.row)
+                        })
+                })
+            {
                 self.page(mouse.kind == MouseKind::WheelUp);
             }
             return;
@@ -3918,6 +4382,16 @@ impl Workbench {
                 // A partially painted frame has no single truthful text
                 // snapshot. Selection starts only on a completed paint.
                 if !self.frames.is_empty() || io.writer.failed() {
+                    return;
+                }
+                if matches!(self.panel, Some(Panel::Agents { .. }))
+                    && let Some(id) = self
+                        .displayed
+                        .as_ref()
+                        .and_then(|frame| frame.agent_at(mouse.column, mouse.row))
+                        .map(str::to_owned)
+                {
+                    self.open_agent(&id);
                     return;
                 }
                 let tab = self
@@ -4284,8 +4758,32 @@ impl Workbench {
         })
     }
     fn inspector(&self) -> Option<Inspector> {
+        if let (Some(editor), Some(Panel::Files(files))) = (&self.editor, &self.panel)
+            && let Some(document) = &files.document
+        {
+            let snapshot = editor.pane.snapshot();
+            return Some(Inspector {
+                title: format!(
+                    "Editor · {}",
+                    document
+                        .path
+                        .strip_prefix(&self.factory.settings.cwd)
+                        .unwrap_or(&document.path)
+                        .display()
+                ),
+                tabs: vec!["Files".into(), "Editor".into()],
+                selected_tab: 1,
+                kind: InspectorKind::Editor,
+                rendered: Some(std::sync::Arc::new(snapshot.rows.clone())),
+                cursor: snapshot
+                    .cursor
+                    .map(|(row, column)| (usize::from(column), usize::from(row))),
+                footer: ":w save · :q → Source".into(),
+                ..Inspector::default()
+            });
+        }
         match self.panel.as_ref()? {
-            Panel::Orchestration { lines, offset } => {
+            Panel::Orchestration { document, offset } => {
                 let footer = if let Some(Menu::Orchestration { selected, proposal }) = &self.menu {
                     let blocked = proposal.plan.execution_ready().err();
                     let actions = [
@@ -4314,7 +4812,7 @@ impl Workbench {
                 };
                 Some(Inspector {
                     title: "Plan · PgUp/PgDn or scroll".into(),
-                    lines: lines.clone(),
+                    document: Some(document.clone()),
                     offset: *offset,
                     footer,
                     kind: InspectorKind::Plan,
@@ -4383,14 +4881,36 @@ impl Workbench {
                 footer: "j/k lines · h/l horizontal · f expand · Esc chat".into(),
                 ..Inspector::default()
             }),
-            Panel::Agents { selected } => Some(Inspector {
-                title: "Conversation agents".into(),
-                agents: self.agent_rows().into_iter().map(|(_, row)| row).collect(),
-                selected: Some(*selected),
-                footer: "↑/↓ select · Enter transcript · Esc back".into(),
-                kind: InspectorKind::Agents,
+            Panel::AgentTranscript(reader) => Some(Inspector {
+                title: format!("Agent transcript · {}", reader.title),
+                document: reader.page.as_ref().map(|page| page.document.clone()),
+                lines: vec![reader.notice.clone()],
+                offset: reader.offset,
+                footer: if reader.notice.is_empty() {
+                    let pages = reader
+                        .page
+                        .as_ref()
+                        .filter(|page| page.begin > 0 || page.end < page.total)
+                        .map_or("", |_| " · [/] pages");
+                    format!("PgUp/PgDn scroll{pages} · r refresh · Esc agents")
+                } else {
+                    format!("{} · Esc agents", reader.notice)
+                },
                 ..Inspector::default()
             }),
+            Panel::Agents { selected } => {
+                let agents: Vec<_> = self.agent_rows().into_iter().map(|(_, row)| row).collect();
+                Some(Inspector {
+                    title: "Conversation agents".into(),
+                    selected: agents
+                        .iter()
+                        .position(|agent| Some(&agent.id) == selected.as_ref()),
+                    agents,
+                    footer: "Click or Enter to open · ↑/↓ select · Esc back".into(),
+                    kind: InspectorKind::Agents,
+                    ..Inspector::default()
+                })
+            }
             Panel::Image { name, view, .. } => Some(Inspector {
                 title: format!("Chart · {name}"),
                 lines: view.as_ref().map_or_else(
@@ -4539,10 +5059,20 @@ impl Workbench {
             }
         }
     }
+    fn side_chat_parent(&self) -> Option<usize> {
+        let child = &self.slots[self.current];
+        if child.kind != Kind::Btw || self.panel.is_some() {
+            return None;
+        }
+        let parent = child.parent.as_deref()?;
+        self.slots.iter().position(|slot| slot.id == parent)
+    }
     fn ui(&self) -> Workspace {
         let slot = &self.slots[self.current];
+        let parent = self.side_chat_parent().map(|index| &self.slots[index]);
+        let main = parent.unwrap_or(slot);
         let mut breadcrumb = Vec::new();
-        let mut current = Some(slot.id.clone());
+        let mut current = Some(main.id.clone());
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..MAX_SESSIONS {
             let Some(id) = current else {
@@ -4553,7 +5083,7 @@ impl Workbench {
             }
             if let Some(title) = self.known_title(&id) {
                 breadcrumb.push(title);
-            } else if id == slot.id && slot.kind == Kind::Fork {
+            } else if id == main.id && main.kind == Kind::Fork {
                 breadcrumb.push("Fork".into());
             }
             if let Some(ancestor) = self.slots.iter().find(|s| s.id == id) {
@@ -4580,14 +5110,14 @@ impl Workbench {
                 .and_then(|g| g.effort.clone())
                 .unwrap_or_default(),
             activity: match self.orchestration_mode {
-                Some(OrchestrationMode::Standard) => "Orchestration".into(),
+                Some(OrchestrationMode::Standard) => "Orchestrate".into(),
                 Some(OrchestrationMode::Plus) => "Orchestrate+".into(),
                 None => String::new(),
             },
             exit_confirmation: self.exit_deadline.is_some(),
-            reading: !slot.state.follow_tail,
-            new_events: snapshot.map_or(0, |s| {
-                s.transcript_size.saturating_sub(slot.state.reading_total)
+            reading: !main.state.follow_tail,
+            new_events: main.state.snapshot.as_ref().map_or(0, |s| {
+                s.transcript_size.saturating_sub(main.state.reading_total)
             }),
             focus: self.focus,
             inspector: self.inspector(),
@@ -4616,6 +5146,20 @@ impl Workbench {
                 && self.focus == Focus::Inspector
                 && (matches!(&self.panel, Some(Panel::EditDiff { .. }))
                     || matches!(&self.panel, Some(Panel::Files(files)) if files.tab == 1)),
+            terminal_shortcut: self
+                .available_commands()
+                .iter()
+                .any(|command| command.name == "/terminals"),
+            side_chat: parent.map(|parent| carbon::SideChat {
+                parent_history: parent
+                    .state
+                    .reading
+                    .clone()
+                    .or_else(|| self.projected_slot(parent))
+                    .unwrap_or_default(),
+                parent_scroll: parent.state.scroll,
+                title: "/btw · read-only · Esc → main chat".into(),
+            }),
         }
     }
     fn animation_enabled(&self) -> bool {
@@ -4704,6 +5248,14 @@ impl Workbench {
         }
     }
     fn render(&mut self, io: &Io, context: &str) {
+        if let Some(Panel::Agents { selected }) = &self.panel {
+            let rows = self.agent_rows();
+            if !rows.iter().any(|(id, _)| Some(id) == selected.as_ref()) {
+                self.panel = Some(Panel::Agents {
+                    selected: rows.into_iter().next().map(|(id, _)| id),
+                });
+            }
+        }
         self.update_displayed(io);
         if self.selection_frame.is_some() {
             return;
@@ -4769,7 +5321,21 @@ impl Workbench {
             } else {
                 "Opening session"
             };
-            let mut frame = carbon::layout_full(&[], b"", 0, status, 0, context, io.size, io.color);
+            let mut frame = if self.side_chat_parent().is_some() {
+                carbon::layout_workspace(
+                    &[],
+                    b"",
+                    0,
+                    status,
+                    0,
+                    context,
+                    io.size,
+                    io.color,
+                    &self.ui(),
+                )
+            } else {
+                carbon::layout_full(&[], b"", 0, status, 0, context, io.size, io.color)
+            };
             if let Some(frame) = &mut frame
                 && let Some(header) = frame.lines.first_mut()
             {
@@ -4820,6 +5386,17 @@ impl Workbench {
             frame = slot
                 .state
                 .render_workspace(io, context, &ui, projected.as_deref());
+        }
+        if let Some(editor) = &mut self.editor
+            && let Some((_, _, width, height)) =
+                frame.as_ref().and_then(|frame| frame.inspector_bounds())
+            && width > 0
+            && height > 0
+        {
+            let size = (height.clamp(1, 128) as u16, width.clamp(1, 256) as u16);
+            if size != editor.size && editor.pane.resize(size.0, size.1).is_ok() {
+                editor.size = size;
+            }
         }
         if self.selection.is_none()
             && matches!(self.panel, Some(Panel::Terminal))
@@ -4974,17 +5551,15 @@ pub async fn run_attached(
     let mut animated_frame = None;
     let mut deferred_input = std::collections::VecDeque::new();
     let mut failure: Option<&'static str> = None;
-    let mut terminating_since = None;
-    let mut editor_cancel_since: Option<Instant> = None;
     let result: Result<()> = async {
-        while !finished || work.editor.is_some() {
+        while !finished {
             if let Some(bridge) = &mut bridge
                 && let Some(root) = work.slots.iter().find(|slot| slot.id == work.root_id) {
                 bridge.set_input_mode(root.state.mode);
             }
             work.update_displayed(io);
             let mut input_guard = None; let mut signal_guard = None;
-            let input_enabled = work.terminal_pending_input.is_empty() && !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing
+            let input_enabled = work.terminal_pending_input.is_empty() && !finished && !work.input_closed && work.pending_editor.is_none() && !work.editor_preparing
                 && work.slots[work.current].state.pending_draft.is_none()
                 && work.slots[work.current].ready && !work.slots[work.current].ready_refresh
                 && work.slots[work.current].state.history_ready && work.displayed.is_some()
@@ -5013,14 +5588,11 @@ pub async fn run_attached(
                 match signal {
                     SIGTERM | SIGHUP => {
                         exit = 128 + signal; finished = true; work.terminating = true;
-                        terminating_since.get_or_insert(Instant::now());
                         work.cancel_editor_request(); work.cancel_modal();
-                        if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); } }
                     }
                     SIGINT => {
                         if work.terminal_focused() { work.terminal_bytes(&[3], io); }
-                        else if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); finished = true; work.terminating = true; terminating_since.get_or_insert(Instant::now()); } }
-                        else if work.pending_editor.is_some() || work.editor_preparing { work.cancel_editor_request(); }
+                        else if work.pending_editor.is_some() || work.editor_preparing { work.cancel_editor_request(); deferred_input.clear(); }
                         else if !finished {
                             if work.input_closed { work.cancel_current(io); }
                             else { finished |= work.interrupt(io, Instant::now()); }
@@ -5028,13 +5600,12 @@ pub async fn run_attached(
                     }
                     SIGTSTP => {
                         if work.terminal_focused() { work.terminal_bytes(&[26], io); }
-                        else if let Some(editor) = &mut work.editor { editor_cancel_since.get_or_insert(Instant::now()); if let Err(code) = editor.cancel() { failure.get_or_insert(code); finished = true; work.terminating = true; terminating_since.get_or_insert(Instant::now()); } }
                         else { io.suspend().await?; }
                         work.last_frame = None;
                     }
                     SIGCONT => { io.resume_terminal()?; work.last_frame = None; }
                     SIGWINCH => { io.resize(); work.last_frame = None;
-                        if (io.size.0 < 12 || io.size.1 < 8) && work.focus == Focus::Inspector {
+                        if (io.size.0 < 12 || io.size.1 < 8) && work.focus == Focus::Inspector && work.editor.is_none() {
                             let pending = work.terminal_decoder.take_pending();
                             if !pending.is_empty() { work.terminal_bytes(&pending, io); }
                             work.terminal_escape_at = None;
@@ -5044,49 +5615,54 @@ pub async fn run_attached(
                     _ => {}
                 }
             }
-            if work.editor_wait.as_mut().is_some_and(|wait| {
-                let now = Instant::now(); let written = io.writer.written();
-                if written != wait.written { wait.written = written; wait.progress = now; }
-                now.duration_since(wait.progress) >= Duration::from_millis(250) || now.duration_since(wait.began) >= Duration::from_secs(1)
-            }) {
-                work.cancel_editor_request(); work.report(io, "Could not hand off the terminal to the editor: output is still pending"); dirty = true;
-            }
-            if let Some(mut editor) = work.editor.take() {
-                if editor_cancel_since.is_some_and(|began| began.elapsed() >= Duration::from_secs(2)) || (finished && terminating_since.is_some_and(|began| began.elapsed() >= Duration::from_secs(2))) {
-                    let _ = editor.abort_for_exit(io).map_err(|code| { failure.get_or_insert(code); });
-                    failure.get_or_insert("editor_cleanup_unknown");
-                    finished = true; work.terminating = true;
-                } else { match editor.poll(io) {
-                    Ok(Some(status)) => {
-                        if status.cleanup_unknown { work.report(io, "Editor exited. Detached process state is unknown"); }
-                        else { work.report(io, &format!("Editor exited: {}", status.code)); }
-                        work.last_frame = None; work.displayed = None; work.frames.clear(); dirty = true;
-                        editor_cancel_since = None;
-                        if !finished && !work.input_closed && let Some(Panel::Files(files)) = &work.panel && let Some(document) = &files.document { work.open_file(document.path.clone(), io); }
-                    }
-                    Ok(None) => work.editor = Some(editor),
-                    Err(code) => {
-                        work.report(io, &format!("Could not open editor: {code}")); work.last_frame = None; dirty = true;
-                        work.slots[work.current].state.exit = 1;
-                        if code == "editor_cleanup_unknown" { failure.get_or_insert(code); finished = true; work.terminating = true; }
-                        editor_cancel_since = None;
-                    }
-                } }
-            }
-            if !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_some() && io.writer.idle()
-                && work.jobs.is_empty() && !work.slots.iter().any(Slot::active)
-            {
-                let command = work.pending_editor.take().expect("checked pending editor");
-                work.editor_wait = None;
-                match io.start_editor(&command.argv, &work.factory.settings.cwd) {
-                    Ok(editor) => { work.editor = Some(editor); editor_cancel_since = None; }
-                    Err(code) => work.report(io, &format!("Could not open editor: {code}")),
+            if let Some(editor) = &mut work.editor {
+                let snapshot = editor.pane.snapshot();
+                dirty |= editor.revision != snapshot.revision;
+                editor.revision = snapshot.revision;
+                if let Some((rows, columns)) = work.terminal_dimensions()
+                    && work.editor.as_ref().is_some_and(|editor| editor.size != (rows, columns))
+                {
+                    dirty = true;
                 }
+                if work.editor.as_ref().is_some_and(|editor| editor.pane.worker_finished()) {
+                    let mut editor = work.editor.take().expect("finished editor");
+                    let outcome = editor.pane.shutdown();
+                    let snapshot = editor.pane.snapshot();
+                    work.terminal_pending_input.clear();
+                    work.terminal_decoder = Default::default();
+                    work.terminal_escape_at = None;
+                    deferred_input.clear();
+                    dirty = true;
+                    if !snapshot.cleanup_known(&outcome) {
+                        work.report(io, "Editor process cleanup is unknown");
+                        failure.get_or_insert("editor_cleanup_unknown");
+                        finished = true;
+                        work.terminating = true;
+                    } else if !finished && !work.input_closed {
+                        if let Some(error) = &snapshot.error {
+                            work.report(io, &format!("Could not open editor: {error}"));
+                        } else if let Some(status) = snapshot.exit_status && !status.success() {
+                            work.report(io, &format!("Editor exited: {status}"));
+                        }
+                        if let Some(Panel::Files(files)) = &work.panel && let Some(document) = &files.document {
+                            work.open_file(document.path.clone(), io);
+                        }
+                    }
+                }
+            }
+            if !finished && !work.input_closed && work.pending_editor.is_some()
+                && work.jobs.is_empty()
+                && !work.slots.iter().any(Slot::active) && work.pending_context.is_empty()
+                && work.orchestration_stop.is_none()
+            {
+                work.launch_panel_editor(io);
+                dirty = true;
             }
             let now = Instant::now();
             dirty |= work.update_orchestration_progress();
             dirty |= work.tick_drag(io, now);
             work.refresh_terminal_screen(now);
+            work.refresh_agent_reader();
             work.flush_terminal_input(io);
             if let Some(terminal) = &work.terminal {
                 let snapshot = terminal.snapshot();
@@ -5113,7 +5689,7 @@ pub async fn run_attached(
             for slot in &mut work.slots {
                 dirty |= slot.poll_replies(io)?;
                 admissions.append(&mut slot.admissions);
-                if work.editor.is_none() && !finished { slot.refresh(io, now); }
+                if !finished { slot.refresh(io, now); }
                 dirty |= slot.state.progress.tick(now);
                 if slot.state.explicit_status { dirty |= slot.state.wait_clock.tick(now); }
             }
@@ -5121,10 +5697,17 @@ pub async fn run_attached(
                 if !accepted {
                     work.pending_context.remove(&id);
                     work.orchestration_summary.retain(|_, pending| pending.0 != id);
-                    if work.planning_context.as_ref().is_some_and(|intent| intent.command.0 == id) {
+                    work.draft_cancellations.retain(|_, pending| pending.submit.0 != id);
+                    if work.planning_context.as_ref().is_some_and(|intent|
+                        intent.command.0 == id || intent.resume.as_ref().is_some_and(|resume| resume.0 == id)) {
                         work.cancel_modal();
                         work.menu = None;
                     }
+                }
+            }
+            if !work.draft_cancellations.is_empty() {
+                for index in 0..work.slots.len() {
+                    work.dispatch_draft_cancel(index);
                 }
             }
             if work.exit_deadline.is_some_and(|deadline| now >= deadline || work.slots[work.current].interruptible()) {
@@ -5137,7 +5720,7 @@ pub async fn run_attached(
                     escape_at = None;
                 }
             } else { escape_at = None; }
-            let can_read = work.terminal_pending_input.is_empty() && !finished && !work.input_closed && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing && work.slots[work.current].state.pending_draft.is_none()
+            let can_read = work.terminal_pending_input.is_empty() && !finished && !work.input_closed && work.pending_editor.is_none() && !work.editor_preparing && work.slots[work.current].state.pending_draft.is_none()
                 && work.slots[work.current].ready && !work.slots[work.current].ready_refresh
                 && work.slots[work.current].state.history_ready && work.displayed.is_some()
                 && work.operational_frame.is_some_and(|sequence| io.writer.displayed(sequence));
@@ -5145,13 +5728,13 @@ pub async fn run_attached(
                 let mut bytes = [0; 4096];
                 let read = if deferred_input.is_empty() { io.input.read(&mut bytes) } else { let count = deferred_input.len().min(bytes.len()); for byte in &mut bytes[..count] { *byte = deferred_input.pop_front().expect("bounded input"); } Ok(count) };
                 match read {
-                    Ok(0) => finished |= work.eof(io, true),
+                    Ok(0) => finished |= work.eof(io, work.editor.is_none()),
                     Ok(count) => {
                         dirty = true;
-                        if work.terminal_focused() {
+                        let count = if work.terminal_focused() {
                             work.terminal_chunk(&bytes[..count], io, &mut deferred_input);
-                            continue;
-                        }
+                            0
+                        } else { count };
                         for (position, &byte) in bytes[..count].iter().enumerate() {
                             work.disarm_exit();
                             if matches!(&work.menu, Some(Menu::Palette { stage, .. }) if stage.editing()) {
@@ -5186,7 +5769,11 @@ pub async fn run_attached(
                                     }
                                     if byte >= 32 && byte != 127 { continue; }
                                 }
-                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Agents { .. })) && byte >= 32 && byte != 127 { continue; }
+                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::AgentTranscript(_))) && matches!(byte, b'r' | b'[' | b']') {
+                                    if let Some(Panel::AgentTranscript(reader)) = &mut work.panel { reader.requested = Some(byte); }
+                                    continue;
+                                }
+                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Agents { .. } | Panel::AgentTranscript(_))) && byte >= 32 && byte != 127 { continue; }
                                 if work.focus == Focus::Inspector && let Some(Panel::EditDiff { rows, offset, column, .. }) = &mut work.panel {
                                     if byte == b'g' { *offset = 0; continue; }
                                     if byte == b'G' { *offset = rows.len().saturating_sub(file_visible); continue; }
@@ -5215,7 +5802,7 @@ pub async fn run_attached(
                                     }
                                     if let Some(tab) = match byte { b's' => Some(0), b'd' => Some(1), b'p' => Some(2), _ => None } { files.preview_end = false; files.tab = tab; files.offset = 0; continue; }
                                     if byte == b'h' { let parent = files.document.as_ref().and_then(|d| d.path.parent()).or_else(|| files.listing.as_ref().and_then(|l| l.path.parent())).map(Path::to_path_buf); if let Some(parent) = parent { work.open_file(parent, io); } continue; }
-                                    if byte == b'e' { work.prepare_editor(io); continue; }
+                                    if byte == b'e' && files.tab == 0 && files.document.is_some() { work.prepare_editor(io); if work.editor_preparing { deferred_input.extend(&bytes[position + 1..count]); break; } continue; }
                                     if byte == b'q' { work.open_terminal(io); deferred_input.extend(&bytes[position + 1..count]); break; }
                                     if byte >= 32 && byte != 127 { continue; }
                                 }
@@ -5279,6 +5866,8 @@ pub async fn run_attached(
                                     Action::Mouse(mouse) => work.mouse(mouse, io),
                                     Action::HistoryOlder | Action::HistoryNewer => work.navigate(action == Action::HistoryOlder),
                                     Action::PageUp => work.page(true), Action::PageDown => work.page(false),
+                                    Action::OpenFiles => { work.open_file(work.factory.settings.cwd.clone(), io); }
+                                    Action::OpenTerminals => { work.inspect_terminal("", io); }
                                     Action::ToggleTools => { let slot = &mut work.slots[work.current]; slot.state.tools_expanded = !slot.state.tools_expanded; slot.state.reading = None; }
                                     Action::CopyHistory => work.slots[work.current].state.start_copy(io),
                                     Action::Overflow => { work.report(io, "ansa: submit_size"); work.slots[work.current].state.exit = 1; work.slots[work.current].state.editor.clear(); work.slots[work.current].state.input_history.reset(); }
@@ -5298,7 +5887,7 @@ pub async fn run_attached(
             }
             work.close_owners();
             if work.jobs.is_empty() && work.pending_context.is_empty() && work.slots.iter().all(|slot| slot.closed) { finished = true; }
-            if dirty && !finished && work.editor.is_none() && work.pending_editor.is_none() && !work.editor_preparing { work.render(io, context); dirty = false; }
+            if dirty && !finished { work.render(io, context); dirty = false; }
             if let Some(mut guard) = input_guard && !io.input.ready(false).map_err(|_| "cli_input_poll")? { guard.clear_ready(); }
             if let Some(mut guard) = signal_guard && !signal_events.get_ref().ready(false).map_err(|_| "cli_signal_poll")? { guard.clear_ready(); }
             if io.writer.failed() { return Err("cli_output"); }
@@ -5315,27 +5904,16 @@ pub async fn run_attached(
         failure.get_or_insert(code);
     }
     if let Some(mut editor) = work.editor.take() {
-        if let Err(code) = editor.cancel() {
-            failure.get_or_insert(code);
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if Instant::now() >= deadline {
-                if let Err(code) = editor.abort_for_exit(io) {
-                    failure.get_or_insert(code);
-                }
+        match tokio::task::spawn_blocking(move || {
+            let outcome = editor.pane.shutdown();
+            (outcome, editor.pane.snapshot())
+        })
+        .await
+        {
+            Ok((outcome, snapshot)) if snapshot.cleanup_known(&outcome) => {}
+            _ => {
                 failure.get_or_insert("editor_cleanup_unknown");
-                break;
             }
-            match editor.poll(io) {
-                Ok(Some(_)) => break,
-                Ok(None) => {}
-                Err(code) => {
-                    failure.get_or_insert(code);
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
     for slot in &work.slots {
@@ -5560,6 +6138,7 @@ mod tests {
                 action: None,
                 edit: None,
                 output: None,
+                agent: None,
             }],
             b"draft",
             5,
@@ -5909,6 +6488,7 @@ mod tests {
                     action: None,
                     edit: None,
                     output: None,
+                    agent: None,
                     status: None,
                     role: "user".into(),
                     text: text.into(),

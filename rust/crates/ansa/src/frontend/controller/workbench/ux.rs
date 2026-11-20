@@ -55,7 +55,10 @@ impl Slot {
 
 impl Workbench {
     pub(super) fn projected(&self) -> Option<Vec<Entry>> {
-        let slot = &self.slots[self.current];
+        self.projected_slot(&self.slots[self.current])
+    }
+
+    pub(super) fn projected_slot(&self, slot: &Slot) -> Option<Vec<Entry>> {
         let mut entries = slot.projected()?;
         for review in &slot.candidate_reviews {
             let plan_key = format!("plan:{}", review.run);
@@ -65,6 +68,27 @@ impl Workbench {
             {
                 let diff = Some(format!("candidate:{}", review.run));
                 let mut review_entries = vec![result_entry(review.heading.clone(), diff, None)];
+                let changed = |row: &crate::frontend::diff::Row| {
+                    use crate::frontend::diff::Kind;
+                    matches!(row.kind, Kind::Add | Kind::Remove)
+                };
+                review_entries.extend(
+                    review
+                        .rows
+                        .iter()
+                        .skip_while(|row| !changed(row))
+                        .take_while(|row| changed(row))
+                        .take(3)
+                        .map(|row| Entry {
+                            role: row.role().into(),
+                            text: row.display(),
+                            action: None,
+                            status: None,
+                            edit: None,
+                            output: None,
+                            agent: None,
+                        }),
+                );
                 review_entries.extend(review.checks.iter().enumerate().map(|(index, view)| {
                     result_entry(
                         format!("{} · passed", view.title),
@@ -75,36 +99,94 @@ impl Workbench {
                 entries.splice(index + 1..index + 1, review_entries);
             }
         }
-        if !slot.state.follow_tail {
+        if slot
+            .timeline
+            .as_ref()
+            .is_some_and(|page| page.end < page.total)
+        {
             return Some(entries);
         }
-        if self.collecting_orchestration() {
+        if self.orchestration_progress.is_some()
+            && self
+                .orchestration_stop
+                .as_ref()
+                .is_some_and(|(owner, _)| owner == &slot.id)
+        {
             let view = self.orchestration_views.get(&slot.id);
+            if let Some(view) = view {
+                let mut plan = format!("## Work plan\n{}", view.plan.summary());
+                for step in view.plan.steps() {
+                    let mark = if view.completed_steps.contains(&step.id) {
+                        '✓'
+                    } else {
+                        '□'
+                    };
+                    let title = step.task.lines().next().unwrap_or(&step.id);
+                    plan.push_str(&format!("\n{mark} {title}"));
+                }
+                entries.push(Entry {
+                    role: "assistant".into(),
+                    text: plan,
+                    action: Some("plan:active".into()),
+                    status: None,
+                    edit: None,
+                    output: None,
+                    agent: None,
+                });
+            }
             entries.push(Entry {
                 text: view.map_or_else(
                     || "Starting agents".into(),
                     |view| {
-                        if view.reviewing {
-                            "Verifying agent changes".into()
+                        let label = if view.reviewing {
+                            "Verifying agent changes"
                         } else if view.clarification_pending {
-                            "Coordinator receives the clarification after the current step".into()
+                            "Coordinator receives the clarification after the current step"
                         } else {
-                            format!(
-                                "{} · {}/{} agents done",
-                                view.title,
-                                view.done,
-                                view.plan.steps().len()
-                            )
-                        }
+                            "Agents"
+                        };
+                        format!(
+                            "{label} · {}/{} agents done",
+                            view.completed_steps.len(),
+                            view.plan.steps().len()
+                        )
                     },
                 ),
                 role: "activity".into(),
-                action: view.map(|_| "plan:active".into()),
+                action: Some("agents:active".into()),
                 status: None,
                 edit: None,
                 output: None,
+                agent: None,
             });
-        } else if self.orchestration_summary.contains_key(&slot.id) {
+            if let Some(view) = view {
+                let active = |agent: &carbon::AgentLine| {
+                    matches!(agent.state.as_str(), "Running" | "Paused")
+                };
+                let recent = view
+                    .agents
+                    .iter()
+                    .filter(|(_, agent)| !active(agent))
+                    .take(2)
+                    .collect::<Vec<_>>();
+                let running = view.agents.iter().filter(|(_, agent)| active(agent));
+                entries.extend(
+                    recent
+                        .into_iter()
+                        .rev()
+                        .chain(running)
+                        .map(|(id, agent)| Entry {
+                            role: "agent_card".into(),
+                            text: String::new(),
+                            action: Some(format!("agent:{id}")),
+                            status: None,
+                            edit: None,
+                            output: None,
+                            agent: Some(Arc::new(agent.clone())),
+                        }),
+                );
+            }
+        } else if slot.state.follow_tail && self.orchestration_summary.contains_key(&slot.id) {
             if entries.last().is_some_and(|entry| entry.role == "activity") {
                 entries.pop();
             }
@@ -115,8 +197,10 @@ impl Workbench {
                 status: None,
                 edit: None,
                 output: None,
+                agent: None,
             });
-        } else if let Some(view) = self.orchestration_views.get(&slot.id)
+        } else if slot.state.follow_tail
+            && let Some(view) = self.orchestration_views.get(&slot.id)
             && view.clarification_pending
         {
             entries.push(Entry {
@@ -126,6 +210,7 @@ impl Workbench {
                 status: None,
                 edit: None,
                 output: None,
+                agent: None,
             });
         }
         Some(entries)
@@ -148,68 +233,28 @@ impl Workbench {
         &mut self,
         plan: &crate::orchestration::plan::Plan,
         prompt: Option<&str>,
+        profile: Option<&RoleProfile>,
     ) {
-        use crate::orchestration::plan::Access;
-        let mut lines = Vec::new();
-        if let Some(folder) = plan.read_folder() {
-            lines.push(format!("Read folder · {folder}"));
-            lines.push(String::new());
-        }
-        lines.extend([plan.summary().to_owned(), String::new()]);
-        if let Some(prompt) = prompt {
-            lines.push("Original request".into());
-            lines.extend(prompt.lines().map(str::to_owned));
-            lines.push(String::new());
+        let mut sections = Vec::new();
+        if let Some(profile) = profile {
+            sections.push(roles::profile_lines(profile).join("  \n"));
         }
         if let Err(code) = plan.execution_ready() {
-            lines.push(if code == "orchestration_manual_checks_required" {
-                "A manual check is required before starting. Select Refine.".into()
+            sections.push(if code == "orchestration_manual_checks_required" {
+                "**A manual check is required before starting. Select Refine.**".into()
             } else {
-                "Select Refine to add a check for the changes.".into()
+                "**Select Refine to add a check for the changes.**".into()
             });
-            lines.push(String::new());
         }
-        for check in plan.command_checks() {
-            lines.push(format!(
-                "Command runs in the project copy with your permissions: {}",
-                serde_json::json!(check.argv)
-            ));
+        if let Some(prompt) = prompt {
+            sections.push(format!("## Original request\n\n{prompt}"));
         }
-        for (index, step) in plan.steps().iter().enumerate() {
-            let access = match step.access {
-                Access::Read => "Read",
-                Access::Write => "Edit workspace copy",
-            };
-            lines.push(format!("{}. {} · {access}", index + 1, step.id));
-            lines.extend(step.task.lines().map(str::to_owned));
-            if step.paths.is_empty() {
-                lines.push("Read scope · entire workspace".into());
-            } else {
-                lines.extend(step.paths.iter().cloned());
-            }
-            if !step.depends_on.is_empty() {
-                lines.push(format!("After steps {}", step.depends_on.join(", ")));
-            }
-            lines.extend(step.acceptance.lines().map(str::to_owned));
-            lines.push(String::new());
-        }
-        if plan.steps().iter().any(|step| step.access == Access::Write) {
-            lines.push("Changes go through a diff check and independent review. Up to two fixes in the listed paths.".into());
-        }
-        for check in plan.checks() {
-            lines.push(format!("Check file {}", check.path));
-            lines.extend(check.contains.lines().map(str::to_owned));
-        }
-        for check in plan.manual_checks() {
-            lines.push(if plan.execution_ready().is_ok() {
-                "Follow-up recommendation".into()
-            } else {
-                "Manual check".into()
-            });
-            lines.extend(check.lines().map(str::to_owned));
-        }
+        sections.extend(plan.markdown_sections());
         self.file_token = self.file_token.wrapping_add(1);
-        self.panel = Some(Panel::Orchestration { lines, offset: 0 });
+        self.panel = Some(Panel::Orchestration {
+            document: crate::frontend::markdown::Document::sections(&sections),
+            offset: 0,
+        });
         self.focus = Focus::Inspector;
     }
 
@@ -270,7 +315,19 @@ impl Workbench {
         if self.result_selected.is_some() && self.result_scroll.is_none() {
             self.result_scroll = Some(slot.state.scroll);
         }
-        if let Some(operation) = key.strip_prefix("image:") {
+        if key == "agents:active" {
+            // A mouse press freezes text for dragging. A click on live progress
+            // should keep the parent following the ongoing run in the other pane.
+            if self.result_selected.is_none() {
+                self.slots[self.current].show_latest();
+            }
+            self.open_agents(io);
+        } else if let Some(id) = key.strip_prefix("agent:") {
+            if self.result_selected.is_none() {
+                self.slots[self.current].show_latest();
+            }
+            self.open_agent(id);
+        } else if let Some(operation) = key.strip_prefix("image:") {
             let source = slot.timeline.as_ref().and_then(|page| {
                 page.entries.iter().find_map(|entry| {
                     graphics::Source::from_entry(entry, &slot.id)
@@ -287,7 +344,7 @@ impl Workbench {
         } else if let Some(run) = key.strip_prefix("plan:") {
             if run == "active" {
                 if let Some(view) = self.orchestration_views.get(&slot.id) {
-                    self.show_orchestration_plan(&view.plan.clone(), None);
+                    self.show_orchestration_plan(&view.plan.clone(), None, None);
                 }
             } else if self.can_job(io) {
                 let parent = self.slots[self.current].id.clone();
@@ -295,7 +352,7 @@ impl Workbench {
                 self.file_token = self.file_token.wrapping_add(1);
                 let token = self.file_token;
                 self.panel = Some(Panel::Orchestration {
-                    lines: vec!["Loading plan".into()],
+                    document: crate::frontend::markdown::Document::parse("Loading plan"),
                     offset: 0,
                 });
                 self.focus = Focus::Inspector;
@@ -475,23 +532,16 @@ impl Workbench {
     }
     pub(super) fn agent_rows(&self) -> Vec<(String, carbon::AgentLine)> {
         let root = self.conversation_root();
-        let mut candidates: Vec<(String, Option<String>, String)> = self
-            .summaries
-            .iter()
-            .map(|s| {
-                (
-                    s.entry.id.clone(),
-                    s.entry.parent.clone(),
-                    s.entry.kind.clone(),
-                )
-            })
-            .collect();
         let progress = self.orchestration_views.get(&root);
-        if let Some(view) = progress {
-            for (id, _) in &view.agents {
-                if !candidates.iter().any(|(candidate, _, _)| candidate == id) {
-                    candidates.push((id.clone(), Some(root.clone()), "agent".into()));
-                }
+        let mut candidates: Vec<_> = progress
+            .into_iter()
+            .flat_map(|view| &view.agents)
+            .map(|(id, _)| (id.clone(), Some(root.clone()), String::from("agent")))
+            .collect();
+        for summary in &self.summaries {
+            let entry = &summary.entry;
+            if !candidates.iter().any(|(id, _, _)| id == &entry.id) {
+                candidates.push((entry.id.clone(), entry.parent.clone(), entry.kind.clone()));
             }
         }
         for slot in &self.slots {
@@ -608,9 +658,13 @@ impl Workbench {
             result.push((
                 id.clone(),
                 carbon::AgentLine {
+                    id: id.clone(),
                     title: format!("{tree}{branch}{}", self.title(id)),
                     state: state.into(),
                     detail,
+                    role: carbon::AgentRole::Research,
+                    model: String::new(),
+                    activity: String::new(),
                 },
             ));
         }
@@ -695,6 +749,19 @@ impl Workbench {
             self.report(io, "The command panel has no model");
             return false;
         }
+        let owner = &self.slots[self.current].id;
+        if self
+            .orchestration_stop
+            .as_ref()
+            .is_some_and(|(id, _)| id == owner)
+            || self.orchestration_summary.contains_key(owner)
+        {
+            self.report(
+                io,
+                "Wait for orchestration to finish before switching models",
+            );
+            return false;
+        }
         if !self.can_job(io) {
             return false;
         }
@@ -759,7 +826,7 @@ impl Workbench {
         slot.state.report(io, "Applying autocompact percentage…");
         true
     }
-    fn terminal_dimensions(&self) -> Option<(u16, u16)> {
+    pub(super) fn terminal_dimensions(&self) -> Option<(u16, u16)> {
         // A key can arrive after the Files footer has been written but before
         // the writer acknowledges the whole frame. Use the newest geometry.
         self.last_frame
@@ -770,10 +837,17 @@ impl Workbench {
             .map(|(_, _, width, height)| (height.clamp(1, 128) as u16, width.clamp(1, 256) as u16))
     }
     pub(super) fn terminal_focused(&self) -> bool {
-        self.menu.is_none()
-            && self.focus == Focus::Inspector
-            && matches!(self.panel, Some(Panel::Terminal))
-            && self.terminal_dimensions().is_some()
+        self.editor.is_some()
+            || self.menu.is_none()
+                && self.focus == Focus::Inspector
+                && matches!(self.panel, Some(Panel::Terminal))
+                && self.terminal_dimensions().is_some()
+    }
+    fn input_terminal(&self) -> Option<&crate::frontend::terminal_pane::TerminalPane> {
+        self.editor
+            .as_ref()
+            .map(|editor| &editor.pane)
+            .or(self.terminal.as_ref())
     }
     pub(super) fn open_terminal(&mut self, io: &Io) {
         let Some((rows, columns)) = self.terminal_dimensions() else {
@@ -850,7 +924,7 @@ impl Workbench {
             self.selection = None;
             self.tool_press = None;
         }
-        if bytes == [3] {
+        if self.editor.is_none() && bytes == [3] {
             self.terminal_pending_input.clear();
         }
         if !self.terminal_pending_input.is_empty() {
@@ -861,7 +935,7 @@ impl Workbench {
             }
             return;
         }
-        let Some(terminal) = &self.terminal else {
+        let Some(terminal) = self.input_terminal() else {
             return;
         };
         for (index, part) in bytes.chunks(4096).enumerate() {
@@ -900,7 +974,8 @@ impl Workbench {
                 }
             }
             TerminalEvent::Escape => {
-                if self.terminal_focused()
+                if self.editor.is_none()
+                    && self.terminal_focused()
                     && self.terminal_pending_input.is_empty()
                     && self
                         .terminal
@@ -929,7 +1004,7 @@ impl Workbench {
                         && event.row >= y
                         && event.row < y + height
                 });
-                let screen = self.terminal.as_ref().map(|terminal| terminal.snapshot());
+                let screen = self.input_terminal().map(|terminal| terminal.snapshot());
                 if in_pane
                     && button & 4 == 0
                     && screen.as_ref().is_some_and(|s| {
@@ -951,7 +1026,7 @@ impl Workbench {
                     if let Some(bytes) = bytes {
                         self.terminal_bytes(&bytes, io);
                     }
-                } else {
+                } else if self.editor.is_none() {
                     self.mouse(event, io);
                 }
             }
@@ -964,8 +1039,7 @@ impl Workbench {
         deferred: &mut std::collections::VecDeque<u8>,
     ) {
         let paste = self
-            .terminal
-            .as_ref()
+            .input_terminal()
             .is_some_and(|terminal| terminal.snapshot().bracketed_paste);
         let events = self.terminal_decoder.feed(bytes, paste);
         for event in events {
@@ -1012,6 +1086,7 @@ fn result_entry(
         text,
         action,
         output,
+        agent: None,
         edit: None,
         status: None,
     }
