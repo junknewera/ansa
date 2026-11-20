@@ -243,7 +243,7 @@ def recall(binary, output):
             editor(screen, "seed-39 Ж界😀", at)
             at = len(screen.raw)
             screen.send(b"x" * (17 * 1024) + b"LONG_DRAFT_END")
-            until(screen,lambda:'LONG_DRAFT_END' in frame_text(screen.vt),'long draft is retained')
+            until(screen,lambda:'LONG_DRAFT_END' in ''.join(frame_text(screen.vt).split()),'long draft is retained')
             screen.send(b"\x03")
             editor(screen, "", at)
             at = len(screen.raw)
