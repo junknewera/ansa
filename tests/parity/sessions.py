@@ -70,7 +70,7 @@ class Context:
         if self.live:
             path=self.bundle.directory/label;path.write_bytes(payload);self.row.setdefault('artifacts',{})[suffix]=protocol.raw(path)
         return protocol.retained_bytes(self.bundle.directory,self.row['artifacts'][suffix],label,4096)
-    def call(self,adapter,request,exit=0,fault=None):
+    def call(self,adapter,request,exit=0,fault=None,started=None):
         request=copy.deepcopy(request)
         if request.get('op') in ('journal','store','catalog','hold'):request['root']=str(self.root)
         label=self.row['id']+'-'+str(self.command_index);self.command_index+=1
@@ -78,7 +78,7 @@ class Context:
         environment={'LD_PRELOAD':str(self.bundle.shim),'ANSA_JOURNAL_FAULT_ROOT':str(self.root/'journal'),'ANSA_JOURNAL_FAULT':fault} if fault else None
         if self.live:
             self.row.setdefault('commands',[]).append(label);path=self.bundle.directory/(label+'.stdin');path.write_bytes(raw)
-            command=common.command([self.bundle.paths[adapter]],common.ROOT,self.bundle.directory,label,timeout=45,input_file=path,process_env=environment)
+            command=common.command([self.bundle.paths[adapter]],common.ROOT,self.bundle.directory,label,timeout=45,input_file=path,process_env=environment,**({'started':started} if started is not None else {}))
             command['stdin']=protocol.raw(path);self.bundle.commands[label]=command
         else:check(self.row['commands'][self.command_index-1]==label,'command order differs')
         check(label not in self.bundle.used,'duplicate command reference');self.bundle.used.add(label)

@@ -44,7 +44,7 @@ def source_info():
     def git(*args):
         return subprocess.check_output(["git", "-C", str(ROOT), *args], timeout=15)
     paths = git("ls-files", "--cached", "--others", "--exclude-standard", "-z", "--",
-                "CMakeLists.txt", "flake.nix", "flake.lock", "include", "src", "tests", "rust")
+                "CMakeLists.txt", "flake.nix", "flake.lock", "include", "src", "tests", "rust", "nix")
     # Only reviewed code/config/fixture types; never inspect environment/credential files.
     suffixes = {".cpp", ".hpp", ".rs", ".py", ".sh", ".cmake", ".nix", ".json", ".sse", ".toml", ".lock"}
     files = {}
@@ -52,13 +52,13 @@ def source_info():
         path = ROOT / name
         if (path.is_file() and not path.is_symlink()
                 and not any(part == ".env" or part.startswith(".env.") for part in path.parts)
-                and (path.suffix in suffixes or path.name == "CMakeLists.txt")):
+                and (path.suffix in suffixes or path.name in {"CMakeLists.txt", "SKILL.md"})):
             files[name] = sha(path)
     return {"head": git("rev-parse", "HEAD").decode().strip(),
             "worktree_status": git("status", "--short").decode(), "files": files}
 
 
-def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=None, process_env=None):
+def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=None, process_env=None, started=None):
     """Keep exact output bytes; kill/reap our process group on a timeout."""
     stdout = output / (label + ".stdout")
     stderr = output / (label + ".stderr")
@@ -82,6 +82,15 @@ def command(argv, cwd, output, label, timeout=60, input_file=None, fixture_root=
         try:
             child = subprocess.Popen(result["argv"], cwd=cwd, stdin=stdin,
                                      stdout=out, stderr=err, start_new_session=True, env=child_environment)
+            if started is not None:
+                result.update(pid=child.pid,parent_pid=os.getpid())
+                try:
+                    started(child.pid)
+                except BaseException:
+                    try:os.killpg(child.pid,signal.SIGKILL)
+                    except ProcessLookupError:pass
+                    child.wait()
+                    raise
             try:
                 result["exit_code"] = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -347,16 +356,27 @@ def main():
     cap.add_argument("--output", type=Path, required=True)
     cap.add_argument("--run-ctest", action="store_true")
     chk = sub.add_parser("check", help="validate native M0, M1 risk, M2 protocol or M3 auth evidence")
-    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3", "M4"], required=True)
+    chk.add_argument("--milestone", choices=["M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"], required=True)
     chk.add_argument("--evidence", type=Path, required=True)
     chk.add_argument("--fault-evidence", type=Path)
     for name, description in (("compare", "capture native parity rows for risk, protocol or auth"),
                               ("fault", "capture native fault rows for risk, protocol or auth"),
-                              ("perf", "not implemented (always nonzero)")):
+                              ("perf", "capture release resource measurements against frozen M0 budgets")):
         future = sub.add_parser(name, help=description)
         for option in ("suite", "cpp-build", "rust-target", "output"):
             future.add_argument("--" + option)
+        if name == "perf":
+            future.add_argument("--cpp", required=True)
+            future.add_argument("--rust", required=True)
     args = parser.parse_args()
+    if args.action in ('capture', 'compare', 'fault', 'perf') and not (ROOT/'CMakeLists.txt').is_file():
+        parser.error('historical C++ differential capture requires a pre-M10 checkout (migration/m9-cutover); current Rust-only gates are documented in README.md')
+    if args.action == "perf":
+        import performance
+        return performance.capture(args)
+    if args.action in ("compare", "fault") and args.suite == "e2e":
+        import e2e
+        return e2e.capture(args)
     if args.action in ("compare", "fault", "perf"):
         if args.action in ("compare", "fault") and args.suite == "risk":
             import risk
@@ -370,9 +390,21 @@ def main():
         if args.action in ("compare", "fault") and args.suite == "sessions":
             import sessions
             return sessions.capture(args)
+        if args.action in ("compare", "fault") and args.suite == "runtime":
+            import runtime
+            return runtime.capture(args)
+        if args.action in ("compare", "fault") and args.suite == "tools":
+            import tools
+            return tools.capture(args)
+        if args.action in ("compare", "fault") and args.suite == "frontend":
+            import frontend
+            return frontend.capture(args)
         print(args.action + ": suite not implemented in M0", file=sys.stderr)
         return 2
     try:
+        if args.action == "check" and args.milestone == "M8":
+            import e2e
+            return e2e.check_evidence(args.evidence, args.fault_evidence)
         if args.action == "check" and args.milestone == "M1":
             import risk
             return risk.check(args.evidence.resolve(), args.fault_evidence)
@@ -385,6 +417,15 @@ def main():
         if args.action == "check" and args.milestone == "M4":
             import sessions
             return sessions.check_evidence(args.evidence.resolve(), args.fault_evidence)
+        if args.action == "check" and args.milestone == "M5":
+            import runtime
+            return runtime.check_evidence(args.evidence.resolve(), args.fault_evidence)
+        if args.action == "check" and args.milestone == "M6":
+            import tools
+            return tools.check_evidence(args.evidence.resolve(), args.fault_evidence)
+        if args.action == "check" and args.milestone == "M7":
+            import frontend
+            return frontend.check_evidence(args.evidence.resolve(), args.fault_evidence)
         manifest = json.loads(MANIFEST.read_bytes())
         if args.action == "preflight":
             args.output.parent.mkdir(parents=True, exist_ok=True)

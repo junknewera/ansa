@@ -15,12 +15,16 @@ SPEC.loader.exec_module(RUN)
 
 
 class EvidenceTests(unittest.TestCase):
-    def test_future_commands_cannot_pass(self):
+    def test_unconfigured_commands_cannot_pass(self):
         for name in ("compare", "fault", "perf"):
             result = subprocess.run([sys.executable, str(Path(RUN.__file__)), name],
                                     capture_output=True, text=True, check=False)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("not implemented", result.stderr)
+            if name == "perf":
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("required: --cpp, --rust", result.stderr)
+            else:
+                self.assertIn("not implemented", result.stderr)
 
     def test_junit_skipped_failed_duplicate_and_missing_are_not_pass(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,0 +1,424 @@
+//! Fresh-executable process supervisor. The runtime never forks directly.
+use super::output_spool;
+use crate::{
+    config::{n, s},
+    protocol::{json::Json, legacy_json_v1::sha256},
+    provider::replay::{Effects, Execution},
+    tools::{command::ProcessOptions, evidence as v, invocation::Invocation, registry::Outcome},
+};
+use ansa_linux::{fs, local, process as linux};
+use std::{
+    fs::File,
+    io::{ErrorKind, Read},
+    os::unix::{fs::MetadataExt, process::ExitStatusExt},
+    path::Path,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread::sleep,
+    time::{Duration, Instant},
+};
+type Result<T> = v::Result<T>;
+struct Primary {
+    child: Child,
+    cleaned: bool,
+    reaped: bool,
+    status: Option<ExitStatus>,
+}
+impl Primary {
+    fn cleanup(&mut self) -> std::io::Result<ExitStatus> {
+        let raw = self.child.id();
+        let pid = linux::Pid::from_raw(raw as i32).ok_or_else(|| std::io::Error::other("pid"))?;
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        if !self.reaped {
+            linux::kill_group(raw)?;
+            if !linux::exited_owned(pid)? {
+                linux::kill_owned(pid)?;
+            }
+        }
+        loop {
+            let children = linux::children(Path::new("/proc"))?;
+            let others: Vec<_> = children
+                .into_iter()
+                .filter(|v| self.reaped || v.as_raw_nonzero().get() as u32 != raw)
+                .collect();
+            for child in &others {
+                linux::kill_owned(*child)?;
+                linux::reap_owned(*child)?;
+            }
+            if !self.reaped && others.is_empty() && linux::exited_owned(pid)? {
+                let status = self.child.wait()?;
+                self.reaped = true;
+                self.status = Some(status);
+            }
+            // Reparenting can happen between the first children snapshot and
+            // primary exit. Continue draining after reap, without using the
+            // primary PID/PGID again (its identity can now be recycled).
+            if self.reaped && linux::children(Path::new("/proc"))?.is_empty() {
+                self.cleaned = true;
+                return self
+                    .status
+                    .ok_or_else(|| std::io::Error::other("primary_status"));
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("cleanup_effect_unknown"));
+            }
+            sleep(Duration::from_millis(5));
+        }
+    }
+}
+impl Drop for Primary {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = self.cleanup();
+        }
+    }
+}
+fn cancelled() -> std::io::Result<bool> {
+    let mut byte = [0];
+    match std::io::stdin().read(&mut byte) {
+        Ok(_) => Ok(true),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+struct Output {
+    saved: Vec<u8>,
+    seen: usize,
+    spool: Option<Vec<u8>>,
+    eof: bool,
+}
+impl Output {
+    fn new(preview: usize, retain: bool) -> Self {
+        Self {
+            saved: Vec::with_capacity(preview),
+            seen: 0,
+            spool: retain.then(Vec::new),
+            eof: false,
+        }
+    }
+
+    fn drain(
+        &mut self,
+        reader: &mut impl Read,
+        other: usize,
+        budget: usize,
+    ) -> std::io::Result<()> {
+        let mut chunk = [0; 4096];
+        for _ in 0..16 {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(count) => {
+                    self.seen = self.seen.saturating_add(count);
+                    if let Some(spool) = &mut self.spool {
+                        let retained = count.min(output_spool::STREAM_BYTES - spool.len());
+                        spool.extend_from_slice(&chunk[..retained]);
+                    }
+                    let keep = count.min(budget - self.saved.len() - other);
+                    self.saved.extend_from_slice(&chunk[..keep]);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn fully_inline(&self) -> bool {
+        self.eof && self.seen == self.saved.len() && std::str::from_utf8(&self.saved).is_ok()
+    }
+}
+fn output(
+    status: Option<ExitStatus>,
+    cancelled: bool,
+    timed_out: bool,
+    [out, err]: [Output; 2],
+    spawn_errno: usize,
+    clean: bool,
+    spool: Option<Json>,
+) -> Result<Outcome> {
+    let exit = status.map_or(127, |s| s.code().unwrap_or(-1));
+    let signal = status.and_then(|s| s.signal()).unwrap_or(0);
+    let mut body = Json::object(vec![
+        ("exit_code", Json::parse(&exit.to_string())?),
+        ("signal", n(signal as usize)),
+        (
+            "cancelled",
+            Json::parse(if cancelled { "true" } else { "false" })?,
+        ),
+        (
+            "timed_out",
+            Json::parse(if timed_out { "true" } else { "false" })?,
+        ),
+        (
+            "truncated",
+            Json::parse(
+                if out.seen > out.saved.len()
+                    || err.seen > err.saved.len()
+                    || spool.is_some() && (!out.eof || !err.eof)
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+            )?,
+        ),
+        ("stdout", s(&fs::utf8_text(&out.saved))?),
+        ("stderr", s(&fs::utf8_text(&err.saved))?),
+        ("stdout_bytes", n(out.seen)),
+        ("stderr_bytes", n(err.seen)),
+        ("spawn_errno", n(spawn_errno)),
+        (
+            "cleanup_complete",
+            Json::parse(if clean { "true" } else { "false" })?,
+        ),
+    ])?;
+    if let Some(spool) = spool {
+        body = body.with("output_spool", spool)?;
+    }
+    Ok(Outcome::from_bytes(
+        if clean {
+            Execution::Succeeded
+        } else {
+            Execution::Failed
+        },
+        if clean {
+            Effects::KnownResult
+        } else {
+            Effects::Unknown
+        },
+        body.dump().into_bytes(),
+    ))
+}
+fn supervise(
+    spec: &Json,
+    bound: Option<&Json>,
+    spool: Option<(&Path, &Invocation)>,
+) -> Result<Outcome> {
+    linux::preflight(Path::new("/proc")).map_err(|_| "process_privileges")?;
+    super::supervisor::capability_probe(
+        &std::env::current_exe().map_err(|_| "process_executable")?,
+    )
+    .map_err(|_| "process_capabilities")?;
+    let options = ProcessOptions::load(spec)?;
+    if Path::new(&options.argv[0])
+        .file_name()
+        .is_some_and(|v| v == "sudo")
+    {
+        return Ok(Outcome::succeeded(
+            r#"{"error":"sudo_disabled","exit_code":126}"#.into(),
+        ));
+    }
+    let directory = File::open(&options.cwd).map_err(|_| "process_cwd")?;
+    let metadata = directory.metadata().map_err(|_| "process_cwd")?;
+    if !metadata.is_dir() {
+        return Err("process_cwd");
+    }
+    if let Some(bound) = bound
+        && (bound.usize_field("version")? != 1
+            || bound.usize_field("device")? as u64 != metadata.dev()
+            || bound.usize_field("inode")? as u64 != metadata.ino())
+    {
+        return Ok(Outcome::failed_known(
+            r#"{"error":"process_cwd_changed"}"#.into(),
+        ));
+    }
+    linux::nonblocking_stdin().map_err(|_| "process_nonblocking")?;
+    let mut command = Command::new(&options.argv[0]);
+    if spec.has("environment") {
+        if spec.text_field("environment")? != "github"
+            || !matches!(options.argv[0].as_str(), "git" | "gh")
+        {
+            return Err("process_environment_policy");
+        }
+        command.env_clear();
+        for name in [
+            "PATH",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "GH_CONFIG_DIR",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "NIX_SSL_CERT_FILE",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_HOST", "github.com");
+    }
+    command
+        .args(&options.argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child =
+        match ansa_linux::managed::spawn(command, Some(&directory), Some(std::process::id())) {
+            Ok(child) => child,
+            Err(e) => {
+                return output(
+                    None,
+                    false,
+                    false,
+                    [Output::new(0, false), Output::new(0, false)],
+                    e.raw_os_error().unwrap_or(5) as usize,
+                    true,
+                    None,
+                );
+            }
+        };
+    let mut primary = Primary {
+        child,
+        cleaned: false,
+        reaped: false,
+        status: None,
+    };
+    let mut stdout = primary.child.stdout.take().ok_or("process_output")?;
+    let mut stderr = primary.child.stderr.take().ok_or("process_output")?;
+    ansa_linux::managed::nonblocking(&stdout).map_err(|_| "process_nonblocking")?;
+    ansa_linux::managed::nonblocking(&stderr).map_err(|_| "process_nonblocking")?;
+    let mut out = Output::new(options.output_bytes, spool.is_some());
+    let mut err = Output::new(options.output_bytes, spool.is_some());
+    let deadline = Instant::now() + Duration::from_millis(options.timeout_ms as u64);
+    let pid = linux::Pid::from_raw(primary.child.id() as i32).ok_or("process_pid")?;
+    let (cancelled, timed_out) = loop {
+        out.drain(&mut stdout, err.saved.len(), options.output_bytes)
+            .map_err(|_| "process_output")?;
+        err.drain(&mut stderr, out.saved.len(), options.output_bytes)
+            .map_err(|_| "process_output")?;
+        let cancelled = cancelled().map_err(|_| "process_control")?;
+        let timed_out = Instant::now() >= deadline;
+        if cancelled || timed_out || linux::exited_owned(pid).map_err(|_| "process_wait")? {
+            break (cancelled, timed_out);
+        }
+        sleep(Duration::from_millis(10));
+    };
+    let status = primary.cleanup();
+    let clean = status.is_ok();
+    out.drain(&mut stdout, err.saved.len(), options.output_bytes)
+        .map_err(|_| "process_output")?;
+    err.drain(&mut stderr, out.saved.len(), options.output_bytes)
+        .map_err(|_| "process_output")?;
+    let spool = spool
+        .map(|(root, invocation)| {
+            output_spool::retain(
+                root,
+                invocation,
+                (out.spool.as_deref().unwrap_or_default(), out.seen, out.eof),
+                (err.spool.as_deref().unwrap_or_default(), err.seen, err.eof),
+                out.fully_inline() && err.fully_inline(),
+            )
+        })
+        .transpose()?;
+    output(
+        status.ok(),
+        cancelled,
+        timed_out,
+        [out, err],
+        0,
+        clean,
+        spool,
+    )
+}
+pub fn process_worker(job: &Path) -> Result<()> {
+    process_worker_in(job, false)
+}
+
+fn process_worker_in(job: &Path, bound_required: bool) -> Result<()> {
+    linux::reset_signals().map_err(|_| "process_signal_reset")?;
+    let directory = fs::private_directory(job).map_err(|_| "local_directory_permissions")?;
+    let spec = v::read(&directory, "request.json")?.ok_or("process_job_request")?;
+    if spec.usize_field("version")? != 1 {
+        return Err("process_job_request");
+    }
+    let _lock = ansa_linux::local::lock(&directory).map_err(|_| "process_job_lock")?;
+    let invocation = Invocation::load(spec.field("invocation")?)?;
+    if v::read(&directory, "result.json")?.is_some() {
+        v::admit(&directory, &invocation)?;
+        return Ok(());
+    }
+    if v::read(&directory, "started.json")?.is_some() {
+        return Err("process_consumed");
+    }
+    v::create(
+        &directory,
+        "started.json",
+        &Json::object(vec![
+            ("version", n(1)),
+            ("request_hash", s(&sha256(spec.dump().as_bytes()))?),
+        ])?,
+    )?;
+    let bound = spec.field("workspace_binding").ok();
+    if bound_required && bound.is_none() {
+        return Err("process_cwd_binding_missing");
+    }
+    let spool = if output_spool::enabled(&invocation) {
+        Some((job.parent().ok_or("process_job_path")?, &invocation))
+    } else {
+        None
+    };
+    let outcome = supervise(&spec, bound, spool).unwrap_or_else(|_| v::unknown());
+    let can_retry = spool.is_some()
+        && matches!(
+            local::entry_exists(&directory, "result.json.pending"),
+            Ok(false)
+        );
+    let published = v::publish(&directory, &spec, &outcome);
+    if published.is_ok() || !can_retry {
+        return published;
+    }
+    // If the blob used the last free blocks, release it and retry only the
+    // evidence write. Never remove a blob once its receipt may be visible.
+    let Some((root, invocation)) = spool else {
+        return published;
+    };
+    let body = Json::parse(std::str::from_utf8(outcome.output()).map_err(|_| "invalid_utf8")?)?;
+    let id = sha256(invocation.operation.as_bytes());
+    if body
+        .field("output_spool")
+        .and_then(|receipt| receipt.text_field("output_id"))
+        != Ok(id.as_str())
+        || !matches!(local::entry_exists(&directory, "result.json"), Ok(false))
+    {
+        return published;
+    }
+    output_spool::release_unpublished(root, &id)?;
+    if local::entry_exists(&directory, "result.json.pending").map_err(|_| "local_file_publish")? {
+        local::unlink(&directory, "result.json.pending").map_err(|_| "local_file_publish")?;
+    }
+    let inline = body.with(
+        "output_spool",
+        Json::object(vec![("status", s("spool_unavailable")?)])?,
+    )?;
+    v::publish(
+        &directory,
+        &spec,
+        &Outcome::from_bytes(
+            outcome.execution(),
+            outcome.effects(),
+            inline.dump().into_bytes(),
+        ),
+    )
+}
+/// Dispatch before Tokio, configuration, auth or any user-facing frontend.
+pub fn private_entry(args: &[String]) -> Option<Result<()>> {
+    if args.get(1)?.as_str() != "--process-worker" {
+        return None;
+    }
+    Some(match args.len() {
+        3 => process_worker(Path::new(&args[2])),
+        4 if args[3] == "--bound-directory" => process_worker_in(Path::new(&args[2]), true),
+        _ => Err("private_mode_arguments"),
+    })
+}

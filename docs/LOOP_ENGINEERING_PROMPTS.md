@@ -1,5 +1,7 @@
 # Prompts для GPT diagnostic loop
 
+Исходный материал [PR #8](https://github.com/junknewera/ansa/pull/8). В реализованном Orchestrate+ три настраиваемые роли, две доработки и одно итоговое ревью сильной моделью. Состояние на дату предложения сохранено в [журнале этой ветки](https://github.com/junknewera/ansa/blob/68ebe611e9757a39ea2540d8b0f92c329fd9cdaa/docs/PROJECT_STATE.md). Текущая реализация и результаты проверок описаны в [сводке по пяти предложениям](PROJECT_STATE.md#реализация-пяти-proposal-после-разбора-требований).
+
 **PROPOSED / design-only.** Эти шаблоны описывают будущие native ANSA children и отдельное implementation задание. Они не включают функцию, не являются текущим `.ansa/config.json` и не разрешают менять migration sequencing. Основной контракт — [Loop engineering](LOOP_ENGINEERING.md); краткое решение — [ADR 0003](adr/0003-gpt-diagnostic-escalation.md).
 
 Уточнение 2026-11-15: [main@5029b8b](https://github.com/junknewera/ansa/blob/5029b8b8972ea4c64ac213474b37f53a13bd5ab5/docs/PROJECT_STATE.md) уже имеет M9 GO, Rust default и сохранённый C++ fallback; M10 остаётся отдельным этапом. Историческая ветка PR не обновляется до этого runtime данным документом; post-M10/O/LE sequencing сохраняется.

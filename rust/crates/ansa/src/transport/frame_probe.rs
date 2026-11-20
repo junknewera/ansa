@@ -29,11 +29,11 @@ use tower_service::Service;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 trait Wire: hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send {}
 impl<T: hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send> Wire for T {}
-struct Io(Box<dyn Wire>);
-struct Counted<T> {
-    inner: T,
-    bytes: Arc<AtomicUsize>,
-    limit: usize,
+pub(super) struct Io(Box<dyn Wire>);
+pub(super) struct Counted<T> {
+    pub(super) inner: T,
+    pub(super) bytes: Arc<AtomicUsize>,
+    pub(super) limit: usize,
 }
 impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counted<T> {
     fn poll_read(
@@ -159,9 +159,10 @@ pub fn proxy_for(
 }
 
 #[derive(Clone)]
-struct Route {
-    proxy: Option<Intercept>,
-    tls: rustls::ClientConfig,
+pub(super) struct Route {
+    pub(super) proxy: Option<Intercept>,
+    pub(super) tls: rustls::ClientConfig,
+    pub(super) local_only: bool,
 }
 impl Service<Uri> for Route {
     type Response = Io;
@@ -173,6 +174,7 @@ impl Service<Uri> for Route {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let proxy = self.proxy.clone();
         let tls = self.tls.clone();
+        let local_only = self.local_only;
         Box::pin(async move {
             let mut tcp = HttpConnector::new();
             tcp.enforce_http(false);
@@ -180,10 +182,12 @@ impl Service<Uri> for Route {
             let Some(proxy) = proxy else {
                 return Ok(Io(Box::new(tcp.call(uri).await?)));
             };
-            if !matches!(
-                proxy.uri().host(),
-                Some("localhost" | "127.0.0.1" | "[::1]")
-            ) {
+            if local_only
+                && !matches!(
+                    proxy.uri().host(),
+                    Some("localhost" | "127.0.0.1" | "[::1]")
+                )
+            {
                 return Err("probe_proxy_not_local".into());
             }
             let target = proxy.uri().clone();
@@ -223,14 +227,14 @@ impl Service<Uri> for Route {
 }
 
 #[derive(Default)]
-struct HeaderBudget {
+pub(super) struct HeaderBudget {
     bytes: usize,
     fields: usize,
-    failed: bool,
-    interim: Vec<u16>,
+    pub(super) failed: bool,
+    pub(super) interim: Vec<u16>,
 }
 impl HeaderBudget {
-    fn observe(&mut self, headers: &HeaderMap, new_head: bool) -> bool {
+    pub(super) fn observe(&mut self, headers: &HeaderMap, new_head: bool) -> bool {
         if new_head {
             self.fields = 0;
         }
@@ -402,7 +406,11 @@ async fn exchange(
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .wrap_connector(Route { proxy, tls });
+        .wrap_connector(Route {
+            proxy,
+            tls,
+            local_only: true,
+        });
     let stream = connector.call(uri.clone()).await?;
     let h2 = stream.connected().is_negotiated_h2() || spec.h2_only;
     let wire_bytes = Arc::new(AtomicUsize::new(0));

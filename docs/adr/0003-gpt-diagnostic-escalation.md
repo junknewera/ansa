@@ -1,5 +1,7 @@
 # ADR 0003: bounded GPT diagnostic escalation
 
+Исходный материал [PR #8](https://github.com/junknewera/ansa/pull/8). В реализованном Orchestrate+ три настраиваемые роли, две доработки и одно итоговое ревью сильной моделью. Состояние на дату предложения сохранено в [журнале этой ветки](https://github.com/junknewera/ansa/blob/68ebe611e9757a39ea2540d8b0f92c329fd9cdaa/docs/PROJECT_STATE.md). Текущая реализация и результаты проверок описаны в [сводке по пяти предложениям](../PROJECT_STATE.md#реализация-пяти-proposal-после-разбора-требований).
+
 - **Статус:** Proposed, design-only.
 - **Дата:** 2026-11-13.
 - **Исторический baseline, 2026-11-13:** [main@8f37af0](https://github.com/junknewera/ansa/tree/8f37af075fed5918afc1fafd9d7167271e8c8d26), Rust M4 GO; production/default C++20.

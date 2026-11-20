@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "status": "AGREED_BEFORE_RUST_MEASUREMENTS",
+  "date": "2026-11-14",
+  "approval": "Explicit user acceptance in this session",
+  "frozen_m0_budget": "tests/parity/perf_budget.json",
+  "new_latency": {"max_ratio": 1.5, "additive_floor_seconds": 0.005},
+  "new_time_per_work": {"max_ratio": 1.5},
+  "datasets": [0, 100, 4096],
+  "metrics": ["first_frame", "history_ready", "submit_preview", "terminal_durable_done", "cancel_ack", "process_cleanup", "fsync", "sse_seconds_per_mib", "input_ack"],
+  "limits": "The new policy does not change M0 budgets, correctness limits, or allow comparing unlike profiles/caches. Missing metrics remain open."
+}

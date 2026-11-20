@@ -2,10 +2,11 @@ use ansa::{
     context::{
         epoch::compact_epoch,
         legacy_compact::{CompactedContext, summary_request},
+        prompt_policy::PromptPolicy,
     },
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::{
-        contracts::{GetTranscript, SessionId},
+        contracts::{AgentMode, GetTranscript, SessionId},
         request::{Advertisement, Request},
     },
     session::{
@@ -173,6 +174,40 @@ fn read_only_corruption_and_transactional_reducer() {
     assert_eq!(s.apply(&invalid), Err("session_request_conflict"));
     assert_eq!(s.next_request, 0);
     assert_eq!(before.len(), s.transcript().len());
+
+    // A late rejection after a candidate changed its transcript/history must
+    // preserve both the live index and all previously published snapshots.
+    let trace = events("completed");
+    let mut s = state();
+    for event in &trace[..trace.len() - 1] {
+        s.apply(event).unwrap();
+    }
+    let key = s.turn.as_ref().unwrap().receipt.command.0.clone();
+    let receipt = s.submits[&key].clone();
+    for index in 0..128 {
+        let mut past = receipt.clone();
+        past.command.0 = format!("past_{index}");
+        past.state = "completed".into();
+        s.submits.insert(past.command.0.clone(), past);
+    }
+    let published = s.clone();
+    s.submits.remove(&key);
+    let before = format!("{s:?}");
+    assert_eq!(s.apply(trace.last().unwrap()), Err("session_submit"));
+    assert_eq!(format!("{s:?}"), before);
+    s.submits.insert(key.clone(), receipt);
+    s.apply(trace.last().unwrap()).unwrap();
+    assert_eq!(s.submits[&key].state, "completed");
+    for index in 0..128 {
+        let key = format!("past_{index}");
+        assert_eq!(s.submits[&key].state, published.submits[&key].state);
+        assert!(Arc::ptr_eq(
+            &s.submits[&key].text,
+            &published.submits[&key].text
+        ));
+    }
+    assert_eq!(published.transcript().len(), 1);
+    assert_eq!(s.transcript().len(), 2);
 }
 #[test]
 fn scan_conflict_cannot_adopt_unreplayed_size() {
@@ -387,6 +422,124 @@ fn transcript_snapshot_pages_and_epoch_hashes() {
             &sha256(summary.native().dump().as_bytes())[..16]
         )
     );
+}
+
+#[test]
+fn prompt_policy_replays_legacy_and_opt_in_plan_from_saved_epoch() {
+    let legacy = Request::load(data().field("configuration").unwrap()).unwrap();
+    let accepted = events("plan")[1].clone();
+    let text = accepted.text_field("text").unwrap();
+    let plan_tools = legacy.tools.clone();
+    let old = State::new("fixture".into(), legacy.clone(), plan_tools.clone());
+    assert_eq!(
+        old.request_for(text, AgentMode::Plan)
+            .unwrap()
+            .save()
+            .unwrap(),
+        *accepted.field("next").unwrap()
+    );
+
+    let mut opted_in = legacy;
+    PromptPolicy::HandoffV1.bind(&mut opted_in.epoch).unwrap();
+    let mut state = State::new("fixture".into(), opted_in, plan_tools.clone());
+    state.apply(&state.initialization().unwrap()).unwrap();
+    let next = state.request_for(text, AgentMode::Plan).unwrap();
+    assert_eq!(next.tools, plan_tools);
+    assert_eq!(
+        PromptPolicy::resolve(&next.epoch.exact_state).unwrap(),
+        PromptPolicy::HandoffV1
+    );
+    assert_eq!(state.apply(&accepted), Err("session_request_conflict"));
+    state
+        .apply(&accepted.with("next", next.save().unwrap()).unwrap())
+        .unwrap();
+    let seed = state.fork_seed().unwrap();
+    let fork = seed
+        .restricted_tools(&Advertisement {
+            revision: sha256(b"[]"),
+            descriptors: vec![],
+        })
+        .unwrap()
+        .request()
+        .unwrap();
+    assert!(fork.tools.descriptors.is_empty());
+    assert_eq!(
+        PromptPolicy::resolve(&fork.epoch.exact_state).unwrap(),
+        PromptPolicy::HandoffV1
+    );
+}
+
+#[test]
+fn handoff_reconstruction_keeps_tail_and_rejects_legacy_summary_response() {
+    let fixture = data();
+    let mut original = Request::load(fixture.field("source").unwrap()).unwrap();
+    let legacy = fixture.field("summary").unwrap();
+    let saved = legacy.field("summary_response").unwrap();
+    let mut legacy_epoch = original.epoch.clone();
+    PromptPolicy::LegacyV1.bind(&mut legacy_epoch).unwrap();
+    assert_eq!(legacy_epoch, original.epoch);
+    assert_eq!(
+        summary_request(&original).unwrap().save().unwrap(),
+        *saved.field("request").unwrap()
+    );
+    PromptPolicy::HandoffV1.bind(&mut original.epoch).unwrap();
+    assert_eq!(
+        CompactedContext::admit(original.clone(), legacy.clone()).unwrap_err(),
+        "summary_response_request"
+    );
+    for generation in 1..=3 {
+        let request = summary_request(&original).unwrap();
+        assert!(request.tools.descriptors.is_empty());
+        assert!(request.epoch.instructions.contains("stale checks"));
+        assert_eq!(request.binding, original.binding);
+        let response =
+            ansa::provider::native::load(&saved.with("request", request.save().unwrap()).unwrap())
+                .unwrap();
+        let compacted = CompactedContext::from_summary(original.clone(), &response).unwrap();
+        let restored =
+            CompactedContext::admit(original.clone(), compacted.native().clone()).unwrap();
+        assert_eq!(
+            &restored.output().unwrap()[1..],
+            &original.input[request.input.len()..]
+        );
+        original.epoch = compact_epoch(&original.epoch, generation, &restored).unwrap();
+        let mut continued = restored.output().unwrap().to_vec();
+        continued.extend([
+            Json::parse(r#"{"role":"user","content":"Continue with these exact constraints."}"#)
+                .unwrap(),
+            Json::parse(r#"{"role":"assistant","content":"Continuing this turn."}"#).unwrap(),
+        ]);
+        original = original.with_input(continued).unwrap();
+    }
+}
+
+#[test]
+fn prompt_policy_rejects_unknown_ambiguous_and_overridden_provenance() {
+    for (state, diagnostic) in [
+        (
+            r#"{"prompt_policy":"unknown"}"#,
+            "prompt_policy_unsupported",
+        ),
+        (
+            r#"{"compaction":"unknown"}"#,
+            "compaction_policy_unsupported",
+        ),
+        (
+            r#"{"base_epoch":"id","base_state":{},"base":{}}"#,
+            "prompt_policy_conflict",
+        ),
+        (
+            r#"{"base_epoch":"id","base_state":{"prompt_policy":"handoff-v1"},"prompt_policy":"legacy-v1"}"#,
+            "prompt_policy_conflict",
+        ),
+    ] {
+        let policy = Json::parse(state).unwrap();
+        assert_eq!(PromptPolicy::resolve(&policy), Err(diagnostic));
+        let mut configuration = Request::load(data().field("configuration").unwrap()).unwrap();
+        configuration.epoch.exact_state = policy;
+        let state = State::new("fixture".into(), configuration.clone(), configuration.tools);
+        assert_eq!(state.initialization(), Err(diagnostic));
+    }
 }
 #[test]
 fn catalog_identity_and_latest() {

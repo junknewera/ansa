@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+fixture-e2e = []
+
 [dependencies]
 rustix.workspace = true
 libc.workspace = true

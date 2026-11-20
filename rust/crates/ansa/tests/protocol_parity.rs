@@ -1,6 +1,7 @@
 #[path = "../src/protocol/error.rs"]
 pub mod error;
 #[path = "../src/protocol/json.rs"]
+#[allow(dead_code)] // The wire-size projection is exercised by frontend_parity.
 pub mod json;
 #[path = "../src/protocol/legacy_json_v1.rs"]
 pub mod legacy_json_v1;
@@ -12,9 +13,36 @@ mod protocol {
 #[path = "../src/transport/http.rs"]
 pub mod http_impl;
 #[path = "../src/provider/mod.rs"]
+#[allow(dead_code)] // Source copy has no runtime token accounting.
 pub mod provider;
 #[path = "../src/tools/mod.rs"]
+#[allow(dead_code)] // Source copy intentionally exercises M2 without the M5 owner.
 pub mod tools;
+// File-tool admission reuses the same compiled spool descriptor and page reader.
+#[path = "../src/process/output_spool.rs"]
+#[allow(dead_code)]
+pub(crate) mod output_spool;
+mod process {
+    pub(crate) use super::output_spool;
+}
+pub use ansa::{auth, orchestration};
+#[path = "../src/config/mod.rs"]
+#[allow(dead_code)]
+pub mod config;
+#[path = "../src/frontend/protocol_v1.rs"]
+#[allow(dead_code)]
+pub mod frontend_protocol;
+mod frontend {
+    pub use crate::frontend_protocol as protocol_v1;
+}
+#[path = "../src/session/transcript.rs"]
+#[allow(dead_code)]
+pub mod transcript;
+mod session {
+    pub use crate::transcript;
+    pub use ansa::session::catalog;
+    pub use ansa::session::state;
+}
 mod transport {
     pub use crate::http_impl as http;
 }
@@ -942,6 +970,78 @@ fn streaming_preview_emits_ordered_utf8_and_cancels_before_next_event() {
 }
 
 #[test]
+fn siwc_empty_terminal_output_requires_completed_text_without_calls() {
+    use provider::responses::ResponseStream;
+
+    let decode = |events: &[Json], siwc: bool| {
+        let mut stream = if siwc {
+            ResponseStream::for_siwc(request(), Limits::default(), Some(Box::new(|_| {})), None)
+        } else {
+            ResponseStream::new(request(), Limits::default())
+        };
+        stream.feed(&wire(events))?;
+        stream.finish()
+    };
+    let set_output = |events: &mut [Json], output: &str| {
+        let terminal = events.last_mut().unwrap();
+        let response = terminal.field("response").unwrap();
+        *terminal = with(
+            terminal,
+            "response",
+            with(response, "output", Json::parse(output).unwrap()),
+        );
+    };
+    let mut message = fixture_events("round2.sse");
+    let canonical = decode(&message, false).unwrap();
+    set_output(&mut message, "[]");
+    assert_eq!(decode(&message, false).unwrap_err(), "terminal_item_count");
+    let response = decode(&message, true).unwrap();
+    assert_eq!(response.items(), canonical.items());
+    assert!(!response.items().is_empty());
+    assert!(response.calls().is_empty());
+
+    let tail = message.len() - 1;
+    for (field, value) in [
+        ("phase", r#""commentary""#),
+        ("content", "[]"),
+        ("content", r#"[{"type":"output_text","text":"  "}]"#),
+    ] {
+        let done = &message[tail - 1];
+        let item = with(
+            done.field("item").unwrap(),
+            field,
+            Json::parse(value).unwrap(),
+        );
+        let closed = [
+            message[0].clone(),
+            message[1].clone(),
+            with(done, "item", item),
+            message[tail].clone(),
+        ];
+        assert_eq!(decode(&closed, true).unwrap_err(), "terminal_item_count");
+    }
+    assert_eq!(
+        decode(&message[..tail], true).unwrap_err(),
+        "response_premature_eof"
+    );
+    message.remove(tail - 1);
+    assert_eq!(decode(&message, true).unwrap_err(), "terminal_item_count");
+    set_output(&mut message, "[{}]");
+    assert_eq!(decode(&message, true).unwrap_err(), "terminal_item_count");
+
+    let mut mismatch = fixture_events("round2.sse");
+    set_output(&mut mismatch, "[{}]");
+    assert_eq!(
+        decode(&mismatch, true).unwrap_err(),
+        "terminal_item_mismatch"
+    );
+
+    let mut calls = fixture_events("round1.sse");
+    set_output(&mut calls, "[]");
+    assert_eq!(decode(&calls, true).unwrap_err(), "terminal_item_count");
+}
+
+#[test]
 fn replay_serializes_prefix_native_values_and_matching_results() {
     let response = decode("round1.sse").unwrap();
     let mut registry = Registry::new();
@@ -1013,6 +1113,98 @@ fn replay_results_are_bound_to_the_exact_admitted_response() {
         response.calls()[0].arguments
     );
     assert!(continuation(&different_response, &results).is_err());
+}
+
+#[test]
+fn incomplete_added_reasoning_uses_only_the_verified_final_payload() {
+    let original = decode("round1.sse").unwrap();
+    for initial in [
+        Json::string("partial:encrypted").unwrap(),
+        Json::parse("null").unwrap(),
+        Json::string("").unwrap(),
+    ] {
+        let mut events = fixture_events("round1.sse");
+        events[1] = with(
+            &events[1],
+            "item",
+            with(
+                events[1].field("item").unwrap(),
+                "encrypted_content",
+                initial,
+            ),
+        );
+        let decode = |events: &[Json]| {
+            decode_synthetic(
+                request(),
+                Head {
+                    status: 200,
+                    content_types: vec!["text/event-stream".into()],
+                },
+                &[&wire(events)],
+            )
+        };
+        let admitted = decode(&events).unwrap();
+        assert_eq!(admitted.items()[0].value(), original.items()[0].value());
+        let mut registry = Registry::new();
+        registry
+            .register(Definition {
+                descriptor: admitted.request().tools.descriptors[0].clone(),
+                validator: Arc::new(|_| true),
+                executor: Arc::new(|_| Outcome::succeeded("ok".into())),
+            })
+            .unwrap();
+        let mut ids = OperationIds::new("runtime", 0).unwrap();
+        let results = PreparedBatch::prepare(&admitted, registry.snapshot(), &mut ids)
+            .unwrap()
+            .execute(false);
+        let replay = continuation(&admitted, &results).unwrap();
+        assert_eq!(replay.input[2], *original.items()[0].value());
+        // The final boundary remains strict; a changing initial envelope does
+        // not authorize terminal substitution, missing data or incomplete EOF.
+        let mut bad = events.clone();
+        let terminal = bad.last().unwrap().field("response").unwrap();
+        let mut output = terminal
+            .field("output")
+            .unwrap()
+            .elements()
+            .unwrap()
+            .to_vec();
+        output[0] = with(
+            &output[0],
+            "encrypted_content",
+            Json::string("different-final").unwrap(),
+        );
+        let last = bad.len() - 1;
+        bad[last] = with(
+            &bad[last],
+            "response",
+            with(terminal, "output", Json::array(output).unwrap()),
+        );
+        assert!(decode(&bad).is_err());
+        let mut bad = events.clone();
+        bad[1] = with(
+            &bad[1],
+            "item",
+            with(
+                bad[1].field("item").unwrap(),
+                "id",
+                Json::string("another_item").unwrap(),
+            ),
+        );
+        assert!(decode(&bad).is_err());
+        assert!(decode(&events[..events.len() - 1]).is_err());
+        let mut bad = events.clone();
+        bad[2] = with(
+            &bad[2],
+            "item",
+            with(
+                bad[2].field("item").unwrap(),
+                "encrypted_content",
+                Json::string("").unwrap(),
+            ),
+        );
+        assert!(decode(&bad).is_err());
+    }
 }
 
 #[test]

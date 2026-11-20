@@ -47,7 +47,9 @@ def event(child):
         raise AssertionError('supervisor handshake timeout')
     line = child.stdout.readline(4096)
     if not line.endswith(b'\n'):
-        raise AssertionError('supervisor handshake missing')
+        os.set_blocking(child.stderr.fileno(),False)
+        diagnostic=child.stderr.read(4096) or b''
+        raise AssertionError(f'supervisor handshake missing: mode={child.args[1]}, case={Path(child.args[2]).name}, exit={child.poll()}, diagnostic={diagnostic!r}')
     return json.loads(line)
 
 

@@ -458,7 +458,7 @@ def cases(data, mode):
         ('empty-call-id', lambda e: e.__setitem__(3, replace(e[3], 'item', replace(e[3]['item'], 'call_id', '')))),
         ('missing-opaque-reasoning', lambda e: e.__setitem__(2, replace(e[2], 'item', {k:v for k,v in e[2]['item'].items() if k!='encrypted_content'}))),
         ('empty-opaque-reasoning', lambda e: e.__setitem__(2, replace(e[2], 'item', replace(e[2]['item'], 'encrypted_content', '')))),
-        ('opaque-added-done-conflict', lambda e: e.__setitem__(1, replace(e[1], 'item', replace(e[1]['item'], 'encrypted_content', 'other')))),
+        ('opaque-done-terminal-conflict', lambda e: e.__setitem__(2, replace(e[2], 'item', replace(e[2]['item'], 'encrypted_content', 'other')))),
         ('terminal-native-order', lambda e: e.__setitem__(-1, replace(e[-1], 'response', replace(e[-1]['response'], 'output', list(reversed(e[-1]['response']['output'])))))),
         ('missing-done-item', lambda e: e.pop(7)),
         ('noncompleted-function', lambda e: e.__setitem__(7, replace(e[7], 'item', replace(e[7]['item'], 'status', 'in_progress')))),

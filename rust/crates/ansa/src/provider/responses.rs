@@ -4,7 +4,10 @@ use crate::{
         json::Json,
         sse::{Event, Limits, Parser},
     },
-    provider::{native::NativeItem, request::Request},
+    provider::{
+        native::{ContextBudget, NativeItem, ReportedUsage},
+        request::Request,
+    },
 };
 use std::collections::{BTreeMap, HashSet};
 pub(crate) type TextPreview = Box<dyn FnMut(&str)>;
@@ -15,6 +18,7 @@ struct ValidatedResponse {
     model: String,
     items: Vec<NativeItem>,
     calls: Vec<FunctionCall>,
+    usage: Option<ReportedUsage>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCall {
@@ -45,6 +49,9 @@ pub struct AdmittedResponse {
     pub(crate) items: Vec<NativeItem>,
     pub(crate) calls: Vec<FunctionCall>,
     pub(crate) receipt: super::replay::AdmissionReceipt,
+    tokens: Option<usize>,
+    context_window: Option<usize>,
+    reported_usage: Option<ReportedUsage>,
 }
 impl AdmittedResponse {
     pub fn request(&self) -> &Request {
@@ -62,6 +69,53 @@ impl AdmittedResponse {
     pub fn calls(&self) -> &[FunctionCall] {
         &self.calls
     }
+    pub(crate) fn context_budget(&self) -> Option<ContextBudget> {
+        self.context_window.map(|window| ContextBudget {
+            window,
+            tokens: self.tokens,
+        })
+    }
+    pub(crate) fn token_usage(&self) -> Option<usize> {
+        self.tokens
+    }
+    pub(crate) fn with_token_usage(mut self, tokens: Option<usize>) -> Self {
+        self.tokens = tokens.filter(|tokens| *tokens > 0);
+        self
+    }
+    pub(crate) fn reported_usage(&self) -> Option<ReportedUsage> {
+        self.reported_usage
+    }
+    pub(crate) fn with_reported_usage(mut self, usage: Option<ReportedUsage>) -> Self {
+        self.tokens = usage.and_then(ReportedUsage::calibration_tokens);
+        self.reported_usage = usage;
+        self
+    }
+    pub(crate) fn with_context_estimate(mut self, tokens: usize) -> Self {
+        self.request.set_context_estimate(tokens);
+        self
+    }
+    pub(crate) fn with_context_window(mut self, window: Option<usize>) -> Self {
+        self.context_window = window.filter(|window| *window >= 2);
+        self
+    }
+    pub fn child_result(&self) -> Result<super::structured::ChildResult, &'static str> {
+        if !self.calls.is_empty() {
+            return Err("child_result_not_final");
+        }
+        self.request
+            .final_format()
+            .ok_or("child_result_format_required")?
+            .child_result(&self.items)
+    }
+    pub fn orchestration_plan(&self) -> Result<crate::orchestration::plan::Plan, &'static str> {
+        if !self.calls.is_empty() {
+            return Err("plan_result_not_final");
+        }
+        self.request
+            .final_format()
+            .ok_or("plan_result_format_required")?
+            .plan(&self.items)
+    }
 }
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
 pub(crate) struct Reducer {
@@ -72,10 +126,16 @@ pub(crate) struct Reducer {
     limits: Limits,
     preview: Option<TextPreview>,
     preview_text: String,
+    siwc: bool,
 }
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
 impl Reducer {
     pub(crate) fn new(request: Request, limits: Limits, preview: Option<TextPreview>) -> Self {
+        let preview = if request.final_format().is_none() {
+            preview
+        } else {
+            None
+        };
         Self {
             request,
             events: Vec::new(),
@@ -84,6 +144,7 @@ impl Reducer {
             limits,
             preview,
             preview_text: String::new(),
+            siwc: false,
         }
     }
     pub(crate) fn event(&mut self, event: Event) -> Result<(), &'static str> {
@@ -279,6 +340,13 @@ impl Reducer {
         let value = self
             .validate_events(false)?
             .ok_or("response_premature_eof")?;
+        if let Some(format) = self.request.final_format() {
+            if value.calls.is_empty() {
+                format.validate(&value.items)?;
+            } else {
+                super::structured::reject_refusal(&value.items)?;
+            }
+        }
         Ok(AdmittedResponse {
             request: self.request.clone(),
             id: value.id,
@@ -286,6 +354,9 @@ impl Reducer {
             items: value.items,
             calls: value.calls,
             receipt: super::replay::receipt(&self.request)?,
+            tokens: value.usage.and_then(ReportedUsage::calibration_tokens),
+            reported_usage: value.usage,
+            context_window: None,
         })
     }
     fn validate_events(
@@ -628,16 +699,47 @@ impl Reducer {
         {
             return Err("terminal_error_metadata");
         };
+        if self.siwc
+            && let Some(format) = self.request.final_format()
+        {
+            let expected = format.format()?;
+            let actual = terminal.field("text").and_then(|text| text.field("format"));
+            if !actual.is_ok_and(|actual| {
+                ["type", "name", "strict", "schema"].iter().all(|key| {
+                    actual
+                        .field(key)
+                        .is_ok_and(|value| expected.field(key) == Ok(value))
+                })
+            }) {
+                return Err("siwc_structured_format_unconfirmed");
+            }
+        }
         let mut items = Vec::new();
         let output = terminal.field("output")?.elements()?;
-        if output.len() != added.len() || output.len() != done.len() {
-            return Err("terminal_item_count");
-        };
-        for (i, item) in output.iter().enumerate() {
-            if done.get(&i) != Some(item) {
-                return Err("terminal_item_mismatch");
-            };
-            items.push(NativeItem::new(item.clone())?)
+        if self.siwc
+            && output.is_empty()
+            && done.len() == added.len()
+            && calls.is_empty()
+            && done
+                .values()
+                .rev()
+                .find(|item| item.text_field("type") == Ok("message"))
+                .is_some_and(has_final_text)
+        {
+            // A sparse SIWC terminal is usable for a completed text-only reply.
+            for item in done.into_values() {
+                items.push(NativeItem::new(item)?);
+            }
+        } else {
+            if output.len() != added.len() || output.len() != done.len() {
+                return Err("terminal_item_count");
+            }
+            for (i, item) in output.iter().enumerate() {
+                if done.get(&i) != Some(item) {
+                    return Err("terminal_item_mismatch");
+                }
+                items.push(NativeItem::new(item.clone())?);
+            }
         }
         if calls.iter().any(|c| c.call_id.is_empty())
             || calls
@@ -652,13 +754,43 @@ impl Reducer {
         // Completion events may arrive in a different order. Executable views
         // follow the ordered native output, as the C++ production builder does.
         calls.sort_by_key(|call| call.output_index);
+        let usage = terminal.field("usage").ok().and_then(|usage| {
+            let input = usage.usize_field("input_tokens").ok()?;
+            let output = usage.usize_field("output_tokens").ok()?;
+            let cached = usage
+                .field("input_tokens_details")
+                .and_then(|details| details.usize_field("cached_tokens"))
+                .ok();
+            ReportedUsage::new(input, cached, output)
+        });
         Ok(Some(ValidatedResponse {
             id: response_id,
             model: created_model,
             items,
             calls,
+            usage,
         }))
     }
+}
+
+fn has_final_text(item: &Json) -> bool {
+    item.field("phase")
+        .ok()
+        .is_none_or(|phase| phase.is_null() || phase.text() == Ok("final_answer"))
+        && item
+            .field("content")
+            .and_then(Json::elements)
+            .is_ok_and(|parts| {
+                parts.iter().any(|part| {
+                    let field = if part.text_field("type") == Ok("refusal") {
+                        "refusal"
+                    } else {
+                        "text"
+                    };
+                    part.text_field(field)
+                        .is_ok_and(|text| !text.trim().is_empty())
+                })
+            })
 }
 
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
@@ -679,15 +811,9 @@ fn compatible_added(added: &Json, final_item: &Json) -> Result<(), &'static str>
             return Err("added_metadata_conflict");
         }
     }
-    if added.has("type")
-        && added.text_field("type")? == "reasoning"
-        && added.has("encrypted_content")
-    {
-        let initial = added.text_field("encrypted_content")?;
-        if !initial.is_empty() && initial != final_item.text_field("encrypted_content")? {
-            return Err("opaque_conflict");
-        }
-    }
+    // A reasoning item's added encrypted_content may be incomplete. Only the
+    // done item, checked against terminal output, is admitted and replayed.
+    // https://developers.openai.com/api/reference/resources/responses/methods/retrieve
     Ok(())
 }
 
@@ -747,7 +873,9 @@ fn validate_item(
             }
         }
         "reasoning" => {
-            if item.has("encrypted_content") {
+            if item.has("encrypted_content")
+                && (final_item || !item.field("encrypted_content")?.is_null())
+            {
                 item.text_field("encrypted_content")?;
             }
             for p in item.field("summary")?.elements()? {
@@ -810,6 +938,16 @@ impl ResponseStream {
             closed: false,
             cancelled,
         }
+    }
+    pub(crate) fn for_siwc(
+        request: Request,
+        limits: Limits,
+        preview: Option<TextPreview>,
+        cancelled: Option<Box<dyn Fn() -> bool>>,
+    ) -> Self {
+        let mut stream = Self::new_with_callbacks(request, limits, preview, cancelled);
+        stream.reducer.siwc = true;
+        stream
     }
     #[cfg(feature = "protocol-test-adapter")]
     #[allow(dead_code)]

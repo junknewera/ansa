@@ -4,10 +4,18 @@ use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
-pub struct Json(Value);
-#[derive(Debug, Clone)]
+pub struct Json(Arc<Node>);
+#[derive(Debug)]
+struct Node {
+    value: Value,
+    bytes: usize,
+    nodes: usize,
+    depth: usize,
+}
+#[derive(Debug)]
 enum Value {
     Null,
     Bool(bool),
@@ -43,8 +51,74 @@ impl<'de> Deserialize<'de> for Entries<'de> {
 }
 
 impl Json {
+    pub const FRAME_BYTES: usize = 16 * 1024 * 1024;
+    pub(crate) const JOURNAL_RECORD_BYTES: usize = 32 * 1024 * 1024;
+    pub const FRAME_NODES: usize = 131072;
+
+    pub(crate) fn text_fits_frame(text: &str) -> bool {
+        quoted_bytes(text) <= Self::FRAME_BYTES
+    }
+    pub(crate) fn quoted_size(text: &str) -> usize {
+        quoted_bytes(text)
+    }
+
+    fn owned(value: Value) -> Self {
+        let (bytes, nodes, depth) = match &value {
+            Value::Null => (4, 1, 0),
+            Value::Bool(value) => (if *value { 4 } else { 5 }, 1, 0),
+            Value::Number(value) => (value.len(), 1, 0),
+            Value::String(value) => (quoted_bytes(value), 1, 0),
+            Value::Array(values) => values.iter().enumerate().fold(
+                (2usize, 1usize, 1usize),
+                |(bytes, nodes, depth), (index, value)| {
+                    (
+                        bytes
+                            .saturating_add(usize::from(index > 0))
+                            .saturating_add(value.0.bytes),
+                        nodes.saturating_add(value.0.nodes),
+                        depth.max(value.0.depth.saturating_add(1)),
+                    )
+                },
+            ),
+            Value::Object(values) => values.iter().enumerate().fold(
+                (2usize, 1usize, 1usize),
+                |(bytes, nodes, depth), (index, (key, value))| {
+                    (
+                        bytes
+                            .saturating_add(usize::from(index > 0))
+                            .saturating_add(quoted_bytes(key))
+                            .saturating_add(1)
+                            .saturating_add(value.0.bytes),
+                        nodes.saturating_add(value.0.nodes),
+                        depth.max(value.0.depth.saturating_add(1)),
+                    )
+                },
+            ),
+        };
+        Self(Arc::new(Node {
+            value,
+            bytes,
+            nodes,
+            depth,
+        }))
+    }
+    fn value(&self) -> &Value {
+        &self.0.value
+    }
+    fn constructed(self, max_bytes: usize) -> Result<Self, &'static str> {
+        if self.0.bytes > max_bytes {
+            return Err("json_build_limit");
+        }
+        if self.0.depth >= 64 {
+            return Err("json_depth_limit");
+        }
+        if self.0.nodes > Self::FRAME_NODES {
+            return Err("json_structure_limit");
+        }
+        Ok(self)
+    }
     pub fn parse(input: &str) -> Result<Self, &'static str> {
-        Self::parse_with_limits(input, 16 * 1024 * 1024, 64, 131072)
+        Self::parse_with_limits(input, Self::FRAME_BYTES, 64, Self::FRAME_NODES)
     }
     pub fn parse_with_limits(
         input: &str,
@@ -96,11 +170,11 @@ impl Json {
         }
         let text = raw.get();
         match text.as_bytes()[0] {
-            b'n' => Ok(Self(Value::Null)),
-            b't' => Ok(Self(Value::Bool(true))),
-            b'f' => Ok(Self(Value::Bool(false))),
+            b'n' => Ok(Self::owned(Value::Null)),
+            b't' => Ok(Self::owned(Value::Bool(true))),
+            b'f' => Ok(Self::owned(Value::Bool(false))),
             b'"' => serde_json::from_str(text)
-                .map(|v| Self(Value::String(v)))
+                .map(|v| Self::owned(Value::String(v)))
                 .map_err(|_| "json_invalid"),
             b'[' => {
                 let values: Vec<&RawValue> =
@@ -109,7 +183,7 @@ impl Json {
                     .into_iter()
                     .map(|v| Self::from_raw(v, nodes, max_nodes))
                     .collect::<Result<Vec<_>, _>>()
-                    .map(|v| Self(Value::Array(v)))
+                    .map(|v| Self::owned(Value::Array(v)))
             }
             b'{' => {
                 let values: Entries = serde_json::from_str(text).map_err(|error| {
@@ -124,7 +198,7 @@ impl Json {
                     .into_iter()
                     .map(|(k, v)| Self::from_raw(v, nodes, max_nodes).map(|v| (k, v)))
                     .collect::<Result<Vec<_>, _>>()
-                    .map(|v| Self(Value::Object(v)))
+                    .map(|v| Self::owned(Value::Object(v)))
             }
             _ => {
                 if text.contains(['.', 'e', 'E']) {
@@ -136,71 +210,97 @@ impl Json {
                         return Err("json_nonfinite");
                     }
                 }
-                Ok(Self(Value::Number(text.to_owned())))
+                Ok(Self::owned(Value::Number(text.to_owned())))
             }
         }
     }
 
     pub fn dump(&self) -> String {
-        match &self.0 {
-            Value::Null => "null".into(),
-            Value::Bool(value) => value.to_string(),
-            Value::Number(value) => value.clone(),
-            Value::String(value) => quote_unbounded(value),
-            Value::Array(values) => format!(
-                "[{}]",
-                values.iter().map(Self::dump).collect::<Vec<_>>().join(",")
-            ),
-            Value::Object(entries) => format!(
-                "{{{}}}",
-                entries
-                    .iter()
-                    .map(|(k, v)| format!("{}:{}", quote_unbounded(k), v.dump()))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
+        let mut out = String::with_capacity(self.0.bytes);
+        self.write_dump(&mut out);
+        out
+    }
+    fn write_dump(&self, out: &mut String) {
+        match self.value() {
+            Value::Null => out.push_str("null"),
+            Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            Value::Number(value) => out.push_str(value),
+            Value::String(value) => write_quote(value, out),
+            Value::Array(values) => {
+                out.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',')
+                    }
+                    value.write_dump(out);
+                }
+                out.push(']');
+            }
+            Value::Object(entries) => {
+                out.push('{');
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',')
+                    }
+                    write_quote(key, out);
+                    out.push(':');
+                    value.write_dump(out);
+                }
+                out.push('}');
+            }
         }
     }
 
     pub fn string(text: &str) -> Result<Self, &'static str> {
-        Self::string_with_limits(text, 16 * 1024 * 1024)
+        Self::string_with_limits(text, Self::FRAME_BYTES)
     }
     pub fn string_with_limits(text: &str, max_bytes: usize) -> Result<Self, &'static str> {
-        let encoded = quote_with_limit(text, max_bytes)?;
-        Self::parse_with_limits(&encoded, max_bytes, 64, 1)
+        if quoted_bytes(text) > max_bytes {
+            return Err("json_build_limit");
+        }
+        Ok(Self::owned(Value::String(text.to_owned())))
     }
     pub fn object(entries: Vec<(&str, Json)>) -> Result<Self, &'static str> {
-        Self::object_with_limits(entries, 16 * 1024 * 1024)
+        Self::object_with_limits(entries, Self::FRAME_BYTES)
     }
     pub fn object_with_limits(
         entries: Vec<(&str, Json)>,
         max_bytes: usize,
     ) -> Result<Self, &'static str> {
-        let mut out = String::from("{");
-        for (index, (key, value)) in entries.into_iter().enumerate() {
-            if index != 0 {
-                append_limit(&mut out, ",", max_bytes)?;
-            }
-            append_limit(&mut out, &quote_with_limit(key, max_bytes)?, max_bytes)?;
-            append_limit(&mut out, ":", max_bytes)?;
-            append_limit(&mut out, &value.dump(), max_bytes)?;
+        let bytes = entries
+            .iter()
+            .enumerate()
+            .fold(2usize, |size, (index, (key, value))| {
+                size.saturating_add(usize::from(index > 0))
+                    .saturating_add(quoted_bytes(key))
+                    .saturating_add(1)
+                    .saturating_add(value.0.bytes)
+            });
+        if bytes > max_bytes {
+            return Err("json_build_limit");
         }
-        append_limit(&mut out, "}", max_bytes)?;
-        Self::parse_with_limits(&out, max_bytes, 64, 131072)
+        if entries.iter().any(|(_, value)| value.0.depth >= 63) {
+            return Err("json_depth_limit");
+        }
+        let mut keys = HashSet::new();
+        for (key, _) in &entries {
+            if !keys.insert(*key) {
+                return Err("json_duplicate_key");
+            }
+        }
+        Self::owned(Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+        ))
+        .constructed(max_bytes)
     }
     pub fn array(values: Vec<Json>) -> Result<Self, &'static str> {
-        let mut out = String::from("[");
-        for (index, value) in values.into_iter().enumerate() {
-            if index != 0 {
-                append(&mut out, ",")?;
-            }
-            append(&mut out, &value.dump())?;
-        }
-        append(&mut out, "]")?;
-        Self::parse(&out)
+        Self::owned(Value::Array(values)).constructed(Self::FRAME_BYTES)
     }
     pub fn field(&self, key: &str) -> Result<&Json, &'static str> {
-        if let Value::Object(entries) = &self.0 {
+        if let Value::Object(entries) = self.value() {
             return entries
                 .iter()
                 .find(|(k, _)| k == key)
@@ -210,7 +310,7 @@ impl Json {
         Err("json_expected_object")
     }
     pub fn has(&self, key: &str) -> bool {
-        matches!(&self.0, Value::Object(entries) if entries.iter().any(|(k,_)|k==key))
+        matches!(self.value(), Value::Object(entries) if entries.iter().any(|(k,_)|k==key))
     }
     pub fn text_field(&self, key: &str) -> Result<&str, &'static str> {
         self.field(key)?.text()
@@ -219,50 +319,53 @@ impl Json {
         self.field(key)?.index()
     }
     pub fn text(&self) -> Result<&str, &'static str> {
-        if let Value::String(v) = &self.0 {
+        if let Value::String(v) = self.value() {
             Ok(v)
         } else {
             Err("json_expected_string")
         }
     }
     pub fn elements(&self) -> Result<&[Json], &'static str> {
-        if let Value::Array(v) = &self.0 {
+        if let Value::Array(v) = self.value() {
             Ok(v)
         } else {
             Err("json_expected_array")
         }
     }
     pub fn boolean(&self) -> Result<bool, &'static str> {
-        if let Value::Bool(v) = &self.0 {
+        if let Value::Bool(v) = self.value() {
             Ok(*v)
         } else {
             Err("json_expected_bool")
         }
     }
     pub fn is_object(&self) -> bool {
-        matches!(self.0, Value::Object(_))
+        matches!(self.value(), Value::Object(_))
+    }
+    pub fn is_null(&self) -> bool {
+        matches!(self.value(), Value::Null)
     }
     pub fn is_array(&self) -> bool {
-        matches!(self.0, Value::Array(_))
+        matches!(self.value(), Value::Array(_))
     }
     pub fn is_string(&self) -> bool {
-        matches!(self.0, Value::String(_))
+        matches!(self.value(), Value::String(_))
     }
     pub fn is_number(&self) -> bool {
-        matches!(self.0, Value::Number(_))
+        matches!(self.value(), Value::Number(_))
     }
     pub fn is_integer(&self) -> bool {
-        matches!(&self.0, Value::Number(n) if !n.contains(['.', 'e', 'E']))
+        matches!(self.value(), Value::Number(n) if !n.contains(['.', 'e', 'E']))
     }
     pub fn keys(&self) -> Result<Vec<&str>, &'static str> {
-        if let Value::Object(entries) = &self.0 {
+        if let Value::Object(entries) = self.value() {
             Ok(entries.iter().map(|(k, _)| k.as_str()).collect())
         } else {
             Err("json_expected_object")
         }
     }
     pub fn index(&self) -> Result<usize, &'static str> {
-        if let Value::Number(n) = &self.0
+        if let Value::Number(n) = self.value()
             && !n.starts_with('-')
             && !n.contains(['.', 'e', 'E'])
         {
@@ -271,7 +374,7 @@ impl Json {
         Err("json_expected_unsigned_integer")
     }
     pub fn with(&self, key: &str, replacement: Json) -> Result<Self, &'static str> {
-        let Value::Object(entries) = &self.0 else {
+        let Value::Object(entries) = self.value() else {
             return Err("json_expected_object");
         };
         let mut out =
@@ -293,7 +396,7 @@ impl Json {
         Self::object(out.iter().map(|(k, v)| (k.as_str(), v.clone())).collect())
     }
     pub fn without(&self, key: &str) -> Result<Self, &'static str> {
-        let Value::Object(entries) = &self.0 else {
+        let Value::Object(entries) = self.value() else {
             return Err("json_expected_object");
         };
         Self::object(
@@ -306,37 +409,17 @@ impl Json {
     }
 }
 
-fn append(out: &mut String, text: &str) -> Result<(), &'static str> {
-    append_limit(out, text, 16 * 1024 * 1024)
+fn quoted_bytes(text: &str) -> usize {
+    text.bytes().fold(2usize, |size, byte| {
+        size.saturating_add(match byte {
+            b'"' | b'\\' | 8 | 9 | 10 | 12 | 13 => 2,
+            0..=31 => 6,
+            _ => 1,
+        })
+    })
 }
-fn append_limit(out: &mut String, text: &str, max_bytes: usize) -> Result<(), &'static str> {
-    if text.len() > max_bytes.saturating_sub(out.len()) {
-        return Err("json_build_limit");
-    }
-    out.push_str(text);
-    Ok(())
-}
-fn quote_with_limit(text: &str, max_bytes: usize) -> Result<String, &'static str> {
-    let mut out = String::from("\"");
-    for c in text.chars() {
-        let escaped = match c {
-            '"' => "\\\"".into(),
-            '\\' => "\\\\".into(),
-            '\u{08}' => "\\b".into(),
-            '\u{0c}' => "\\f".into(),
-            '\n' => "\\n".into(),
-            '\r' => "\\r".into(),
-            '\t' => "\\t".into(),
-            c if c < '\u{20}' => format!("\\u{:04X}", c as u32),
-            c => c.to_string(),
-        };
-        append_limit(&mut out, &escaped, max_bytes)?;
-    }
-    append_limit(&mut out, "\"", max_bytes)?;
-    Ok(out)
-}
-fn quote_unbounded(text: &str) -> String {
-    let mut out = String::from("\"");
+fn write_quote(text: &str, out: &mut String) {
+    out.push('"');
     for c in text.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -346,16 +429,22 @@ fn quote_unbounded(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c < '\u{20}' => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c if c < '\u{20}' => {
+                use std::fmt::Write;
+                write!(out, "\\u{:04X}", c as u32).expect("String write");
+            }
             c => out.push(c),
         }
     }
     out.push('"');
-    out
 }
+
 impl PartialEq for Json {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        match (self.value(), other.value()) {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Number(a), Value::Number(b)) | (Value::String(a), Value::String(b)) => a == b,

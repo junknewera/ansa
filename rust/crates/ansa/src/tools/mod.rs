@@ -1,3 +1,14 @@
 pub mod admission;
+mod analysis;
+pub mod artifacts;
+pub mod command;
+mod edit;
+pub mod editor_context;
+pub mod evidence;
+pub mod files;
+pub mod invocation;
 pub mod registry;
 pub mod schema;
+pub mod search;
+pub(crate) mod skills;
+mod workspace;

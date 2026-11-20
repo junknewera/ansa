@@ -1,6 +1,7 @@
 //! Exact v1 result/invocation codec. Responses use the M2 production admission.
 use super::{Result, need, num};
 pub use crate::provider::native::{load as load_response, save as save_response};
+pub use crate::tools::invocation::Invocation;
 use crate::{
     protocol::json::Json,
     provider::{
@@ -11,34 +12,6 @@ use crate::{
         responses::AdmittedResponse,
     },
 };
-#[derive(Clone, Debug, PartialEq)]
-pub struct Invocation {
-    pub operation: String,
-    pub call: String,
-    pub name: String,
-    pub revision: String,
-    pub arguments: Json,
-}
-impl Invocation {
-    pub fn load(value: &Json) -> Result<Self> {
-        Ok(Self {
-            operation: value.text_field("operation")?.into(),
-            call: value.text_field("call")?.into(),
-            name: value.text_field("name")?.into(),
-            revision: value.text_field("revision")?.into(),
-            arguments: value.field("arguments")?.clone(),
-        })
-    }
-    pub fn save(&self) -> Result<Json> {
-        Json::object(vec![
-            ("operation", Json::string(&self.operation)?),
-            ("call", Json::string(&self.call)?),
-            ("name", Json::string(&self.name)?),
-            ("revision", Json::string(&self.revision)?),
-            ("arguments", self.arguments.clone()),
-        ])
-    }
-}
 #[derive(Clone, Debug)]
 pub struct SavedResult {
     pub result: ToolResult,
@@ -60,7 +33,6 @@ impl SavedResult {
             _ => return Err("session_outcome"),
         };
         let output = value.text_field("output")?;
-        need(output.len() <= 128 * 1024, "session_outcome_limit")?;
         let dispatched = value.field("dispatched")?.boolean()?;
         need(
             dispatched || effects == Effects::NotStarted && execution != Execution::Succeeded,
@@ -78,20 +50,35 @@ impl SavedResult {
         })
     }
     pub fn save(&self) -> Result<Json> {
-        Json::object(vec![
-            ("operation", Json::string(self.result.operation_id())?),
-            ("call", Json::string(self.result.call_id())?),
-            ("output", Json::string(self.result.output())?),
-            ("execution", num(self.result.execution() as usize)?),
-            ("effects", num(self.result.effects() as usize)?),
-            (
-                "dispatched",
-                Json::parse(if self.dispatched { "true" } else { "false" })?,
-            ),
-        ])
+        Json::object_with_limits(
+            vec![
+                ("operation", Json::string(self.result.operation_id())?),
+                ("call", Json::string(self.result.call_id())?),
+                ("output", Json::string(self.result.output())?),
+                ("execution", num(self.result.execution() as usize)?),
+                ("effects", num(self.result.effects() as usize)?),
+                (
+                    "dispatched",
+                    Json::parse(if self.dispatched { "true" } else { "false" })?,
+                ),
+            ],
+            Json::JOURNAL_RECORD_BYTES,
+        )
     }
 }
 pub fn response_text(response: &AdmittedResponse) -> Result<String> {
+    if response.calls().is_empty()
+        && response.request().final_format()
+            == Some(crate::provider::structured::FinalFormat::ChildResult)
+    {
+        let result = response.child_result()?;
+        let mut text = result.summary;
+        for finding in result.findings {
+            text.push_str("\n- ");
+            text.push_str(&finding);
+        }
+        return Ok(text);
+    }
     let mut text = String::new();
     for item in response.items() {
         let item = item.value();
@@ -104,7 +91,6 @@ pub fn response_text(response: &AdmittedResponse) -> Result<String> {
             } else {
                 "text"
             })?;
-            need(value.len() <= 64 * 1024 - text.len(), "runtime_text_limit")?;
             text.push_str(value);
         }
     }

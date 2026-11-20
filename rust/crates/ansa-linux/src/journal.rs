@@ -2,9 +2,253 @@
 use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags};
 use std::{fs::File, io, os::unix::fs::MetadataExt, path::Path};
 
+/// Test-only workspace creation anchored to a verified synthetic root.
+#[cfg(feature = "fixture-e2e")]
+pub fn fixture_workspace(root: &Path) -> io::Result<()> {
+    fixture_root(root)?;
+    fn child(parent: &File, name: &str) -> io::Result<File> {
+        match fs::mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => (),
+            Err(error) => return Err(error.into()),
+        }
+        let fd = fs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file = File::from(fd);
+        let meta = file.metadata()?;
+        if meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::other("fixture_directory"));
+        }
+        Ok(file)
+    }
+    let parent = crate::fs::private_directory(root)?;
+    let home = child(&parent, "home")?;
+    let cwd = child(&home, "workspace")?;
+    child(&parent, "journal")?;
+    child(&parent, "auth")?;
+    fixture_files(&cwd, false)
+}
+
+/// Each measurement scope is a separate owned workspace, including shell outputs.
+#[cfg(feature = "fixture-e2e")]
+pub fn fixture_scope(root: &Path, scope: &str) -> io::Result<()> {
+    fixture_root(root)?;
+    if !scope.starts_with("metrics_")
+        || scope.len() > 64
+        || !scope
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(io::Error::other("fixture_scope"));
+    }
+    let mut directory = crate::fs::private_directory(root)?;
+    for name in ["home", "workspace", scope] {
+        directory = File::from(fs::openat(
+            &directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let meta = directory.metadata()?;
+        if meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::other("fixture_scope_directory"));
+        }
+    }
+    fixture_files(&directory, true)
+}
+
+#[cfg(feature = "fixture-e2e")]
+fn fixture_files(cwd: &File, fresh_process: bool) -> io::Result<()> {
+    use std::io::{Read, Write};
+    if fresh_process {
+        for name in ["primary", "ready"] {
+            match fs::statat(cwd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(rustix::io::Errno::NOENT) => (),
+                _ => return Err(io::Error::other("fixture_readiness_exists")),
+            }
+        }
+    }
+    match fs::openat(
+        cwd,
+        "value.txt",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    ) {
+        Ok(fd) => {
+            let mut file = File::from(fd);
+            file.write_all(b"SOURCE_VALUE\n")?;
+            file.sync_all()?;
+        }
+        Err(rustix::io::Errno::EXIST) => (),
+        Err(error) => return Err(error.into()),
+    }
+    for (name, limit) in [("value.txt", 13), ("marker", 4096)] {
+        let fd = match fs::openat(
+            cwd,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) if name == "marker" => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut file = File::from(fd);
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.nlink() != 1
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.len() > limit
+        {
+            return Err(io::Error::other("fixture_file"));
+        }
+        let mut bytes = vec![];
+        Read::by_ref(&mut file)
+            .take(limit + 1)
+            .read_to_end(&mut bytes)?;
+        if (name == "value.txt" && bytes != b"SOURCE_VALUE\n")
+            || (name == "marker" && bytes.iter().any(|b| *b != b'x'))
+        {
+            return Err(io::Error::other("fixture_data"));
+        }
+    }
+    Ok(())
+}
+
 pub struct Files {
     directory: File,
     _lock: File,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl DirectoryIdentity {
+    pub fn capture(directory: &File) -> io::Result<Self> {
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(io::Error::other("journal_directory_type"));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+/// Read-only inspection coexists with the exclusive writer. It creates no
+/// files, obtains no lease, and exposes only checked ordinary journal parts.
+pub struct ReadOnly {
+    directory: File,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    links: u64,
+    owner: u32,
+    mode: u32,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+impl ReadIdentity {
+    pub fn capture(file: &File) -> io::Result<Self> {
+        let meta = file.metadata()?;
+        Ok(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            size: meta.len(),
+            links: meta.nlink(),
+            owner: meta.uid(),
+            mode: meta.mode(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+impl ReadOnly {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            directory: crate::fs::private_directory(path)?,
+        })
+    }
+    pub fn names(&self) -> io::Result<Vec<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStringExt;
+        let mut names = Vec::new();
+        let mut count = 0;
+        for entry in fs::Dir::read_from(&self.directory)? {
+            let entry = entry?;
+            let bytes = entry.file_name().to_bytes();
+            if matches!(bytes, b"." | b"..") {
+                continue;
+            }
+            count += 1;
+            if count > 8192 {
+                return Err(io::Error::other("journal_parts_limit"));
+            }
+            if bytes.starts_with(b"part-") && bytes.ends_with(b".log") {
+                if names.len() == 4096 {
+                    return Err(io::Error::other("journal_parts_limit"));
+                }
+                names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+    pub fn part(&self, name: &str) -> io::Result<File> {
+        if name.len() != 29
+            || !name.starts_with("part-")
+            || !name.ends_with(".log")
+            || !name.as_bytes()[5..25].iter().all(u8::is_ascii_digit)
+        {
+            return Err(io::Error::other("journal_part_sequence"));
+        }
+        let file = File::from(fs::openat(
+            &self.directory,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.nlink() != 1
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.mode() & 0o077 != 0
+        {
+            return Err(io::Error::other("journal_part_type"));
+        }
+        Ok(file)
+    }
+    pub fn unchanged(&self, name: &str, file: &File, expected: &ReadIdentity) -> io::Result<bool> {
+        let open = ReadIdentity::capture(file)?;
+        let named = fs::statat(&self.directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        Ok(
+            fs::FileType::from_raw_mode(named.st_mode) == fs::FileType::RegularFile
+                && open.device == named.st_dev
+                && open.inode == named.st_ino
+                && open.links == 1
+                && open == *expected
+                && i128::from(named.st_nlink) == i128::from(expected.links)
+                && named.st_uid == expected.owner
+                && named.st_mode == expected.mode
+                && i128::from(named.st_size) == i128::from(expected.size)
+                && named.st_mtime == expected.modified.0
+                && i128::from(named.st_mtime_nsec) == i128::from(expected.modified.1)
+                && named.st_ctime == expected.changed.0
+                && i128::from(named.st_ctime_nsec) == i128::from(expected.changed.1),
+        )
+    }
 }
 
 pub struct Catalog {
@@ -24,6 +268,9 @@ impl Catalog {
                 .ok_or_else(|| io::Error::other("session_directory"))?,
         )?
         .sync_all()?;
+        Self::open_read_only(path)
+    }
+    pub fn open_read_only(path: &Path) -> io::Result<Self> {
         Ok(Self {
             directory: crate::fs::private_directory(path)?,
         })
@@ -130,8 +377,18 @@ impl Catalog {
             }
             let meta = fs::statat(&directory, entry.file_name(), AtFlags::empty())?;
             if fs::FileType::from_raw_mode(meta.st_mode) == fs::FileType::RegularFile {
-                result = Some(result.map_or((meta.st_mtime, meta.st_mtime_nsec), |old| {
-                    std::cmp::max(old, (meta.st_mtime, meta.st_mtime_nsec))
+                // rustix's libc backend (including Miri) uses signed nanoseconds;
+                // the raw Linux backend uses u64. Normalize without wrapping.
+                #[allow(clippy::useless_conversion)]
+                let nanos: u64 = meta
+                    .st_mtime_nsec
+                    .try_into()
+                    .map_err(|_| io::Error::other("session_mtime"))?;
+                if nanos >= 1_000_000_000 {
+                    return Err(io::Error::other("session_mtime"));
+                }
+                result = Some(result.map_or((meta.st_mtime, nanos), |old| {
+                    std::cmp::max(old, (meta.st_mtime, nanos))
                 }));
             }
         }
@@ -188,13 +445,37 @@ impl Files {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         File::open(parent)?.sync_all()?;
+        Self::lock(directory, OFlags::CREATE)
+    }
+
+    /// Recover an existing private journal under its original directory lease.
+    /// Recovery must never create a directory or replace a missing lock.
+    pub fn open_existing(path: &Path, expected: DirectoryIdentity) -> io::Result<Self> {
+        let directory = crate::fs::private_directory(path)?;
+        if DirectoryIdentity::capture(&directory)? != expected {
+            return Err(io::Error::other("journal_directory_identity"));
+        }
+        Self::lock(directory, OFlags::empty())
+    }
+
+    pub fn identity(&self) -> io::Result<DirectoryIdentity> {
+        DirectoryIdentity::capture(&self.directory)
+    }
+
+    fn lock(directory: File, create: OFlags) -> io::Result<Self> {
         let lock = File::from(fs::openat(
             &directory,
             "lock",
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC | create,
             Mode::RUSR | Mode::WUSR,
         )?);
-        if !lock.metadata()?.is_file() || lock.metadata()?.nlink() != 1 {
+        let metadata = lock.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || create.is_empty()
+                && (metadata.uid() != rustix::process::geteuid().as_raw()
+                    || metadata.mode() & 0o077 != 0)
+        {
             return Err(io::Error::other("journal_lock_type"));
         }
         fs::flock(&lock, FlockOperation::NonBlockingLockExclusive)
@@ -222,6 +503,14 @@ impl Files {
         Ok(names)
     }
     pub fn part(&self, name: &str, create: bool) -> io::Result<File> {
+        self.open_part(name, create, false)
+    }
+
+    pub fn private_part(&self, name: &str) -> io::Result<File> {
+        self.open_part(name, false, true)
+    }
+
+    fn open_part(&self, name: &str, create: bool, private: bool) -> io::Result<File> {
         if name.len() != 29
             || !name.starts_with("part-")
             || !name.ends_with(".log")
@@ -240,7 +529,13 @@ impl Files {
             flags,
             Mode::RUSR | Mode::WUSR,
         )?);
-        if !file.metadata()?.is_file() || file.metadata()?.nlink() != 1 {
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || private
+                && (metadata.uid() != rustix::process::geteuid().as_raw()
+                    || metadata.mode() & 0o077 != 0)
+        {
             return Err(io::Error::other("journal_part_type"));
         }
         Ok(file)

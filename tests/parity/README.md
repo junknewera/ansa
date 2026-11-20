@@ -2,6 +2,77 @@
 
 `run.py` использует только Python standard library. M0 capture сохраняет C++ baseline. M1 добавляет `compare/fault --suite risk` и `check --milestone M1`; M2 - `--suite protocol` и `--milestone M2`; M3 - `--suite auth` и `--milestone M3`. Другие future suites, `compare/fault` без suite и `perf` возвращают nonzero с явным `not implemented`; неизвестный milestone тоже не проходит. Production runtime остаётся C++.
 
+## M7 CLI/Carbon/JSONL suite
+
+Из clean checkpoint в pinned Nix shell собери C++ targets и Rust examples/binary
+с `--all-features`. Production/default остаётся C++.
+
+```sh
+cargo test --manifest-path rust/Cargo.toml --locked --test frontend_parity
+cargo build --manifest-path rust/Cargo.toml --workspace --locked --all-features --bins --examples
+python tests/parity/run.py compare --suite frontend --cpp-build build-ansa --rust-target rust/target --output build-migration/M7
+python tests/parity/run.py fault --suite frontend --cpp-build build-ansa --rust-target rust/target --output build-migration/M7-fault
+python tests/parity/run.py check --milestone M7 --evidence build-migration/M7
+```
+
+Compare сохраняет command/flag matrix, v1 events, настоящие CLI roundtrips,
+cross-client session reopen/append и production Carbon frames (80×24, 100×32,
+small→large, color/NO_COLOR). Fault добавляет PTY, ранний Ctrl+C при accepted fsync,
+отказ admission с сохранённым input, повторную отмену, resize/job control,
+blocked stdout/unread stderr/EPIPE и большой валидный event. Первый frame
+проверяется на actual CLI с истёкшим synthetic profile и loopback proxy trap:
+network разрешён только после Submit. Реального login/provider traffic нет.
+
+Новый auth/provider bridge отдельно проверяется на HTTP/TLS/H2 terminal/EOF,
+headers/trailers и wire budgets. Peer сохраняет actual request body/path/headers;
+malformed response вызывает ноль counter executors. Checker повторяет проверки
+по сохранённым stdin/stdout, PTY prefixes, typed identities и journal frames.
+Missing/skipped cases, fake cleanup, пустой journal и подмена output не проходят.
+
+Для oracle-only build directory существующие неизменённые C++ binary/native
+suites можно скопировать в `build-reference/` (или `build-reference-sanitize/`),
+с отдельным source proof. Обычный `build-ansa` использует собственные targets.
+
+## M6 local tools/process suite
+
+Собери C++ targets и Rust examples с `--all-features`, затем из clean checkpoint
+внутри `nix develop --no-update-lock-file`:
+
+```sh
+cargo test --manifest-path rust/Cargo.toml --workspace --locked
+python tests/parity/run.py compare --suite tools --cpp-build build-ansa --rust-target rust/target --output build-migration/M6
+python tests/parity/run.py fault --suite tools --cpp-build build-ansa --rust-target rust/target --output build-migration/M6-fault
+python tests/parity/run.py check --milestone M6 --evidence build-migration/M6
+```
+
+Проверяются config/AGENTS, schema/revision/read-only snapshots, byte-limited
+file/search и process results. Request/started/result records сверяются с exact
+v1 hashes; другой binary читает и переиспользует outcome без повторного launch.
+Crash controller привязывает pidfds к actual Popen и ancestry всей fixture tree.
+Known cleanup проверяется до обязательной очистки harness; guardian death даёт
+unknown. Partial publication и неверный spec не допускают повторного эффекта.
+Native Linux tests дополнительно проверяют wait-error ownership и закрытые stdio.
+
+## M5 runtime suite
+
+Из clean checkpoint собери C++ targets и Rust examples с `--all-features`.
+Внутри `nix develop --no-update-lock-file`:
+
+```sh
+cargo test --manifest-path rust/Cargo.toml -p ansa --locked --test runtime_parity
+cargo build --manifest-path rust/Cargo.toml --workspace --locked --all-features --examples
+python tests/parity/run.py compare --suite runtime --cpp-build build-ansa --rust-target rust/target --output build-migration/M5
+python tests/parity/run.py fault --suite runtime --cpp-build build-ansa --rust-target rust/target --output build-migration/M5-fault
+python tests/parity/run.py check --milestone M5 --evidence build-migration/M5
+```
+
+Compare проверяет production requests, typed events, transcript, context и точные
+journal events; interop сохраняет исходные bytes при append другим runtime.
+Fault включает native assertions, 48 crash boundaries и 20 stress schedules.
+Checker повторяет семантические проверки по raw stdin/stdout и journal frames.
+Source/binary hashes, clean status и NixOS/aarch64 обязательны. Неподдерживаемый
+или пустой suite не считается PASS. Production CLI остаётся C++.
+
 ## M4 session suite
 
 M4 добавляет `compare/fault --suite sessions` и `check --milestone M4`.
