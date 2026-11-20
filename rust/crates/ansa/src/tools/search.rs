@@ -8,7 +8,7 @@ use crate::{
 use std::io::Read;
 impl Host {
     pub fn search(&self, args: &Json, stop: &Cancel) -> Result<Outcome> {
-        let root = self.path(args.text_field("path")?)?;
+        let root = self.task_directory_path(args.text_field("path")?)?;
         if let Some(value) = self.instructions(&root, args)? {
             return Ok(value);
         }
@@ -22,10 +22,12 @@ impl Host {
         {
             return Err("file_search_arguments");
         }
-        let mut stack = vec![std::fs::read_dir(&root).map_err(|_| "file_access_failed")?];
+        let entries =
+            ansa_linux::fs::read_directory(&root, false).map_err(|_| "file_access_failed")?;
+        let mut stack = vec![(root, entries)];
         let (mut matches, mut scopes) = (vec![], vec![]);
         let (mut visited, mut scanned, mut bytes, mut truncated) = (0, 0, 0, false);
-        while let Some(entries) = stack.last_mut() {
+        while let Some((directory, entries)) = stack.last_mut() {
             let entry = match entries.next() {
                 Some(Ok(entry)) => entry,
                 Some(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
@@ -43,22 +45,22 @@ impl Host {
                 truncated = true;
                 break;
             }
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.as_encoded_bytes();
-            if ansa_linux::fs::protected_path(&path)
-                || path.starts_with(&self.auth)
-                || path.starts_with(self.settings.directory.join("auth"))
-                || path.starts_with(self.settings.directory.join("sessions"))
+            let path = directory.join(&entry.name);
+            let name = entry.name.as_encoded_bytes();
+            if self.protected_path(&path)
                 || self.settings.exclude.iter().any(|v| v.as_bytes() == name)
             {
                 continue;
             }
-            let kind = entry.file_type().map_err(|_| "file_access_failed")?;
-            if kind.is_symlink() {
+            if entry.symlink {
                 continue;
             }
-            if kind.is_dir() {
+            if entry.directory {
+                if self.check_task_path(&path, false).is_err()
+                    && !self.task_directory_allowed(&path)
+                {
+                    continue;
+                }
                 if path.join("AGENTS.md").exists() {
                     if scopes.len() < 50
                         && !append(
@@ -70,18 +72,22 @@ impl Host {
                         truncated = true;
                     }
                 } else {
-                    match std::fs::read_dir(&path) {
-                        Ok(entries) => stack.push(entries),
+                    match ansa_linux::fs::read_directory(&path, false) {
+                        Ok(entries) => stack.push((path, entries)),
                         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
                         Err(_) => return Err("file_access_failed"),
                     }
                 }
                 continue;
             }
-            if !kind.is_file() {
+            if !entry.regular {
                 continue;
             }
-            let file = self.path_os(&path)?;
+            let file = match self.path_os(&path) {
+                Ok(path) => path,
+                Err("task_path_scope") => continue,
+                Err(code) => return Err(code),
+            };
             if mode == "name" {
                 if name.windows(query.len()).any(|v| v == query.as_bytes())
                     && !append(

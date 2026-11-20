@@ -1,5 +1,7 @@
 # Предложение: развитие harness ANSA по Hermes и Harness²
 
+Исходный материал [PR #14](https://github.com/junknewera/ansa/pull/14). Состояние на дату предложения сохранено в [журнале этой ветки](https://github.com/junknewera/ansa/blob/ef4f4080aaa5e6c14d16f461ffdb9bc0c5dd744e/docs/PROJECT_STATE.md). Текущая реализация и результаты проверок описаны в [сводке по пяти предложениям](PROJECT_STATE.md#реализация-пяти-proposal-после-разбора-требований).
+
 - Дата: 2026-11-15.
 - Статус: **PROPOSED, docs-only**. Реализация и модельный сравнительный eval не выполнены.
 - Исторический baseline предложения: [ANSA `9e6e6de`][ansa-base], после merge PR #13 с Rust SIWC streaming hotfix.

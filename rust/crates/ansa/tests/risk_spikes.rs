@@ -43,7 +43,7 @@ fn isolated_supervisor_risks() {
         });
     let output = std::process::Command::new("python3")
         .arg(root.join("risk_process.py"))
-        .arg(env!("CARGO_BIN_EXE_ansa-rs"))
+        .arg(env!("CARGO_BIN_EXE_ansa"))
         .output()
         .unwrap();
     assert!(

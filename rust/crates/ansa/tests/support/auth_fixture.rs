@@ -791,6 +791,44 @@ fn case_lazy() -> Result<()> {
         s.catalogs.load(Ordering::Acquire) == 2 && guard.session() == original.session,
         "catalog_cache_or_short_circuit",
     )?;
+    let mut request = request(&original.account)?;
+    request.binding.requested_model = "fixture-model".into();
+    request.binding.returned_model = "fixture-model".into();
+    guard.check_request(&request, 0, &Cancel::default())?;
+    ensure(
+        s.catalogs.load(Ordering::Acquire) == 2,
+        "selected_model_cache_lost",
+    )?;
+    use ansa::provider::contracts::GenerationSelection;
+    guard.check_generation(
+        &GenerationSelection {
+            model: "fixture-model".into(),
+            effort: None,
+        },
+        &Cancel::default(),
+    )?;
+    ensure(
+        s.catalogs.load(Ordering::Acquire) == 2,
+        "selected_generation_lost_shared_cache",
+    )?;
+    let unsupported = request.with_effort(Some("unconfirmed".into()))?;
+    ensure(
+        guard
+            .check_request(&unsupported, 0, &Cancel::default())
+            .is_err()
+            && guard
+                .check_generation(
+                    &GenerationSelection {
+                        model: "fixture-model".into(),
+                        effort: Some("unconfirmed".into()),
+                    },
+                    &Cancel::default(),
+                )
+                .is_err()
+            && s.inference.load(Ordering::Acquire) == 0
+            && s.catalogs.load(Ordering::Acquire) == 2,
+        "unconfirmed_effort_authorized",
+    )?;
     let mut wrong = expired.clone();
     wrong.account = "other".into();
     let mut mismatch =

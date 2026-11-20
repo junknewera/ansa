@@ -1,5 +1,6 @@
-//! Legacy process records share the v1 JSON codec and publish-once file helper.
+//! Versioned process records share the legacy JSON codec and publish-once files.
 use crate::{
+    process::output_spool,
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::replay::{Effects, Execution},
     tools::{invocation::Invocation, registry::Outcome},
@@ -37,7 +38,7 @@ pub(crate) fn admit(directory: &File, invocation: &Invocation) -> Result<Outcome
     let hash = sha256(spec.dump().as_bytes());
     if spec.usize_field("version")? != 1
         || started.usize_field("version")? != 1
-        || result.usize_field("version")? != 1
+        || result.usize_field("version")? != result_version(invocation)
         || started.text_field("request_hash")? != hash
         || result.text_field("request_hash")? != hash
         || *spec.field("invocation")? != invocation.save()?
@@ -67,11 +68,12 @@ pub(crate) fn admit(directory: &File, invocation: &Invocation) -> Result<Outcome
     ))
 }
 pub(crate) fn publish(directory: &File, spec: &Json, outcome: &Outcome) -> Result<()> {
+    let invocation = Invocation::load(spec.field("invocation")?)?;
     create(
         directory,
         "result.json",
         &Json::object(vec![
-            ("version", crate::config::n(1)),
+            ("version", crate::config::n(result_version(&invocation))),
             (
                 "request_hash",
                 Json::string(&sha256(spec.dump().as_bytes()))?,
@@ -84,4 +86,12 @@ pub(crate) fn publish(directory: &File, spec: &Json, outcome: &Outcome) -> Resul
             ),
         ])?,
     )
+}
+
+fn result_version(invocation: &Invocation) -> usize {
+    if output_spool::enabled(invocation) {
+        2
+    } else {
+        1
+    }
 }

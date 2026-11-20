@@ -48,7 +48,7 @@ fn hex(raw: &str) -> Result<Vec<u8>> {
         })
         .collect()
 }
-fn command(c: &RuntimeCommand) -> Json {
+fn command(c: &RuntimeCommand) -> Result<Json> {
     let mut f = vec![
         ("schema_version", n(1)),
         ("session", s(&c.session.0)),
@@ -57,24 +57,50 @@ fn command(c: &RuntimeCommand) -> Json {
         ("command_id", s(&c.command.0)),
     ];
     match &c.payload {
+        CommandPayload::Handoff(_) => return Err("internal_command"),
         CommandPayload::Submit(v) => f.extend([
             ("type", s("submit")),
             ("text", s(&v.text)),
             ("mode", s(jsonl::mode(v.mode))),
         ]),
         CommandPayload::Cancel(v) => f.extend([("type", s("cancel")), ("target", s(&v.0))]),
+        CommandPayload::Steer(v) => f.extend([
+            ("type", s("steer")),
+            ("target", s(&v.target.0)),
+            ("text", s(&v.text)),
+        ]),
+        CommandPayload::SetGeneration(v) => f.extend([
+            ("type", s("generation")),
+            ("model", s(&v.model)),
+            ("effort", v.effort.as_deref().map_or_else(null, s)),
+        ]),
+        CommandPayload::SetAutocompact(percent) => f.extend([
+            ("type", s("autocompact")),
+            ("percent", n(usize::from(*percent))),
+        ]),
+        CommandPayload::GetContext => f.push(("type", s("context"))),
+        CommandPayload::GetMessageReceipt(v) => {
+            f.extend([("type", s("message_receipt_query")), ("target", s(&v.0))])
+        }
         CommandPayload::Resume(v) => f.extend([("type", s("resume")), ("target", s(&v.0))]),
         CommandPayload::GetSnapshot(v) => {
             f.extend([("type", s("snapshot")), ("after_sequence", n(*v as usize))])
         }
-        CommandPayload::GetTranscript(v) => f.extend([
-            ("type", s("transcript")),
+        CommandPayload::GetTranscript(v) | CommandPayload::GetTimeline(v) => f.extend([
+            (
+                "type",
+                s(if matches!(c.payload, CommandPayload::GetTimeline(_)) {
+                    "timeline"
+                } else {
+                    "transcript"
+                }),
+            ),
             ("before", n(v.before)),
             ("limit", n(v.limit)),
             ("forward", b(v.forward)),
         ]),
     }
-    obj(f)
+    Ok(obj(f))
 }
 fn run(row: &Json) -> Result<Json> {
     let root = Path::new(row.text_field("root")?);
@@ -93,7 +119,7 @@ fn run(row: &Json) -> Result<Json> {
                     code
                 }
             })?;
-            Ok(self::command(&command))
+            self::command(&command)
         }
         "args" => {
             let home = root.join("home");
@@ -133,6 +159,10 @@ fn run(row: &Json) -> Result<Json> {
                     .iter()
                     .map(|v| {
                         Ok(carbon::Entry {
+                            action: None,
+                            edit: None,
+                            output: None,
+                            status: None,
                             role: v.text_field("role")?.into(),
                             text: v.text_field("text")?.into(),
                         })
@@ -288,6 +318,12 @@ fn events() -> Result<Json> {
         output: Arc::new("result".into()),
     };
     let snapshot = Snapshot {
+        timeline_size: 0,
+        generation: GenerationSelection {
+            model: "fixture-model".into(),
+            effort: None,
+        },
+        followups: vec![],
         through_sequence: 7,
         state: "paused".into(),
         request: Some("request".into()),
@@ -304,6 +340,7 @@ fn events() -> Result<Json> {
         ],
         history_items: 5,
         compactions: 2,
+        autocompact_percent: 50,
         storage_failed: false,
         durable: true,
         resume_available: true,
@@ -324,6 +361,7 @@ fn events() -> Result<Json> {
                 forward: false,
             },
             entries: vec![ansa::session::transcript::Entry {
+                tool: None,
                 turn: "turn".into(),
                 request: "request".into(),
                 role: "user".into(),
@@ -397,8 +435,174 @@ fn final_response(
         ("items", Json::array(vec![item])?),
     ]))
 }
+fn workspace_edit(root: &Path) -> Result<i32> {
+    use ansa::{
+        config::{agents::agent_epoch, load_agent_settings},
+        frontend::sessions::{Factory, Kind},
+        protocol::legacy_json_v1::sha256,
+        tools::files::local_tools,
+    };
+    let home = root.join("home");
+    let cwd = home.join("workspace");
+    let settings = load_agent_settings(&cwd, &home)?;
+    let epoch = agent_epoch(&settings)?;
+    let instruction_token = sha256(epoch.exact_state.field("instructions")?.dump().as_bytes());
+    let selected = settings.catalog("offline")?.create_kind("main", None)?;
+    let worker = std::env::current_exe().map_err(|_| "fixture_worker")?;
+    let auth = root.join("auth");
+    let tools = local_tools(
+        settings.clone(),
+        epoch.clone(),
+        &selected.directory,
+        &auth,
+        &worker,
+    )?;
+    std::fs::write(cwd.join("edit-target.rs"), b"fn main() {\n    old();\n}\n")
+        .map_err(|_| "fixture_edit_source")?;
+    let mut binding = app::binding();
+    binding.requested_model = settings.model.clone();
+    binding.returned_model = settings.returned_model.clone();
+    let configuration = Request::new(binding, epoch, tools.advertisement().clone(), vec![])?;
+    let root_path = root.to_owned();
+    let first_generation = std::sync::atomic::AtomicBool::new(true);
+    let generate = Arc::new(
+        move |request: &Request, stop: &Cancel, _: ansa::runtime::PreviewSink| {
+            if first_generation.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while root_path.join("hold-generation").exists() {
+                    if stop.cancelled() {
+                        return Err("offline_cancelled");
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("fixture_hold_timeout");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            if stop.cancelled() {
+                return Err("offline_cancelled");
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root_path.join("generated"))
+                .and_then(|mut file| file.write_all(b"x"))
+                .map_err(|_| "fixture_marker")?;
+            if root_path.join("fail-generation").exists() {
+                return Err("terminal_item_count");
+            }
+            let image = root_path.join("preview-chart").exists();
+            let dataset = root_path.join("preview-dataset").exists();
+            if let Some(last) = request.input.last()
+                && last.text_field("type") == Ok("function_call_output")
+            {
+                let output = Json::parse(last.text_field("output")?)?;
+                if image || dataset {
+                    return final_response(
+                        request,
+                        output.text_field("status").unwrap_or("PNG_REJECTED"),
+                    );
+                }
+                if !output.field("applied")?.boolean()? {
+                    return Err("fixture_edit_not_applied");
+                }
+                return final_response(request, "EDIT_DONE");
+            }
+            let (name, arguments) = if dataset {
+                (
+                    "python_execute",
+                    obj(vec![
+                        ("path", s("sales.csv")),
+                        ("date_column", s("date")),
+                        ("value_column", s("amount")),
+                        ("report_key", s("sales")),
+                        ("instruction_token", s(&instruction_token)),
+                    ]),
+                )
+            } else if image {
+                let path = if root_path.join("preview-other").exists() {
+                    "other.png"
+                } else {
+                    "chart.png"
+                };
+                (
+                    "show_png",
+                    obj(vec![
+                        ("path", s(path)),
+                        ("instruction_token", s(&instruction_token)),
+                    ]),
+                )
+            } else {
+                (
+                    "edit_file",
+                    obj(vec![
+                        ("path", s("edit-target.rs")),
+                        ("old_text", s("old();")),
+                        ("new_text", s("new();")),
+                        ("instruction_token", s(&instruction_token)),
+                    ]),
+                )
+            };
+            let call = obj(vec![
+                ("type", s("function_call")),
+                ("id", s(&format!("visual_item_{}", request.input.len()))),
+                (
+                    "call_id",
+                    s(&format!("visual_call_{}", request.input.len())),
+                ),
+                ("namespace", s("omh")),
+                ("name", s(name)),
+                ("arguments", s(&arguments.dump())),
+                ("status", s("completed")),
+            ]);
+            native::load(&obj(vec![
+                ("request", request.save()?),
+                ("id", s(&format!("visual_response_{}", request.input.len()))),
+                ("model", s(&request.binding.returned_model)),
+                ("items", Json::array(vec![call])?),
+            ]))
+        },
+    );
+    // Block terminal signals before the owner and worker threads inherit them.
+    let mut io = Io::open(true)?;
+    let runtime = Runtime::new(
+        selected.id.as_str().into(),
+        configuration,
+        tools,
+        generate,
+        Limits::default(),
+        Options {
+            directory: Some(selected.directory.clone()),
+            ..Options::default()
+        },
+    )?;
+    let factory = Factory::new(settings, auth, true, "offline-fixture".into(), None);
+    let reactor = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| "fixture_runtime")?;
+    reactor.block_on(controller::workbench::run(
+        runtime,
+        &mut io,
+        "workspace edit fixture",
+        factory,
+        selected.id,
+        Kind::Main,
+        None,
+    ))
+}
 fn fixture(root: &Path, mode: &str) -> Result<i32> {
     ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
+    if mode == "workspace-edit" {
+        return workspace_edit(root);
+    }
+    if mode == "openrouter-carbon" {
+        return app::openrouter_carbon_fixture(root);
+    }
+    if mode == "siwc-carbon" {
+        return app::siwc_carbon_fixture(root);
+    }
     let mut io = Io::open(mode != "backpressure" && mode != "large-jsonl")?;
     let hold_terminal_for_cancel = mode == "terminal" && io.raw.is_some();
     let failure = match mode {
@@ -409,14 +613,27 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
         _ => None,
     };
     let tools = app::pure_tools()?;
-    let tools = if mode == "large-jsonl" {
+    let tools = if matches!(mode, "large-jsonl" | "progress" | "progress-error") {
         let mut registry = ansa::tools::registry::Registry::new();
         let mut definition = tools
             .definition("get_test_value")
             .expect("fixture tool")
             .clone();
-        definition.executor =
-            Arc::new(|_| ansa::tools::registry::Outcome::succeeded("x".repeat(100 * 1024)));
+        let selected = mode.to_owned();
+        definition.executor = Arc::new(move |_| {
+            if selected == "large-jsonl" {
+                return ansa::tools::registry::Outcome::succeeded("x".repeat(100 * 1024));
+            }
+            std::thread::sleep(Duration::from_millis(1200));
+            if selected == "progress-error" {
+                ansa::tools::registry::Outcome::failed_known("TOOL_FAILURE Ж😀".into())
+            } else {
+                ansa::tools::registry::Outcome::succeeded(format!(
+                    "TOOL_RESULT Ж😀\n\x1b]0;INJECTED\x07\n{}",
+                    "details ".repeat(600)
+                ))
+            }
+        });
         registry.register_with_policy(
             definition,
             ansa::tools::registry::Policy {
@@ -517,12 +734,13 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
             if mode_owned == "preview-invalid" {
                 return Err("fixture_invalid_response");
             }
-            if mode_owned == "large-jsonl"
-                && request.input.last().is_none_or(|v| {
-                    !v.has("type") || v.text_field("type") != Ok("function_call_output")
-                })
-            {
-                let items = (0..12)
+            if matches!(
+                mode_owned.as_str(),
+                "large-jsonl" | "progress" | "progress-error"
+            ) && request.input.last().is_none_or(|v| {
+                !v.has("type") || v.text_field("type") != Ok("function_call_output")
+            }) {
+                let items = (0..if mode_owned == "large-jsonl" { 12 } else { 1 })
                     .map(|i| {
                         obj(vec![
                             ("type", s("function_call")),

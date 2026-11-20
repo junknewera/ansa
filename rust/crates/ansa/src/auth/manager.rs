@@ -13,12 +13,17 @@ use crate::{
     },
     transport::http::{Head, RESPONSES_ENDPOINT, admit_request},
 };
-use std::{path::Path, sync::Arc, thread::JoinHandle, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    thread::JoinHandle,
+    time::Duration,
+};
 
 #[derive(Debug)]
-pub struct HttpRequest {
+pub struct HttpRequest<'a> {
     pub method: &'static str,
-    pub url: &'static str,
+    pub url: &'a str,
     pub content_type: &'static str,
     pub body: Secret,
     pub bearer: Option<Secret>,
@@ -70,7 +75,18 @@ pub struct AuthManager {
     exchange: Exchange,
     streaming: Option<StreamExchange>,
     clock: Clock,
+    models: Mutex<Option<LiveModels>>,
 }
+/// Only a successful live exchange populates this cache. The display cache on
+/// disk never enters this authorization path and no bearer is retained here.
+struct LiveModels {
+    account: String,
+    session: String,
+    expires_at: u64,
+    checked_at: u64,
+    catalog: Json,
+}
+const MODELS_TTL: u64 = 300;
 
 struct Watch {
     operation: Cancel,
@@ -228,6 +244,7 @@ impl AuthManager {
             exchange,
             clock,
             streaming,
+            models: Mutex::new(None),
         })
     }
     fn request(
@@ -559,7 +576,11 @@ impl AuthManager {
         })
     }
     pub fn status(&self) -> Result<Status> {
-        let _lock = self.store.lock(&Cancel::default())?;
+        self.status_with_cancel(&Cancel::default())
+    }
+    /// Status inspection never refreshes credentials or calls a provider.
+    pub fn status_with_cancel(&self, cancel: &Cancel) -> Result<Status> {
+        let _lock = self.store.lock(cancel)?;
         self.store.clean()?;
         let Some(record) = self.store.read("credentials.json")? else {
             return Ok(Status::default());
@@ -687,7 +708,29 @@ impl AuthManager {
     }
     pub fn models(&self, cancel: &Cancel) -> Result<Json> {
         let lease = self.access(cancel, false)?;
-        json_reply(self.authorized(
+        cancel.check()?;
+        let now = (self.clock)();
+        let cached = {
+            let mut cached = self.models.lock().map_err(|_| "model_catalog_cache")?;
+            if cached.as_ref().is_some_and(|v| {
+                v.account != lease.account
+                    || v.session != lease.session
+                    || v.expires_at != lease.expires_at
+                    || now < v.checked_at
+                    || now - v.checked_at >= MODELS_TTL
+            }) {
+                *cached = None;
+            }
+            cached.as_ref().map(|v| v.catalog.clone())
+        };
+        if let Some(cached) = cached {
+            cancel.check()?;
+            let _lock = self.store.lock(cancel)?;
+            self.admit_lease(&lease)?;
+            cancel.check()?;
+            return Ok(cached);
+        }
+        let catalog = json_reply(self.authorized(
             HttpRequest {
                 method: "GET",
                 url: "https://api.openai.com/v1/models",
@@ -699,7 +742,29 @@ impl AuthManager {
             },
             &lease,
             cancel,
-        )?)
+        )?)?;
+        // Keep the original selected-model parser semantics: unrelated invalid
+        // entries cannot invalidate authorization for an otherwise valid model.
+        catalog.field("models")?.elements()?;
+        cancel.check()?;
+        let _lock = self.store.lock(cancel)?;
+        self.admit_lease(&lease)?;
+        cancel.check()?;
+        *self.models.lock().map_err(|_| "model_catalog_cache")? = Some(LiveModels {
+            account: lease.account,
+            session: lease.session,
+            expires_at: lease.expires_at,
+            checked_at: (self.clock)(),
+            catalog: catalog.clone(),
+        });
+        Ok(catalog)
+    }
+    /// A rejected absent model permits a later explicit request to discover a
+    /// changed catalogue; unsupported efforts stay fail-closed in the TTL.
+    pub fn invalidate_models(&self) {
+        if let Ok(mut models) = self.models.lock() {
+            *models = None;
+        }
     }
     pub fn generate(
         &self,
@@ -721,7 +786,7 @@ impl AuthManager {
             let record = self.admit_lease(&lease)?;
             let watch = Watch::new(self.store.clone(), cancel)?;
             let stopped = watch.operation.clone();
-            let mut stream = ResponseStream::new_with_callbacks(
+            let mut stream = ResponseStream::for_siwc(
                 request.clone(),
                 Limits::default(),
                 preview,
@@ -767,7 +832,7 @@ impl AuthManager {
             true,
         )?;
         let stopped = cancel.clone();
-        let mut stream = ResponseStream::new_with_callbacks(
+        let mut stream = ResponseStream::for_siwc(
             request,
             Limits::default(),
             preview,

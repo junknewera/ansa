@@ -33,7 +33,6 @@ impl SavedResult {
             _ => return Err("session_outcome"),
         };
         let output = value.text_field("output")?;
-        need(output.len() <= 128 * 1024, "session_outcome_limit")?;
         let dispatched = value.field("dispatched")?.boolean()?;
         need(
             dispatched || effects == Effects::NotStarted && execution != Execution::Succeeded,
@@ -51,20 +50,35 @@ impl SavedResult {
         })
     }
     pub fn save(&self) -> Result<Json> {
-        Json::object(vec![
-            ("operation", Json::string(self.result.operation_id())?),
-            ("call", Json::string(self.result.call_id())?),
-            ("output", Json::string(self.result.output())?),
-            ("execution", num(self.result.execution() as usize)?),
-            ("effects", num(self.result.effects() as usize)?),
-            (
-                "dispatched",
-                Json::parse(if self.dispatched { "true" } else { "false" })?,
-            ),
-        ])
+        Json::object_with_limits(
+            vec![
+                ("operation", Json::string(self.result.operation_id())?),
+                ("call", Json::string(self.result.call_id())?),
+                ("output", Json::string(self.result.output())?),
+                ("execution", num(self.result.execution() as usize)?),
+                ("effects", num(self.result.effects() as usize)?),
+                (
+                    "dispatched",
+                    Json::parse(if self.dispatched { "true" } else { "false" })?,
+                ),
+            ],
+            Json::JOURNAL_RECORD_BYTES,
+        )
     }
 }
 pub fn response_text(response: &AdmittedResponse) -> Result<String> {
+    if response.calls().is_empty()
+        && response.request().final_format()
+            == Some(crate::provider::structured::FinalFormat::ChildResult)
+    {
+        let result = response.child_result()?;
+        let mut text = result.summary;
+        for finding in result.findings {
+            text.push_str("\n- ");
+            text.push_str(&finding);
+        }
+        return Ok(text);
+    }
     let mut text = String::new();
     for item in response.items() {
         let item = item.value();
@@ -77,7 +91,6 @@ pub fn response_text(response: &AdmittedResponse) -> Result<String> {
             } else {
                 "text"
             })?;
-            need(value.len() <= 64 * 1024 - text.len(), "runtime_text_limit")?;
             text.push_str(value);
         }
     }

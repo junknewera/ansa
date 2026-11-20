@@ -13,17 +13,19 @@ use crate::{
         manager::{AuthManager, Clock, Exchange},
     },
     config::{agent_epoch, load_agent_settings},
-    context::legacy_compact::{CompactedContext, summary_request},
+    context::summary::summarizer,
+    openrouter::{MODEL as OPENROUTER_MODEL, OpenRouter},
     protocol::json::Json,
     provider::request::{Binding, Epoch, Request},
     runtime::{Generate, Lease, Limits, Options as RuntimeOptions, Runtime},
+    terminal_host::tools as terminals,
     tools::{
-        files::local_tools,
+        files::{LocalExtensions, local_tools_extended},
         registry::{Definition, Outcome, Policy, Registry},
     },
 };
 use std::{
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -117,6 +119,80 @@ pub fn auth_manager(path: &Path) -> Result<Arc<AuthManager>> {
         Some(Arc::new(crate::transport::client::stream)),
     )?))
 }
+
+const OPENROUTER_KEY_FILE: &str = "openrouter.key";
+
+fn openrouter_auth_path() -> Result<PathBuf> {
+    Ok(home()?.join(".ansa/openrouter"))
+}
+
+fn openrouter_client(bytes: Vec<u8>) -> Result<OpenRouter> {
+    let key = String::from_utf8(bytes).map_err(|_| "openrouter_key_invalid")?;
+    OpenRouter::new(
+        crate::auth::Secret::new(key.trim_end_matches(['\r', '\n']).to_owned()),
+        Arc::new(crate::transport::client::openrouter_exchange),
+    )
+}
+
+fn load_openrouter(path: &Path) -> Result<Arc<OpenRouter>> {
+    let directory =
+        ansa_linux::auth_store::Directory::open(path).map_err(|_| "openrouter_key_store")?;
+    let key = directory
+        .read(OPENROUTER_KEY_FILE)
+        .map_err(|_| "openrouter_key_store")?
+        .ok_or("openrouter_key_required")?;
+    Ok(Arc::new(openrouter_client(key)?))
+}
+
+fn save_openrouter(path: &Path) -> Result<i32> {
+    use std::io::Read;
+    if std::io::stdin().is_terminal() {
+        return Err("openrouter_key_requires_pipe");
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(515)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "openrouter_key_input")?;
+    if bytes.len() > 514 {
+        return Err("openrouter_key_invalid");
+    }
+    openrouter_client(bytes.clone())?;
+    let directory =
+        ansa_linux::auth_store::Directory::open(path).map_err(|_| "openrouter_key_store")?;
+    let _lease = directory
+        .try_lock()
+        .map_err(|_| "openrouter_key_store_busy")?;
+    directory
+        .save(
+            OPENROUTER_KEY_FILE,
+            &bytes,
+            &crate::auth::pkce::random_token(16)?,
+            |_, _| Ok(()),
+        )
+        .map_err(|_| "openrouter_key_store")?;
+    write_json(&object(vec![("status", s("openrouter_key_saved"))]))?;
+    Ok(0)
+}
+
+pub(super) fn openrouter_runtime(route: Arc<OpenRouter>) -> (Generate, RuntimeOptions) {
+    let catalog = route.clone();
+    let generate: Generate = Arc::new(move |request, stop, _| route.generate(request, stop));
+    let options = RuntimeOptions {
+        compact: Some(summarizer(generate.clone())),
+        model_window: Arc::new(move |request| catalog.cached_window(request)),
+        keep_recent_turns: 2,
+        select_generation: Arc::new(|selection, stop| {
+            stop.check()?;
+            if selection.model != OPENROUTER_MODEL || selection.effort.is_some() {
+                return Err("model_not_available");
+            }
+            Ok(())
+        }),
+        ..RuntimeOptions::default()
+    };
+    (generate, options)
+}
 pub fn pure_tools() -> Result<Arc<crate::tools::registry::Snapshot>> {
     let mut registry = Registry::new();
     registry.register_with_policy(Definition {descriptor:crate::provider::request::Descriptor {name:"get_test_value".into(),description:"Return a fixed test JSON value without side effects".into(),revision:"1".into(),schema:Json::parse(r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#)?},validator:Arc::new(|_|true),executor:Arc::new(|_|Outcome::succeeded(r#"{"ok":true,"value":"OMH_FIXED_VALUE_42"}"#.into()))},Policy {read_only:true,..Policy::default()})?;
@@ -167,7 +243,7 @@ pub fn offline_runtime(directory: Option<PathBuf>, delayed: bool) -> Result<Runt
         Limits::default(),
         RuntimeOptions {
             directory,
-            compact: Some(Arc::new(offline::compact)),
+            compact: Some(Arc::new(offline::compact_retained)),
             keep_recent_turns: 2,
             ..RuntimeOptions::default()
         },
@@ -239,36 +315,74 @@ pub fn authorized(
     auth: Arc<AuthManager>,
     model: String,
 ) -> Result<(String, Generate, RuntimeOptions)> {
-    let guard = Authorization::new(auth.clone(), &auth.status()?, model)?;
+    authorized_with_cancel(auth, model, &Cancel::default())
+}
+
+pub(super) fn authorized_with_cancel(
+    auth: Arc<AuthManager>,
+    model: String,
+    stop: &Cancel,
+) -> Result<(String, Generate, RuntimeOptions)> {
+    let guard = Authorization::new(auth.clone(), &auth.status_with_cancel(stop)?, model)?;
     let account = guard.account().to_owned();
     let guard = Arc::new(Mutex::new(guard));
     let check = guard.clone();
+    let request_check = guard.clone();
+    let selection = guard.clone();
     let provider = guard.clone();
+    let catalog = guard.clone();
     let lease = guard;
     let generate_auth = auth.clone();
     let lease_auth = auth;
     let generate: Generate = Arc::new(move |request, cancel, preview| {
-        let session = provider
-            .lock()
-            .map_err(|_| "auth_state")?
-            .session()
-            .to_owned();
-        generate_auth.generate(
-            request.clone(),
-            cancel,
-            &session,
-            Some(Box::new(move |text| {
-                let _ = preview(text);
-            })),
-        )
+        let (session, window) = {
+            let provider = provider.lock().map_err(|_| "auth_state")?;
+            (
+                provider.session().to_owned(),
+                provider.context_window(request),
+            )
+        };
+        let tokens = request
+            .estimated_tokens()
+            .unwrap_or_else(|| crate::context::estimate_request_tokens(request));
+        if let Some(window) = window {
+            crate::context::require_response_room(tokens, window)?;
+        }
+        generate_auth
+            .generate(
+                request.clone(),
+                cancel,
+                &session,
+                Some(Box::new(move |text| {
+                    let _ = preview(text);
+                })),
+            )
+            .map(|response| {
+                response
+                    .with_context_window(window)
+                    .with_context_estimate(tokens)
+            })
     });
     let compact_generate = generate.clone();
     let options = RuntimeOptions {
+        model_window: Arc::new(move |request| catalog.try_lock().ok()?.context_window(request)),
+        check_request: Arc::new(move |request, epoch, cancel| {
+            request_check
+                .lock()
+                .map_err(|_| "auth_state")?
+                .check_request(request, epoch, cancel)
+        }),
+        select_generation: Arc::new(move |value, cancel| {
+            selection
+                .lock()
+                .map_err(|_| "auth_state")?
+                .check_generation(value, cancel)
+        }),
         check_dispatch: Arc::new(move |epoch, cancel| {
             check
                 .lock()
                 .map_err(|_| "auth_state")?
-                .check_dispatch(epoch, cancel)
+                .check_account(epoch, cancel)
         }),
         tool_guard: Arc::new(move |cancel| {
             let session = lease.lock().map_err(|_| "auth_state")?.session().to_owned();
@@ -279,11 +393,7 @@ pub fn authorized(
                 stop,
             })
         }),
-        compact: Some(Arc::new(move |request, cancel| {
-            let response =
-                compact_generate(&summary_request(request)?, cancel, Arc::new(|_| Ok(())))?;
-            CompactedContext::from_summary(request.clone(), &response)
-        })),
+        compact: Some(summarizer(compact_generate)),
         keep_recent_turns: 2,
         streaming: true,
         ..RuntimeOptions::default()
@@ -291,18 +401,52 @@ pub fn authorized(
     Ok((account, generate, options))
 }
 fn text(args: &[String]) -> Result<i32> {
+    text_with_providers(args, load_openrouter, auth_manager)
+}
+
+fn text_with_providers(
+    args: &[String],
+    load_openrouter: impl FnOnce(&Path) -> Result<Arc<OpenRouter>>,
+    load_siwc: impl FnOnce(&Path) -> Result<Arc<AuthManager>>,
+) -> Result<i32> {
+    let default_auth = if args.iter().any(|arg| arg == "--openrouter") {
+        openrouter_auth_path()?
+    } else {
+        auth_path()?
+    };
     let parsed = Options::parse(
         args,
         std::env::current_dir().map_err(|_| "file_access_failed")?,
-        auth_path()?,
+        default_auth,
     )?;
+    let interactive = parsed.prompt.is_none()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
     let mut settings = load_agent_settings(&parsed.cwd, &home()?)?;
+    let use_saved_generation = interactive
+        && !parsed.resume
+        && parsed.session.is_empty()
+        && parsed.model.is_none()
+        && parsed.returned_model.is_none()
+        && !parsed.openrouter;
+    if parsed.openrouter
+        && [&parsed.model, &parsed.returned_model]
+            .into_iter()
+            .flatten()
+            .any(|model| model != OPENROUTER_MODEL)
+    {
+        return Err("model_not_available");
+    }
     if let Some(model) = parsed.model {
         settings.model = model.clone();
         settings.returned_model = model;
     }
     if let Some(model) = parsed.returned_model {
         settings.returned_model = model;
+    }
+    if parsed.openrouter {
+        settings.model = OPENROUTER_MODEL.into();
+        settings.returned_model = OPENROUTER_MODEL.into();
     }
     if parsed.print_config {
         write_json(&settings.effective()?)?;
@@ -311,27 +455,64 @@ fn text(args: &[String]) -> Result<i32> {
     let mut bound = binding();
     bound.requested_model = settings.model.clone();
     bound.returned_model = settings.returned_model.clone();
-    let (generate, mut options) = if parsed.offline {
+    let mut workspace_auth = None;
+    let openrouter = parsed
+        .openrouter
+        .then(|| load_openrouter(&parsed.auth))
+        .transpose()?;
+    let (generate, mut options) = if let Some(route) = &openrouter {
+        bound = route.binding().clone();
+        openrouter_runtime(route.clone())
+    } else if parsed.offline {
         (
             Arc::new(|request: &Request, stop: &Cancel, _| offline::generate(request, stop))
                 as Generate,
             RuntimeOptions {
-                compact: Some(Arc::new(offline::compact)),
+                compact: Some(Arc::new(offline::compact_retained)),
                 keep_recent_turns: 2,
                 ..RuntimeOptions::default()
             },
         )
     } else {
-        let (account, generate, options) =
-            authorized(auth_manager(&parsed.auth)?, settings.model.clone())?;
+        let auth = load_siwc(&parsed.auth)?;
+        let (account, generate, options) = authorized(auth.clone(), settings.model.clone())?;
+        workspace_auth = Some(auth);
         bound.account = account;
         (generate, options)
     };
-    let epoch = agent_epoch(&settings)?;
+    let mut factory = super::sessions::Factory::new(
+        settings.clone(),
+        parsed.auth.clone(),
+        parsed.offline,
+        bound.account.clone(),
+        workspace_auth,
+    )
+    .with_carbon_frontend(interactive);
+    factory.harness_trial = parsed.harness_trial;
+    if let Some(route) = openrouter {
+        factory = factory.with_openrouter(route);
+    }
+    let mut effort = None;
+    if use_saved_generation && let Some(selection) = factory.saved_generation() {
+        effort.clone_from(&selection.effort);
+        factory.use_generation(selection);
+        settings = factory.settings.clone();
+        bound.requested_model.clone_from(&settings.model);
+        bound.returned_model.clone_from(&settings.returned_model);
+    }
+    let mut epoch = agent_epoch(&settings)?;
     if parsed.resume && !parsed.session.is_empty() {
         return Err("session_selection_conflict");
     }
-    let catalog = settings.catalog(if parsed.offline { "offline" } else { "live" })?;
+    let profile = if parsed.resume || !parsed.session.is_empty() {
+        None
+    } else {
+        crate::harness::select(&settings, None, factory.harness_trial.as_deref())?
+    };
+    if let Some(profile) = &profile {
+        profile.attach(&mut epoch)?;
+    }
+    let catalog = settings.catalog(factory.profile())?;
     let selected = if !parsed.session.is_empty() {
         catalog.explicit(&parsed.session)?
     } else if parsed.resume {
@@ -339,43 +520,551 @@ fn text(args: &[String]) -> Result<i32> {
     } else {
         catalog.create()?
     };
-    let tools = local_tools(
+    let editor = parsed.workspace_editor.then(|| {
+        crate::tools::editor_context::EditorHub::new(
+            settings.cwd.clone(),
+            vec![
+                parsed.auth.clone(),
+                settings.directory.clone(),
+                selected.directory.clone(),
+            ],
+        )
+    });
+    if let Some(editor) = &editor {
+        factory = factory.with_editor(selected.directory.clone(), editor.clone());
+    }
+    let terminal =
+        (!parsed.resume && parsed.session.is_empty() && factory.new_main_uses_terminal())
+            .then(|| factory.open_terminal_owner(&selected, false))
+            .transpose()?;
+    if terminal.is_some() {
+        terminals::add_agent_instructions(&mut epoch);
+    }
+    // Mask signals before MCP and runtime workers inherit the process mask.
+    let mut io = Io::open(parsed.prompt.is_none())?;
+    let tools = local_tools_extended(
         settings.clone(),
         epoch.clone(),
         &selected.directory,
         &parsed.auth,
         &std::env::current_exe().map_err(|_| "process_executable")?,
-    )?;
-    let configuration = Request::new(bound, epoch, tools.advertisement().clone(), vec![])?;
-    options.directory = Some(selected.directory);
-    // Signals must be blocked before starting owner and output threads.
-    let mut io = Io::open(parsed.prompt.is_none())?;
-    let mut runtime = Runtime::new(
-        SessionId(selected.id.clone()),
-        configuration,
-        tools,
-        generate,
-        Limits {
-            compact_bytes: settings.compact_bytes,
-            tool_rounds: settings.tool_rounds,
-            tool_calls: settings.tool_calls,
-            ..Limits::default()
+        LocalExtensions {
+            editor: editor.clone(),
+            shared_writer: terminal.as_ref().map(terminals::workspace_writer),
         },
-        options,
+        |registry| {
+            terminal.clone().map_or(Ok(()), |owner| {
+                terminals::register(registry, owner, &selected.directory)
+            })?;
+            if let Some(profile) = &profile {
+                crate::tools::skills::register(registry, Some(profile.clone()))?;
+            }
+            if !parsed.resume && parsed.session.is_empty() {
+                crate::mcp::register(
+                    registry,
+                    &settings.directory,
+                    &settings.cwd,
+                    None,
+                    &Cancel::default(),
+                )?;
+            }
+            Ok(())
+        },
     )?;
+    let tools = if terminal.is_some() {
+        tools.without_tool("run_command")
+    } else {
+        tools
+    };
+    let configuration =
+        Request::new(bound, epoch, tools.advertisement().clone(), vec![])?.with_effort(effort)?;
+    options.directory = Some(selected.directory.clone());
+    if !parsed.resume && parsed.session.is_empty() {
+        options.autocompact_percent = factory.saved_autocompact();
+    }
+    options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&settings));
+    if parsed.offline {
+        let model = settings.model.clone();
+        options.select_generation = Arc::new(move |selection, _| {
+            if selection.model == model && selection.effort.is_none() {
+                Ok(())
+            } else {
+                Err("model_not_available")
+            }
+        });
+    }
+    let (mut runtime, root_kind, parent) = if parsed.resume || !parsed.session.is_empty() {
+        let restored = factory.resume(&selected.id)?;
+        (restored.runtime, restored.kind, restored.parent)
+    } else {
+        (
+            Runtime::new(
+                SessionId(selected.id.clone()),
+                configuration,
+                tools,
+                generate,
+                Limits {
+                    tool_rounds: settings.tool_rounds,
+                    tool_calls: settings.tool_calls,
+                    ..Limits::default()
+                },
+                options,
+            )?,
+            super::sessions::Kind::Main,
+            None,
+        )
+    };
+    factory.retain_terminal_owner(&selected.id, terminal)?;
     io.status(&format!(
         "ansa session {} (full access, sudo disabled)\n",
         selected.id
     ));
+    if io.raw.is_some() {
+        return reactor()?.block_on(controller::workbench::run_attached(
+            runtime,
+            &mut io,
+            &settings.cwd.to_string_lossy(),
+            factory,
+            selected.id,
+            root_kind,
+            parent,
+            parsed
+                .workspace
+                .map(|directory| -> Result<_> {
+                    Ok(super::bridge::BridgeOptions {
+                        directory,
+                        editor,
+                        artifact_store: Some(crate::tools::artifacts::Store::new(
+                            &selected.directory,
+                        )?),
+                    })
+                })
+                .transpose()?,
+        ));
+    }
+    if parsed.workspace.is_some() {
+        return Err("workspace_requires_tty");
+    }
     let context = format!("{}  {}", settings.cwd.display(), settings.model);
-    reactor()?.block_on(controller::run(
+    let result = reactor()?.block_on(controller::run(
         &mut runtime,
         &mut io,
         parsed.prompt.as_deref(),
         false,
         &context,
-    ))
+    ));
+    if result.is_ok() && factory.has_terminal_owners() && !factory.close_terminals() {
+        return Err("terminal_cleanup_unknown");
+    }
+    result
 }
+
+#[cfg(feature = "frontend-test-adapter")]
+pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
+    use serde_json::{Value, json};
+    ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
+    let home = root.join("home");
+    if std::env::var_os("HOME").as_deref() != Some(home.as_os_str()) {
+        return Err("fixture_home");
+    }
+    let cwd = home.join("workspace");
+    ansa_linux::fs::private_directory(&cwd).map_err(|_| "fixture_workspace")?;
+    let cwd = cwd.to_str().ok_or("fixture_workspace")?;
+    use crate::{
+        auth::manager::HttpReply,
+        openrouter::{CATALOG, ENDPOINT, PROVIDER},
+        transport::http::Head,
+    };
+    let hold_child = root.join("hold-orchestration-child");
+    let hold_summary = root.join("hold-orchestration-summary");
+    let exchange: Exchange = Arc::new(move |request, stop| {
+        let content = if request.url == CATALOG {
+            json!({"data":{"id":OPENROUTER_MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}})
+        } else {
+            let request: Value =
+                serde_json::from_str(request.body.expose()).map_err(|_| "fixture_body")?;
+            let format = &request["response_format"]["json_schema"];
+            let hold = match format["name"].as_str() {
+                Some("ansa_child_result_v1") => Some(&hold_child),
+                None if request.get("tools").is_none() => Some(&hold_summary),
+                _ => None,
+            };
+            if let Some(hold) = hold {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                while hold.exists() {
+                    stop.check()?;
+                    if std::time::Instant::now() >= deadline {
+                        return Err("fixture_hold_timeout");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            let text = match format["name"].as_str() {
+                Some("ansa_native_schema_probe") if format["strict"] == true => r#"{"value":"schema-enforced"}"#.into(),
+                Some("ansa_orchestration_plan_v3") if format["strict"] == true => json!({"schema_version":1,"summary":"OPENROUTER_CARBON_PLAN","steps":[{"id":"one","task":"Проверить вход","access":"read","paths":[],"depends_on":[],"acceptance":"Ответ получен"}],"checks":[],"manual_checks":["Утвердить удаление после отчёта"],"command_checks":[],"read_folder":null}).to_string(),
+                Some("ansa_child_result_v1") if format["strict"] == true && request["tool_choice"] == "none" => r#"{"status":"completed","summary":"Синтетическая проверка пройдена","findings":[]}"#.into(),
+                None if request.get("tools").is_some() => "Готов к итоговому ответу".into(),
+                None => "OPENROUTER_CARBON_DONE".into(),
+                _ => return Err("fixture_format"),
+            };
+            json!({"id":"fixture_response","model":OPENROUTER_MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":text}}]})
+        };
+        Ok(HttpReply {
+            head: Head {
+                status: 200,
+                content_types: vec!["application/json".into()],
+            },
+            body: content.to_string(),
+        })
+    });
+    let route = Arc::new(OpenRouter::new(
+        crate::auth::Secret::new("synthetic-fixture-key-0123456789".into()),
+        exchange,
+    )?);
+    text_with_providers(
+        &["--openrouter".into(), "--cwd".into(), cwd.into()],
+        |_| Ok(route),
+        |_| Err("fixture_provider"),
+    )
+}
+
+#[cfg(feature = "frontend-test-adapter")]
+pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
+    use crate::{auth::manager::HttpReply, transport::http::Head};
+    use serde_json::{Value, json};
+    const MODEL: &str = "gpt-6.2-sol";
+    ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
+    let fixture_home = root.join("home");
+    if home()? != fixture_home {
+        return Err("fixture_home");
+    }
+    let cwd = fixture_home.join("workspace");
+    ansa_linux::fs::private_directory(&cwd).map_err(|_| "fixture_workspace")?;
+    let plus = root.join("orchestration-plus").is_file();
+    let trace = root.join("plus-requests.jsonl");
+    let sequence = std::sync::atomic::AtomicUsize::new(0);
+    let auth_path = fixture_home.join(".ansa/auth");
+    let mut args = vec!["--model".into(), MODEL.into()];
+    for (flag, path) in [("--cwd", &cwd), ("--auth-dir", &auth_path)] {
+        args.extend([
+            flag.into(),
+            path.to_str().ok_or("fixture_workspace")?.into(),
+        ]);
+    }
+    text_with_providers(
+        &args,
+        |_| Err("fixture_provider"),
+        move |path| {
+            if path != auth_path {
+                return Err("fixture_provider");
+            }
+            Ok(Arc::new(AuthManager::new(
+                path,
+                Arc::new(move |request, _| {
+                    if request.url != "https://api.openai.com/v1/models" {
+                        return Err("fixture_unexpected_exchange");
+                    }
+                    Ok(HttpReply {
+                        head: Head {
+                            status: 200,
+                            content_types: vec!["application/json".into()],
+                        },
+                        body: if plus {
+                            json!({"models":[
+                                {"slug":MODEL,"visibility":"list","supported_reasoning_levels":["high"]},
+                                {"slug":"gpt-6.1-sol","visibility":"list","supported_reasoning_levels":["medium"]},
+                                {"slug":"gpt-6.1-luna","visibility":"list","supported_reasoning_levels":["low"]},
+                            ]})
+                        } else {
+                            json!({"models":[{"slug":MODEL,"visibility":"list"}]})
+                        }.to_string(),
+                    })
+                }),
+                Arc::new(|| 2_000_000_000),
+                None,
+                Some(Arc::new(move |request, bearer, feed, stop| {
+                    if bearer.expose() != "synthetic-access" {
+                        return Err("fixture_bearer");
+                    }
+                    let request: Value =
+                        serde_json::from_str(&request.dump()).map_err(|_| "fixture_body")?;
+                    if (!plus && request["model"] != MODEL)
+                        || request["store"] != false
+                        || request["stream"] != true
+                    {
+                        return Err("fixture_request");
+                    }
+                    let input = request["input"].as_array().ok_or("fixture_input")?;
+                    let last = input.last().ok_or("fixture_input")?;
+                    let text = request.get("text");
+                    let format = &request["text"]["format"];
+                    let name = format["name"].as_str();
+                    if text.is_some()
+                        && (format["strict"] != true || format["type"] != "json_schema")
+                    {
+                        return Err("fixture_format");
+                    }
+                    if plus {
+                        let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let item = plus_fixture_response(&request, input, &trace, index)?;
+                        let mut added = item.clone();
+                        added["status"] = json!("in_progress");
+                        if item["type"] == "function_call" {
+                            added["arguments"] = json!("");
+                        }
+                        let model = &request["model"];
+                        let id = format!("plus-response-{index}");
+                        let mut completed =
+                            json!({"id":id,"model":model,"status":"completed","output":[item]});
+                        if let Some(text) = text {
+                            completed["text"] = text.clone();
+                        }
+                        let events = [
+                            json!({"type":"response.created","sequence_number":0,"response":{"id":id,"model":model,"status":"in_progress","output":[]}}),
+                            json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":added}),
+                            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":item}),
+                            json!({"type":"response.completed","sequence_number":3,"response":completed}),
+                        ];
+                        for event in events {
+                            stop.check()?;
+                            feed(format!("data: {event}\n\n").as_bytes())?;
+                        }
+                        return Ok(());
+                    }
+                    let output: Value = last["output"]
+                        .as_str()
+                        .and_then(|output| serde_json::from_str(output).ok())
+                        .unwrap_or_default();
+                    let needs_instructions = output["status"] == "instructions_required";
+                    let call = name == Some("ansa_child_result_v1")
+                        && (last["type"] != "function_call_output" || needs_instructions);
+                    let nested = input.iter().any(|item| {
+                        item["content"].as_str().is_some_and(|content| {
+                            content.starts_with("Inspect nested project instructions")
+                        })
+                    });
+                    let item = if call {
+                        if !request["tools"].to_string().contains("list_directory") {
+                            return Err("fixture_tools");
+                        }
+                        let token = if needs_instructions {
+                            if !nested
+                                || !output["instructions"][0]["text"]
+                                    .as_str()
+                                    .is_some_and(|text| text.ends_with("END_NESTED_INSTRUCTIONS\n"))
+                            {
+                                return Err("fixture_nested_instructions");
+                            }
+                            output["instruction_token"].as_str()
+                        } else {
+                            request["instructions"]
+                                .as_str()
+                                .and_then(|instructions| {
+                                    instructions.split_once("instruction_token is ")
+                                })
+                                .and_then(|(_, suffix)| suffix.split_once('.'))
+                                .map(|(token, _)| token)
+                        }
+                        .ok_or("fixture_instruction_token")?;
+                        let path = if nested { "ansa" } else { "." };
+                        let round = usize::from(needs_instructions);
+                        let arguments = json!({"path":path,"instruction_token":token}).to_string();
+                        json!({"type":"function_call","id":format!("call-item-{round}"),"call_id":format!("fixture-call-{round}"),"namespace":"omh","name":"list_directory","arguments":arguments,"status":"completed"})
+                    } else {
+                        let answer = match name {
+                        Some("ansa_orchestration_plan_v3") if request["tools"] == json!([]) =>
+                            json!({"schema_version":1,"summary":"SIWC_CARBON_PLAN","steps":[
+                                {"id":"one","task":"Inspect the fixture","access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"},
+                                {"id":"two","task":if last["content"] == "Inspect Workspace/pet" { "Inspect nested project instructions" } else { "Check the fixture again" },"access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"}
+                            ],"checks":[],"manual_checks":[],"command_checks":[],"read_folder":match last["content"].as_str() {
+                                Some("Inspect Workspace/pet" | "UNNAMED_READ_SCOPE") => Some("Workspace/pet"), _ => None
+                            }}).to_string(),
+                        Some("ansa_child_result_v1") if output["entries"].is_array() =>
+                            r#"{"status":"completed","summary":"SIWC_HELPER_DONE","findings":[]}"#.into(),
+                        None => "SIWC_CARBON_DONE".into(),
+                        _ => return Err("fixture_format"),
+                    };
+                        json!({"type":"message","id":"fixture-message","role":"assistant","status":"completed","content":[{"type":"output_text","text":answer}]})
+                    };
+                    let mut added = item.clone();
+                    added["status"] = json!("in_progress");
+                    if call {
+                        added["arguments"] = json!("");
+                    }
+                    let mut completed = json!({"id":"fixture-response","model":MODEL,"status":"completed","output":[item]});
+                    if let Some(text) = text
+                        && last["content"] != "UNCONFIRMED_FORMAT"
+                    {
+                        completed["text"] = text.clone();
+                        if last["content"] == "UNCONSTRAINED_FORMAT" {
+                            completed["text"]["format"]["strict"] = json!(false);
+                        }
+                    }
+                    let events = [
+                        json!({"type":"response.created","sequence_number":0,"response":{"id":"fixture-response","model":MODEL,"status":"in_progress","output":[]}}),
+                        json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":added}),
+                        json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":item}),
+                        json!({"type":"response.completed","sequence_number":3,"response":completed}),
+                    ];
+                    for event in events {
+                        stop.check()?;
+                        feed(format!("data: {event}\n\n").as_bytes())?;
+                    }
+                    Ok(())
+                })),
+            )?))
+        },
+    )
+}
+
+#[cfg(feature = "frontend-test-adapter")]
+fn plus_fixture_response(
+    request: &serde_json::Value,
+    input: &[serde_json::Value],
+    trace: &Path,
+    index: usize,
+) -> Result<serde_json::Value> {
+    use serde_json::{Value, json};
+    let prompt = |item: &Value| {
+        if item["role"] == "user" {
+            item["content"].as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    };
+    let task = input.iter().rev().find_map(prompt).ok_or("fixture_input")?;
+    let format = request["text"]["format"]["name"].as_str();
+    let desired = |status, summary, findings: &[&str]| {
+        json!({"status":status,"summary":summary,"findings":findings}).to_string()
+    };
+    let completed = |summary| desired("completed", summary, &["fixture evidence"]);
+    let strong = ("gpt-6.2-sol", "high");
+    let medium = ("gpt-6.1-sol", "medium");
+    let weak = ("gpt-6.1-luna", "low");
+    let model = request["model"].as_str().ok_or("fixture_request")?;
+    let checks_passed = task
+        .contains(r#""passed_command_checks":[{"command":"./check.sh","status":"passed"}]"#)
+        && task.contains(r#""failed_checks":[]"#)
+        && !task.contains("fixture-check-output");
+    let seen = |marker: &str| {
+        input
+            .iter()
+            .any(|item| item["role"] == "assistant" && item.to_string().contains(marker))
+    };
+    let mut edit = None;
+    let (stage, role, text) = match format {
+        Some("ansa_orchestration_plan_v3") => (
+            if model == strong.0 { "strong-plan" } else { "medium-plan" },
+            if model == strong.0 { strong } else { medium },
+            json!({
+                "schema_version":1,"summary":"PLUS_CARBON_PLAN","steps":[
+                    {"id":"quick","task":"Set report to after fixture","access":"write","paths":["report.txt"],"depends_on":[],"acceptance":"Report starts with after fixture"},
+                    {"id":"fresh","task":"Confirm report preserves the fixture","access":"read","paths":["report.txt"],"depends_on":["quick"],"acceptance":"Report preserves the fixture"},
+                ],"checks":[{"path":"report.txt","contains":"after fixture"}],"manual_checks":[],
+                "command_checks":[{"argv":["./check.sh"]}],"read_folder":null
+            }).to_string(),
+        ),
+        Some("ansa_child_result_v1") if task.starts_with("You are the coordinator") =>
+            ("coordinate", medium, completed("ORIGINAL_COORDINATOR")),
+        Some("ansa_child_result_v1") if task.starts_with("You are a fresh coordinator") => {
+            if seen("ORIGINAL_COORDINATOR") || !task.contains("FRESH_DECISION") {
+                return Err("fixture_replan_context");
+            }
+            ("fresh-coordinate", medium, completed("FRESH_COORDINATOR"))
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Assigned task") => {
+            if task.contains("QUICK_DECISION") {
+                edit = Some(("before fixture", "after fixture"));
+                ("quick-fix", medium, completed("QUICK_FIX_APPLIED"))
+            } else if task.contains("FRESH_COORDINATOR") {
+                ("fresh-worker", weak, completed("FRESH_EVIDENCE"))
+            } else {
+                ("worker-rejected", weak, desired("completed", "WORKER_WITHOUT_EVIDENCE", &[]))
+            }
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Evaluate the worker") => {
+            if task.contains("QUICK_FIX_APPLIED") && seen("ORIGINAL_COORDINATOR") {
+                ("quick-verify", medium, completed("QUICK_VERIFIED"))
+            } else if task.contains("FRESH_EVIDENCE") && seen("FRESH_COORDINATOR") {
+                ("fresh-verify", medium, completed("FRESH_VERIFIED"))
+            } else if task.contains("WORKER_WITHOUT_EVIDENCE") && seen("ORIGINAL_COORDINATOR") {
+                ("reject", medium, desired("changes_requested", "Use another method", &["Missing evidence"]))
+            } else {
+                return Err("fixture_coordinator_context");
+            }
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Resolve a failed approved task") => {
+            if task.matches("WORKER_WITHOUT_EVIDENCE").count() != 3 {
+                return Err("fixture_escalation_context");
+            }
+            if task.contains("\nTask quick\n") {
+                ("escalate-quick", strong, completed("QUICK_DECISION"))
+            } else {
+                ("escalate-fresh", strong, desired("changes_requested", "FRESH_DECISION", &["Start independent context"]))
+            }
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Perform the whole candidate's") => {
+            if !checks_passed {
+                return Err("fixture_review_checks");
+            }
+            ("whole-review", strong, desired("changes_requested", "INITIAL_STRONG_REVIEW", &["Append reviewed to the report."]))
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Recheck the preceding findings") => {
+            if !seen("INITIAL_STRONG_REVIEW") || !task.contains("candidate-1/ansa-candidate.diff")
+                || !checks_passed
+            {
+                return Err("fixture_reviewer_context");
+            }
+            ("targeted-review", strong, completed("TARGETED_STRONG_REVIEW"))
+        }
+        Some("ansa_child_result_v1") if task.starts_with("Coordinate a focused correction") =>
+            ("review-coordinate", medium, completed("Append reviewed to the report.")),
+        Some("ansa_child_result_v1") if task.starts_with("Apply the focused correction") => {
+            edit = Some(("after fixture", "after fixture reviewed"));
+            ("review-fix", weak, completed("REVIEW_FIX_APPLIED"))
+        }
+        None => ("summary", (model, ""), "PLUS_CARBON_DONE".into()),
+        _ => return Err("fixture_format"),
+    };
+    if !role.1.is_empty() && (model != role.0 || request["reasoning"]["effort"] != role.1) {
+        return Err("fixture_roles");
+    }
+    let id = format!("plus-item-{index}");
+    let last = input.last().ok_or("fixture_input")?;
+    if let Some((old, new)) = edit {
+        if last["type"] != "function_call_output" {
+            let token = request["instructions"]
+                .as_str()
+                .and_then(|instructions| instructions.split_once("instruction_token is "))
+                .and_then(|(_, suffix)| suffix.split_once('.'))
+                .map(|(token, _)| token)
+                .ok_or("fixture_instruction_token")?;
+            if !request["tools"].to_string().contains("edit_file") {
+                return Err("fixture_tools");
+            }
+            let arguments = json!({"path":"report.txt","old_text":old,"new_text":new,"instruction_token":token}).to_string();
+            return Ok(
+                json!({"type":"function_call","id":id,"call_id":format!("plus-call-{index}"),"namespace":"omh","name":"edit_file","arguments":arguments,"status":"completed"}),
+            );
+        }
+        let result: Value = serde_json::from_str(last["output"].as_str().ok_or("fixture_edit")?)
+            .map_err(|_| "fixture_edit")?;
+        if result["applied"] != true {
+            return Err("fixture_edit");
+        }
+    }
+    let line = json!({"stage":stage,"model":model,"effort":request["reasoning"]["effort"]});
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace)
+        .and_then(|mut file| writeln!(file, "{line}"))
+        .map_err(|_| "fixture_trace")?;
+    Ok(
+        json!({"type":"message","id":id,"role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}),
+    )
+}
+
 fn auth_cli(command: &str, path: &Path) -> Result<i32> {
     let manager = auth_manager(path)?;
     let cancel = Cancel::default();
@@ -395,7 +1084,7 @@ fn auth_cli(command: &str, path: &Path) -> Result<i32> {
                 }
             }
             let mut launcher = Launcher(None);
-            eprintln!("Continue with ChatGPT в открывшемся браузере.");
+            eprintln!("Continue with ChatGPT in your browser.");
             manager.login(
                 |url| {
                     if url.contains("id_token_hint") {
@@ -463,7 +1152,6 @@ fn live_jsonl(args: &[String]) -> Result<i32> {
     let mut directory = None;
     let mut model = "gpt-6.1-sol".to_owned();
     let mut returned = None;
-    let mut compact_bytes = 256 * 1024;
     let mut seen = std::collections::BTreeSet::new();
     for chunk in args.chunks(2) {
         if chunk.len() != 2 || !seen.insert(&chunk[0]) {
@@ -479,7 +1167,8 @@ fn live_jsonl(args: &[String]) -> Result<i32> {
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                     return Err("live_cli_options");
                 }
-                compact_bytes = value.parse().map_err(|_| "live_cli_options")?;
+                // Preserve the v1 CLI syntax for callers using saved arguments.
+                value.parse::<usize>().map_err(|_| "live_cli_options")?;
             }
             _ => return Err("live_cli_unknown_option"),
         }
@@ -488,11 +1177,10 @@ fn live_jsonl(args: &[String]) -> Result<i32> {
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or("live_session_required")?;
     let auth = auth_manager(&auth)?;
-    let initial = auth.access(&Cancel::default(), false)?;
+    // Match the interactive path: token/refresh checks belong to cancellable
+    // dispatch, after signals are installed, never to JSONL startup. No auth
+    // watcher or refresh transport runs before the single-thread signal guard.
     let (account, generate, mut options) = authorized(auth, model.clone())?;
-    if account != initial.account {
-        return Err("auth_account_mismatch");
-    }
     options.directory = Some(directory);
     let tools = pure_tools()?;
     let bound = Binding {
@@ -508,10 +1196,7 @@ fn live_jsonl(args: &[String]) -> Result<i32> {
         Request::new(bound, epoch, tools.advertisement().clone(), vec![])?,
         tools,
         generate,
-        Limits {
-            compact_bytes,
-            ..Limits::default()
-        },
+        Limits::default(),
         options,
     )?;
     jsonl_runtime(io, runtime)
@@ -526,6 +1211,30 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         "--live-jsonl" => live_jsonl(&args[1..]),
+        "--export-evidence" => {
+            let [_, directory] = args else {
+                return Err("evidence_export_options");
+            };
+            let absolute = std::path::absolute(directory).map_err(|_| "evidence_export_options")?;
+            let path = absolute.as_path();
+            let catalog = crate::tools::files::summary_catalog(
+                &crate::config::AgentSettings::defaults(path, path),
+            )?;
+            let fixture = pure_tools()?;
+            let export = crate::session::evidence::export(path, &catalog, &fixture)?;
+            write_json(&export)?;
+            Ok(0)
+        }
+        "--harness" => {
+            let result = crate::harness::cli(&args[1..], &home()?)?;
+            write_json(&Json::parse(&result.to_string())?)?;
+            Ok(0)
+        }
+        "--openrouter-login" => match &args[1..] {
+            [] => save_openrouter(&openrouter_auth_path()?),
+            [flag, directory] if flag == "--auth-dir" => save_openrouter(Path::new(directory)),
+            _ => Err("openrouter_login_options"),
+        },
         "--login" | "--login-consent" | "--logout" | "--auth-status" | "--refresh-auth"
         | "--models" => {
             if args.len() == 1 {

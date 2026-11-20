@@ -16,6 +16,30 @@ pub struct AgentSettings {
     pub exclude: Vec<String>,
 }
 impl AgentSettings {
+    pub(crate) fn defaults(cwd: &Path, home: &Path) -> Self {
+        Self {
+            directory: home.join(".ansa"),
+            cwd: cwd.into(),
+            home: home.into(),
+            model: "gpt-6.1-sol".into(),
+            returned_model: "gpt-6.1-sol".into(),
+            compact_bytes: 256 * 1024,
+            tool_rounds: 32,
+            tool_calls: 64,
+            process_timeout_ms: 60000,
+            process_output_bytes: 16384,
+            exclude: [
+                ".git",
+                "node_modules",
+                ".cache",
+                "build",
+                "build-ansa",
+                "result",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
     pub fn effective(&self) -> Result<Json> {
         Json::object(vec![
             ("schema_version", n(1)),
@@ -102,28 +126,7 @@ fn overlay(settings: &mut AgentSettings, path: &Path, project: bool) -> Result<(
 pub fn load_agent_settings(cwd: &Path, home: &Path) -> Result<AgentSettings> {
     let cwd = cwd.canonicalize().map_err(|_| "file_access_failed")?;
     let home = home.canonicalize().map_err(|_| "file_access_failed")?;
-    let mut settings = AgentSettings {
-        directory: home.join(".ansa"),
-        cwd,
-        home,
-        model: "gpt-6.1-sol".into(),
-        returned_model: "gpt-6.1-sol".into(),
-        compact_bytes: 256 * 1024,
-        tool_rounds: 32,
-        tool_calls: 64,
-        process_timeout_ms: 60000,
-        process_output_bytes: 16384,
-        exclude: [
-            ".git",
-            "node_modules",
-            ".cache",
-            "build",
-            "build-ansa",
-            "result",
-        ]
-        .map(String::from)
-        .to_vec(),
-    };
+    let mut settings = AgentSettings::defaults(&cwd, &home);
     let user = settings.directory.join("config.json");
     let project = settings.cwd.join(".ansa/config.json");
     overlay(&mut settings, &user, false)?;

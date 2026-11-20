@@ -52,7 +52,7 @@ def source_info():
         path = ROOT / name
         if (path.is_file() and not path.is_symlink()
                 and not any(part == ".env" or part.startswith(".env.") for part in path.parts)
-                and (path.suffix in suffixes or path.name == "CMakeLists.txt")):
+                and (path.suffix in suffixes or path.name in {"CMakeLists.txt", "SKILL.md"})):
             files[name] = sha(path)
     return {"head": git("rev-parse", "HEAD").decode().strip(),
             "worktree_status": git("status", "--short").decode(), "files": files}
@@ -369,6 +369,8 @@ def main():
             future.add_argument("--cpp", required=True)
             future.add_argument("--rust", required=True)
     args = parser.parse_args()
+    if args.action in ('capture', 'compare', 'fault', 'perf') and not (ROOT/'CMakeLists.txt').is_file():
+        parser.error('historical C++ differential capture requires a pre-M10 checkout (migration/m9-cutover); current Rust-only gates are documented in README.md')
     if args.action == "perf":
         import performance
         return performance.capture(args)
