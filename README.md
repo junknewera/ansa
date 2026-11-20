@@ -505,3 +505,4 @@ Request profile следует [официальному SIWC Preview contract](
 - Диагностическая эскалация и варианты распределения ролей. [Предложение](docs/LOOP_ENGINEERING.md), [ADR 0003](docs/adr/0003-gpt-diagnostic-escalation.md), [промпты](docs/LOOP_ENGINEERING_PROMPTS.md).
 - Профили, учёт контекста и проверка изменений harness. [Исходное предложение](docs/HARNESS_EVOLUTION_PROPOSAL.md).
 - Постоянные терминалы, владение вводом и переподключение. [Проект терминального хоста](docs/NATIVE_TERMINALS_DESIGN.md).
+- Эволюция промптов для планирования и свёртки. [Исследование](docs/PROMPT_EVOLUTION_RESEARCH.md), [источники и история изменений](docs/research/prompt-evolution-evidence.json).
