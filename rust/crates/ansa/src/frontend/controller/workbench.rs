@@ -283,7 +283,7 @@ impl Slot {
                 .pending_draft
                 .as_ref()
                 .is_some_and(|(pending, _, _)| *pending == id)
-                && (!submit || code.is_some())
+                && (!submit || code.is_some() || self.follow_accepted_submit.as_ref() != Some(&id))
             {
                 let (_, bytes, cursor) = self
                     .state
