@@ -55,6 +55,18 @@
       packages = each (system: {
         default = rustPackage system;
         ansa-rust = rustPackage system;
+        ansa-form-zh3 =
+          let
+            pkgs = import nixpkgs { inherit system; };
+            python = pkgs.python3.withPackages (ps: [ ps.tkinter ps.python-xlib ]);
+          in pkgs.writeShellApplication {
+            name = "ansa-form-zh3";
+            meta.mainProgram = "ansa-form-zh3";
+            runtimeInputs = [ (rustPackage system) pkgs.gitMinimal pkgs.xterm pkgs.neovim ];
+            text = ''
+              exec ${python}/bin/python3 -B ${./integrations/form-zh3}/app.py "$@"
+            '';
+          };
         workspace-neovim = let pkgs = import nixpkgs { inherit system; }; in
           pkgs.callPackage ./nix/workspace-neovim.nix { integration = ./integrations/ansa.nvim; };
       });
