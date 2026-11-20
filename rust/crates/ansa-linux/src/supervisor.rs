@@ -45,11 +45,18 @@ impl Supervisor {
         self.pid.as_raw_nonzero().get() as u32
     }
     pub fn spawn(executable: &Path, job: &Path) -> io::Result<Self> {
-        let argv = [
+        Self::spawn_with_directory(executable, job, false)
+    }
+
+    pub fn spawn_with_directory(executable: &Path, job: &Path, bound: bool) -> io::Result<Self> {
+        let mut argv = vec![
             cstring(executable.as_os_str().as_encoded_bytes())?,
             CString::new("--process-worker").expect("literal"),
             cstring(job.as_os_str().as_encoded_bytes())?,
         ];
+        if bound {
+            argv.push(CString::new("--bound-directory").expect("literal"));
+        }
         Self::spawn_prepared(&argv)
     }
     fn spawn_prepared(argv: &[CString]) -> io::Result<Self> {

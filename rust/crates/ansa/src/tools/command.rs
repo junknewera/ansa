@@ -7,7 +7,7 @@ use crate::{
 };
 use std::{
     fs::DirBuilder,
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     thread::sleep,
     time::{Duration, Instant},
@@ -22,6 +22,14 @@ pub struct ProcessOptions {
 }
 impl ProcessOptions {
     pub fn specification(&self, invocation: &Invocation) -> Result<Json> {
+        self.specification_with_workspace(invocation, None)
+    }
+
+    fn specification_with_workspace(
+        &self,
+        invocation: &Invocation,
+        workspace: Option<Json>,
+    ) -> Result<Json> {
         if !self.cwd.is_absolute()
             || path_text(&self.cwd)?.contains('\0')
             || self.argv.is_empty()
@@ -39,7 +47,7 @@ impl ProcessOptions {
             }
             bytes += arg.len();
         }
-        Json::object(vec![
+        let mut fields = vec![
             ("version", n(1)),
             ("invocation", invocation.save()?),
             ("cwd", s(path_text(&self.cwd)?)?),
@@ -49,7 +57,11 @@ impl ProcessOptions {
             ),
             ("timeout_ms", n(self.timeout_ms)),
             ("output_bytes", n(self.output_bytes)),
-        ])
+        ];
+        if let Some(workspace) = workspace {
+            fields.push(("workspace_binding", workspace));
+        }
+        Json::object(fields)
     }
     pub(crate) fn load(spec: &Json) -> Result<Self> {
         let options = Self {
@@ -73,9 +85,30 @@ pub struct ProcessRunner {
     worker: PathBuf,
 }
 impl ProcessRunner {
+    pub(crate) fn read_output(&self, args: &Json) -> Result<Json> {
+        crate::process::output_spool::read_page(&self.root, args)
+    }
+
+    pub(crate) fn has_job(&self, invocation: &Invocation) -> Result<bool> {
+        match self
+            .root
+            .join(sha256(invocation.operation.as_bytes()))
+            .symlink_metadata()
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err("process_job_metadata"),
+        }
+    }
+
     pub fn new(root: &Path, worker: &Path) -> Result<Self> {
+        let runner = Self::configured(root, worker)?;
+        ansa_linux::fs::create_private(&runner.root).map_err(|_| "local_directory_permissions")?;
+        Ok(runner)
+    }
+
+    pub(crate) fn configured(root: &Path, worker: &Path) -> Result<Self> {
         let root = std::path::absolute(root).map_err(|_| "local_directory_path")?;
-        ansa_linux::fs::create_private(&root).map_err(|_| "local_directory_permissions")?;
         let worker = worker.canonicalize().map_err(|_| "process_worker_path")?;
         Ok(Self { root, worker })
     }
@@ -85,6 +118,36 @@ impl ProcessRunner {
         options: &ProcessOptions,
         stop: &Cancel,
     ) -> Result<Outcome> {
+        self.run_in(invocation, options, stop, None)
+    }
+
+    pub(crate) fn run_in(
+        &self,
+        invocation: &Invocation,
+        options: &ProcessOptions,
+        stop: &Cancel,
+        workspace: Option<ansa_linux::local::WorkspaceWrite>,
+    ) -> Result<Outcome> {
+        self.run_owned(invocation, options, stop, workspace, false)
+    }
+
+    pub(crate) fn run_github(
+        &self,
+        invocation: &Invocation,
+        options: &ProcessOptions,
+        stop: &Cancel,
+    ) -> Result<Outcome> {
+        self.run_owned(invocation, options, stop, None, true)
+    }
+
+    fn run_owned(
+        &self,
+        invocation: &Invocation,
+        options: &ProcessOptions,
+        stop: &Cancel,
+        mut workspace: Option<ansa_linux::local::WorkspaceWrite>,
+        github: bool,
+    ) -> Result<Outcome> {
         if stop.cancelled() {
             return Ok(Outcome::from_bytes(
                 Execution::Cancelled,
@@ -92,7 +155,35 @@ impl ProcessRunner {
                 br#"{"error":"cancelled"}"#.to_vec(),
             ));
         }
-        let spec = options.specification(invocation)?;
+        let binding = if let Some(workspace) = &workspace {
+            let directory = workspace
+                .directory()
+                .metadata()
+                .map_err(|_| "terminal_workspace_identity")?;
+            let number = |value: u64| Json::parse(&value.to_string());
+            let scopes = workspace
+                .records()
+                .map(|((device, inode), root)| {
+                    Json::object(vec![
+                        ("device", number(device)?),
+                        ("inode", number(inode)?),
+                        ("root", Json::parse(if root { "true" } else { "false" })?),
+                    ])
+                })
+                .collect::<Result<_>>()?;
+            Some(Json::object(vec![
+                ("version", n(1)),
+                ("device", number(directory.dev())?),
+                ("inode", number(directory.ino())?),
+                ("scopes", Json::array(scopes)?),
+            ])?)
+        } else {
+            None
+        };
+        let mut spec = options.specification_with_workspace(invocation, binding)?;
+        if github {
+            spec = spec.with("environment", s("github")?)?;
+        }
         let root = ansa_linux::fs::private_directory(&self.root)
             .map_err(|_| "local_directory_permissions")?;
         let path = self.root.join(sha256(invocation.operation.as_bytes()));
@@ -112,8 +203,62 @@ impl ProcessRunner {
         let directory =
             ansa_linux::fs::private_directory(&path).map_err(|_| "local_directory_permissions")?;
         v::create(&directory, "request.json", &spec)?;
-        let mut child = ansa_linux::supervisor::Supervisor::spawn(&self.worker, &path)
-            .map_err(|_| "process_supervisor_spawn")?;
+        if let Some(workspace) = workspace.as_mut() {
+            workspace.begin(&sha256(invocation.save()?.dump().as_bytes()))?;
+        }
+        let outcome = self.run_job(
+            invocation,
+            options,
+            stop,
+            &path,
+            &directory,
+            workspace.is_some(),
+        );
+        if outcome
+            .as_ref()
+            .is_ok_and(|outcome| outcome.effects() != Effects::Unknown)
+            && let Some(workspace) = workspace
+        {
+            let _ = workspace.finish();
+        }
+        outcome
+    }
+
+    fn run_job(
+        &self,
+        invocation: &Invocation,
+        options: &ProcessOptions,
+        stop: &Cancel,
+        path: &Path,
+        directory: &std::fs::File,
+        bound_required: bool,
+    ) -> Result<Outcome> {
+        let mut child = match ansa_linux::supervisor::Supervisor::spawn_with_directory(
+            &self.worker,
+            path,
+            bound_required,
+        ) {
+            Ok(child) => child,
+            // Once clone3 has returned a child PID, the supervisor only
+            // emits custom identity errors. A system errno here proves that
+            // no worker could have dispatched this request.
+            Err(error) if error.raw_os_error().is_some() && bound_required => {
+                let spec = v::read(directory, "request.json")?.ok_or("process_job_request")?;
+                v::create(
+                    directory,
+                    "started.json",
+                    &Json::object(vec![
+                        ("version", n(1)),
+                        ("request_hash", s(&sha256(spec.dump().as_bytes()))?),
+                    ])?,
+                )?;
+                let outcome =
+                    Outcome::failed_known(r#"{"error":"process_supervisor_spawn"}"#.into());
+                v::publish(directory, &spec, &outcome)?;
+                return Ok(outcome);
+            }
+            Err(_) => return Err("process_supervisor_spawn"),
+        };
         let deadline = Instant::now()
             + Duration::from_millis(options.timeout_ms as u64)
             + Duration::from_secs(5);
@@ -157,9 +302,24 @@ impl ProcessRunner {
             }
             sleep(Duration::from_millis(10));
         }
-        v::admit(&directory, invocation)
+        v::admit(directory, invocation)
     }
     pub fn recover(&self, invocation: &Invocation) -> Result<Option<Outcome>> {
+        self.recover_in(invocation, None)
+    }
+
+    pub(crate) fn inspect_outcome(root: &Path, invocation: &Invocation) -> Result<Outcome> {
+        let path = root.join(sha256(invocation.operation.as_bytes()));
+        let directory =
+            ansa_linux::fs::private_directory(&path).map_err(|_| "local_directory_permissions")?;
+        v::admit(&directory, invocation)
+    }
+
+    pub(crate) fn recover_in(
+        &self,
+        invocation: &Invocation,
+        registry: Option<&Path>,
+    ) -> Result<Option<Outcome>> {
         let path = self.root.join(sha256(invocation.operation.as_bytes()));
         if !path.exists() {
             return Ok(None);
@@ -168,7 +328,26 @@ impl ProcessRunner {
             ansa_linux::fs::private_directory(&path).map_err(|_| "local_directory_permissions")?;
         for _ in 0..60 {
             if v::read(&directory, "result.json")?.is_some() {
-                return v::admit(&directory, invocation).map(Some);
+                let outcome = v::admit(&directory, invocation)?;
+                if outcome.effects() == Effects::KnownResult
+                    && let Some(registry) = registry
+                    && let Some(spec) = v::read(&directory, "request.json")?
+                    && let Ok(binding) = spec.field("workspace_binding")
+                {
+                    let marker = sha256(invocation.save()?.dump().as_bytes());
+                    for scope in binding.field("scopes")?.elements()? {
+                        let _ = ansa_linux::local::reconcile_writer(
+                            registry,
+                            &marker,
+                            (
+                                scope.usize_field("device")? as u64,
+                                scope.usize_field("inode")? as u64,
+                            ),
+                            scope.field("root")?.boolean()?,
+                        );
+                    }
+                }
+                return Ok(Some(outcome));
             }
             sleep(Duration::from_millis(50));
         }

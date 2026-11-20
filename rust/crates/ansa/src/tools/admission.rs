@@ -172,9 +172,8 @@ impl PreparedBatch {
             }));
             let result = match outcome {
                 Ok(mut value) => {
-                    if value.output.len() > 128 * 1024
-                        || value.execution == Execution::Succeeded
-                            && value.effects != Effects::KnownResult
+                    if value.execution == Execution::Succeeded
+                        && value.effects != Effects::KnownResult
                     {
                         ToolResult::new(
                             operation_id.clone(),
@@ -185,14 +184,14 @@ impl PreparedBatch {
                         )
                     } else {
                         match String::from_utf8(std::mem::take(&mut value.output)) {
-                            Ok(output) => ToolResult::new(
+                            Ok(output) if Json::text_fits_frame(&output) => ToolResult::new(
                                 operation_id.clone(),
                                 call_id.clone(),
                                 output,
                                 value.execution,
                                 value.effects,
                             ),
-                            Err(_) => ToolResult::new(
+                            _ => ToolResult::new(
                                 operation_id.clone(),
                                 call_id.clone(),
                                 r#"{"error":"executor_failure","effects":"unknown"}"#.to_owned(),

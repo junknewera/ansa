@@ -12,12 +12,19 @@ pub(crate) struct Envelope {
     pub command: RuntimeCommand,
     pub reply: oneshot::Sender<Result<PostStatus>>,
 }
+pub(crate) struct ChildLookup {
+    pub command: CommandId,
+    pub turn: TurnId,
+    pub submit: Submit,
+    pub reply: oneshot::Sender<Result<ChildAttempt>>,
+}
 pub(crate) struct Mailboxes {
     pub submits: mpsc::Receiver<Envelope>,
     pub cancel: mpsc::Receiver<Envelope>,
     pub snapshot: mpsc::Receiver<Envelope>,
     pub resume: mpsc::Receiver<Envelope>,
     pub transcript: mpsc::Receiver<Envelope>,
+    pub child: mpsc::Receiver<ChildLookup>,
 }
 pub(crate) struct Closing {
     pub mode: AtomicU8,
@@ -32,12 +39,50 @@ pub struct Handle {
     snapshot: mpsc::Sender<Envelope>,
     resume: mpsc::Sender<Envelope>,
     transcript: mpsc::Sender<Envelope>,
+    child: mpsc::Sender<ChildLookup>,
     pub(crate) closing: Arc<Closing>,
     pub(crate) outbox: Arc<Outbox>,
     pub(crate) gate: Arc<Gate>,
     ready: watch::Receiver<Option<Result<()>>>,
 }
 impl Handle {
+    #[cfg(test)]
+    pub(crate) fn test_channels() -> (Self, Mailboxes) {
+        let (submits, submit_rx) = mpsc::channel(1);
+        let (cancel, cancel_rx) = mpsc::channel(1);
+        let (snapshot, snapshot_rx) = mpsc::channel(1);
+        let (resume, resume_rx) = mpsc::channel(1);
+        let (transcript, transcript_rx) = mpsc::channel(1);
+        let (child, child_rx) = mpsc::channel(1);
+        let (_, ready) = watch::channel(Some(Ok(())));
+        (
+            Self {
+                session: "test-session".into(),
+                incarnation: "test-incarnation".into(),
+                submits,
+                cancel,
+                snapshot,
+                resume,
+                transcript,
+                child,
+                closing: Arc::new(Closing {
+                    mode: AtomicU8::new(0),
+                    wake: Notify::new(),
+                }),
+                outbox: Outbox::new(2),
+                gate: Gate::new(),
+                ready,
+            },
+            Mailboxes {
+                submits: submit_rx,
+                cancel: cancel_rx,
+                snapshot: snapshot_rx,
+                resume: resume_rx,
+                transcript: transcript_rx,
+                child: child_rx,
+            },
+        )
+    }
     pub fn incarnation(&self) -> &RuntimeIncarnation {
         &self.incarnation
     }
@@ -68,8 +113,15 @@ impl Handle {
             CommandPayload::Cancel(_) => &self.cancel,
             CommandPayload::GetSnapshot(_) => &self.snapshot,
             CommandPayload::Resume(_) => &self.resume,
-            CommandPayload::GetTranscript(_) => &self.transcript,
-            CommandPayload::Submit(_) => &self.submits,
+            CommandPayload::GetTranscript(_)
+            | CommandPayload::GetTimeline(_)
+            | CommandPayload::GetMessageReceipt(_)
+            | CommandPayload::GetContext => &self.transcript,
+            CommandPayload::Submit(_)
+            | CommandPayload::Handoff(_)
+            | CommandPayload::Steer(_)
+            | CommandPayload::SetGeneration(_)
+            | CommandPayload::SetAutocompact(_) => &self.submits,
         };
         let (reply, receiver) = oneshot::channel();
         match sender.try_send(Envelope { command, reply }) {
@@ -80,6 +132,37 @@ impl Handle {
     }
     pub async fn next_event(&self) -> Option<RuntimeEvent> {
         self.outbox.next().await
+    }
+
+    /// Query the exact submission in this runtime's original journal.
+    pub async fn child_attempt(
+        &self,
+        command: CommandId,
+        turn: TurnId,
+        submit: Submit,
+    ) -> Result<ChildAttempt> {
+        if !crate::provider::contracts::valid_id(&command.0)
+            || !crate::provider::contracts::valid_id(&turn.0)
+            || submit.text.is_empty()
+        {
+            return Err("child_lookup_contract");
+        }
+        if self.closing.mode.load(Ordering::Acquire) != 0 {
+            return Err("runtime_closed");
+        }
+        let (reply, result) = oneshot::channel();
+        self.child
+            .try_send(ChildLookup {
+                command,
+                turn,
+                submit,
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => "child_lookup_busy",
+                mpsc::error::TrySendError::Closed(_) => "runtime_closed",
+            })?;
+        result.await.map_err(|_| "runtime_closed")?
     }
     pub fn close_input(&self) {
         let _ = self
@@ -122,6 +205,7 @@ impl Runtime {
         let (snapshot, snapshot_rx) = mpsc::channel(1);
         let (resume, resume_rx) = mpsc::channel(1);
         let (transcript, transcript_rx) = mpsc::channel(1);
+        let (child, child_rx) = mpsc::channel(1);
         let closing = Arc::new(Closing {
             mode: AtomicU8::new(0),
             wake: Notify::new(),
@@ -138,6 +222,7 @@ impl Runtime {
             snapshot,
             resume,
             transcript,
+            child,
             closing: closing.clone(),
             outbox: outbox.clone(),
             gate: gate.clone(),
@@ -188,6 +273,7 @@ impl Runtime {
                                 snapshot: snapshot_rx,
                                 resume: resume_rx,
                                 transcript: transcript_rx,
+                                child: child_rx,
                             },
                             completions,
                             starts,
@@ -262,6 +348,7 @@ mod tests {
         let (snapshot, _) = mpsc::channel(1);
         let (resume, _) = mpsc::channel(1);
         let (transcript, _) = mpsc::channel(1);
+        let (child, _) = mpsc::channel(1);
         let (_, ready) = watch::channel(Some(Ok(())));
         let handle = Handle {
             session: "session".into(),
@@ -271,6 +358,7 @@ mod tests {
             snapshot,
             resume,
             transcript,
+            child,
             closing: Arc::new(Closing {
                 mode: AtomicU8::new(0),
                 wake: Notify::new(),

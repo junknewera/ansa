@@ -65,7 +65,7 @@ pub fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 pub fn worker() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_ansa-rs")
+    option_env!("CARGO_BIN_EXE_ansa")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_exe().unwrap())
 }
@@ -566,6 +566,40 @@ pub fn evidence() {
     )
     .unwrap();
     assert!(runner.recover(&id).is_err());
+
+    use std::os::unix::fs::MetadataExt;
+    let cwd = root.0.join("bound-cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    let identity = std::fs::metadata(&cwd).unwrap();
+    std::fs::rename(&cwd, root.0.join("original-cwd")).unwrap();
+    std::fs::create_dir(&cwd).unwrap();
+    let job = root.0.join("bound-job");
+    ansa_linux::fs::create_private_leaf(&job).unwrap();
+    let record = ansa_linux::fs::private_directory(&job).unwrap();
+    let id = invocation("changed_cwd");
+    let options = ProcessOptions {
+        cwd: cwd.clone(),
+        ..self::options(&root, "printf effect > marker")
+    };
+    let mut spec: serde_json::Value =
+        serde_json::from_str(&options.specification(&id).unwrap().dump()).unwrap();
+    spec["workspace_binding"] = serde_json::json!({
+        "version": 1, "device": identity.dev(), "inode": identity.ino(), "scopes": [],
+    });
+    ansa_linux::local::create(&record, "request.json", spec.to_string().as_bytes()).unwrap();
+    assert!(
+        std::process::Command::new(worker())
+            .arg("--process-worker")
+            .arg(&job)
+            .arg("--bound-directory")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = std::fs::read_to_string(job.join("result.json")).unwrap();
+    assert!(result.contains("process_cwd_changed"));
+    assert!(!cwd.join("marker").exists());
+    assert!(!root.0.join("original-cwd/marker").exists());
 }
 
 pub fn runtime_loop(cancel: bool) {
@@ -772,4 +806,229 @@ pub fn runtime_loop(cancel: bool) {
                 assert!(!Path::new("/proc").join(pid).exists());
             }
         });
+}
+
+pub fn retained_output() {
+    use ansa::protocol::legacy_json_v1::sha256;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let root = Root::new();
+    let session = root.0.join("session");
+    let operations = session.join("operations");
+    let worker = worker();
+    let runner = ProcessRunner::new(&operations, &worker).unwrap();
+    let settings = root.settings();
+    let catalog = |directory: &Path| {
+        local_tools(
+            settings.clone(),
+            agent_epoch(&settings).unwrap(),
+            directory,
+            &root.0.join("auth"),
+            &worker,
+        )
+        .unwrap()
+    };
+    let tools = catalog(&session);
+    let mut invocation = invocation("retained-output");
+    invocation.name = "run_command".into();
+    let mut old_definition = tools.definition("run_command").unwrap().clone();
+    invocation.revision = old_definition.descriptor.revision.clone();
+    old_definition.descriptor.revision = "ansa_process_v1".into();
+    old_definition.descriptor.description = "Run argv without a shell unless explicitly requested. Noninteractive, no sudo, no background services. timeout_ms must be positive and not exceed the configured limit. Exit codes and truncated stdout/stderr are returned as data.".into();
+    let mut old = ansa::tools::registry::Registry::new();
+    old.register_with_policy(
+        old_definition,
+        ansa::tools::registry::Policy {
+            requires_journal: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let old = old.snapshot();
+    let resumed = tools.compatible(old.advertisement()).unwrap();
+    assert_eq!(resumed.advertisement(), old.advertisement());
+    assert!(resumed.definition("read_output").is_none());
+    let options = options(
+        &root,
+        r"printf x >> marker; head -c 270000 /dev/zero; head -c 20000 /dev/zero >&2; printf 'END\377' >&2",
+    );
+    let outcome = runner
+        .run(&invocation, &options, &Cancel::default())
+        .unwrap();
+    let output = parsed(&outcome);
+    assert!(output.field("truncated").unwrap().boolean().unwrap());
+    let receipt = output.field("output_spool").unwrap();
+    let id = receipt.text_field("output_id").unwrap();
+    assert_eq!(id, sha256(invocation.operation.as_bytes()));
+    assert_eq!(receipt.text_field("status").unwrap(), "retained");
+    let stdout = receipt.field("stdout").unwrap();
+    assert_eq!(stdout.usize_field("observed_bytes").unwrap(), 270000);
+    assert_eq!(stdout.usize_field("stored_bytes").unwrap(), 256 * 1024);
+    assert!(!stdout.field("complete").unwrap().boolean().unwrap());
+    let stderr = receipt.field("stderr").unwrap();
+    assert!(stderr.field("complete").unwrap().boolean().unwrap());
+
+    let reopened = catalog(&session).read_only();
+    let read = |tools: &ansa::tools::registry::Snapshot, id: &str, offset: usize, limit: usize| {
+        let definition = tools.definition("read_output").unwrap();
+        let args = Json::object(vec![
+            ("id", s(id)),
+            ("stream", s("stderr")),
+            ("offset", n(offset)),
+            ("limit", n(limit)),
+        ])
+        .unwrap();
+        assert!((definition.validator)(&args));
+        parsed(&(definition.executor)(&args))
+    };
+    let first = read(&reopened, id, 19999, 3);
+    assert_eq!(first.usize_field("next_offset").unwrap(), 20002);
+    assert!(
+        !first
+            .field("end_of_stored_output")
+            .unwrap()
+            .boolean()
+            .unwrap()
+    );
+    assert_eq!(
+        STANDARD
+            .decode(first.text_field("bytes_base64").unwrap())
+            .unwrap(),
+        [0, b'E', b'N']
+    );
+    let last = read(&reopened, id, 20002, 32);
+    assert_eq!(last.usize_field("next_offset").unwrap(), 20004);
+    assert!(
+        last.field("end_of_stored_output")
+            .unwrap()
+            .boolean()
+            .unwrap()
+    );
+    assert_eq!(
+        STANDARD
+            .decode(last.text_field("bytes_base64").unwrap())
+            .unwrap(),
+        [b'D', 255]
+    );
+    assert_eq!(
+        read(&reopened, id, 20005, 32).text_field("error").unwrap(),
+        "output_page_bounds"
+    );
+    let invalid = j(r#"{"id":"../../secrets","stream":"stderr","offset":0,"limit":32}"#);
+    assert!(!(reopened.definition("read_output").unwrap().validator)(
+        &invalid
+    ));
+    let other = catalog(&root.0.join("other"));
+    assert_eq!(
+        read(&other, id, 0, 1).text_field("error").unwrap(),
+        "output_receipt_missing"
+    );
+    assert_eq!(std::fs::read(root.0.join("marker")).unwrap(), b"x");
+
+    let mut legacy = invocation.clone();
+    legacy.operation = "legacy".into();
+    legacy.revision = "ansa_process_v1".into();
+    let legacy_outcome = runner.run(&legacy, &options, &Cancel::default()).unwrap();
+    assert!(!parsed(&legacy_outcome).has("output_spool"));
+    let legacy_id = sha256(legacy.operation.as_bytes());
+    assert_eq!(
+        read(&reopened, &legacy_id, 0, 1)
+            .text_field("error")
+            .unwrap(),
+        "output_receipt_prefix_only"
+    );
+
+    let restarted = ProcessRunner::new(&operations, &worker).unwrap();
+    assert_eq!(restarted.recover(&invocation).unwrap().unwrap(), outcome);
+    assert_eq!(
+        restarted
+            .run(&invocation, &options, &Cancel::default())
+            .unwrap(),
+        outcome
+    );
+    let mut restaged = options.clone();
+    restaged.timeout_ms -= 1;
+    assert_eq!(
+        restarted.run(&invocation, &restaged, &Cancel::default()),
+        Err("process_operation_conflict")
+    );
+
+    let store = operations.join(".output");
+    let blob = store.join(id);
+    let mut corrupted = std::fs::read(&blob).unwrap();
+    corrupted[0] ^= 1;
+    std::fs::write(&blob, &corrupted).unwrap();
+    assert_eq!(
+        read(&reopened, id, 0, 1).text_field("error").unwrap(),
+        "output_blob_invalid"
+    );
+    std::fs::remove_file(&blob).unwrap();
+    let replacement = root.0.join("replacement");
+    std::fs::write(&replacement, &corrupted).unwrap();
+    symlink(&replacement, &blob).unwrap();
+    assert_eq!(
+        read(&reopened, id, 0, 1).text_field("error").unwrap(),
+        "output_blob_invalid"
+    );
+    std::fs::remove_file(&blob).unwrap();
+    assert_eq!(
+        read(&reopened, id, 0, 1).text_field("error").unwrap(),
+        "output_blob_missing"
+    );
+    assert_eq!(restarted.recover(&invocation).unwrap().unwrap(), outcome);
+    assert_eq!(std::fs::read(root.0.join("marker")).unwrap(), b"xx");
+
+    // Simulate a stopped worker after blob publish and before receipt publish.
+    let orphan = sha256(b"orphan");
+    let job = ansa_linux::fs::create_private_leaf(&operations.join(&orphan)).unwrap();
+    let lock = ansa_linux::local::lock(&job).unwrap();
+    let directory = ansa_linux::fs::private_directory(&store).unwrap();
+    ansa_linux::local::create(&directory, &orphan, b"unfinished stdout").unwrap();
+    let mut attempt = invocation.clone();
+    attempt.operation = "with-active-orphan".into();
+    let mut small = options.clone();
+    small.output_bytes = 1;
+    small.argv[2] = "printf oversize".into();
+    assert!(parsed(&runner.run(&attempt, &small, &Cancel::default()).unwrap()).has("output_spool"));
+    assert!(store.join(&orphan).exists());
+    drop(lock);
+    attempt.operation = "after-orphan-worker-crash".into();
+    let recovered = parsed(&runner.run(&attempt, &small, &Cancel::default()).unwrap());
+    assert!(!store.join(&orphan).exists());
+    let retained_receipt = recovered.field("output_spool").unwrap();
+    let retained_id = retained_receipt.text_field("output_id").unwrap();
+
+    let store_lock = ansa_linux::local::lock(&directory).unwrap();
+    attempt.operation = "busy-spool".into();
+    let busy = runner.run(&attempt, &small, &Cancel::default()).unwrap();
+    assert_eq!(busy.effects(), Effects::KnownResult);
+    assert_eq!(
+        parsed(&busy)
+            .field("output_spool")
+            .unwrap()
+            .text_field("status")
+            .unwrap(),
+        "spool_busy"
+    );
+    drop(store_lock);
+
+    for index in 0..30 {
+        let other = sha256(format!("irreconcilable-{index}").as_bytes());
+        ansa_linux::local::create(&directory, &other, b"occupied").unwrap();
+    }
+    let recovered_blob = store.join(retained_id);
+    attempt.operation = "quota-exhaustion".into();
+    let quota = runner.run(&attempt, &small, &Cancel::default()).unwrap();
+    assert_eq!(quota.effects(), Effects::KnownResult);
+    let quota = parsed(&quota);
+    assert_eq!(quota.text_field("stdout").unwrap(), "o");
+    assert_eq!(
+        quota
+            .field("output_spool")
+            .unwrap()
+            .text_field("status")
+            .unwrap(),
+        "spool_quota_exhausted"
+    );
+    assert!(recovered_blob.exists());
 }

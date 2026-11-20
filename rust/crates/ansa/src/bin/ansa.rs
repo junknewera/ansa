@@ -14,8 +14,26 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    if let Some(result) = ansa::process::runner::private_entry(&args) {
-        return if result.is_ok() {
+    if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        use std::os::unix::process::CommandExt;
+        let _ = std::env::current_exe().map(|binary| {
+            std::process::Command::new(binary)
+                .args(&args[1..])
+                .env_remove("OPENROUTER_API_KEY")
+                .exec()
+        });
+        eprintln!(
+            "{}",
+            ansa::frontend::jsonl::diagnostic("openrouter_startup_environment").dump()
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    if let Some(ok) = ansa::terminal_host::native::private_entry(&args)
+        .map(|result| result.is_ok())
+        .or_else(|| ansa::terminal_host::daemon::private_entry(&args).map(|result| result.is_ok()))
+        .or_else(|| ansa::process::runner::private_entry(&args).map(|result| result.is_ok()))
+    {
+        return if ok {
             std::process::ExitCode::SUCCESS
         } else {
             std::process::ExitCode::from(125)

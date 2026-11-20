@@ -1,10 +1,7 @@
 //! Admission receipt and exact serialized continuation construction.
 use crate::{
     protocol::json::Json,
-    provider::{
-        request::{Epoch, Request},
-        responses::AdmittedResponse,
-    },
+    provider::{request::Request, responses::AdmittedResponse},
 };
 #[derive(Debug)]
 pub struct AdmissionReceipt {
@@ -138,7 +135,6 @@ pub fn continuation(
             || result.operation_id.is_empty()
             || !seen.insert(&result.operation_id)
             || result.effects == Effects::Unknown
-            || result.output.len() > 128 * 1024
         {
             return Err("replay_result_mismatch");
         };
@@ -148,14 +144,5 @@ pub fn continuation(
             ("output", Json::string(&result.output)?),
         ])?);
     }
-    Request::new(
-        response.request.binding.clone(),
-        Epoch {
-            id: response.request.epoch.id.clone(),
-            instructions: response.request.epoch.instructions.clone(),
-            exact_state: response.request.epoch.exact_state.clone(),
-        },
-        response.request.tools.clone(),
-        input,
-    )
+    response.request.clone().with_input(input)
 }

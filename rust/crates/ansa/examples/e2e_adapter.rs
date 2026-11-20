@@ -147,6 +147,7 @@ async fn run(row: &Json, frontend: Option<&mut ansa::frontend::terminal::Io>) ->
     let generations = Arc::new(AtomicUsize::new(0));
     let gen_count = generations.clone();
     let measuring = frontend.is_some();
+    let compact_enabled = option(row, "compact");
     let cancel_process = option(row, "cancel_process");
     let measurements = Arc::new(Mutex::new(Measurements::default()));
     let model_measurements = measurements.clone();
@@ -252,12 +253,20 @@ async fn run(row: &Json, frontend: Option<&mut ansa::frontend::terminal::Io>) ->
                 ("status", s("completed")),
             ])
         };
-        let response = native::load(&o(vec![
+        let mut saved = o(vec![
             ("request", request.save()?),
             ("id", s(&format!("response_{label}_{index}"))),
             ("model", s(&request.binding.returned_model)),
             ("items", Json::array(vec![item])?),
-        ]))?;
+        ]);
+        if compact_enabled {
+            saved = saved
+                .with("context_tokens", n(50000))?
+                .with("context_window", n(100000))?;
+        } else if quiet {
+            saved = saved.with("model_context_window", n(65536))?;
+        }
+        let response = native::load(&saved)?;
         if measuring && index == final_index {
             model_measurements.lock().unwrap().terminal = Some(Instant::now());
         }
@@ -265,7 +274,7 @@ async fn run(row: &Json, frontend: Option<&mut ansa::frontend::terminal::Io>) ->
     });
     let compactions = Arc::new(AtomicUsize::new(0));
     let compact_count = compactions.clone();
-    let compact: Compact = Arc::new(move |request, stop| {
+    let compact: Compact = Arc::new(move |request, _, stop| {
         compact_count.fetch_add(1, Ordering::SeqCst);
         offline::compact(request, stop)
     });
@@ -317,11 +326,6 @@ async fn run(row: &Json, frontend: Option<&mut ansa::frontend::terminal::Io>) ->
         generate,
         Limits {
             tool_rounds: rounds,
-            compact_bytes: if option(row, "compact") {
-                256
-            } else {
-                256 * 1024
-            },
             ..Limits::default()
         },
         Options {

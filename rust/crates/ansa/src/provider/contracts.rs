@@ -5,11 +5,12 @@
 //! use ansa::provider::contracts::{SessionId, TurnId};
 //! fn wrong_identity(session: SessionId) -> TurnId { session }
 //! ```
-use crate::provider::replay::Effects;
+use crate::{protocol::json::Json, provider::replay::Effects};
 
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq)]
+        #[cfg_attr(test, derive(serde::Serialize, serde::Deserialize), serde(transparent))]
         pub struct $name(pub String);
         impl From<&str> for $name {
             fn from(value: &str) -> Self {
@@ -35,19 +36,66 @@ pub struct Submit {
     pub text: String,
     pub mode: AgentMode,
 }
+/// A user message for the active task, admitted independently of Submit FIFO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Steer {
+    pub target: RequestId,
+    pub text: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationSelection {
+    pub model: String,
+    pub effort: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Followup {
+    pub command: CommandId,
+    pub target: RequestId,
+    pub text: String,
+    pub state: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetTranscript {
     pub before: usize,
     pub limit: usize,
     pub forward: bool,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Submit,
+    Steer,
+}
+/// Status only: no submitted text, native items, tool payloads or auth binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageReceiptInfo {
+    pub kind: MessageKind,
+    pub turn: TurnId,
+    pub request: Option<RequestId>,
+    pub state: String,
+    pub mode: Option<AgentMode>,
+    /// Binds a reconnect lookup to the exact user message without exporting it.
+    pub text_sha256: String,
+    /// The message admission is confirmed by the canonical journal.
+    pub admission_durable: bool,
+    /// The reported state also matches an acknowledged journal state.
+    pub state_durable: bool,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandPayload {
+    SetAutocompact(u8),
     Submit(Submit),
+    /// Native-only synthesis input from the coordinator. Frontend wire
+    /// decoders accept ordinary Submit and never construct this variant.
+    Handoff(Submit),
+    Steer(Steer),
+    SetGeneration(GenerationSelection),
+    GetContext,
+    GetTimeline(GetTranscript),
     Cancel(RequestId),
     GetSnapshot(u64),
     Resume(RequestId),
     GetTranscript(GetTranscript),
+    GetMessageReceipt(CommandId),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeCommand {
@@ -60,6 +108,33 @@ pub struct RuntimeCommand {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventPayload {
+    MessageReceipt {
+        query: CommandId,
+        command: CommandId,
+        receipt: Option<Box<MessageReceiptInfo>>,
+        ready: bool,
+        storage_failed: bool,
+        recovery_required: bool,
+    },
+    FollowupQueued {
+        command: CommandId,
+    },
+    FollowupDelivered {
+        commands: Vec<CommandId>,
+    },
+    AutocompactSelected {
+        command: CommandId,
+        percent: u8,
+    },
+    GenerationSelected {
+        command: CommandId,
+        selection: GenerationSelection,
+    },
+    ContextSnapshot {
+        command: CommandId,
+        seed: crate::session::state::ForkSeed,
+    },
+    TimelinePage(crate::frontend::protocol_v1::TranscriptPage),
     CommandAccepted {
         command: CommandId,
         request: Option<RequestId>,
@@ -127,16 +202,46 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         CommandPayload::Cancel(id) | CommandPayload::Resume(id) if !valid_id(&id.0) => {
             Err("request_id")
         }
-        CommandPayload::Submit(submit) => {
-            if submit.text.is_empty() || submit.text.len() > 16 * 1024 {
+        CommandPayload::GetMessageReceipt(id) if !valid_id(&id.0) => Err("command_id"),
+        CommandPayload::Submit(submit) | CommandPayload::Handoff(submit) => {
+            if submit.text.is_empty() || !Json::text_fits_frame(&submit.text) {
                 return Err("submit_size");
             }
             if submit.mode != AgentMode::Basic && submit.mode != AgentMode::Plan {
                 return Err("submit_mode");
             }
+            if matches!(command.payload, CommandPayload::Handoff(_))
+                && submit.mode != AgentMode::Plan
+            {
+                return Err("handoff_read_only");
+            }
             Ok(())
         }
-        CommandPayload::GetTranscript(query) if query.limit == 0 || query.limit > 64 => {
+        CommandPayload::Steer(message) => {
+            if !valid_id(&message.target.0)
+                || message.text.is_empty()
+                || !Json::text_fits_frame(&message.text)
+            {
+                return Err("steer_contract");
+            }
+            Ok(())
+        }
+        CommandPayload::SetAutocompact(percent) if !(1..=100).contains(percent) => {
+            Err("autocompact_range")
+        }
+        CommandPayload::SetGeneration(selection) => {
+            if selection.model.is_empty()
+                || selection.model.len() > 256
+                || selection.model.chars().any(char::is_control)
+                || selection.effort.as_ref().is_some_and(|v| !valid_id(v))
+            {
+                return Err("generation_selection");
+            }
+            Ok(())
+        }
+        CommandPayload::GetTranscript(query) | CommandPayload::GetTimeline(query)
+            if query.limit == 0 || query.limit > 64 =>
+        {
             Err("transcript_page_limit")
         }
         _ => Ok(()),

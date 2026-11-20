@@ -74,7 +74,7 @@ pub enum Point {
 fn valid_name(name: &str) -> bool {
     matches!(
         name,
-        "registration.json" | "credentials.json" | "signed-out" | "lock"
+        "registration.json" | "credentials.json" | "openrouter.key" | "signed-out" | "lock"
     )
 }
 fn guard(file: &File, bounded: bool) -> io::Result<()> {
@@ -195,8 +195,10 @@ impl Directory {
         suffix: &str,
         mut observe: impl FnMut(Point, &str) -> io::Result<()>,
     ) -> io::Result<()> {
-        if !matches!(name, "registration.json" | "credentials.json")
-            || bytes.is_empty()
+        if !matches!(
+            name,
+            "registration.json" | "credentials.json" | "openrouter.key"
+        ) || bytes.is_empty()
             || bytes.len() as u64 > MAX
             || suffix.len() != 22
             || !suffix
@@ -205,7 +207,11 @@ impl Directory {
         {
             return Err(io::Error::other("auth_store_contract"));
         }
-        let temporary = format!("pending-{suffix}");
+        let temporary = if name == "openrouter.key" {
+            format!("openrouter.key.pending-{suffix}")
+        } else {
+            format!("pending-{suffix}")
+        };
         let fd = fs::openat(
             &*self.0,
             temporary.as_str(),

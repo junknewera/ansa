@@ -13,6 +13,11 @@ runtime-test-adapter = []
 tools-test-adapter = []
 frontend-test-adapter = ["protocol-test-adapter"]
 e2e-test-adapter = ["ansa-linux/fixture-e2e", "protocol-test-adapter"]
+orchestration-pilot = []
+
+[[example]]
+name = "orchestration_pilot"
+required-features = ["orchestration-pilot"]
 
 [[example]]
 name = "e2e_adapter"
@@ -43,7 +48,7 @@ name = "auth_adapter"
 required-features = ["auth-test-adapter"]
 
 [[bin]]
-name = "ansa-rs"
+name = "ansa"
 path = "src/bin/ansa.rs"
 
 [dependencies]
@@ -61,6 +66,11 @@ http-body-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
 tower-service.workspace = true
+pulldown-cmark.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+vt100.workspace = true
+png = "0.18.1"
 
 [dev-dependencies]
 tokio-rustls.workspace = true

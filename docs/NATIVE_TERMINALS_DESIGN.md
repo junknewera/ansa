@@ -1,6 +1,8 @@
 # Постоянные native терминалы: system design
 
-Статус: **PROPOSED, docs-only**. Дата: 2026-11-15.
+Исходное предложение [PR #17](https://github.com/junknewera/ansa/pull/17) от
+2026-11-15. Текущая реализация и результаты проверок описаны в
+[PROJECT_STATE](PROJECT_STATE.md).
 Runtime baseline: [`main@a6f2031`][ansa-main] после startup fix #16.
 Rust остаётся Nix default, M9 имеет GO, C++ fallback сохранён; M10 отдельно не закрыт.
 Этот документ задаёт будущие контракты и gates, а не сообщает об их реализации.

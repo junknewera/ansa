@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1120" viewBox="0 0 1440 1120">
+  <rect width="1440" height="1120" fill="#101315"/>
+  <g font-family="DejaVu Sans Mono,monospace" font-size="24" fill="#e1e4e2">
+    <text x="36" y="48" font-size="18" fill="#9baba5">МАКЕТ: Carbon на всю высоту терминала по умолчанию</text>
+    <text x="36" y="104" fill="#85dcb1" font-weight="bold">ansa</text>
+    <text x="132" y="104">~/Workspace/pet/ansa</text>
+    <text x="1030" y="104" font-size="20" fill="#9baba5">История: страница 3</text>
+    <text x="36" y="171" fill="#85dcb1">&gt; Объясни, как устроена отмена запроса.</text>
+    <text x="36" y="221">Cancel адресован конкретному запросу. Runtime прекращает</text>
+    <text x="36" y="259">дальнейший dispatch и сохраняет уже известные результаты.</text>
+    <text x="36" y="317">Если инструмент успел совершить внешний эффект, отмена</text>
+    <text x="36" y="355">не откатывает его. Неопределённый результат остаётся</text>
+    <text x="36" y="393">помеченным как effect_unknown и не повторяется автоматически.</text>
+    <text x="36" y="469" fill="#85dcb1">&gt; А что происходит при обновлении экрана?</text>
+    <text x="36" y="519">В режиме чтения открытая страница остаётся на месте.</text>
+    <text x="36" y="557">Новые события не заменяют читаемый текст. Внизу видны</text>
+    <text x="36" y="595">состояние задачи и число новых сообщений.</text>
+    <text x="36" y="671">Черновик и положение курсора сохраняются. Ctrl+F возвращает</text>
+    <text x="36" y="709">к последним сообщениям. PgUp и PgDn листают историю.</text>
+    <text x="36" y="785">Текст можно выделять мышью и копировать средствами</text>
+    <text x="36" y="823">терминала. Ctrl+Y копирует подтверждённый диалог.</text>
+    <rect x="24" y="887" width="1392" height="55" fill="#2a2e30"/>
+    <text x="36" y="923" fill="#85dcb1">&gt; Добавь пример использования...</text>
+    <text x="36" y="978" font-size="21" fill="#85dcb1">basic  ожидание модели 18 с  tools 2/3  новых сообщений: 2</text>
+    <text x="36" y="1027" font-size="20" fill="#aab3af">PgUp/PgDn: история    Ctrl+F: вниз    Ctrl+C: отмена</text>
+    <text x="36" y="1071" font-size="19" fill="#aab3af">Ctrl+Y / /copy: диалог до 64 KiB, требуется OSC 52</text>
+  </g>
+</svg>

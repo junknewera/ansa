@@ -1,6 +1,48 @@
 //! Persistent blocks retain immutable snapshots and bounded pages.
 use crate::provider::contracts::{AgentMode, GetTranscript, RequestId, TurnId};
+use crate::provider::replay::{Effects, Execution};
 use std::sync::Arc;
+
+/// Display metadata derived from an acknowledged intent or outcome. Payload
+/// bytes remain in `Entry::text`; this offset avoids parsing human labels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolDetail {
+    pub operation: String,
+    pub name: String,
+    pub call: String,
+    pub purpose: Arc<str>,
+    pub target: String,
+    pub phase: ToolPhase,
+    pub content_start: usize,
+    pub continued: bool,
+    pub last_chunk: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolPhase {
+    Prepared,
+    Finished {
+        execution: Execution,
+        effects: Effects,
+    },
+}
+impl ToolDetail {
+    pub(super) fn display_valid(&self) -> bool {
+        [&self.operation, &self.name, &self.call]
+            .iter()
+            .all(|id| !id.is_empty() && id.len() <= 4096)
+            && self.purpose.len() <= 128 * 1024
+            && self.target.chars().take(501).count() <= 500
+            && self.display_bytes() <= 256 * 1024 - 4
+    }
+    pub fn display_bytes(&self) -> usize {
+        self.operation.len()
+            + self.name.len()
+            + self.call.len()
+            + self.purpose.len()
+            + self.target.len()
+            + 64
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub turn: TurnId,
@@ -9,6 +51,12 @@ pub struct Entry {
     pub text: String,
     pub state: String,
     pub mode: AgentMode,
+    pub tool: Option<Arc<ToolDetail>>,
+}
+impl Entry {
+    fn display_bytes(&self) -> usize {
+        self.text.len() + self.tool.as_ref().map_or(0, |tool| tool.display_bytes())
+    }
 }
 #[derive(Clone, Debug)]
 struct Block {
@@ -47,8 +95,13 @@ impl Transcript {
         self.tail = Some(Arc::new(block));
         self.size += 1;
     }
-    pub(crate) fn set_last(&mut self, state: &str) {
-        let Some(tail) = &self.tail else {
+    pub(crate) fn set_last(&mut self, request: &RequestId, state: &str) {
+        let Some(tail) = self.tail.as_ref().filter(|block| {
+            block
+                .entries
+                .last()
+                .is_some_and(|entry| entry.request == *request && entry.state != "rejected")
+        }) else {
             return;
         };
         let mut block = (**tail).clone();
@@ -98,7 +151,7 @@ impl Transcript {
                         continue;
                     }
                     if entries.len() == limit
-                        || !entries.is_empty() && bytes + entry.text.len() > 256 * 1024
+                        || !entries.is_empty() && bytes + entry.display_bytes() > 256 * 1024
                     {
                         return Page {
                             begin,
@@ -108,7 +161,7 @@ impl Transcript {
                             query,
                         };
                     }
-                    bytes += entry.text.len();
+                    bytes += entry.display_bytes();
                     entries.push((**entry).clone());
                     end += 1;
                 }
@@ -120,7 +173,7 @@ impl Transcript {
                         continue;
                     }
                     if entries.len() == limit
-                        || !entries.is_empty() && bytes + entry.text.len() > 256 * 1024
+                        || !entries.is_empty() && bytes + entry.display_bytes() > 256 * 1024
                     {
                         entries.reverse();
                         return Page {
@@ -131,7 +184,7 @@ impl Transcript {
                             query,
                         };
                     }
-                    bytes += entry.text.len();
+                    bytes += entry.display_bytes();
                     entries.push((**entry).clone());
                     begin -= 1;
                 }

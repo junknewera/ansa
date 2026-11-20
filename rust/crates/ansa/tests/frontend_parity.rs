@@ -56,6 +56,7 @@ fn argument_grammar_keeps_legacy_option_and_prompt_rules() {
         (vec!["a", "b"], "cli_prompt_arguments"),
         (vec!["--unknown", "x"], "unknown_cli_option"),
         (vec!["/cancel"], "slash_command_requires_stdin"),
+        (vec!["/copy"], "slash_command_requires_stdin"),
     ] {
         assert_eq!(args(&input).unwrap_err(), expected);
     }
@@ -119,7 +120,7 @@ fn jsonl_rejects_invalid_types_fields_and_versions() {
     );
 }
 #[test]
-fn editor_preserves_utf8_boundaries_and_escape_following_text() {
+fn editor_preserves_utf8_boundaries_and_consumes_alt_prefix() {
     let mut editor = Editor::default();
     for &ch in "привет".as_bytes() {
         editor.feed(ch, true);
@@ -134,19 +135,29 @@ fn editor_preserves_utf8_boundaries_and_escape_following_text() {
     for &ch in b"\x1babc" {
         editor.feed(ch, true);
     }
-    assert_eq!(editor.text(), Ok("abc"));
-    assert_eq!(editor.feed(9, true), Some(Action::ToggleMode));
-    assert_eq!(editor.feed(6, true), Some(Action::ToggleHistory));
+    assert_eq!(editor.text(), Ok("bc"));
+    assert_eq!(editor.feed(9, true), Some(Action::FocusNext));
+    assert_eq!(editor.feed(6, true), None);
+    for (sequence, expected) in [
+        (b"\x1b[A", Action::HistoryOlder),
+        (b"\x1b[B", Action::HistoryNewer),
+    ] {
+        for &ch in &sequence[..2] {
+            assert!(editor.feed(ch, true).is_none());
+        }
+        assert_eq!(editor.feed(sequence[2], true), Some(expected));
+    }
+    assert_eq!(editor.feed(20, true), Some(Action::ToggleTools));
 }
 #[test]
 fn editor_overflow_cannot_be_healed_by_backspaces() {
     let mut editor = Editor::default();
-    for _ in 0..16 * 1024 + 1 {
-        editor.feed(b'x', true);
-    }
-    for _ in 0..16 * 1024 {
-        editor.feed(127, true);
-    }
+    editor
+        .bytes
+        .resize(ansa::frontend::input::MAX_COMPOSER_BYTES, b'x');
+    editor.cursor = editor.bytes.len();
+    editor.feed(b'x', true);
+    editor.feed(127, true);
     assert!(editor.overflow);
     assert_eq!(editor.feed(b'\r', true), Some(Action::Overflow));
     editor.clear();
@@ -154,6 +165,10 @@ fn editor_overflow_cannot_be_healed_by_backspaces() {
 }
 fn entry(role: &str, text: &str) -> Entry {
     Entry {
+        action: None,
+        edit: None,
+        output: None,
+        status: None,
         role: role.into(),
         text: text.into(),
     }
@@ -226,6 +241,50 @@ fn carbon_keeps_role_markdown_and_clears_shrunk_rows() {
     assert!(small.paint(frame.lines.len()).contains("\x1b7\x1b[1B"));
     assert_eq!(small.cursor, 7);
     assert!(carbon::layout(&history, b"", 0, "basic", false, 0, "", (4, 3), false).is_none());
+    // Full mode owns the real terminal height, and status ticks leave the
+    // selectable dialogue untouched. Resizing repaints the new dimensions.
+    let full = carbon::layout_full(
+        &history,
+        b"draft",
+        3,
+        "basic",
+        0,
+        "context",
+        (80, 48),
+        false,
+    )
+    .unwrap();
+    assert_eq!(full.lines.len(), 48);
+    assert_eq!(full.lines[46], "> draft");
+    assert_eq!(full.cursor, 5);
+    let tick = carbon::layout_full(
+        &history,
+        b"draft",
+        3,
+        "basic  1 s",
+        0,
+        "context",
+        (80, 48),
+        false,
+    )
+    .unwrap();
+    let delta = tick.paint_changes(&full);
+    assert!(!delta.contains("bold") && !delta.contains("draft") && !delta.contains("\x1b[2J"));
+    assert!(delta.contains("1 s"));
+    let resized = carbon::layout_full(
+        &history,
+        b"draft",
+        3,
+        "basic",
+        0,
+        "context",
+        (40, 10),
+        false,
+    )
+    .unwrap();
+    assert_eq!(resized.lines.len(), 10);
+    assert_eq!(resized.lines[8], "> draft");
+    assert!(resized.paint_changes(&full).starts_with("\x1b[H\x1b[2J"));
 }
 #[test]
 fn history_queries_and_preview_cannot_publish_stale_or_tool_round_text() {
@@ -235,6 +294,7 @@ fn history_queries_and_preview_cannot_publish_stale_or_tool_round_text() {
         forward: false,
     };
     let entry = ansa::session::transcript::Entry {
+        tool: None,
         turn: "turn".into(),
         request: "request".into(),
         role: "user".into(),
@@ -333,17 +393,20 @@ fn ca_loader_checks_regular_type_size_and_public_symlink() {
     std::fs::write(&path, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
     assert!(ansa::transport::client::read_ca(&path).is_err());
 }
-fn cli(root: &Root, args: &[&str]) -> std::process::Output {
+fn fixture_command(root: &Root, args: &[&str]) -> std::process::Command {
     let home = root.0.join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::process::Command::new(env!("CARGO_BIN_EXE_ansa-rs"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ansa"));
+    command
         .args(args)
         .arg("--cwd")
         .arg(&home)
         .env("HOME", &home)
-        .env_remove("XDG_STATE_HOME")
-        .output()
-        .unwrap()
+        .env_remove("XDG_STATE_HOME");
+    command
+}
+fn cli(root: &Root, args: &[&str]) -> std::process::Output {
+    fixture_command(root, args).output().unwrap()
 }
 #[test]
 fn executable_runs_real_local_catalog_and_resume() {
@@ -369,7 +432,7 @@ fn executable_rejects_non_submitting_one_shot_prompts() {
 #[test]
 fn executable_invalid_utf8_argv_is_a_controlled_diagnostic() {
     use std::os::unix::ffi::OsStrExt;
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ansa-rs"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ansa"))
         .args([
             std::ffi::OsStr::new("--offline"),
             std::ffi::OsStr::from_bytes(b"\xff"),
@@ -395,6 +458,13 @@ fn large_valid_snapshot_is_encoded_with_complete_tool_results() {
         })
         .collect();
     let snapshot = Snapshot {
+        autocompact_percent: 50,
+        timeline_size: 0,
+        generation: GenerationSelection {
+            model: "fixture-model".into(),
+            effort: None,
+        },
+        followups: vec![],
         through_sequence: 1,
         state: "completed".into(),
         request: Some("request".into()),
@@ -433,4 +503,213 @@ fn large_valid_snapshot_is_encoded_with_complete_tool_results() {
             .iter()
             .all(|tool| tool.text_field("output") == Ok(output.as_str()))
     );
+}
+
+#[test]
+fn alt_keys_never_leave_the_composer_or_split_utf8() {
+    let mut editor = Editor::default();
+    for &byte in "первое второе".as_bytes() {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    for &byte in b"\x1bb" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.cursor, "первое ".len());
+    for &byte in b"\x1bf" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.cursor, editor.bytes.len());
+    for &byte in "\x1bж".as_bytes() {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.text().unwrap(), "первое второе");
+    editor.feed(b'!', true);
+    assert_eq!(editor.text().unwrap(), "первое второе!");
+    editor.feed(27, true);
+    assert_eq!(editor.flush_escape(), Some(Action::Escape));
+}
+#[test]
+fn right_arrow_completes_only_with_an_open_suggestion() {
+    let mut editor = Editor::default();
+    for &byte in b"/mo" {
+        editor.feed(byte, true);
+    }
+    editor.set_completion(true);
+    for &byte in b"\x1b[" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.feed(b'C', true), Some(Action::Complete));
+    assert_eq!(editor.text().unwrap(), "/mo");
+    editor.set_completion(false);
+    for &byte in b"\x1b[D" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.cursor, 2);
+    for &byte in b"\x1b[C" {
+        assert!(editor.feed(byte, true).is_none());
+    }
+    assert_eq!(editor.cursor, 3);
+}
+
+#[test]
+fn executable_exports_validated_journal_without_context_bodies_or_writes() {
+    use std::io::Write;
+
+    let root = Root::new();
+    let marker = "private prompt marker";
+    let first = cli(&root, &["--offline", marker]);
+    assert!(first.status.success(), "{first:?}");
+    let directory = std::fs::read_dir(root.0.join("home/.ansa/sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let snapshot = || {
+        std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name(),
+                    entry
+                        .file_type()
+                        .unwrap()
+                        .is_file()
+                        .then(|| std::fs::read(entry.path()).unwrap()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = snapshot();
+    let run_export = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ansa"))
+            .arg("--export-evidence")
+            .arg(&directory)
+            .env_remove("HOME")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap()
+    };
+    let result = run_export();
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(before, snapshot());
+    assert_eq!(result.stdout, run_export().stdout);
+    let document = std::str::from_utf8(&result.stdout).unwrap();
+    assert!(!document.contains(marker));
+    assert!(!document.contains("OMH_FIXED_VALUE_42"));
+    assert!(!document.contains("offline-fixture"));
+    let evidence = Json::parse(document.trim()).unwrap();
+    assert_eq!(evidence.usize_field("schema_version"), Ok(1));
+    assert!(!evidence.field("seeded").unwrap().boolean().unwrap());
+    assert!(
+        evidence
+            .field("fresh_initial_context")
+            .unwrap()
+            .boolean()
+            .unwrap()
+    );
+    assert_eq!(evidence.text_field("status"), Ok("completed"));
+    assert_eq!(
+        evidence
+            .field("initial_manifest")
+            .unwrap()
+            .text_field("prompt_policy"),
+        Ok("legacy-v1")
+    );
+    let records = evidence.field("records").unwrap().elements().unwrap();
+    assert_eq!(
+        evidence.text_field("journal_head_sha256"),
+        records.last().unwrap().text_field("record_sha256")
+    );
+    let accepted = records
+        .iter()
+        .find(|record| record.text_field("kind") == Ok("accepted"))
+        .unwrap();
+    assert!(!accepted.field("internal").unwrap().boolean().unwrap());
+    assert!(records.iter().any(|record| {
+        record.text_field("kind") == Ok("outcome")
+            && record.text_field("effects") == Ok("known_result")
+            && record.text_field("operation").is_ok()
+    }));
+    assert!(records.iter().any(|record| {
+        record.text_field("kind") == Ok("response")
+            && record.usize_field("estimated_input_tokens").is_ok()
+            && record.text_field("estimate_source") == Ok("dispatch")
+            && record.text_field("context_window_status") == Ok("unknown")
+            && !record.has("reported_usage")
+    }));
+
+    let part = before
+        .keys()
+        .find(|name| name.to_str().unwrap().starts_with("part-"))
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(directory.join(part))
+        .unwrap()
+        .write_all(b"torn")
+        .unwrap();
+    let result = run_export();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+}
+
+#[test]
+fn executable_resumes_profiled_session_without_loading_unread_skill_bodies() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let root = Root::new();
+    let mut operator = fixture_command(&root, &["--harness", "baseline"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let profile = serde_json::json!({"version":1,"guidance":"Pinned project rule","memory":[],"prompt_policy":"handoff-v1",
+        "skills":[{"name":"release","trigger":"For a release","body":"unread-profile-body-1234"}]});
+    operator
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&profile).unwrap())
+        .unwrap();
+    let applied = operator.wait_with_output().unwrap();
+    assert!(applied.status.success(), "{applied:?}");
+    let record: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    let first = cli(&root, &["--offline", "first"]);
+    assert!(first.status.success(), "{first:?}");
+    let second = cli(&root, &["--offline", "--continue", "second"]);
+    assert!(second.status.success(), "{second:?}");
+    assert_eq!(first.stdout, second.stdout);
+    let mut sessions = std::fs::read_dir(root.0.join("home/.ansa/sessions")).unwrap();
+    let session = sessions.next().unwrap().unwrap().path();
+    assert!(sessions.next().is_none());
+    let mut verified = false;
+    for file in std::fs::read_dir(&session).unwrap() {
+        let file = file.unwrap();
+        if file.file_name().to_string_lossy().starts_with("part-") {
+            let bytes = std::fs::read(file.path()).unwrap();
+            let content = String::from_utf8_lossy(&bytes);
+            assert!(!content.contains("unread-profile-body-1234"));
+            verified |= content.contains("read_skill") && content.contains("Pinned project rule");
+        }
+    }
+    assert!(verified);
+    let export = Command::new(env!("CARGO_BIN_EXE_ansa"))
+        .current_dir(session.parent().unwrap())
+        .arg("--export-evidence")
+        .arg(session.file_name().unwrap())
+        .output()
+        .unwrap();
+    assert!(export.status.success(), "{export:?}");
+    let document: serde_json::Value = serde_json::from_slice(&export.stdout).unwrap();
+    let identity = &document["initial_manifest"];
+    assert_eq!(
+        identity["harness_profile"]["revision"],
+        record["activation"]["revision"]
+    );
+    assert_eq!(identity["prompt_policy"], "handoff-v1");
 }
