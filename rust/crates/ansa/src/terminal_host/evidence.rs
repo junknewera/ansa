@@ -1,4 +1,7 @@
-use super::protocol::{Binding, Effect, Id, Intent, VERSION, sha256};
+use super::{
+    HostMode,
+    protocol::{Binding, Effect, Id, Intent, VERSION, sha256},
+};
 use ansa_linux::{fs, local};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, path::Path};
@@ -69,12 +72,17 @@ pub struct FileJournal {
     sequence: usize,
     previous: String,
     failed: bool,
+    record_limit: usize,
 }
 
 impl FileJournal {
     /// Reserve a fresh private store. Existing headers and remnants require an
     /// explicit open and never become permission to start a replacement host.
-    pub(super) fn create(path: &Path, binding: &Binding) -> Result<Self, &'static str> {
+    pub(super) fn create(
+        path: &Path,
+        binding: &Binding,
+        mode: HostMode,
+    ) -> Result<Self, &'static str> {
         if !binding.validate() || path.starts_with(&binding.workspace) {
             return Err("terminal_binding");
         }
@@ -92,10 +100,15 @@ impl FileJournal {
             sequence: 0,
             previous: sha256(&header),
             failed: false,
+            record_limit: record_limit(mode),
         })
     }
 
-    pub(super) fn open(path: &Path, expected: &Binding) -> Result<Restored, &'static str> {
+    pub(super) fn open(
+        path: &Path,
+        expected: &Binding,
+        mode: HostMode,
+    ) -> Result<Restored, &'static str> {
         if !expected.validate() || path.starts_with(&expected.workspace) {
             return Err("terminal_binding");
         }
@@ -106,14 +119,16 @@ impl FileJournal {
             return Err("terminal_binding");
         }
         let mut previous = sha256(&bytes);
-        let (names, more) = local::names(&directory, 256).map_err(|_| "terminal_store")?;
-        let names: Vec<_> = names
-            .into_iter()
-            .filter(|name| name != "worker.lock" && name != HEADER && name != SEALED)
-            .collect();
+        let record_limit = record_limit(mode);
+        let entries = local::count_names(
+            &directory,
+            &["worker.lock", HEADER, SEALED],
+            record_limit.saturating_add(1),
+        )
+        .map_err(|_| "terminal_store")?;
         let mut records = Vec::new();
         let mut tail = Tail::End;
-        for sequence in 0..MAX_RECORDS {
+        for sequence in 0..entries.min(record_limit) {
             let filename = record_name(sequence);
             match read_entry(&directory, &filename, sequence, &previous) {
                 Ok(Some((record, digest))) => {
@@ -127,14 +142,13 @@ impl FileJournal {
                 }
             }
         }
-        if tail == Tail::End && (more || names.len() != records.len()) {
+        if tail == Tail::End && entries != records.len() {
             let pending = format!("{}.pending", record_name(records.len()));
             // A valid published prefix remains readable even if the directory
             // listing overflows or contains a foreign record after the cap.
-            tail = if !more
-                && records.len() < MAX_RECORDS
-                && names.len() == records.len() + 1
-                && names.iter().any(|name| name == pending.as_str())
+            tail = if records.len() < record_limit
+                && entries == records.len() + 1
+                && local::entry_exists(&directory, &pending).unwrap_or(false)
             {
                 Tail::Unpublished
             } else {
@@ -168,6 +182,7 @@ impl FileJournal {
                 sequence: records.len(),
                 previous,
                 failed: true,
+                record_limit,
             },
             records,
             tail,
@@ -190,7 +205,7 @@ impl FileJournal {
 
     fn lock(path: &Path) -> Result<(File, File), &'static str> {
         let directory = fs::private_directory(path).map_err(|_| "terminal_store")?;
-        let lock = local::lock(&directory).map_err(|_| "terminal_store_locked")?;
+        let lock = local::lock_existing(&directory).map_err(|_| "terminal_store_locked")?;
         Ok((directory, lock))
     }
 }
@@ -218,7 +233,7 @@ fn read_entry(
 
 impl Journal for FileJournal {
     fn publish(&mut self, record: &Record) -> Result<(), &'static str> {
-        if self.failed || self.sequence >= MAX_RECORDS {
+        if self.failed || self.sequence >= self.record_limit {
             return Err("terminal_store_unavailable");
         }
         let entry = Entry {
@@ -235,6 +250,13 @@ impl Journal for FileJournal {
         self.previous = sha256(&bytes);
         self.sequence += 1;
         Ok(())
+    }
+}
+
+fn record_limit(mode: HostMode) -> usize {
+    match mode {
+        HostMode::Bounded => MAX_RECORDS,
+        HostMode::Conversation => usize::MAX,
     }
 }
 

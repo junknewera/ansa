@@ -12,7 +12,7 @@ use crate::{
         journal_v1::Journal,
     },
     terminal_host::tools as terminals,
-    tools::files::{TaskScope, local_task_tools, local_tools_extended},
+    tools::files::{LocalExtensions, TaskScope, local_task_tools, local_tools_extended},
 };
 use std::{
     collections::BTreeMap,
@@ -54,7 +54,7 @@ pub struct Factory {
     initial_effort: Option<String>,
     auth: Option<Arc<AuthManager>>,
     editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
-    native_terminals: bool,
+    carbon_terminal: bool,
     terminal_owners: Arc<Mutex<BTreeMap<String, terminals::Owner>>>,
     openrouter: Option<Arc<OpenRouter>>,
     #[cfg(feature = "orchestration-pilot")]
@@ -82,16 +82,22 @@ impl Factory {
             initial_effort: None,
             auth,
             editor: None,
-            native_terminals: false,
+            carbon_terminal: false,
             terminal_owners: Arc::default(),
             openrouter: None,
             #[cfg(feature = "orchestration-pilot")]
             pilot: None,
         }
     }
-    pub fn with_native_terminals(mut self, enabled: bool) -> Self {
-        self.native_terminals = enabled;
+    pub(crate) fn with_carbon_frontend(mut self, interactive: bool) -> Self {
+        // Keep the terminal evidence store outside its workspace.
+        self.carbon_terminal =
+            interactive && !self.settings.directory.starts_with(&self.settings.cwd);
         self
+    }
+
+    pub(crate) fn new_main_uses_terminal(&self) -> bool {
+        self.carbon_terminal
     }
 
     pub(crate) fn open_terminal_owner(
@@ -741,7 +747,7 @@ impl Factory {
             return Err("session_configuration_mismatch");
         }
         let wants_terminals = source_configuration.as_ref().map_or(
-            self.native_terminals && kind == Kind::Main,
+            kind == Kind::Main && self.new_main_uses_terminal(),
             |source| {
                 source
                     .tools
@@ -750,9 +756,6 @@ impl Factory {
                     .any(|descriptor| descriptor.name == "terminal_create")
             },
         );
-        if wants_terminals && !self.offline && !self.native_terminals {
-            return Err("native_terminal_opt_in_required");
-        }
         let terminal = wants_terminals
             .then(|| self.open_terminal_owner(&selected, restored.is_some()))
             .transpose()?;
@@ -762,10 +765,14 @@ impl Factory {
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
-            self.editor
-                .as_ref()
-                .filter(|(directory, _)| directory == &selected.directory)
-                .map(|(_, hub)| hub.clone()),
+            LocalExtensions {
+                editor: self
+                    .editor
+                    .as_ref()
+                    .filter(|(directory, _)| directory == &selected.directory)
+                    .map(|(_, hub)| hub.clone()),
+                shared_writer: terminal.as_ref().map(terminals::workspace_writer),
+            },
             |registry| {
                 terminal.clone().map_or(Ok(()), |owner| {
                     terminals::register(registry, owner, &selected.directory)
@@ -778,6 +785,8 @@ impl Factory {
             tools
                 .compatible(&source.tools)
                 .ok_or("session_fork_tools")?
+        } else if terminal.is_some() {
+            tools.without_tool("run_command")
         } else {
             tools
         };

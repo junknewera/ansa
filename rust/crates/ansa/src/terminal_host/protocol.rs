@@ -50,6 +50,16 @@ pub struct Binding {
 }
 
 impl Binding {
+    pub(super) fn attached(session: Id, workspace: String) -> Self {
+        let digest = sha256(session.as_str().as_bytes());
+        Self {
+            host: Id::try_from(format!("attached_{digest}")).expect("fixed attached host ID"),
+            scope: session.clone(),
+            session,
+            workspace,
+        }
+    }
+
     pub(crate) fn validate(&self) -> bool {
         absolute_path(&self.workspace)
     }
@@ -105,6 +115,10 @@ pub struct Launch {
 }
 
 impl Launch {
+    pub(super) fn session_lifetime(&self) -> bool {
+        self.lifetime_seconds == 0 && self.idle_seconds == 0
+    }
+
     pub(crate) fn validate(&self) -> bool {
         !self.label.is_empty()
             && self.label.len() <= 64
@@ -118,8 +132,10 @@ impl Launch {
                 .all(|arg| !arg.chars().any(char::is_control))
             && self.argv.iter().map(String::len).sum::<usize>() <= 2048
             && self.size.validate()
-            && (1..=MAX_LIFETIME_SECONDS).contains(&self.lifetime_seconds)
-            && (1..=MAX_IDLE_SECONDS.min(self.lifetime_seconds)).contains(&self.idle_seconds)
+            && (self.session_lifetime()
+                || (1..=MAX_LIFETIME_SECONDS).contains(&self.lifetime_seconds)
+                    && (1..=MAX_IDLE_SECONDS.min(self.lifetime_seconds))
+                        .contains(&self.idle_seconds))
     }
 }
 

@@ -82,12 +82,20 @@ struct Operation {
     status: OperationStatus,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostMode {
+    Bounded,
+    Conversation,
+}
+
 pub struct Host<J: Journal, B: Backend> {
     binding: Binding,
+    mode: HostMode,
     journal: J,
     backend: B,
     terminals: BTreeMap<Id, Terminal>,
     operations: BTreeMap<Id, Operation>,
+    archived_operations: BTreeMap<Id, Operation>,
     quarantined: bool,
     storage_failed: bool,
     recovery: Option<Recovery>,
@@ -96,12 +104,30 @@ pub struct Host<J: Journal, B: Backend> {
 
 impl<B: Backend> Host<FileJournal, B> {
     pub fn create_file(path: &Path, binding: Binding, backend: B) -> Result<Self, &'static str> {
-        let journal = FileJournal::create(path, &binding)?;
-        Self::new(binding, journal, backend)
+        Self::create_in_mode(path, binding, backend, HostMode::Bounded)
+    }
+
+    fn create_in_mode(
+        path: &Path,
+        binding: Binding,
+        backend: B,
+        mode: HostMode,
+    ) -> Result<Self, &'static str> {
+        let journal = FileJournal::create(path, &binding, mode)?;
+        Self::new_in_mode(binding, journal, backend, mode)
     }
 
     pub fn restore_file(path: &Path, binding: Binding, backend: B) -> Result<Self, &'static str> {
-        let restored = FileJournal::open(path, &binding)?;
+        Self::restore_in_mode(path, binding, backend, HostMode::Bounded)
+    }
+
+    fn restore_in_mode(
+        path: &Path,
+        binding: Binding,
+        backend: B,
+        mode: HostMode,
+    ) -> Result<Self, &'static str> {
+        let restored = FileJournal::open(path, &binding, mode)?;
         Self::restore(
             binding,
             restored.journal,
@@ -109,6 +135,7 @@ impl<B: Backend> Host<FileJournal, B> {
             restored.records,
             restored.tail,
             restored.sealed,
+            mode,
         )
     }
 
@@ -128,15 +155,26 @@ impl<B: Backend> Host<FileJournal, B> {
 
 impl<J: Journal, B: Backend> Host<J, B> {
     pub fn new(binding: Binding, journal: J, backend: B) -> Result<Self, &'static str> {
+        Self::new_in_mode(binding, journal, backend, HostMode::Bounded)
+    }
+
+    fn new_in_mode(
+        binding: Binding,
+        journal: J,
+        backend: B,
+        mode: HostMode,
+    ) -> Result<Self, &'static str> {
         if !binding.validate() {
             return Err("terminal_binding");
         }
         Ok(Self {
             binding,
+            mode,
             journal,
             backend,
             terminals: BTreeMap::new(),
             operations: BTreeMap::new(),
+            archived_operations: BTreeMap::new(),
             quarantined: false,
             storage_failed: false,
             recovery: None,
@@ -151,11 +189,12 @@ impl<J: Journal, B: Backend> Host<J, B> {
         records: Vec<Record>,
         tail: Tail,
         sealed: bool,
+        mode: HostMode,
     ) -> Result<Self, &'static str> {
-        if records.len() > MAX_OPERATIONS * 2 {
+        if mode == HostMode::Bounded && records.len() > MAX_OPERATIONS * 2 {
             return Err("terminal_store_limit");
         }
-        let mut host = Self::new(binding, journal, backend)?;
+        let mut host = Self::new_in_mode(binding, journal, backend, mode)?;
         let mut pending = None;
         let mut recovery = Recovery {
             verified_records: 0,
@@ -252,7 +291,13 @@ impl<J: Journal, B: Backend> Host<J, B> {
     }
 
     pub fn operation(&self, id: &Id) -> Option<OperationStatus> {
-        self.operations.get(id).map(|operation| operation.status)
+        self.operation_record(id).map(|operation| operation.status)
+    }
+
+    fn operation_record(&self, id: &Id) -> Option<&Operation> {
+        self.operations
+            .get(id)
+            .or_else(|| self.archived_operations.get(id))
     }
 
     pub fn matching_receipt(
@@ -263,8 +308,7 @@ impl<J: Journal, B: Backend> Host<J, B> {
         if intent.binding != self.binding || !intent.binds_payload(input) {
             return Err("terminal_operation_conflict");
         }
-        self.operations
-            .get(&intent.operation)
+        self.operation_record(&intent.operation)
             .map(|prior| {
                 (prior.intent == *intent)
                     .then_some(prior.status)
@@ -347,7 +391,7 @@ impl<J: Journal, B: Backend> Host<J, B> {
         }
         self.apply_receipt(&intent.operation, effect)?;
         self.backend.receipt_committed();
-        if self.operations.len() == MAX_OPERATIONS {
+        if self.mode == HostMode::Bounded && self.operations.len() == MAX_OPERATIONS {
             self.emergency_stop();
         }
         Ok(OperationStatus::Durable(effect))
@@ -417,21 +461,28 @@ impl<J: Journal, B: Backend> Host<J, B> {
         } else {
             NORMAL_OPERATIONS
         };
-        if self.operations.len() >= limit {
+        let attached = self.mode == HostMode::Conversation;
+        if !attached && self.operations.len() >= limit {
             return Err("terminal_operation_budget");
         }
         if let Action::Create { launch } = &intent.action {
+            let live_limit = if self.runtime_bound {
+                1
+            } else {
+                MAX_LIVE_TERMINALS
+            };
             return if intent.epoch == 0
                 && intent.terminal == self.terminal_id(&intent.operation)
                 && Path::new(&launch.cwd).starts_with(&self.binding.workspace)
                 && !ansa_linux::fs::protected_path(Path::new(&launch.cwd))
-                && self.terminals.len() < MAX_TERMINAL_IDS
+                && (!launch.session_lifetime() || intent.writer == Writer::Agent && attached)
+                && (attached || self.terminals.len() < MAX_TERMINAL_IDS)
                 && self
                     .terminals
                     .values()
                     .filter(|terminal| terminal.lifecycle != Lifecycle::Closed)
                     .count()
-                    < MAX_LIVE_TERMINALS
+                    < live_limit
                 && !self.terminals.contains_key(&intent.terminal)
             {
                 Ok(())
@@ -458,7 +509,8 @@ impl<J: Journal, B: Backend> Host<J, B> {
             }
             Action::Input { count, .. } => {
                 intent.writer == terminal.writer
-                    && terminal.input_bytes + count <= MAX_TERMINAL_INPUT
+                    && (terminal.launch.session_lifetime()
+                        || terminal.input_bytes + count <= MAX_TERMINAL_INPUT)
             }
             _ => intent.writer == terminal.writer || emergency_close,
         };
@@ -539,6 +591,9 @@ impl<J: Journal, B: Backend> Host<J, B> {
             self.backend.quarantine();
         }
         record.status = OperationStatus::Durable(effect);
+        if self.mode == HostMode::Conversation && terminal.lifecycle == Lifecycle::Closed {
+            self.terminals.remove(&record.intent.terminal);
+        }
         Ok(())
     }
 }

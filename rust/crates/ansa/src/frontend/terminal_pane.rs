@@ -153,6 +153,7 @@ impl TerminalPane {
                     let mut pending = VecDeque::new();
                     let mut pending_accounted = 0;
                     let mut prompt = false;
+                    let mut bash_input = BashInput::default();
                     let mut eof = false;
                     let mut last_publish = Instant::now() - Duration::from_secs(1);
                     let mut unpublished = false;
@@ -193,6 +194,7 @@ impl TerminalPane {
                             init.cancel_directory();
                             prompt = false;
                             filter.prompt = None;
+                            bash_input = BashInput::default();
                             queued.fetch_sub(pending_accounted, Ordering::AcqRel);
                             pending_accounted = 0;
                             pending.clear();
@@ -207,8 +209,12 @@ impl TerminalPane {
                         if pending.is_empty()
                             && let Ok(bytes) = receiver.try_recv()
                         {
-                            prompt = false;
-                            filter.prompt = None;
+                            // Bash emits PS0 before execution, but has no redraw hook.
+                            // Keep its prompt state while Readline edits the current line.
+                            if init.zsh || bash_input.submits(&bytes) {
+                                prompt = false;
+                                filter.prompt = None;
+                            }
                             init.cancel_directory();
                             pending_accounted = bytes.len();
                             pending.extend(bytes);
@@ -336,6 +342,10 @@ impl TerminalPane {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    pub fn shell_ready(&self) -> bool {
+        self.queued.load(Ordering::Acquire) == 0 && self.snapshot().shell_ready
     }
     pub fn input(&self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() {
@@ -713,6 +723,44 @@ impl EscapeFilter {
     }
 }
 
+#[derive(Default)]
+struct BashInput {
+    in_paste: bool,
+    delimiter_prefix: usize,
+    quoted: bool,
+}
+
+impl BashInput {
+    fn submits(&mut self, bytes: &[u8]) -> bool {
+        use super::terminal_input::{BEGIN, END};
+        let mut submits = false;
+        for &byte in bytes {
+            if self.quoted {
+                self.quoted = false;
+                continue;
+            }
+            if !self.in_paste && matches!(byte, 17 | 22) {
+                self.quoted = true;
+                continue;
+            }
+            if !self.in_paste && matches!(byte, b'\r' | b'\n' | 15) {
+                submits = true;
+            }
+            let delimiter = if self.in_paste { END } else { BEGIN };
+            self.delimiter_prefix = if byte == delimiter[self.delimiter_prefix] {
+                self.delimiter_prefix + 1
+            } else {
+                usize::from(byte == delimiter[0])
+            };
+            if self.delimiter_prefix == delimiter.len() {
+                self.in_paste = !self.in_paste;
+                self.delimiter_prefix = 0;
+            }
+        }
+        submits
+    }
+}
+
 struct ShellInit {
     directory: Option<PathBuf>,
     marker: Vec<u8>,
@@ -789,7 +837,7 @@ add-zle-hook-widget line-init __ansa_prompt_marker\n\
 add-zle-hook-widget line-pre-redraw __ansa_prompt_marker\n\
 unset ANSA_INIT_DIR ANSA_USER_ZDOTDIR __ansa_user_zdotdir\n", marker.replace(";A;", ";B;")))?;
         } else {
-            value.write("bashrc", &format!("[[ -r $HOME/.bashrc ]] && source \"$HOME/.bashrc\"\n{hook}if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then\n  PROMPT_COMMAND+=(__ansa_prompt_marker)\nelse\n  PROMPT_COMMAND=\"${{PROMPT_COMMAND:+${{PROMPT_COMMAND}}; }}__ansa_prompt_marker\"\nfi\nPS0=\"${{PS0}}\"$'\\e]{}\\a'\n",marker.replace(";A;", ";B;")))?;
+            value.write("bashrc", &format!("[[ -r $HOME/.bashrc ]] && source \"$HOME/.bashrc\"\n{hook}if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then\n  PROMPT_COMMAND+=(__ansa_prompt_marker)\nelse\n  PROMPT_COMMAND=\"${{PROMPT_COMMAND:+${{PROMPT_COMMAND}}; }}__ansa_prompt_marker\"\nfi\nPS0=\"${{PS0}}\"$'\\e]{}\\a'\nPS2='\\['$'\\e]{marker}\\a''\\]'\"$PS2\"\n",marker.replace(";A;", ";B;")))?;
         }
         Ok(value)
     }

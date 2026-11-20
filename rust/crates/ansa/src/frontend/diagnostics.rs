@@ -156,8 +156,6 @@ fn explanation(code: &str) -> &'static str {
         "terminal_workspace_busy" => "Workspace is in use by a terminal or another conversation",
         "terminal_workspace_quarantined" => "Verify the terminal result first",
         "terminal_worker_lost" => "Lost connection to the terminal",
-        "native_terminal_requires_carbon" => "--native-terminals requires interactive Carbon",
-        "native_terminal_opt_in_required" => "Open this conversation with --native-terminals",
         "cli_output_stalled" => "Output stalled before the message was delivered",
         "cli_output_interrupted" => "Output interrupted",
         "cli_output" => "Could not finish writing output",

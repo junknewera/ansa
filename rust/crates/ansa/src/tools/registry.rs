@@ -270,6 +270,10 @@ impl Snapshot {
         self.filtered(|definition, _| names.contains(&definition.descriptor.name.as_str()))
     }
 
+    pub(crate) fn without_tool(&self, name: &str) -> Arc<Self> {
+        self.filtered(|definition, _| definition.descriptor.name != name)
+    }
+
     fn filtered(&self, include: impl Fn(&Definition, &Policy) -> bool) -> Arc<Self> {
         let mut registry = Registry::new();
         registry.owner = self.owner.clone();

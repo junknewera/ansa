@@ -50,6 +50,21 @@ impl Claim {
         })
     }
 
+    pub(super) fn write_descendant(
+        &self,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<local::WorkspaceWrite, &'static str> {
+        let root = ansa_linux::fs::open_nofollow(root, local::read_flags())
+            .and_then(|directory| directory.metadata())
+            .map_err(|_| "terminal_workspace_identity")?;
+        if (root.dev(), root.ino()) != self.identity {
+            return Err("terminal_workspace_identity");
+        }
+        self.workspace
+            .write_descendant(relative, Some(&self.marker))
+    }
+
     pub(super) fn release(self) -> Result<(), &'static str> {
         if local::read(&self.directory, MARKER, 8192)
             .map_err(|_| "terminal_workspace_evidence")?

@@ -1277,7 +1277,7 @@ impl Workbench {
             .terminal_owner(&self.slots[self.current].id)
             .is_none()
         {
-            self.report(io, "Open a new conversation with --native-terminals");
+            self.report(io, "Agent terminal unavailable in this conversation");
             return;
         }
         self.file_token = self.file_token.wrapping_add(1);

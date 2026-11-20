@@ -853,10 +853,11 @@ impl Workbench {
             }
             TerminalEvent::Escape => {
                 if self.terminal_focused()
+                    && self.terminal_pending_input.is_empty()
                     && self
                         .terminal
                         .as_ref()
-                        .is_some_and(|terminal| terminal.snapshot().shell_ready)
+                        .is_some_and(crate::frontend::terminal_pane::TerminalPane::shell_ready)
                 {
                     self.hide_terminal(io);
                 } else if self.terminal_focused() {

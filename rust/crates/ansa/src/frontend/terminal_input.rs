@@ -1,8 +1,8 @@
 //! Raw child input with bounded escape framing and isolated mouse/paste parsing.
 use super::input::{MouseEvent, MouseKind};
 
-const BEGIN: &[u8] = b"\x1b[200~";
-const END: &[u8] = b"\x1b[201~";
+pub(super) const BEGIN: &[u8] = b"\x1b[200~";
+pub(super) const END: &[u8] = b"\x1b[201~";
 const SEQUENCE_LIMIT: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

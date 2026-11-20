@@ -266,8 +266,8 @@ fn terminal_fixture(request: &Request) -> Result<Option<AdmittedResponse>> {
             "argv": ["sh", "-c", "printf 'ANSA_%s\\n' TERMINAL_READY; exec sh -i"],
             "rows": 24,
             "columns": 80,
-            "lifetime_seconds": 60,
-            "idle_seconds": 45,
+            "lifetime_seconds": 0,
+            "idle_seconds": 0,
         });
         (
             format!("fixture_terminal_open_{suffix}"),
