@@ -133,7 +133,7 @@ async fn context(runtime: &Runtime, id: &str) -> ansa::runtime::ForkSeed {
         }
     }
 }
-async fn complete(runtime: &Runtime, id: &str, text: &str) {
+async fn complete(runtime: &Runtime, id: &str, text: &str, mode: AgentMode) {
     tokio::time::timeout(Duration::from_secs(5), runtime.ready())
         .await
         .unwrap()
@@ -145,7 +145,7 @@ async fn complete(runtime: &Runtime, id: &str, text: &str) {
                 id,
                 CommandPayload::Submit(Submit {
                     text: text.into(),
-                    mode: AgentMode::Basic
+                    mode
                 })
             ))
             .await
@@ -181,7 +181,13 @@ async fn child_title_is_first_own_prompt_and_completed_tree_survives_restart() {
     let root = Root::new();
     let factory = root.factory();
     let mut main = factory.create(Kind::Main, None).unwrap();
-    complete(&main.runtime, "parent_command", "Parent original title").await;
+    complete(
+        &main.runtime,
+        "parent_command",
+        "Parent original title",
+        AgentMode::Plan,
+    )
+    .await;
     let seed = context(&main.runtime, "parent_context").await;
     let mut child = factory.create(Kind::Agent, Some(seed)).unwrap();
     context(&child.runtime, "child_ready").await;
@@ -198,11 +204,18 @@ async fn child_title_is_first_own_prompt_and_completed_tree_survives_restart() {
     assert_eq!(summary.title, None);
     assert_eq!(summary.status, SummaryStatus::Empty);
     assert_eq!(fingerprints(&child.selected.directory), before);
-    complete(&child.runtime, "child_command", "Own child task title").await;
+    complete(
+        &child.runtime,
+        "child_command",
+        "Own child task title",
+        AgentMode::Basic,
+    )
+    .await;
     complete(
         &child.runtime,
         "child_second",
         "Later user prompt is a preview, not the title",
+        AgentMode::Basic,
     )
     .await;
     let main_id = main.selected.id.clone();
@@ -233,6 +246,7 @@ async fn child_title_is_first_own_prompt_and_completed_tree_survives_restart() {
         .find(|value| value.entry.id == child_id)
         .unwrap();
     assert_eq!(main_summary.title.as_deref(), Some("Parent original title"));
+    assert_eq!(main_summary.status, SummaryStatus::Completed);
     assert_eq!(child_summary.title.as_deref(), Some("Own child task title"));
     assert_eq!(
         child_summary.entry.parent.as_deref(),

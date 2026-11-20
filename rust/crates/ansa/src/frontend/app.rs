@@ -176,9 +176,11 @@ fn save_openrouter(path: &Path) -> Result<i32> {
 }
 
 pub(super) fn openrouter_runtime(route: Arc<OpenRouter>) -> (Generate, RuntimeOptions) {
+    let catalog = route.clone();
     let generate: Generate = Arc::new(move |request, stop, _| route.generate(request, stop));
     let options = RuntimeOptions {
         compact: Some(summarizer(generate.clone())),
+        model_window: Arc::new(move |request| catalog.cached_window(request)),
         keep_recent_turns: 2,
         select_generation: Arc::new(|selection, stop| {
             stop.check()?;
@@ -328,6 +330,7 @@ pub(super) fn authorized_with_cancel(
     let request_check = guard.clone();
     let selection = guard.clone();
     let provider = guard.clone();
+    let catalog = guard.clone();
     let lease = guard;
     let generate_auth = auth.clone();
     let lease_auth = auth;
@@ -339,6 +342,12 @@ pub(super) fn authorized_with_cancel(
                 provider.context_window(request),
             )
         };
+        if let Some(window) = window {
+            let tokens = request
+                .estimated_tokens()
+                .unwrap_or_else(|| crate::context::estimate_request_tokens(request));
+            crate::context::require_response_room(tokens, window)?;
+        }
         generate_auth
             .generate(
                 request.clone(),
@@ -352,6 +361,7 @@ pub(super) fn authorized_with_cancel(
     });
     let compact_generate = generate.clone();
     let options = RuntimeOptions {
+        model_window: Arc::new(move |request| catalog.try_lock().ok()?.context_window(request)),
         check_request: Arc::new(move |request, epoch, cancel| {
             request_check
                 .lock()
@@ -517,6 +527,8 @@ fn text_with_providers(
     if terminal.is_some() {
         terminals::add_agent_instructions(&mut epoch);
     }
+    // Mask signals before MCP and runtime workers inherit the process mask.
+    let mut io = Io::open(parsed.prompt.is_none())?;
     let tools = local_tools_extended(
         settings.clone(),
         epoch.clone(),
@@ -530,7 +542,17 @@ fn text_with_providers(
         |registry| {
             terminal.clone().map_or(Ok(()), |owner| {
                 terminals::register(registry, owner, &selected.directory)
-            })
+            })?;
+            if !parsed.resume && parsed.session.is_empty() {
+                crate::mcp::register(
+                    registry,
+                    &settings.directory,
+                    &settings.cwd,
+                    None,
+                    &Cancel::default(),
+                )?;
+            }
+            Ok(())
         },
     )?;
     let tools = if terminal.is_some() {
@@ -552,8 +574,6 @@ fn text_with_providers(
             }
         });
     }
-    // Signals must be blocked before starting owner and output threads.
-    let mut io = Io::open(parsed.prompt.is_none())?;
     let (mut runtime, root_kind, parent) = if parsed.resume || !parsed.session.is_empty() {
         let restored = factory.resume(&selected.id)?;
         (restored.runtime, restored.kind, restored.parent)
@@ -565,7 +585,6 @@ fn text_with_providers(
                 tools,
                 generate,
                 Limits {
-                    compact_bytes: settings.compact_bytes,
                     tool_rounds: settings.tool_rounds,
                     tool_calls: settings.tool_calls,
                     ..Limits::default()
@@ -928,7 +947,6 @@ fn live_jsonl(args: &[String]) -> Result<i32> {
     let mut directory = None;
     let mut model = "gpt-6.1-sol".to_owned();
     let mut returned = None;
-    let mut compact_bytes = 256 * 1024;
     let mut seen = std::collections::BTreeSet::new();
     for chunk in args.chunks(2) {
         if chunk.len() != 2 || !seen.insert(&chunk[0]) {
@@ -944,7 +962,8 @@ fn live_jsonl(args: &[String]) -> Result<i32> {
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                     return Err("live_cli_options");
                 }
-                compact_bytes = value.parse().map_err(|_| "live_cli_options")?;
+                // Preserve the v1 CLI syntax for callers using saved arguments.
+                value.parse::<usize>().map_err(|_| "live_cli_options")?;
             }
             _ => return Err("live_cli_unknown_option"),
         }
@@ -972,10 +991,7 @@ fn live_jsonl(args: &[String]) -> Result<i32> {
         Request::new(bound, epoch, tools.advertisement().clone(), vec![])?,
         tools,
         generate,
-        Limits {
-            compact_bytes,
-            ..Limits::default()
-        },
+        Limits::default(),
         options,
     )?;
     jsonl_runtime(io, runtime)

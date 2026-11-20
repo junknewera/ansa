@@ -274,13 +274,23 @@ impl Timeline {
                     event.text_field("text")?.into(),
                 );
             }
-            "steered" => {
+            kind @ ("steered" | "steer_rejected") => {
                 for command in event.field("commands")?.elements()? {
                     if let Some(text) = self.pending.remove(command.text()?) {
-                        self.append("user", text, "delivered");
+                        self.append(
+                            "user",
+                            text,
+                            if kind == "steered" {
+                                "delivered"
+                            } else {
+                                "rejected"
+                            },
+                        );
                     }
                 }
-                self.final_text.clear();
+                if kind == "steered" {
+                    self.final_text.clear();
+                }
             }
             "accepted" => {
                 self.turn = event.text_field("turn")?.into();

@@ -25,12 +25,13 @@ def environment(mode,compiler):
     env['CARGO_ENCODED_RUSTFLAGS']='\x1f'.join(flags)
     if mode=='miri':env.update(MIRI=str(compiler.parent/'miri'),MIRIFLAGS='-Zmiri-strict-provenance')
     else:env.update(ASAN_OPTIONS='detect_leaks=1:halt_on_error=1',LSAN_OPTIONS='exitcode=23',TSAN_OPTIONS='halt_on_error=1')
+    env.setdefault('RUST_TEST_THREADS','1')
     return env,flags
 
 def executed_tests(data,mode):
     text=data.decode('utf-8','strict')
     rows=re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;',text)
-    expected=2 if mode=='miri' else 393
+    expected=2 if mode=='miri' else 402
     if not rows or sum(int(row[0]) for row in rows)!=expected or any(any(int(v) for v in row[1:]) for row in rows):raise ValueError('quality executed/ignored test inventory')
     return expected
 

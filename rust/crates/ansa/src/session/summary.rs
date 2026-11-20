@@ -84,6 +84,7 @@ pub(crate) fn read(
     entry: CatalogEntry,
     budget: &mut usize,
     stop: &Cancel,
+    compiled: Option<&crate::tools::registry::Snapshot>,
 ) -> Result<SessionSummary> {
     let mut summary = SessionSummary {
         entry: entry.clone(),
@@ -106,9 +107,7 @@ pub(crate) fn read(
     let mut paused = false;
     let mut configuration: Option<Request> = None;
     let mut canonical: Option<State> = None;
-    let mut accepted_text = String::new();
     let mut plan = false;
-    let mut compactions = 0;
     let result = inspect_read_only(
         path,
         budget,
@@ -121,25 +120,14 @@ pub(crate) fn read(
                     "session_missing_init",
                 )?;
                 let saved = Request::load(event.field("configuration")?)?;
-                // Replay through the production reducer before presenting a state.
-                // Inspection has no compiled read-only tool policy, so plan turns
-                // remain unavailable instead of trusting their saved advertisement.
                 let structured_child = saved.final_format()
                     == Some(crate::provider::structured::FinalFormat::ChildResult);
-                let plan_tools = if structured_child
-                    && saved.tools.descriptors.iter().all(|tool| {
-                        matches!(
-                            tool.name.as_str(),
-                            "list_directory" | "read_file" | "search_files"
-                        )
-                    }) {
-                    saved.tools.clone()
-                } else {
-                    Advertisement {
+                let plan_tools = compiled
+                    .and_then(|catalog| catalog.verified_plan_tools(&saved.tools))
+                    .unwrap_or_else(|| Advertisement {
                         revision: String::new(),
                         descriptors: vec![],
-                    }
-                };
+                    });
                 let mut state = State::new(entry.id.as_str().into(), saved.clone(), plan_tools);
                 state.apply(event)?;
                 canonical = Some(state);
@@ -213,7 +201,6 @@ pub(crate) fn read(
                 };
                 need(
                     !text.is_empty()
-                        && text.len() <= 16 * 1024
                         && valid_id(event.text_field("command")?)
                         && valid_id(event.text_field("request")?)
                         && valid_id(event.text_field("turn")?),
@@ -253,7 +240,6 @@ pub(crate) fn read(
                 response = None;
                 results.clear();
                 request_id = event.text_field("request")?.into();
-                accepted_text = content;
                 plan = event.has("mode") && event.text_field("mode")? == "plan";
                 paused = false;
                 let question = if internal {
@@ -416,7 +402,6 @@ pub(crate) fn read(
                         valid_id(event.text_field("command")?)
                             && event.text_field("target")? == request_id
                             && !event.text_field("text")?.is_empty()
-                            && event.text_field("text")?.len() <= 16 * 1024
                             && queued.len() < 16,
                         "session_followup",
                     )?;
@@ -425,7 +410,7 @@ pub(crate) fn read(
                         event.text_field("text")?.into(),
                     ));
                 }
-                "steered" => {
+                "steered" | "steer_rejected" => {
                     need(
                         !queued.is_empty()
                             && !matches!(stage, Stage::Completed | Stage::Empty)
@@ -442,6 +427,10 @@ pub(crate) fn read(
                                 .all(|(id, (command, _))| id.text() == Ok(command.as_str())),
                         "session_followup_order",
                     )?;
+                    if kind == "steer_rejected" {
+                        queued.clear();
+                        return Ok(());
+                    }
                     let next = Request::load(event.field("next")?)?;
                     let previous = expected.as_ref().ok_or("session_followup_context")?;
                     need(
@@ -494,62 +483,13 @@ pub(crate) fn read(
                         stage == Stage::Compacting && !paused,
                         "session_compaction_stage",
                     )?;
-                    let value = event.field("compaction")?;
-                    let compacted = crate::context::legacy_compact::CompactedContext::admit(
-                        Request::load(value.field("request")?)?,
-                        value.field("native")?.clone(),
-                    )?;
-                    let previous = expected.as_ref().ok_or("session_compaction_request")?;
-                    let saved = configuration.as_ref().ok_or("session_missing_init")?;
-                    let original = Request::new(
-                        previous.binding.clone(),
-                        previous.epoch.clone(),
-                        saved.tools.clone(),
-                        previous.input[..previous.input.len() - 1].to_vec(),
-                    )?
-                    .with_effort(previous.effort.clone())?;
-                    need(
-                        compacted.request() == &original,
-                        "session_compaction_request",
-                    )?;
-                    compactions += 1;
-                    let mut epoch = crate::context::epoch::compact_epoch(
-                        &saved.epoch,
-                        compactions,
-                        &compacted,
-                    )?;
-                    if plan {
-                        let provenance = Json::object(vec![
-                            ("base_epoch", Json::string(&epoch.id)?),
-                            ("base_state", epoch.exact_state.clone()),
-                            ("base_instructions", Json::string(&epoch.instructions)?),
-                            ("mode", Json::string("plan")?),
-                            ("tools_revision", Json::string(&previous.tools.revision)?),
-                        ])?;
-                        epoch = crate::provider::request::Epoch {
-                            id: crate::protocol::legacy_json_v1::sha256(
-                                provenance.dump().as_bytes(),
-                            ),
-                            instructions: format!(
-                                "{}\nPlan mode: inspect and reason using read-only tools. Do not modify files or execute commands. Provide a concrete plan.",
-                                epoch.instructions
-                            ),
-                            exact_state: provenance,
-                        };
-                    }
-                    let mut input = compacted.output()?.to_vec();
-                    input.push(Json::object(vec![
-                        ("role", Json::string("user")?),
-                        ("content", Json::string(&accepted_text)?),
-                    ])?);
                     expected = Some(
-                        Request::new(
-                            previous.binding.clone(),
-                            epoch,
-                            previous.tools.clone(),
-                            input,
-                        )?
-                        .with_effort(previous.effort.clone())?,
+                        canonical
+                            .as_ref()
+                            .and_then(|state| state.turn.as_ref())
+                            .ok_or("session_compaction_request")?
+                            .next
+                            .clone(),
                     );
                     stage = Stage::Generating;
                 }

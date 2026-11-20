@@ -150,6 +150,11 @@ fn explanation(code: &str) -> &'static str {
         "auth_required" => "Sign in again",
         "provider_policy_denied" => "Provider denied the request",
         "provider_usage_limit" => "Provider usage limit reached",
+        "model_context_limit" => "The request exceeds the model's context window",
+        "request_frame_limit" => "The request cannot be stored in a journal record",
+        "followup_frame_limit" => {
+            "Clarifications exceed the request frame and were kept in history"
+        }
         "session_interrupted" => "Restored an unfinished request after restart",
         "opaque_conflict" => "An encrypted response item changed while streaming",
         "terminal_item_count" => "Response items do not match",

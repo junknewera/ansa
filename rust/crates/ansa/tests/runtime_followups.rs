@@ -44,6 +44,60 @@ async fn steer(handle: &Handle, id: &str, target: &RequestId, text: &str) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn oversized_followup_batch_is_kept_without_poisoning_the_journal() {
+    let root = fixture::Root::new();
+    let gate = Arc::new(fixture::Gate::default());
+    let hold = gate.clone();
+    let provider: Generate = Arc::new(move |request, stop, _| {
+        if has_user(request, "first") {
+            assert_eq!(request.input.len(), 1);
+            hold.hold(stop);
+        }
+        native::load(&fixture::saved_response(request, Some("done"), 0))
+    });
+    let options = Options {
+        directory: Some(root.journal()),
+        ..Options::default()
+    };
+    let mut runtime = fixture::setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider.clone(),
+        Limits::default(),
+        options.clone(),
+    )
+    .await;
+    let handle = runtime.handle();
+    let request = fixture::submit(&handle, "first", "first", "turn").await;
+    gate.wait();
+    let large = "a".repeat(Json::FRAME_BYTES / 2);
+    steer(&handle, "large_a", &request, &large).await;
+    steer(&handle, "large_b", &request, &large).await;
+    gate.release();
+    fixture::until(&handle, |p| matches!(p, EventPayload::RuntimeError { diagnostic, .. } if diagnostic == "followup_frame_limit")).await;
+    fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    fixture::finish(&mut runtime).await;
+    let mut reopened = fixture::setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider,
+        Limits::default(),
+        options,
+    )
+    .await;
+    let snapshot = fixture::snapshot(&reopened.handle(), "check").await;
+    assert!(!snapshot.storage_failed);
+    assert_eq!(snapshot.followups.len(), 2);
+    assert!(
+        snapshot
+            .followups
+            .iter()
+            .all(|message| message.state == "rejected")
+    );
+    fixture::finish(&mut reopened).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn new_turn_preserves_cancelled_context_over_compaction_threshold() {
     let root = fixture::Root::new();
     let first = Arc::new(fixture::Gate::default());
@@ -66,16 +120,17 @@ async fn new_turn_preserves_cancelled_context_over_compaction_threshold() {
             }
             _ => {}
         }
-        native::load(&fixture::saved_response(request, Some("done"), 0))
+        native::load(
+            &fixture::saved_response(request, Some("done"), 0)
+                .with("context_tokens", Json::parse("49998")?)?
+                .with("context_window", Json::parse("100000")?)?,
+        )
     });
     let mut runtime = fixture::setup(
         Arc::new(AtomicUsize::new(0)),
         None,
         provider,
-        Limits {
-            compact_bytes: 12 * 1024,
-            ..Limits::default()
-        },
+        Limits::default(),
         Options {
             directory: Some(root.journal()),
             keep_recent_turns: 2,
@@ -149,15 +204,12 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
         };
         native::load(&saved)
     });
-    let start = |compact_bytes| {
+    let start = || {
         fixture::setup(
             Arc::new(AtomicUsize::new(0)),
             None,
             provider.clone(),
-            Limits {
-                compact_bytes,
-                ..Limits::default()
-            },
+            Limits::default(),
             Options {
                 directory: Some(root.journal()),
                 keep_recent_turns: 2,
@@ -166,7 +218,7 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
             },
         )
     };
-    let mut runtime = start(12 * 1024).await;
+    let mut runtime = start().await;
     let handle = runtime.handle();
     for (id, text) in [("A", large.as_str()), ("B", "B"), ("C", "C"), ("D", "D")] {
         fixture::submit(&handle, id, text, id).await;
@@ -178,7 +230,7 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
     );
     fixture::finish(&mut runtime).await;
 
-    let mut runtime = start(64 * 1024).await;
+    let mut runtime = start().await;
     let handle = runtime.handle();
     fixture::submit(&handle, "E", "E", "E").await;
     fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
@@ -206,15 +258,12 @@ async fn autocompact_estimates_the_known_window_without_usage_after_reopen() {
         }
         native::load(&saved)
     });
-    let start = |compact_bytes| {
+    let start = || {
         fixture::setup(
             Arc::new(AtomicUsize::new(0)),
             None,
             provider.clone(),
-            Limits {
-                compact_bytes,
-                ..Limits::default()
-            },
+            Limits::default(),
             Options {
                 directory: Some(root.journal()),
                 keep_recent_turns: 2,
@@ -223,7 +272,7 @@ async fn autocompact_estimates_the_known_window_without_usage_after_reopen() {
             },
         )
     };
-    let mut runtime = start(12 * 1024).await;
+    let mut runtime = start().await;
     let handle = runtime.handle();
     for (id, text) in [("A", older.as_str()), ("B", "B"), ("C", "C"), ("D", "D")] {
         fixture::submit(&handle, id, text, id).await;
@@ -237,7 +286,7 @@ async fn autocompact_estimates_the_known_window_without_usage_after_reopen() {
     );
     fixture::finish(&mut runtime).await;
 
-    let mut runtime = start(64 * 1024).await;
+    let mut runtime = start().await;
     let handle = runtime.handle();
     fixture::submit(&handle, "E", &crosses_half, "E").await;
     fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
@@ -247,6 +296,49 @@ async fn autocompact_estimates_the_known_window_without_usage_after_reopen() {
             .compactions,
         1
     );
+    fixture::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_window_does_not_compact_a_large_serialized_request() {
+    let root = fixture::Root::new();
+    let text = "Ж".repeat(150_000);
+    let expected = text.clone();
+    let reached = Arc::new(AtomicBool::new(false));
+    let observed = reached.clone();
+    let provider: Generate = Arc::new(move |request, _, _| {
+        if request.input.last().unwrap().text_field("content")? == expected {
+            assert!(has_user(request, "earliest"));
+            observed.store(true, Ordering::SeqCst);
+        }
+        native::load(&fixture::saved_response(request, Some("done"), 0))
+    });
+    let mut runtime = fixture::setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider,
+        Limits::default(),
+        Options {
+            directory: Some(root.journal()),
+            keep_recent_turns: 2,
+            compact: Some(Arc::new(|_, _, _| {
+                panic!("unknown window triggered compaction")
+            })),
+            ..Options::default()
+        },
+    )
+    .await;
+    let handle = runtime.handle();
+    for (id, input) in [
+        ("A", "earliest"),
+        ("B", "second"),
+        ("C", "third"),
+        ("D", &text),
+    ] {
+        fixture::submit(&handle, id, input, id).await;
+        fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    }
+    assert!(reached.load(Ordering::SeqCst));
     fixture::finish(&mut runtime).await;
 }
 

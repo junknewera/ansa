@@ -152,12 +152,12 @@ fn editor_preserves_utf8_boundaries_and_consumes_alt_prefix() {
 #[test]
 fn editor_overflow_cannot_be_healed_by_backspaces() {
     let mut editor = Editor::default();
-    for _ in 0..16 * 1024 + 1 {
-        editor.feed(b'x', true);
-    }
-    for _ in 0..16 * 1024 {
-        editor.feed(127, true);
-    }
+    editor
+        .bytes
+        .resize(ansa::frontend::input::MAX_COMPOSER_BYTES, b'x');
+    editor.cursor = editor.bytes.len();
+    editor.feed(b'x', true);
+    editor.feed(127, true);
     assert!(editor.overflow);
     assert_eq!(editor.feed(b'\r', true), Some(Action::Overflow));
     editor.clear();

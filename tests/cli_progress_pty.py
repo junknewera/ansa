@@ -238,12 +238,13 @@ def recall(binary, output):
             at = len(screen.raw)
             screen.send(b"\x1b[BX")
             editor(screen, "DRAFT ЖX界😀", at)
-            # Overflow is a clear boundary, including any saved recall draft.
+            # A long draft remains editable after recalling a short message.
             screen.send(b"\x1b[A")
             editor(screen, "seed-39 Ж界😀", at)
             at = len(screen.raw)
-            screen.send(b"x" * (17 * 1024) + b"\r")
-            until(screen,lambda:'submit_size' in frame_text(screen.vt),'submit size diagnostic')
+            screen.send(b"x" * (17 * 1024) + b"LONG_DRAFT_END")
+            until(screen,lambda:'LONG_DRAFT_END' in ''.join(frame_text(screen.vt).split()),'long draft is retained')
+            screen.send(b"\x03")
             editor(screen, "", at)
             at = len(screen.raw)
             screen.send(b"\x1b[B")
@@ -252,7 +253,7 @@ def recall(binary, output):
             editor(screen, "", at)
             assert "DRAFT" not in frame_text(screen.vt)
             screen.send(b"\x04")
-            row = save(screen, output, "recall-pages-overflow", (1,))
+            row = save(screen, output, "recall-pages-long-draft", (0,))
         finally:
             (output / "recall-live.pty").write_bytes(screen.raw)
             screen.close()

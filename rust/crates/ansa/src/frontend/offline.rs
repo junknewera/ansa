@@ -38,7 +38,7 @@ pub fn generate(request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
     if stop.cancelled() {
         return Err("offline_cancelled");
     }
-    if let Some(response) = orchestration_fixture(request)? {
+    if let Some(response) = orchestration_fixture(request, stop)? {
         return Ok(response);
     }
     if let Some(response) = terminal_fixture(request)? {
@@ -108,7 +108,7 @@ pub fn generate(request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
     ]))
 }
 
-fn orchestration_fixture(request: &Request) -> Result<Option<AdmittedResponse>> {
+fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<AdmittedResponse>> {
     if request.final_format().is_none()
         && request.epoch.exact_state.text_field("purpose") != Ok("orchestration_summary")
     {
@@ -123,6 +123,12 @@ fn orchestration_fixture(request: &Request) -> Result<Option<AdmittedResponse>> 
         })
         .unwrap_or_default();
     let id = sha256(request.save()?.dump().as_bytes());
+    if request.final_format() == Some(FinalFormat::ChildResult)
+        && user.starts_with("Review first fixture file")
+    {
+        stop.wait(std::time::Duration::from_millis(950));
+        stop.check()?;
+    }
     if request.final_format() == Some(FinalFormat::ChildResult) {
         let operation = if user.starts_with("Синтетическая правка отчёта")
         {
@@ -158,6 +164,12 @@ fn orchestration_fixture(request: &Request) -> Result<Option<AdmittedResponse>> 
         }
     }
     let text = match request.final_format() {
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder) if user == "ORCHESTRATION_CLARIFICATION_FIXTURE" => serde_json::json!({
+            "schema_version": 1, "summary": "Read and compare two files", "checks":[], "manual_checks":[], "steps": [
+                {"id":"first", "task":"Review first fixture file", "access":"read", "paths":["first.txt"], "depends_on":[], "acceptance":"Keep the first file intact"},
+                {"id":"second", "task":"Review second fixture file", "access":"read", "paths":["second.txt"], "depends_on":["first"], "acceptance":"Compare the findings"}
+            ]
+        }).to_string(),
         Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder) if user == "ORCHESTRATION_LONG_PLAN_FIXTURE" => serde_json::json!({
             "schema_version": 1, "summary": "Проверить перенос длинного плана", "checks":[], "manual_checks":[], "steps": [
                 {"id":"long", "task":format!("{}VISIBLE_END_OF_STEP", "длинная строка ".repeat(130)), "access":"read", "paths":[], "depends_on":[], "acceptance":"Прочитать строку целиком"}

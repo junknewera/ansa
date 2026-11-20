@@ -706,10 +706,11 @@ fn run_synthetic(
         "Put the assertion that report.txt contains Status: verified in checks. The coordinator runs the check and ",
         "independent review automatically. Leave all other lines and files unchanged."
     );
-    let proposal = Proposal::generate(factory, seed, prompt.into(), stop)?;
+    let proposal = Proposal::generate(factory, seed, prompt.into(), false, None, stop)?;
     check_scenario_scope(&proposal.plan, report)?;
     let (progress, _) = tokio::sync::watch::channel(None);
-    let completed = orchestration::execute(factory, proposal, stop, progress)?;
+    let (_, inbox) = tokio::sync::mpsc::channel(1);
+    let completed = orchestration::execute(factory, proposal, stop, progress, inbox)?;
     let candidate = completed
         .candidate
         .as_ref()
@@ -744,7 +745,7 @@ fn run_synthetic(
                 .post(command(
                     "summary",
                     CommandPayload::Handoff(Submit {
-                        text: completed.evidence,
+                        text: completed.evidence.ok_or("pilot_parent_handoff")?,
                         mode: AgentMode::Plan,
                     }),
                 ))

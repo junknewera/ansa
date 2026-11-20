@@ -29,7 +29,7 @@ pub struct Advertisement {
     pub revision: String,
     pub descriptors: Vec<Descriptor>,
 }
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Request {
     pub binding: Binding,
     pub epoch: Epoch,
@@ -38,9 +38,20 @@ pub struct Request {
     /// Omitted for legacy requests, preserving their exact serialized bytes.
     pub effort: Option<String>,
     final_format: Option<FinalFormat>,
+    context_estimate: Option<usize>,
+}
+impl PartialEq for Request {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding
+            && self.epoch == other.epoch
+            && self.tools == other.tools
+            && self.input == other.input
+            && self.effort == other.effort
+            && self.final_format == other.final_format
+    }
 }
 impl Request {
-    pub const MAX_ITEMS: usize = 4096;
+    pub const MAX_ITEMS: usize = Json::FRAME_NODES;
     pub fn new(
         binding: Binding,
         epoch: Epoch,
@@ -83,6 +94,7 @@ impl Request {
             input,
             effort: None,
             final_format: None,
+            context_estimate: None,
         })
     }
     pub fn with_effort(mut self, effort: Option<String>) -> Result<Self, &'static str> {
@@ -111,6 +123,12 @@ impl Request {
     }
     pub fn final_format(&self) -> Option<FinalFormat> {
         self.final_format
+    }
+    pub(crate) fn set_context_estimate(&mut self, tokens: usize) {
+        self.context_estimate = Some(tokens);
+    }
+    pub(crate) fn estimated_tokens(&self) -> Option<usize> {
+        self.context_estimate
     }
     pub fn json(&self) -> Result<Json, &'static str> {
         let functions = self

@@ -18,15 +18,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-const TOOL_RESULT_BYTES: usize = 120 * 1024;
-
 pub(crate) fn result(value: Json) -> Outcome {
-    let text = value.dump();
-    Outcome::succeeded(if text.len() > TOOL_RESULT_BYTES {
-        r#"{"error":"tool_output_limit"}"#.into()
-    } else {
-        text
-    })
+    Outcome::succeeded(value.dump())
 }
 pub(crate) fn error(code: &str) -> Outcome {
     result(Json::object(vec![("error", s(code).expect("diagnostic"))]).expect("diagnostic object"))
@@ -55,6 +48,7 @@ pub(crate) struct LocalExtensions {
 
 pub struct TaskScope {
     root: PathBuf,
+    reads: Vec<PathBuf>,
     writes: Vec<PathBuf>,
 }
 
@@ -78,8 +72,13 @@ impl TaskScope {
         }
         Ok(Self {
             root,
+            reads: Vec::new(),
             writes: paths,
         })
+    }
+    pub(crate) fn restrict_reads(mut self, reads: &[String]) -> Result<Self> {
+        self.reads = Self::new(&self.root, reads)?.writes;
+        Ok(self)
     }
 }
 
@@ -113,7 +112,10 @@ impl Host {
     pub(super) fn check_task_path(&self, path: &Path, writing: bool) -> Result<()> {
         if let Some(scope) = &self.scope
             && (!path.starts_with(&scope.root)
-                || writing && !scope.writes.iter().any(|allowed| path.starts_with(allowed)))
+                || writing && !scope.writes.iter().any(|allowed| path.starts_with(allowed))
+                || !writing
+                    && !scope.reads.is_empty()
+                    && !scope.reads.iter().any(|allowed| path.starts_with(allowed)))
         {
             return Err("task_path_scope");
         }
@@ -122,7 +124,19 @@ impl Host {
     pub fn path(&self, text: &str) -> Result<PathBuf> {
         self.path_os(Path::new(text))
     }
+    pub(super) fn task_directory_path(&self, text: &str) -> Result<PathBuf> {
+        self.resolve_path(Path::new(text), true)
+    }
     pub fn path_os(&self, path: &Path) -> Result<PathBuf> {
+        self.resolve_path(path, false)
+    }
+    pub(super) fn task_directory_allowed(&self, path: &Path) -> bool {
+        self.scope.as_ref().is_some_and(|scope| {
+            path.starts_with(&scope.root)
+                && scope.reads.iter().any(|allowed| allowed.starts_with(path))
+        })
+    }
+    pub(super) fn resolve_path(&self, path: &Path, traverse: bool) -> Result<PathBuf> {
         let bytes = path.as_os_str().as_encoded_bytes();
         if bytes.is_empty() || bytes.len() > 4096 || bytes.contains(&0) {
             return Err("file_path");
@@ -135,12 +149,17 @@ impl Host {
         if self.protected_path(&input) {
             return Err("protected_file");
         }
-        self.check_task_path(&ansa_linux::fs::normalize(&input), false)?;
+        let normalized = ansa_linux::fs::normalize(&input);
+        if !traverse || !self.task_directory_allowed(&normalized) {
+            self.check_task_path(&normalized, false)?;
+        }
         let resolved = input.canonicalize().map_err(|_| "file_access_failed")?;
         if self.protected_path(&resolved) {
             return Err("protected_file");
         }
-        self.check_task_path(&resolved, false)?;
+        if !traverse || !self.task_directory_allowed(&resolved) {
+            self.check_task_path(&resolved, false)?;
+        }
         Ok(resolved)
     }
     pub fn instructions(&self, directory: &Path, args: &Json) -> Result<Option<Outcome>> {
@@ -163,13 +182,10 @@ impl Host {
             ("instructions", Json::array(added)?),
         ])?
         .dump();
-        if output.len() > TOOL_RESULT_BYTES {
-            return Err("instruction_size_limit");
-        }
         Ok(Some(Outcome::succeeded(output)))
     }
     pub fn list(&self, args: &Json, stop: &Cancel) -> Result<Outcome> {
-        let path = self.path(args.text_field("path")?)?;
+        let path = self.task_directory_path(args.text_field("path")?)?;
         if let Some(value) = self.instructions(&path, args)? {
             return Ok(value);
         }
@@ -187,7 +203,11 @@ impl Host {
                 break;
             }
             let entry = entry.map_err(|_| "file_access_failed")?;
-            if self.protected_path(&path.join(&entry.name)) {
+            let entry_path = path.join(&entry.name);
+            if self.protected_path(&entry_path)
+                || (self.check_task_path(&entry_path, false).is_err()
+                    && !(entry.directory && self.task_directory_allowed(&entry_path)))
+            {
                 continue;
             }
             let value = Json::object(vec![
@@ -371,6 +391,25 @@ pub(crate) fn local_tools_extended(
     let mut host = local_host(settings, epoch, session, auth, worker, extensions.editor)?;
     host.shared_writer = extensions.shared_writer;
     register_local_tools(Arc::new(host), extend)
+}
+
+pub(crate) fn summary_catalog(settings: &AgentSettings) -> Result<Arc<Snapshot>> {
+    let worker = std::env::current_exe().map_err(|_| "process_executable")?;
+    let host = Host {
+        settings: settings.clone(),
+        epoch: Epoch {
+            id: "summary_catalog".into(),
+            instructions: String::new(),
+            exact_state: Json::object(vec![])?,
+        },
+        processes: ProcessRunner::configured(&settings.directory.join("operations"), &worker)?,
+        auth: settings.directory.join("auth"),
+        session: settings.directory.clone(),
+        editor: None,
+        shared_writer: None,
+        scope: None,
+    };
+    Ok(register_local_tools(Arc::new(host), |_| Ok(()))?.read_only())
 }
 
 pub fn local_task_tools(

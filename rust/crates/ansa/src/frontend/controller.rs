@@ -680,6 +680,10 @@ impl State {
                 diagnostic,
             } => {
                 if let Some(command) = command {
+                    if event.request.is_none() && self.pending.as_ref() == Some(command) {
+                        self.pending = None;
+                        self.exit = 1;
+                    }
                     self.progress.rejected(command);
                     self.copy.rejected(command);
                 }
@@ -1014,7 +1018,7 @@ pub async fn run(
                 }
             },
             event=handle.next_event(),if !events_done && io.writer.capacity()=>{
-                if let Some(event)=event {dirty=true;if jsonl_mode {io.writer.text(jsonl::encode(&event).dump()+"\n");}else{if matches!(event.payload,EventPayload::ResyncRequired {..}){resync=true;}state.apply(&event,io);}}else{events_done=true;}
+                if let Some(event)=event {dirty=true;if jsonl_mode {io.writer.text(jsonl::encode(&event).dump()+"\n");}else{if matches!(event.payload,EventPayload::ResyncRequired {..}){resync=true;}state.apply(&event,io); if event.request.is_none() && prompt_id.is_some() && matches!(&event.payload, EventPayload::RuntimeError { command, .. } if *command == prompt_id) { finished = true; }}}else{events_done=true;}
             },
             result=runtime.join(),if !actor_done=>{result?;actor_done=true;},
             ready=async {input_events.as_ref().expect("enabled").readable().await},if can_read&&input_events.is_some()=>{input_guard=Some(ready.map_err(|_|"cli_input_poll")?);},

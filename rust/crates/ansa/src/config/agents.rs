@@ -61,7 +61,7 @@ pub const BASE: &str = concat!(
     "Keep user-facing answers concise and use the user's language."
 );
 pub fn saved_instructions(directory: &Path, home: &Path) -> Result<Vec<Json>> {
-    load_instructions_at(directory, home, 64 * 1024)?
+    load_instructions_at(directory, home, Json::FRAME_BYTES)?
         .into_iter()
         .map(|file| {
             Json::object(vec![

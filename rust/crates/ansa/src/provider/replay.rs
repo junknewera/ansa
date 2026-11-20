@@ -135,7 +135,6 @@ pub fn continuation(
             || result.operation_id.is_empty()
             || !seen.insert(&result.operation_id)
             || result.effects == Effects::Unknown
-            || result.output.len() > 128 * 1024
         {
             return Err("replay_result_mismatch");
         };

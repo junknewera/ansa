@@ -21,9 +21,9 @@ use std::{
 };
 
 #[derive(Debug)]
-pub struct HttpRequest {
+pub struct HttpRequest<'a> {
     pub method: &'static str,
-    pub url: &'static str,
+    pub url: &'a str,
     pub content_type: &'static str,
     pub body: Secret,
     pub bearer: Option<Secret>,

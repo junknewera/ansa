@@ -90,11 +90,26 @@ pub(super) fn agent_task(text: &str) -> Option<&str> {
         (verb.to_lowercase().as_str(), object.to_lowercase().as_str()),
         ("запусти" | "попроси", "субагента" | "субагентов")
             | ("поручи", "субагенту" | "субагентам")
+            | ("spawn" | "launch", "subagent" | "subagents")
     ) {
         return None;
     }
     let task = task.trim_start_matches(|ch: char| ch.is_whitespace() || ch == ':');
     (!task.trim().is_empty()).then_some(task.trim_end())
+}
+
+pub(super) fn skill_request(text: &str) -> Option<(&str, &str)> {
+    let (name, task) = text
+        .trim()
+        .strip_prefix('$')?
+        .split_once(char::is_whitespace)?;
+    (!name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        && !task.trim().is_empty())
+    .then(|| (name, task.trim()))
 }
 
 #[derive(Clone)]

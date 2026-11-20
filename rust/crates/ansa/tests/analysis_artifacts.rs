@@ -494,14 +494,25 @@ async fn invalid_or_missing_dataset_is_known_and_does_not_start_a_worker() {
         )
         .await;
         let event = finished_tool(&run.handle()).await;
-        assert_eq!(
-            (event.execution, event.effects),
-            (Execution::Failed, Effects::KnownResult)
-        );
+        assert_eq!(event.effects, Effects::KnownResult);
         let result = Json::parse(&event.output).unwrap();
-        assert!(result.has("error"));
         if index == 2 {
-            assert_eq!(result.text_field("error"), Ok("instruction_size_limit"));
+            assert_eq!(event.execution, Execution::Succeeded);
+            assert_eq!(result.text_field("status"), Ok("instructions_required"));
+            assert_eq!(result.field("executed").unwrap().boolean(), Ok(false));
+            let instructions = result.field("instructions").unwrap().elements().unwrap();
+            assert_eq!(
+                instructions
+                    .last()
+                    .unwrap()
+                    .text_field("text")
+                    .unwrap()
+                    .len(),
+                64 * 1024 + 1
+            );
+        } else {
+            assert_eq!(event.execution, Execution::Failed);
+            assert!(result.has("error"));
         }
         f::until(&run.handle(), |p| matches!(p, EventPayload::Done)).await;
         assert!(!root.0.join("session/artifacts").exists());

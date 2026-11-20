@@ -10,7 +10,10 @@ use crate::{
         input::{MouseEvent, MouseKind},
         orchestration::{self, Proposal},
         sessions::{Created, Factory, Kind},
-        theme::{Catalog as ThemeCatalog, Preview as ThemePreview, Store as ThemeStore, Theme},
+        theme::{
+            self, Catalog as ThemeCatalog, PaletteSource, Preview as ThemePreview,
+            Store as ThemeStore, Theme,
+        },
         workspace::{DiffStatus, EditorCommand, FileDocument, FileHost, FileListing},
     },
     orchestration::run::RunId,
@@ -280,6 +283,7 @@ impl Slot {
                 .pending_draft
                 .as_ref()
                 .is_some_and(|(pending, _, _)| *pending == id)
+                && (!submit || code.is_some() || self.follow_accepted_submit.as_ref() != Some(&id))
             {
                 let (_, bytes, cursor) = self
                     .state
@@ -544,6 +548,14 @@ struct CreateIntent {
     foreground: bool,
     plan_only: bool,
 }
+struct PlanningContext {
+    command: CommandId,
+    owner: String,
+    prompt: String,
+    token: u64,
+    read_only: bool,
+    skill: Option<String>,
+}
 enum FileValue {
     Listing(FileListing),
     Document(FileDocument),
@@ -558,6 +570,11 @@ enum Job {
     OrchestrationDone {
         owner: String,
         result: Result<orchestration::Completed>,
+    },
+    ClarificationSaved {
+        owner: String,
+        text: String,
+        result: Result<()>,
     },
     OrchestrationReceipt {
         result: Result<()>,
@@ -579,6 +596,10 @@ enum Job {
         theme: Theme,
         result: Result<()>,
     },
+    PaletteGenerated {
+        token: u64,
+        result: Result<Theme>,
+    },
     ThemeReload {
         revision: u64,
         result: Result<Theme>,
@@ -594,7 +615,7 @@ enum Job {
         owner: String,
         token: u64,
         result: Result<Vec<SessionSummary>>,
-        continuation: Option<(RunId, String)>,
+        plans: orchestration::PlanLinks,
     },
     CachedModels {
         result: Result<Option<Json>>,
@@ -646,6 +667,10 @@ enum Menu {
         selected: usize,
     },
     Themes(ThemePreview),
+    Palette {
+        original: Theme,
+        stage: PaletteStage,
+    },
     DraftingPlan,
     Loading(String),
     Sessions {
@@ -653,6 +678,7 @@ enum Menu {
         selected: usize,
         resume_target: Option<RequestId>,
         continuation: Option<(RunId, String)>,
+        clarification: Option<RunId>,
     },
     Models {
         models: Vec<(String, String, Vec<String>)>,
@@ -668,6 +694,24 @@ enum Menu {
         selected: usize,
         entries: &'static [commands::Command],
     },
+}
+enum PaletteStage {
+    Source,
+    Scheme {
+        source: PaletteSource,
+        selected: usize,
+    },
+    Contrast {
+        source: PaletteSource,
+        scheme: usize,
+    },
+    Generating,
+    Preview(Theme),
+}
+impl PaletteStage {
+    fn editing(&self) -> bool {
+        matches!(self, Self::Source | Self::Contrast { .. })
+    }
 }
 type PreviewRows = std::sync::Arc<Vec<super::super::markdown::Row>>;
 struct PreviewJob {
@@ -796,14 +840,16 @@ struct Workbench {
     jobs: JoinSet<Job>,
     stop: Cancel,
     pending_context: BTreeMap<String, CreateIntent>,
-    planning_context: Option<(CommandId, String, String, u64)>,
+    planning_context: Option<PlanningContext>,
     orchestration_stop: Option<(String, Cancel)>,
+    orchestration_inbox: Option<tokio::sync::mpsc::Sender<orchestration::Clarification>>,
+    clarification_pending: bool,
     orchestration_progress: Option<tokio::sync::watch::Receiver<Option<orchestration::RunView>>>,
     orchestration_views: BTreeMap<String, orchestration::RunView>,
     orchestration_handoffs: BTreeMap<String, String>,
     orchestration_summary: BTreeMap<String, CommandId>,
     orchestration_mode: bool,
-    refinement: Option<String>,
+    refinement: Option<(String, bool, Option<String>)>,
     menu: Option<Menu>,
     completion: Option<Completion>,
     navigation_editor: super::super::input::Editor,
@@ -894,6 +940,8 @@ impl Workbench {
     ) -> Result<Self> {
         let files = FileHost::new(&factory.settings, &factory.auth_path)?;
         let theme_store = ThemeStore::new(&factory.settings.home, &factory.settings.directory);
+        let stop = Cancel::default();
+        let factory = factory.with_stop(stop.clone());
         let (sender, events) = mpsc::channel(64);
         let mut value = Self {
             factory,
@@ -915,10 +963,12 @@ impl Workbench {
             events,
             sender,
             jobs: JoinSet::new(),
-            stop: Cancel::default(),
+            stop,
             pending_context: BTreeMap::new(),
             planning_context: None,
             orchestration_stop: None,
+            orchestration_inbox: None,
+            clarification_pending: false,
             orchestration_progress: None,
             orchestration_views: BTreeMap::new(),
             orchestration_handoffs: BTreeMap::new(),
@@ -1483,9 +1533,13 @@ impl Workbench {
     }
     fn cancel_modal(&mut self) {
         self.planning_context = None;
-        if let Some(Menu::Themes(preview)) = &self.menu {
-            let original = preview.original();
-            self.set_theme(original);
+        match &self.menu {
+            Some(Menu::Themes(preview)) => self.set_theme(preview.original()),
+            Some(Menu::Palette { original, .. }) => {
+                self.set_theme(original.clone());
+                self.navigation_editor.clear();
+            }
+            _ => {}
         }
         self.modal_token = self.modal_token.wrapping_add(1);
         if let Some(stop) = self.modal_stop.take() {
@@ -1541,7 +1595,7 @@ impl Workbench {
         // Enter accepted this preference. Finish its publication even if the
         // user exits; only previews and palette reads are cancellable.
         self.jobs.spawn_blocking(move || {
-            let result = store.save(theme.id());
+            let result = store.save_theme(&theme);
             Job::ThemeSaved {
                 revision,
                 theme,
@@ -1576,6 +1630,65 @@ impl Workbench {
         }
         self.start_theme_save();
     }
+    fn enter_palette(&mut self, original: Theme, stage: PaletteStage, io: &Io) {
+        let stage = match stage {
+            PaletteStage::Source => {
+                let text = self.navigation_editor.text().unwrap_or_default();
+                match PaletteSource::parse(
+                    text,
+                    &self.factory.settings.cwd,
+                    &self.factory.settings.home,
+                ) {
+                    Ok(source) => {
+                        self.navigation_editor.clear();
+                        PaletteStage::Scheme {
+                            source,
+                            selected: 0,
+                        }
+                    }
+                    Err(_) => {
+                        self.report(io, "Enter an image path or a color such as #c67ca9");
+                        PaletteStage::Source
+                    }
+                }
+            }
+            PaletteStage::Scheme { source, selected } => PaletteStage::Contrast {
+                source,
+                scheme: selected,
+            },
+            PaletteStage::Contrast { source, scheme } => {
+                let value = self.navigation_editor.text().unwrap_or_default().trim();
+                let contrast = if value.is_empty() {
+                    Ok(0)
+                } else {
+                    value.parse::<i8>()
+                };
+                if let Ok(contrast) = contrast
+                    && (-100..=100).contains(&contrast)
+                    && self.can_job(io)
+                {
+                    self.navigation_editor.clear();
+                    let token = self.modal_token;
+                    let stop = Cancel::linked(&self.stop);
+                    self.modal_stop = Some(stop.clone());
+                    self.jobs.spawn_blocking(move || Job::PaletteGenerated {
+                        token,
+                        result: theme::generate(source, scheme, contrast, &stop),
+                    });
+                    PaletteStage::Generating
+                } else {
+                    self.report(io, "Enter a contrast from -100 to 100");
+                    PaletteStage::Contrast { source, scheme }
+                }
+            }
+            PaletteStage::Preview(theme) => {
+                self.commit_theme(theme);
+                return;
+            }
+            PaletteStage::Generating => PaletteStage::Generating,
+        };
+        self.menu = Some(Menu::Palette { original, stage });
+    }
     fn prepare_theme(&mut self, now: Instant) {
         self.start_theme_save();
         if !self.theme.is_dynamic()
@@ -1608,9 +1721,7 @@ impl Workbench {
         let owner = self.slots[self.current].id.clone();
         self.menu = Some(Menu::Loading("Project sessions".into()));
         self.jobs.spawn_blocking(move || Job::Sessions {
-            continuation: orchestration::latest_continuation(&factory, &owner)
-                .ok()
-                .flatten(),
+            plans: orchestration::recent_plan_links(&factory, &owner).unwrap_or_default(),
             owner,
             token,
             result: factory.summaries(&Cancel::default()),
@@ -1733,7 +1844,11 @@ impl Workbench {
         self.report(io, mode);
     }
 
-    fn start_orchestration_plan(&mut self, text: &str, io: &Io) -> bool {
+    fn start_orchestration_plan(&mut self, text: &str, skill: Option<String>, io: &Io) -> bool {
+        if !matches!(self.slots[self.current].kind, Kind::Main | Kind::Fork) {
+            self.report(io, "Open the main conversation to delegate work");
+            return false;
+        }
         if self.factory.orchestration_route().is_err() {
             self.report(
                 io,
@@ -1748,14 +1863,22 @@ impl Workbench {
         if !self.can_job(io) {
             return false;
         }
-        let prompt = self.refinement.as_ref().map_or_else(
-            || text.to_owned(),
-            |previous| format!("{previous}\n\nClarification: {text}"),
+        let (prompt, read_only, skill) = self.refinement.as_ref().map_or_else(
+            || {
+                (
+                    text.to_owned(),
+                    self.slots[self.current].state.mode == AgentMode::Plan,
+                    skill,
+                )
+            },
+            |(previous, read_only, skill)| {
+                (
+                    format!("{previous}\n\nClarification: {text}"),
+                    *read_only || self.slots[self.current].state.mode == AgentMode::Plan,
+                    skill.clone(),
+                )
+            },
         );
-        if prompt.len() > 16 * 1024 {
-            self.report(io, "The request and its clarifications are too long");
-            return false;
-        }
         self.cancel_modal();
         let token = self.modal_token;
         let slot = &mut self.slots[self.current];
@@ -1768,7 +1891,14 @@ impl Workbench {
             self.report(io, "Wait for the current requests");
             return false;
         }
-        self.planning_context = Some((id, slot.id.clone(), prompt, token));
+        self.planning_context = Some(PlanningContext {
+            command: id,
+            owner: slot.id.clone(),
+            prompt,
+            token,
+            read_only,
+            skill,
+        });
         slot.state.status.clear();
         self.menu = Some(Menu::DraftingPlan);
         true
@@ -1776,6 +1906,10 @@ impl Workbench {
 
     fn approve_orchestration(&mut self, proposal: Proposal, io: &Io) {
         let slot = &self.slots[self.current];
+        if slot.state.mode == AgentMode::Plan && !proposal.plan.is_read_only() {
+            self.report(io, "Plan mode only allows read-only steps");
+            return;
+        }
         if self.orchestration_stop.is_some()
             || slot.active()
             || slot.id != proposal.seed.source_session().0
@@ -1787,6 +1921,8 @@ impl Workbench {
         let owner = self.slots[self.current].id.clone();
         let stop = Cancel::linked(&self.stop);
         let (progress, receiver) = tokio::sync::watch::channel(None);
+        let (inbox, commands) = tokio::sync::mpsc::channel(8);
+        self.orchestration_inbox = Some(inbox);
         self.orchestration_progress = Some(receiver);
         self.orchestration_views.remove(&owner);
         let slot = &mut self.slots[self.current];
@@ -1797,12 +1933,13 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            result: orchestration::execute(&factory, proposal, &stop, progress),
+            result: orchestration::execute(&factory, proposal, &stop, progress, commands),
         });
     }
 
     fn resume_orchestration(&mut self, identity: RunId, io: &Io) {
         let slot = &self.slots[self.current];
+        let read_only = slot.state.mode == AgentMode::Plan;
         if self.orchestration_stop.is_some()
             || slot.active()
             || slot.id != identity.parent_session
@@ -1814,6 +1951,8 @@ impl Workbench {
         let owner = identity.parent_session.clone();
         let stop = Cancel::linked(&self.stop);
         let (progress, receiver) = tokio::sync::watch::channel(None);
+        let (inbox, commands) = tokio::sync::mpsc::channel(8);
+        self.orchestration_inbox = Some(inbox);
         self.orchestration_progress = Some(receiver);
         self.orchestration_views.remove(&owner);
         self.slots[self.current].state.status.clear();
@@ -1821,7 +1960,7 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            result: orchestration::resume(&factory, identity, &stop, progress),
+            result: orchestration::resume(&factory, identity, read_only, &stop, progress, commands),
         });
     }
 
@@ -1851,21 +1990,68 @@ impl Workbench {
                 .is_some_and(|(owner, _)| owner == &self.slots[self.current].id)
     }
 
+    fn clarify_orchestration(&mut self, text: &str, io: &Io) {
+        if self.clarification_pending || !self.can_job(io) {
+            return;
+        }
+        let (acknowledgement, reply) = tokio::sync::oneshot::channel();
+        let message = orchestration::Clarification {
+            text: text.into(),
+            acknowledgement,
+        };
+        if self
+            .orchestration_inbox
+            .as_ref()
+            .is_none_or(|inbox| inbox.try_send(message).is_err())
+        {
+            self.report(
+                io,
+                "The coordinator is finishing · your draft is still here",
+            );
+            return;
+        }
+        self.clarification_pending = true;
+        let owner = self.slots[self.current].id.clone();
+        let text = text.to_owned();
+        self.jobs.spawn(async move {
+            Job::ClarificationSaved {
+                owner,
+                text,
+                result: reply
+                    .await
+                    .unwrap_or(Err("orchestration_clarification_closed")),
+            }
+        });
+    }
+
     fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
         if !text.trim_start().starts_with('/')
             && !text.trim().is_empty()
-            && (self.collecting_orchestration()
-                || self
-                    .orchestration_summary
-                    .contains_key(&self.slots[self.current].id))
+            && self.collecting_orchestration()
         {
+            self.clarify_orchestration(text, io);
             return (false, false);
         }
+        if !text.trim_start().starts_with('/')
+            && self
+                .orchestration_summary
+                .contains_key(&self.slots[self.current].id)
+        {
+            self.report(
+                io,
+                "The coordinator is writing the summary · your draft is still here",
+            );
+            return (false, false);
+        }
+        let delegation = commands::skill_request(text).map(|(name, _)| name.to_owned());
         if !text.trim().is_empty()
             && !text.trim_start().starts_with('/')
-            && (self.orchestration_mode || commands::agent_task(text).is_some())
+            && (self.orchestration_mode
+                || self.refinement.is_some()
+                || commands::agent_task(text).is_some()
+                || delegation.is_some())
         {
-            return (self.start_orchestration_plan(text, io), false);
+            return (self.start_orchestration_plan(text, delegation, io), false);
         }
         let (command, argument) = text
             .trim()
@@ -2138,7 +2324,7 @@ impl Workbench {
             && self
                 .planning_context
                 .as_ref()
-                .is_some_and(|(_, owner, _, _)| owner == id)
+                .is_some_and(|intent| intent.owner == id)
         {
             self.cancel_modal();
             self.menu = None;
@@ -2148,8 +2334,15 @@ impl Workbench {
             && self
                 .planning_context
                 .as_ref()
-                .is_some_and(|(pending, owner, _, _)| pending == command && owner == id)
-            && let Some((_, owner, prompt, token)) = self.planning_context.take()
+                .is_some_and(|intent| &intent.command == command && intent.owner == id)
+            && let Some(PlanningContext {
+                owner,
+                prompt,
+                token,
+                read_only,
+                skill,
+                ..
+            }) = self.planning_context.take()
         {
             let factory = self.factory.clone();
             let seed = seed.clone();
@@ -2158,7 +2351,14 @@ impl Workbench {
             self.jobs.spawn_blocking(move || Job::OrchestrationPlan {
                 owner,
                 token,
-                result: Proposal::generate(&factory, seed, prompt, &stop),
+                result: Proposal::generate(
+                    &factory,
+                    seed,
+                    prompt,
+                    read_only,
+                    skill.as_deref(),
+                    &stop,
+                ),
             });
         }
         if let EventPayload::ContextSnapshot { command, seed } = &event.payload
@@ -2184,7 +2384,7 @@ impl Workbench {
             if self
                 .planning_context
                 .as_ref()
-                .is_some_and(|(pending, _, _, _)| pending == command)
+                .is_some_and(|intent| &intent.command == command)
             {
                 self.cancel_modal();
                 self.menu = None;
@@ -2247,6 +2447,7 @@ impl Workbench {
             EventPayload::CommandAccepted { command, .. }
                 if slot.follow_accepted_submit.as_ref() == Some(command) =>
             {
+                slot.state.pending_draft = None;
                 slot.follow_accepted_submit = None;
                 slot.show_latest();
             }
@@ -2256,6 +2457,7 @@ impl Workbench {
                     && slot.follow_accepted_submit.is_some()
                     && slot.follow_accepted_submit == snapshot.submit =>
             {
+                slot.state.pending_draft = None;
                 slot.follow_accepted_submit = None;
                 slot.show_latest();
             }
@@ -2264,6 +2466,10 @@ impl Workbench {
                 ..
             } if slot.follow_accepted_submit.as_ref() == Some(command) => {
                 slot.follow_accepted_submit = None;
+                if let Some((_, bytes, cursor)) = slot.state.pending_draft.take() {
+                    slot.state.editor.bytes = bytes;
+                    slot.state.editor.cursor = cursor;
+                }
             }
             EventPayload::ResyncRequired { .. } => {
                 slot.resync = true;
@@ -2327,6 +2533,18 @@ impl Workbench {
                 request: ThemeLoad::Startup,
                 ..
             } => !self.input_closed && !self.terminating && !self.theme_initialized,
+            Job::PaletteGenerated { token, .. } => {
+                !self.input_closed
+                    && !self.terminating
+                    && *token == self.modal_token
+                    && matches!(
+                        &self.menu,
+                        Some(Menu::Palette {
+                            stage: PaletteStage::Generating,
+                            ..
+                        })
+                    )
+            }
             Job::Themes {
                 request: ThemeLoad::Picker { owner, token, .. },
                 ..
@@ -2472,19 +2690,43 @@ impl Workbench {
                     }
                 }
             }
+            Job::ClarificationSaved {
+                owner,
+                text,
+                result,
+            } => {
+                self.clarification_pending = false;
+                if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
+                    match result {
+                        Ok(()) => {
+                            if slot.state.editor.bytes == text.as_bytes() {
+                                slot.state.editor.clear();
+                                slot.state.input_history.reset();
+                            }
+                            slot.show_latest();
+                            slot.state
+                                .report(io, "Clarification saved for the coordinator");
+                        }
+                        Err(code) => slot
+                            .state
+                            .report(io, &format!("Could not save clarification ({code})")),
+                    }
+                }
+            }
             Job::OrchestrationDone { owner, result } => {
                 self.update_orchestration_progress();
                 self.orchestration_progress = None;
                 self.orchestration_stop = None;
-                if result.is_err() {
-                    self.orchestration_views.remove(&owner);
-                    if matches!(self.panel, Some(Panel::Agents { .. })) && self.can_job(io) {
-                        let factory = self.factory.clone();
-                        let stop = Cancel::linked(&self.stop);
-                        self.jobs.spawn_blocking(move || Job::CachedSummaries {
-                            result: factory.summaries(&stop),
-                        });
-                    }
+                self.orchestration_inbox = None;
+                if result.is_err()
+                    && matches!(self.panel, Some(Panel::Agents { .. }))
+                    && self.can_job(io)
+                {
+                    let factory = self.factory.clone();
+                    let stop = Cancel::linked(&self.stop);
+                    self.jobs.spawn_blocking(move || Job::CachedSummaries {
+                        result: factory.summaries(&stop),
+                    });
                 }
                 let foreground = self.slots[self.current].id == owner;
                 let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner) else {
@@ -2499,10 +2741,14 @@ impl Workbench {
                             }
                             parent.remember_candidate(review);
                         }
+                        let Some(evidence) = completed.evidence else {
+                            parent.state.report(io, "The model context is full · reports are in /agents");
+                            return;
+                        };
                         let mut command = parent.state.command(
                             &parent.handle,
                             CommandPayload::Handoff(Submit {
-                                text: completed.evidence,
+                                text: evidence,
                                 mode: AgentMode::Plan,
                             }),
                         );
@@ -2537,6 +2783,8 @@ impl Workbench {
                     Err("orchestration_paused") => parent
                         .state
                         .report(io, "Agent paused · resume with /sessions"),
+                    Err("orchestration_scope_confirmation") => parent.state.report(io,
+                        "Plan stopped at the approved scope · submit the revised request to review a new plan"),
                     Err(code) => parent.state.report(io, &format!("Plan stopped ({code})")),
                 }
             }
@@ -2612,6 +2860,22 @@ impl Workbench {
                 theme,
                 result,
             } => self.saved_theme(revision, theme, result, io),
+            Job::PaletteGenerated { result, .. } => {
+                self.modal_stop = None;
+                if let Some(Menu::Palette { original, .. }) = self.menu.take() {
+                    let stage = match result {
+                        Ok(theme) => {
+                            self.set_theme(theme.clone());
+                            PaletteStage::Preview(theme)
+                        }
+                        Err(code) => {
+                            self.report(io, &format!("Could not generate a palette ({code})"));
+                            PaletteStage::Source
+                        }
+                    };
+                    self.menu = Some(Menu::Palette { original, stage });
+                }
+            }
             Job::GenerationSaved { owner, result } => {
                 if let Err(code) = result
                     && let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner)
@@ -2685,11 +2949,7 @@ impl Workbench {
                 }
                 Err(code) => self.report(io, &format!("Could not open session: {code}")),
             },
-            Job::Sessions {
-                result,
-                continuation,
-                ..
-            } => match result {
+            Job::Sessions { result, plans, .. } => match result {
                 Ok(entries) => {
                     self.summaries = entries.clone();
                     self.menu = Some(Menu::Sessions {
@@ -2699,7 +2959,8 @@ impl Workbench {
                             .collect(),
                         selected: 0,
                         resume_target: self.resume_target(),
-                        continuation,
+                        continuation: plans.continuation,
+                        clarification: plans.clarification,
                     })
                 }
                 Err(code) => self.report(io, &format!("Could not load sessions: {code}")),
@@ -3096,17 +3357,26 @@ impl Workbench {
                 let theme = preview.current();
                 self.set_theme(theme);
             }
+            Some(Menu::Palette {
+                stage: PaletteStage::Scheme { selected, .. },
+                ..
+            }) => {
+                delta(selected, theme::MATUGEN_SCHEMES.len());
+            }
+            Some(Menu::Palette { .. }) => {}
             Some(Menu::Loading(_) | Menu::DraftingPlan) => {}
             Some(Menu::Sessions {
                 entries,
                 selected,
                 resume_target,
                 continuation,
+                clarification,
             }) => delta(
                 selected,
                 entries.len()
                     + usize::from(resume_target.is_some())
-                    + usize::from(continuation.is_some()),
+                    + usize::from(continuation.is_some())
+                    + usize::from(clarification.is_some()),
             ),
             Some(Menu::Models { models, selected }) => delta(selected, models.len()),
             Some(Menu::Efforts {
@@ -3192,13 +3462,22 @@ impl Workbench {
                     match selected {
                         0 => self.approve_orchestration(*proposal, io),
                         1 => {
-                            self.refinement = Some(proposal.prompt);
+                            self.refinement =
+                                Some((proposal.prompt, proposal.read_only, proposal.skill));
                             self.report(io, "Enter a clarification for the plan");
                         }
                         _ => self.report(io, "Plan cancelled"),
                     }
                 }
+                Menu::Themes(preview) if preview.generating() => {
+                    self.navigation_editor.clear();
+                    self.menu = Some(Menu::Palette {
+                        original: preview.original(),
+                        stage: PaletteStage::Source,
+                    });
+                }
                 Menu::Themes(preview) => self.commit_theme(preview.current()),
+                Menu::Palette { original, stage } => self.enter_palette(original, stage, io),
                 Menu::Loading(title) => self.menu = Some(Menu::Loading(title)),
                 Menu::DraftingPlan => self.menu = Some(Menu::DraftingPlan),
                 Menu::Sessions {
@@ -3206,9 +3485,11 @@ impl Workbench {
                     selected,
                     resume_target,
                     continuation,
+                    clarification,
                 } => {
                     let native = usize::from(resume_target.is_some());
                     let orchestration = usize::from(continuation.is_some());
+                    let archived = usize::from(clarification.is_some());
                     if let Some(target) = resume_target.as_ref().filter(|_| selected == 0) {
                         if self.resume_target().as_ref() == Some(target) {
                             let slot = &mut self.slots[self.current];
@@ -3220,7 +3501,13 @@ impl Workbench {
                         }
                     } else if let Some((id, _)) = continuation.filter(|_| selected == native) {
                         self.resume_orchestration(id, io);
-                    } else if let Some(entry) = entries.get(selected - native - orchestration) {
+                    } else if let Some(id) =
+                        clarification.filter(|_| selected == native + orchestration)
+                    {
+                        self.activate_result(format!("plan:{}", id.run), None, None, io);
+                    } else if let Some(entry) =
+                        entries.get(selected - native - orchestration - archived)
+                    {
                         self.resume(entry.entry.id.clone(), io);
                     }
                 }
@@ -3306,7 +3593,7 @@ impl Workbench {
         }
     }
     fn mouse(&mut self, mouse: MouseEvent, io: &Io) {
-        if matches!(&self.menu, Some(Menu::Themes(_)))
+        if matches!(&self.menu, Some(Menu::Themes(_) | Menu::Palette { .. }))
             || matches!(&self.menu, Some(Menu::Loading(title)) if title == "/theme")
         {
             if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
@@ -3537,10 +3824,85 @@ impl Workbench {
                             theme.id().into()
                         },
                     })
+                    .chain(std::iter::once(Choice {
+                        label: "Generate with Matugen".into(),
+                        detail: "Image or HEX color".into(),
+                    }))
                     .collect(),
                 selected: preview.selected(),
-                footer: "Enter save · Esc cancel".into(),
+                footer: if preview.generating() {
+                    "Enter continue"
+                } else {
+                    "Enter save"
+                }
+                .to_owned()
+                    + " · Esc cancel",
             },
+            Menu::Palette { stage, .. } => {
+                let editor = &self.navigation_editor;
+                let input = String::from_utf8_lossy(&editor.bytes);
+                let cursor = editor.cursor.min(input.len());
+                let before = input.floor_char_boundary(cursor);
+                let mut draft = format!("{}▏{}", &input[..before], &input[before..]);
+                if draft.chars().count() > 60 {
+                    draft = format!(
+                        "…{}",
+                        draft
+                            .chars()
+                            .rev()
+                            .take(55)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<String>()
+                    );
+                }
+                let (subtitle, items, selected, footer) = match stage {
+                    PaletteStage::Source => (
+                        "Image path or HEX color",
+                        vec![Choice {
+                            label: draft,
+                            detail: String::new(),
+                        }],
+                        0,
+                        "Enter choose scheme",
+                    ),
+                    PaletteStage::Scheme { selected, .. } => (
+                        "Palette scheme",
+                        theme::MATUGEN_SCHEMES
+                            .iter()
+                            .map(|(name, _)| Choice {
+                                label: (*name).into(),
+                                detail: String::new(),
+                            })
+                            .collect(),
+                        *selected,
+                        "Enter set contrast",
+                    ),
+                    PaletteStage::Contrast { .. } => (
+                        "Contrast from -100 to 100 (default 0)",
+                        vec![Choice {
+                            label: draft,
+                            detail: String::new(),
+                        }],
+                        0,
+                        "Enter preview",
+                    ),
+                    PaletteStage::Generating => ("Generating palette…", Vec::new(), 0, ""),
+                    PaletteStage::Preview(_) => ("Palette preview", Vec::new(), 0, "Enter save"),
+                };
+                Popup {
+                    title: "Matugen".into(),
+                    subtitle: subtitle.into(),
+                    items,
+                    selected,
+                    footer: if footer.is_empty() {
+                        "Esc cancel".into()
+                    } else {
+                        format!("{footer} · Esc cancel")
+                    },
+                }
+            }
             Menu::Loading(title) => Popup {
                 title: title.clone(),
                 subtitle: "Loading…".into(),
@@ -3557,6 +3919,7 @@ impl Workbench {
                 selected,
                 resume_target,
                 continuation,
+                clarification,
             } => Popup {
                 title: "Project sessions".into(),
                 subtitle: "Choose a conversation".into(),
@@ -3569,6 +3932,10 @@ impl Workbench {
                     .chain(continuation.iter().map(|(_, title)| Choice {
                         label: "Resume orchestration".into(),
                         detail: title.clone(),
+                    }))
+                    .chain(clarification.iter().map(|_| Choice {
+                        label: "Open plan and saved clarifications".into(),
+                        detail: String::new(),
                     }))
                     .chain(entries.iter().map(|e| Choice {
                         label: e.title.clone().unwrap_or_else(|| "New conversation".into()),
@@ -3949,8 +4316,7 @@ impl Workbench {
             animate: self.animation_enabled(),
             animation_frame: Self::animation_frame(),
             draft_notice: !slot.state.editor.bytes.is_empty()
-                && (self.collecting_orchestration()
-                    || self.orchestration_summary.contains_key(&slot.id)),
+                && self.orchestration_summary.contains_key(&slot.id),
             interrupt_hint: if !slot.state.editor.bytes.is_empty() {
                 "Ctrl+C clear draft"
             } else if self.collecting_orchestration() || slot.interruptible() {
@@ -4479,7 +4845,7 @@ pub async fn run_attached(
                 if !accepted {
                     work.pending_context.remove(&id);
                     work.orchestration_summary.retain(|_, pending| pending.0 != id);
-                    if work.planning_context.as_ref().is_some_and(|(pending, _, _, _)| pending.0 == id) {
+                    if work.planning_context.as_ref().is_some_and(|intent| intent.command.0 == id) {
                         work.cancel_modal();
                         work.menu = None;
                     }
@@ -4512,6 +4878,14 @@ pub async fn run_attached(
                         }
                         for (position, &byte) in bytes[..count].iter().enumerate() {
                             work.disarm_exit();
+                            if matches!(&work.menu, Some(Menu::Palette { stage, .. }) if stage.editing()) {
+                                match work.navigation_editor.feed(byte, true) {
+                                    Some(Action::Submit | Action::QueueSubmit) => { work.enter(io); }
+                                    Some(Action::Escape) => work.escape(io),
+                                    _ => {}
+                                }
+                                continue;
+                            }
                             // Modal/read-only navigation never edits a draft.
                             if byte.is_ascii() && !work.input_editor().escape_pending() && !work.input_editor().pasting() {
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());

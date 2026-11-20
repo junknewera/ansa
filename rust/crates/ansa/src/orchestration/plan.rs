@@ -8,7 +8,6 @@ use std::{
 
 type Result<T> = std::result::Result<T, &'static str>;
 
-const PLAN_BYTES: usize = 64 * 1024;
 const PLAN_STEPS: usize = 16;
 const ACTIVE_CHILDREN: usize = 2;
 
@@ -92,27 +91,25 @@ pub enum Progress {
 
 impl Plan {
     pub fn parse(input: &str) -> Result<Self> {
-        if input.len() > PLAN_BYTES {
-            return Err("plan_size");
-        }
+        crate::protocol::json::Json::parse(input).map_err(|_| "plan_schema")?;
         let proposal: Proposal = serde_json::from_str(input).map_err(|_| "plan_schema")?;
         if proposal.schema_version != 1
             || proposal.steps.len() > PLAN_STEPS
             || proposal.checks.len() > 16
             || proposal.command_checks.len() > 8
             || proposal.manual_checks.len() > 8
-            || !valid_text(&proposal.summary, 4096)
+            || !valid_text(&proposal.summary)
         {
             return Err("plan_limits");
         }
         if proposal
             .checks
             .iter()
-            .any(|check| !valid_path(&check.path) || !valid_text(&check.contains, 2048))
+            .any(|check| !valid_path(&check.path) || !valid_text(&check.contains))
             || proposal
                 .manual_checks
                 .iter()
-                .any(|check| !valid_text(check, 2048))
+                .any(|check| !valid_text(check))
             || proposal.command_checks.iter().any(|check| {
                 check.argv.is_empty()
                     || check.argv.len() > 64
@@ -132,7 +129,7 @@ impl Plan {
             if !valid_id(&step.id) || !ids.insert(step.id.as_str()) {
                 return Err("plan_step_identity");
             }
-            if !valid_text(&step.task, 4096) || !valid_text(&step.acceptance, 2048) {
+            if !valid_text(&step.task) || !valid_text(&step.acceptance) {
                 return Err("plan_step_description");
             }
             if step.paths.len() > 32 || step.access == Access::Write && step.paths.is_empty() {
@@ -146,7 +143,7 @@ impl Plan {
             {
                 return Err("plan_step_path");
             }
-            if step.assignment().text.len() > 16 * 1024 {
+            if !crate::protocol::json::Json::text_fits_frame(&step.assignment().text) {
                 return Err("plan_step_description");
             }
             if step.access == Access::Write {
@@ -234,7 +231,7 @@ impl Plan {
     }
 
     pub(crate) fn execution_ready(&self) -> Result<()> {
-        if self.steps().iter().all(|step| step.access == Access::Read) {
+        if self.is_read_only() {
             return Ok(());
         }
         if !self.manual_checks().is_empty() {
@@ -244,6 +241,9 @@ impl Plan {
             return Err("orchestration_missing_checks");
         }
         Ok(())
+    }
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.steps().iter().all(|step| step.access == Access::Read)
     }
 
     pub(crate) fn candidate_access(&self, step: &Step) -> bool {
@@ -312,9 +312,8 @@ impl Plan {
     }
 }
 
-fn valid_text(text: &str, limit: usize) -> bool {
+fn valid_text(text: &str) -> bool {
     !text.trim().is_empty()
-        && text.len() <= limit
         && text
             .chars()
             .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))

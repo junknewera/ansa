@@ -8,7 +8,7 @@ use crate::{
 use std::io::Read;
 impl Host {
     pub fn search(&self, args: &Json, stop: &Cancel) -> Result<Outcome> {
-        let root = self.path(args.text_field("path")?)?;
+        let root = self.task_directory_path(args.text_field("path")?)?;
         if let Some(value) = self.instructions(&root, args)? {
             return Ok(value);
         }
@@ -56,6 +56,11 @@ impl Host {
                 continue;
             }
             if entry.directory {
+                if self.check_task_path(&path, false).is_err()
+                    && !self.task_directory_allowed(&path)
+                {
+                    continue;
+                }
                 if path.join("AGENTS.md").exists() {
                     if scopes.len() < 50
                         && !append(
@@ -78,7 +83,11 @@ impl Host {
             if !entry.regular {
                 continue;
             }
-            let file = self.path_os(&path)?;
+            let file = match self.path_os(&path) {
+                Ok(path) => path,
+                Err("task_path_scope") => continue,
+                Err(code) => return Err(code),
+            };
             if mode == "name" {
                 if name.windows(query.len()).any(|v| v == query.as_bytes())
                     && !append(

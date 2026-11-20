@@ -7,6 +7,14 @@ use crate::{
 fn s(v: &str) -> Json {
     Json::string(v).expect("validated UTF-8")
 }
+fn excerpt(value: &str, bytes: usize) -> Json {
+    let end = value.floor_char_boundary(bytes.min(value.len()));
+    if end == value.len() {
+        s(value)
+    } else {
+        s(&format!("{}…", &value[..end]))
+    }
+}
 fn n(v: u64) -> Json {
     Json::parse(&v.to_string()).expect("u64")
 }
@@ -173,7 +181,7 @@ fn preview(v: &Preview) -> Json {
         ("state", s(&v.state)),
     ])
 }
-fn activity(v: &Activity) -> Json {
+fn activity(v: &Activity, maximum: usize) -> Json {
     let mut fields = vec![("operation_id", s(&v.operation().0))];
     match v {
         Activity::Started(v) => fields.push(("call_id", s(&v.call_id))),
@@ -181,7 +189,7 @@ fn activity(v: &Activity) -> Json {
             ("call_id", s(&v.call_id)),
             ("execution", s(execution(v.execution))),
             ("effects", s(effects(v.effects))),
-            ("output", s(&v.output)),
+            ("output", excerpt(&v.output, maximum)),
         ]),
     }
     object(fields)
@@ -266,63 +274,99 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                 ("source_turn", s(&seed.source_turn().0)),
             ],
         ),
-        EventPayload::FrontendSnapshot(v) => (
-            "snapshot",
-            vec![
-                ("through_sequence", n(v.through_sequence)),
-                ("state", s(&v.state)),
-                ("worker_busy", b(v.worker_busy)),
-                ("completed_tools", n(v.completed_tools as u64)),
-                ("text", s(&v.text)),
-                ("diagnostic", s(&v.diagnostic)),
-                (
-                    "recovery_operation",
-                    id(v.recovery_operation.as_ref().map(|v| v.0.as_str())),
-                ),
-                ("submit_id", id(v.submit.as_ref().map(|v| v.0.as_str()))),
-                ("command_id", id(v.command.as_ref().map(|v| v.0.as_str()))),
-                (
-                    "tools",
-                    Json::array(v.tools.iter().map(activity).collect()).expect("activities"),
-                ),
-                ("history_items", n(v.history_items as u64)),
-                ("compactions", n(v.compactions as u64)),
-                ("storage_failed", b(v.storage_failed)),
-                ("durable", b(v.durable)),
-                ("resume_available", b(v.resume_available)),
-                ("mode", s(mode(v.mode))),
-                ("transcript_size", n(v.transcript_size as u64)),
-                ("preview", v.preview.as_ref().map_or_else(null, preview)),
-                ("timeline_size", n(v.timeline_size as u64)),
-                (
-                    "generation",
-                    object(vec![
-                        ("model", s(&v.generation.model)),
-                        (
-                            "effort",
-                            v.generation.effort.as_deref().map_or_else(null, s),
-                        ),
-                    ]),
-                ),
-                (
-                    "followups",
-                    Json::array(
-                        v.followups
-                            .iter()
-                            .map(|f| {
-                                object(vec![
-                                    ("command_id", s(&f.command.0)),
-                                    ("target", s(&f.target.0)),
-                                    ("text", s(&f.text)),
-                                    ("state", s(&f.state)),
-                                ])
-                            })
-                            .collect(),
-                    )
-                    .expect("bounded followups"),
-                ),
-            ],
-        ),
+        EventPayload::FrontendSnapshot(v) => {
+            // Reserve room for the envelope, response preview and JSON escapes.
+            // Ordinary snapshots retain all their content.
+            let group = Json::FRAME_BYTES / 4;
+            let complete_tools = v
+                .tools
+                .iter()
+                .map(|entry| match entry {
+                    Activity::Started(_) => 0,
+                    Activity::Finished(tool) => Json::quoted_size(&tool.output),
+                })
+                .sum::<usize>()
+                <= group;
+            let complete_followups = v
+                .followups
+                .iter()
+                .map(|entry| Json::quoted_size(&entry.text))
+                .sum::<usize>()
+                <= group;
+            let tool_output_limit = if complete_tools {
+                usize::MAX
+            } else {
+                group / 6 / v.tools.len().max(1)
+            };
+            let followup_limit = if complete_followups {
+                usize::MAX
+            } else {
+                group / 6 / v.followups.len().max(1)
+            };
+            (
+                "snapshot",
+                vec![
+                    ("through_sequence", n(v.through_sequence)),
+                    ("state", s(&v.state)),
+                    ("worker_busy", b(v.worker_busy)),
+                    ("completed_tools", n(v.completed_tools as u64)),
+                    ("text", excerpt(&v.text, 128 * 1024)),
+                    ("diagnostic", s(&v.diagnostic)),
+                    (
+                        "recovery_operation",
+                        id(v.recovery_operation.as_ref().map(|v| v.0.as_str())),
+                    ),
+                    ("submit_id", id(v.submit.as_ref().map(|v| v.0.as_str()))),
+                    ("command_id", id(v.command.as_ref().map(|v| v.0.as_str()))),
+                    (
+                        "tools",
+                        Json::array(
+                            v.tools
+                                .iter()
+                                .map(|entry| activity(entry, tool_output_limit))
+                                .collect(),
+                        )
+                        .expect("activities"),
+                    ),
+                    ("history_items", n(v.history_items as u64)),
+                    ("compactions", n(v.compactions as u64)),
+                    ("storage_failed", b(v.storage_failed)),
+                    ("durable", b(v.durable)),
+                    ("resume_available", b(v.resume_available)),
+                    ("mode", s(mode(v.mode))),
+                    ("transcript_size", n(v.transcript_size as u64)),
+                    ("preview", v.preview.as_ref().map_or_else(null, preview)),
+                    ("timeline_size", n(v.timeline_size as u64)),
+                    (
+                        "generation",
+                        object(vec![
+                            ("model", s(&v.generation.model)),
+                            (
+                                "effort",
+                                v.generation.effort.as_deref().map_or_else(null, s),
+                            ),
+                        ]),
+                    ),
+                    (
+                        "followups",
+                        Json::array(
+                            v.followups
+                                .iter()
+                                .map(|f| {
+                                    object(vec![
+                                        ("command_id", s(&f.command.0)),
+                                        ("target", s(&f.target.0)),
+                                        ("text", excerpt(&f.text, followup_limit)),
+                                        ("state", s(&f.state)),
+                                    ])
+                                })
+                                .collect(),
+                        )
+                        .expect("bounded followups"),
+                    ),
+                ],
+            )
+        }
         EventPayload::Preview(v) => (
             "text_preview",
             vec![
@@ -419,7 +463,7 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                 ("call_id", s(&v.call_id)),
                 ("execution", s(execution(v.execution))),
                 ("effects", s(effects(v.effects))),
-                ("output", s(&v.output)),
+                ("output", excerpt(&v.output, 1024 * 1024)),
             ],
         ),
         EventPayload::Cancelled { command } => ("cancelled", vec![("command_id", s(&command.0))]),

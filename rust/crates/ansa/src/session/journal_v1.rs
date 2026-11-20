@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-pub const MAX_RECORD: usize = 32 * 1024 * 1024;
+pub const MAX_RECORD: usize = Json::JOURNAL_RECORD_BYTES;
 const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Point {
@@ -36,6 +36,21 @@ pub struct Journal {
 }
 fn name(index: usize) -> String {
     format!("part-{index:020}.log")
+}
+fn record_body(sequence: u64, previous: &str, event: &Json) -> Result<Json> {
+    Json::object_with_limits(
+        vec![
+            ("schema_version", num(1)?),
+            ("sequence", Json::parse(&sequence.to_string())?),
+            ("previous", Json::string(previous)?),
+            ("event", event.clone()),
+        ],
+        MAX_RECORD,
+    )
+}
+
+pub(crate) fn check_record_frame(event: &Json) -> Result<()> {
+    record_body(u64::MAX, ZERO, event).map(|_| ())
 }
 fn header(index: usize, previous: &str) -> String {
     format!("OMHJ1 {index:020} {previous}\n")
@@ -383,13 +398,7 @@ impl Journal {
             .sequence
             .checked_add(1)
             .ok_or("journal_sequence_limit")?;
-        let body = Json::object(vec![
-            ("schema_version", num(1)?),
-            ("sequence", Json::parse(&sequence.to_string())?),
-            ("previous", Json::string(&self.previous_record)?),
-            ("event", event.clone()),
-        ])?
-        .dump();
+        let body = record_body(sequence, &self.previous_record, event)?.dump();
         need(body.len() <= MAX_RECORD, "journal_record_limit")?;
         let length = body.len() as u32;
         let hash = sha256(body.as_bytes());

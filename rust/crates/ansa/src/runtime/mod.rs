@@ -25,6 +25,7 @@ pub type CheckRequest = Arc<dyn Fn(&Request, u64, &Cancel) -> Result<()> + Send 
 pub type SelectGeneration = Arc<dyn Fn(&GenerationSelection, &Cancel) -> Result<()> + Send + Sync>;
 pub type ToolGuard = Arc<dyn Fn(&Cancel) -> Result<Lease> + Send + Sync>;
 pub type PlanGuard = Arc<dyn Fn() -> Result<Box<dyn Send>> + Send + Sync>;
+pub type ModelWindow = Arc<dyn Fn(&Request) -> Option<usize> + Send + Sync>;
 /// Ownership is retained and dropped on the auth worker, never on the reactor.
 pub struct Lease {
     pub ownership: Box<dyn Send>,
@@ -43,7 +44,6 @@ pub struct Limits {
     pub commands: usize,
     pub events: usize,
     pub submit_ids: usize,
-    pub compact_bytes: usize,
     pub tool_rounds: usize,
     pub tool_calls: usize,
 }
@@ -53,7 +53,6 @@ impl Default for Limits {
             commands: 16,
             events: 64,
             submit_ids: 4096,
-            compact_bytes: 256 * 1024,
             tool_rounds: 1,
             tool_calls: 16,
         }
@@ -69,6 +68,7 @@ pub struct Options {
     pub existing_journal: Option<DirectoryIdentity>,
     pub inspect_only: bool,
     pub compact: Option<Compact>,
+    pub model_window: ModelWindow,
     pub journal: Option<Observer>,
     pub keep_recent_turns: usize,
     pub check_dispatch: CheckDispatch,
@@ -86,6 +86,7 @@ impl Default for Options {
             existing_journal: None,
             inspect_only: false,
             compact: None,
+            model_window: Arc::new(|_| None),
             journal: None,
             keep_recent_turns: 0,
             check_dispatch: Arc::new(|_, _| Ok(())),
@@ -190,8 +191,6 @@ pub(crate) fn valid_configuration(
         || limits.events > 256
         || limits.submit_ids == 0
         || limits.submit_ids > 65536
-        || limits.compact_bytes < 256
-        || limits.compact_bytes > 4 * 1024 * 1024
         || limits.tool_rounds == 0
         || limits.tool_rounds > 64
         || limits.tool_calls == 0

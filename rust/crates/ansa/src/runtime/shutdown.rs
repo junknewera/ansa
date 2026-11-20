@@ -143,7 +143,6 @@ impl Handle {
         if !crate::provider::contracts::valid_id(&command.0)
             || !crate::provider::contracts::valid_id(&turn.0)
             || submit.text.is_empty()
-            || submit.text.len() > 16 * 1024
         {
             return Err("child_lookup_contract");
         }

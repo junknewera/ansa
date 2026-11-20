@@ -783,7 +783,7 @@ fn layout_impl(
             lines.push(line);
         }
     }
-    let cursor = cursor.min(input.len());
+    let (input, cursor) = visible_composer(input, cursor, cols, 1);
     let input_glyphs = compact_input_glyphs(input);
     let split = input_glyphs.partition_point(|glyph| glyph.source_end <= cursor);
     let (before, after) = input_glyphs.split_at(split);
@@ -1153,6 +1153,23 @@ fn heading(left: &str, right: &str, columns: usize, color: bool) -> String {
 fn rule(columns: usize, color: bool) -> String {
     styled(&"─".repeat(columns), RULE, color)
 }
+fn visible_composer(input: &[u8], cursor: usize, columns: usize, rows: usize) -> (&[u8], usize) {
+    let cursor = cursor.min(input.len());
+    let margin = columns
+        .saturating_mul(rows.saturating_add(1))
+        .saturating_mul(24)
+        .max(1024);
+    let mut start = cursor.saturating_sub(margin);
+    let mut end = cursor.saturating_add(margin).min(input.len());
+    while start > 0 && start < cursor && input[start] & 0xc0 == 0x80 {
+        start += 1;
+    }
+    while end > cursor && input.get(end).is_some_and(|byte| byte & 0xc0 == 0x80) {
+        end -= 1;
+    }
+    (&input[start..end], cursor - start)
+}
+
 fn editor_rows(
     input: &[u8],
     cursor: usize,
@@ -1160,7 +1177,7 @@ fn editor_rows(
     maximum: usize,
     color: bool,
 ) -> (Vec<String>, usize, usize) {
-    let cursor = cursor.min(input.len());
+    let (input, cursor) = visible_composer(input, cursor, columns, maximum);
     let mut logical = vec![String::new()];
     let mut row = 0;
     let mut used = 2;

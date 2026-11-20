@@ -70,7 +70,7 @@ impl Host {
         }
         // Resolve for auth/session scope checks, but open the original path
         // without following any component, including its final filename.
-        let parent = self.path_os(path.parent().ok_or("file_path")?)?;
+        let parent = self.resolve_path(path.parent().ok_or("file_path")?, true)?;
         let resolved = parent.join(path.file_name().ok_or("file_path")?);
         self.check_task_path(&resolved, true)?;
         if self.protected_path(&resolved) {
@@ -296,6 +296,15 @@ mod tests {
         let outside = root.0.join("outside");
         std::fs::write(&outside, "before").unwrap();
         assert!(host.path_os(&outside).is_err());
+        host.scope = Some(
+            crate::tools::files::TaskScope::new(&root.cwd(), &["file".into()])
+                .unwrap()
+                .restrict_reads(&["file".into()])
+                .unwrap(),
+        );
+        assert_eq!(host.path_os(&other), Err("task_path_scope"));
+        assert_eq!(host.path_os(&root.path()), Ok(root.path()));
+        assert_eq!(host.task_directory_path("."), Ok(root.cwd()));
         let stop = Cancel::default();
         for denied in [&other, &outside] {
             let result = host.edit(&root.args(&host, denied, "before", "after"), &stop);

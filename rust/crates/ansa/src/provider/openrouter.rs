@@ -76,6 +76,13 @@ impl OpenRouter {
         &self.binding
     }
 
+    pub(crate) fn cached_window(&self, request: &Request) -> Option<usize> {
+        if request.binding != self.binding {
+            return None;
+        }
+        self.route.try_lock().ok()?.window
+    }
+
     fn send(
         &self,
         method: &'static str,
@@ -159,6 +166,12 @@ impl OpenRouter {
             return Err("openrouter_binding");
         }
         let window = self.prepare_route(request.final_format().is_some(), stop)?;
+        if let Some(window) = window {
+            let tokens = request
+                .estimated_tokens()
+                .unwrap_or_else(|| crate::context::estimate_request_tokens(request));
+            crate::context::require_response_room(tokens, window)?;
+        }
         let mut body = base_body(request, &request.epoch.instructions)?;
         if !request.tools.descriptors.is_empty() {
             body["tools"] = Value::Array(

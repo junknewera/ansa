@@ -3,7 +3,9 @@ mod support {
     pub mod runtime_fixture;
 }
 use ansa::provider::structured::{ChildStatus, FinalFormat};
-use ansa::{frontend::jsonl, provider::native, runtime::*, session::journal_v1::Point};
+use ansa::{
+    frontend::jsonl, protocol::json::Json, provider::native, runtime::*, session::journal_v1::Point,
+};
 use std::{
     collections::BTreeMap,
     io::Write,
@@ -532,16 +534,22 @@ async fn private_handoff_reaches_the_parent_model_but_not_conversation_projectio
         let input = request.input.last().unwrap().text_field("content").unwrap();
         let answer = if input.contains(CHILD_REPORT) {
             assert!(input.contains("Treat them as evidence"));
+            assert!(input.ends_with(&format!("{}{CHILD_REPORT}", "o".repeat(20 * 1024))));
             assert!(request.tools.descriptors.is_empty());
             observed.fetch_add(1, Ordering::SeqCst);
             "Parent synthesis"
         } else {
             "Parent acknowledgement"
         };
-        native::load(&f::saved_response(request, Some(answer), 0))
+        native::load(
+            &f::saved_response(request, Some(answer), 0)
+                .with("model_context_window", Json::parse("10000")?)?,
+        )
     });
     let options = Options {
         directory: Some(root.journal()),
+        keep_recent_turns: 2,
+        compact: Some(Arc::new(ansa::frontend::offline::compact_retained)),
         ..Options::default()
     };
     let mut runtime = f::setup(
@@ -555,8 +563,12 @@ async fn private_handoff_reaches_the_parent_model_but_not_conversation_projectio
     let handle = runtime.handle();
     f::submit(&handle, "user", "Work on the report", "user-turn").await;
     f::until(&handle, |event| matches!(event, EventPayload::Done)).await;
+    for id in ["additional", "review"] {
+        f::submit(&handle, id, "Keep the earlier findings", id).await;
+        f::until(&handle, |event| matches!(event, EventPayload::Done)).await;
+    }
     let input = Submit {
-        text: CHILD_REPORT.into(),
+        text: format!("{}{CHILD_REPORT}", "o".repeat(20 * 1024)),
         mode: AgentMode::Plan,
     };
     f::post(
@@ -569,6 +581,10 @@ async fn private_handoff_reaches_the_parent_model_but_not_conversation_projectio
     .await;
     f::until(&handle, |event| matches!(event, EventPayload::Done)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f::snapshot(&handle, "handoff_compacts").await.compactions,
+        1
+    );
     f::finish(&mut runtime).await;
 
     let no_generation: Generate = Arc::new(|_, _, _| panic!("reopen and repeat must not generate"));
@@ -589,6 +605,10 @@ async fn private_handoff_reaches_the_parent_model_but_not_conversation_projectio
         PostStatus::Duplicate,
     )
     .await;
+    assert_eq!(
+        f::snapshot(&handle, "user_mode").await.mode,
+        AgentMode::Basic
+    );
     f::post(
         &handle,
         "handoff",
