@@ -545,6 +545,14 @@ struct CreateIntent {
     foreground: bool,
     plan_only: bool,
 }
+struct PlanningContext {
+    command: CommandId,
+    owner: String,
+    prompt: String,
+    token: u64,
+    read_only: bool,
+    skill: Option<String>,
+}
 enum FileValue {
     Listing(FileListing),
     Document(FileDocument),
@@ -559,6 +567,11 @@ enum Job {
     OrchestrationDone {
         owner: String,
         result: Result<orchestration::Completed>,
+    },
+    ClarificationSaved {
+        owner: String,
+        text: String,
+        result: Result<()>,
     },
     OrchestrationReceipt {
         result: Result<()>,
@@ -797,14 +810,16 @@ struct Workbench {
     jobs: JoinSet<Job>,
     stop: Cancel,
     pending_context: BTreeMap<String, CreateIntent>,
-    planning_context: Option<(CommandId, String, String, u64)>,
+    planning_context: Option<PlanningContext>,
     orchestration_stop: Option<(String, Cancel)>,
+    orchestration_inbox: Option<tokio::sync::mpsc::Sender<orchestration::Clarification>>,
+    clarification_pending: bool,
     orchestration_progress: Option<tokio::sync::watch::Receiver<Option<orchestration::RunView>>>,
     orchestration_views: BTreeMap<String, orchestration::RunView>,
     orchestration_handoffs: BTreeMap<String, String>,
     orchestration_summary: BTreeMap<String, CommandId>,
     orchestration_mode: bool,
-    refinement: Option<String>,
+    refinement: Option<(String, bool, Option<String>)>,
     menu: Option<Menu>,
     completion: Option<Completion>,
     navigation_editor: super::super::input::Editor,
@@ -920,6 +935,8 @@ impl Workbench {
             pending_context: BTreeMap::new(),
             planning_context: None,
             orchestration_stop: None,
+            orchestration_inbox: None,
+            clarification_pending: false,
             orchestration_progress: None,
             orchestration_views: BTreeMap::new(),
             orchestration_handoffs: BTreeMap::new(),
@@ -1734,7 +1751,11 @@ impl Workbench {
         self.report(io, mode);
     }
 
-    fn start_orchestration_plan(&mut self, text: &str, io: &Io) -> bool {
+    fn start_orchestration_plan(&mut self, text: &str, skill: Option<String>, io: &Io) -> bool {
+        if !matches!(self.slots[self.current].kind, Kind::Main | Kind::Fork) {
+            self.report(io, "Open the main conversation to delegate work");
+            return false;
+        }
         if self.factory.orchestration_route().is_err() {
             self.report(
                 io,
@@ -1749,9 +1770,11 @@ impl Workbench {
         if !self.can_job(io) {
             return false;
         }
-        let prompt = self.refinement.as_ref().map_or_else(
-            || text.to_owned(),
-            |previous| format!("{previous}\n\nClarification: {text}"),
+        let (prompt, read_only, skill) = self.refinement.as_ref().map_or_else(
+            || (text.to_owned(), self.slots[self.current].state.mode == AgentMode::Plan, skill),
+            |(previous, read_only, skill)| (
+                format!("{previous}\n\nClarification: {text}"), *read_only, skill.clone()
+            ),
         );
         self.cancel_modal();
         let token = self.modal_token;
@@ -1765,7 +1788,10 @@ impl Workbench {
             self.report(io, "Wait for the current requests");
             return false;
         }
-        self.planning_context = Some((id, slot.id.clone(), prompt, token));
+        self.planning_context = Some(PlanningContext {
+            command: id, owner: slot.id.clone(), prompt, token,
+            read_only, skill,
+        });
         slot.state.status.clear();
         self.menu = Some(Menu::DraftingPlan);
         true
@@ -1784,6 +1810,8 @@ impl Workbench {
         let owner = self.slots[self.current].id.clone();
         let stop = Cancel::linked(&self.stop);
         let (progress, receiver) = tokio::sync::watch::channel(None);
+        let (inbox, commands) = tokio::sync::mpsc::channel(8);
+        self.orchestration_inbox = Some(inbox);
         self.orchestration_progress = Some(receiver);
         self.orchestration_views.remove(&owner);
         let slot = &mut self.slots[self.current];
@@ -1794,7 +1822,7 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            result: orchestration::execute(&factory, proposal, &stop, progress),
+            result: orchestration::execute(&factory, proposal, &stop, progress, commands),
         });
     }
 
@@ -1811,6 +1839,8 @@ impl Workbench {
         let owner = identity.parent_session.clone();
         let stop = Cancel::linked(&self.stop);
         let (progress, receiver) = tokio::sync::watch::channel(None);
+        let (inbox, commands) = tokio::sync::mpsc::channel(8);
+        self.orchestration_inbox = Some(inbox);
         self.orchestration_progress = Some(receiver);
         self.orchestration_views.remove(&owner);
         self.slots[self.current].state.status.clear();
@@ -1818,7 +1848,7 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            result: orchestration::resume(&factory, identity, &stop, progress),
+            result: orchestration::resume(&factory, identity, &stop, progress, commands),
         });
     }
 
@@ -1848,21 +1878,48 @@ impl Workbench {
                 .is_some_and(|(owner, _)| owner == &self.slots[self.current].id)
     }
 
+    fn clarify_orchestration(&mut self, text: &str, io: &Io) {
+        if self.clarification_pending || !self.can_job(io) {
+            return;
+        }
+        let (acknowledgement, reply) = tokio::sync::oneshot::channel();
+        let message = orchestration::Clarification { text: text.into(), acknowledgement };
+        if self.orchestration_inbox.as_ref().is_none_or(|inbox| inbox.try_send(message).is_err()) {
+            self.report(io, "The coordinator is finishing · your draft is still here");
+            return;
+        }
+        self.clarification_pending = true;
+        let owner = self.slots[self.current].id.clone();
+        let text = text.to_owned();
+        self.jobs.spawn(async move {
+            Job::ClarificationSaved {
+                owner, text,
+                result: reply.await.unwrap_or(Err("orchestration_clarification_closed")),
+            }
+        });
+    }
+
     fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
         if !text.trim_start().starts_with('/')
             && !text.trim().is_empty()
-            && (self.collecting_orchestration()
-                || self
-                    .orchestration_summary
-                    .contains_key(&self.slots[self.current].id))
+            && self.collecting_orchestration()
         {
+            self.clarify_orchestration(text, io);
             return (false, false);
         }
+        if !text.trim_start().starts_with('/')
+            && self.orchestration_summary.contains_key(&self.slots[self.current].id)
+        {
+            self.report(io, "The coordinator is writing the summary · your draft is still here");
+            return (false, false);
+        }
+        let delegation = commands::skill_request(text).map(|(name, _)| name.to_owned());
         if !text.trim().is_empty()
             && !text.trim_start().starts_with('/')
-            && (self.orchestration_mode || commands::agent_task(text).is_some())
+            && (self.orchestration_mode || self.refinement.is_some()
+                || commands::agent_task(text).is_some() || delegation.is_some())
         {
-            return (self.start_orchestration_plan(text, io), false);
+            return (self.start_orchestration_plan(text, delegation, io), false);
         }
         let (command, argument) = text
             .trim()
@@ -2135,7 +2192,7 @@ impl Workbench {
             && self
                 .planning_context
                 .as_ref()
-                .is_some_and(|(_, owner, _, _)| owner == id)
+                .is_some_and(|intent| intent.owner == id)
         {
             self.cancel_modal();
             self.menu = None;
@@ -2145,8 +2202,8 @@ impl Workbench {
             && self
                 .planning_context
                 .as_ref()
-                .is_some_and(|(pending, owner, _, _)| pending == command && owner == id)
-            && let Some((_, owner, prompt, token)) = self.planning_context.take()
+                .is_some_and(|intent| &intent.command == command && intent.owner == id)
+            && let Some(PlanningContext { owner, prompt, token, read_only, skill, .. }) = self.planning_context.take()
         {
             let factory = self.factory.clone();
             let seed = seed.clone();
@@ -2155,7 +2212,7 @@ impl Workbench {
             self.jobs.spawn_blocking(move || Job::OrchestrationPlan {
                 owner,
                 token,
-                result: Proposal::generate(&factory, seed, prompt, &stop),
+                result: Proposal::generate(&factory, seed, prompt, read_only, skill.as_deref(), &stop),
             });
         }
         if let EventPayload::ContextSnapshot { command, seed } = &event.payload
@@ -2181,7 +2238,7 @@ impl Workbench {
             if self
                 .planning_context
                 .as_ref()
-                .is_some_and(|(pending, _, _, _)| pending == command)
+                .is_some_and(|intent| &intent.command == command)
             {
                 self.cancel_modal();
                 self.menu = None;
@@ -2475,12 +2532,28 @@ impl Workbench {
                     }
                 }
             }
+            Job::ClarificationSaved { owner, text, result } => {
+                self.clarification_pending = false;
+                if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
+                    match result {
+                        Ok(()) => {
+                            if slot.state.editor.bytes == text.as_bytes() {
+                                slot.state.editor.clear();
+                                slot.state.input_history.reset();
+                            }
+                            slot.show_latest();
+                            slot.state.report(io, "Clarification saved for the coordinator");
+                        }
+                        Err(code) => slot.state.report(io, &format!("Could not save clarification ({code})")),
+                    }
+                }
+            }
             Job::OrchestrationDone { owner, result } => {
                 self.update_orchestration_progress();
                 self.orchestration_progress = None;
                 self.orchestration_stop = None;
+                self.orchestration_inbox = None;
                 if result.is_err() {
-                    self.orchestration_views.remove(&owner);
                     if matches!(self.panel, Some(Panel::Agents { .. })) && self.can_job(io) {
                         let factory = self.factory.clone();
                         let stop = Cancel::linked(&self.stop);
@@ -2540,6 +2613,8 @@ impl Workbench {
                     Err("orchestration_paused") => parent
                         .state
                         .report(io, "Agent paused · resume with /sessions"),
+                    Err("orchestration_scope_confirmation") => parent.state.report(io,
+                        "Plan stopped at the approved scope · submit the revised request to review a new plan"),
                     Err(code) => parent.state.report(io, &format!("Plan stopped ({code})")),
                 }
             }
@@ -3195,7 +3270,7 @@ impl Workbench {
                     match selected {
                         0 => self.approve_orchestration(*proposal, io),
                         1 => {
-                            self.refinement = Some(proposal.prompt);
+                            self.refinement = Some((proposal.prompt, proposal.read_only, proposal.skill));
                             self.report(io, "Enter a clarification for the plan");
                         }
                         _ => self.report(io, "Plan cancelled"),
@@ -4482,7 +4557,7 @@ pub async fn run_attached(
                 if !accepted {
                     work.pending_context.remove(&id);
                     work.orchestration_summary.retain(|_, pending| pending.0 != id);
-                    if work.planning_context.as_ref().is_some_and(|(pending, _, _, _)| pending.0 == id) {
+                    if work.planning_context.as_ref().is_some_and(|intent| intent.command.0 == id) {
                         work.cancel_modal();
                         work.menu = None;
                     }

@@ -25,13 +25,15 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub(super) struct Proposal {
     pub prompt: String,
     pub seed: ForkSeed,
     pub plan: Plan,
     pub digest: String,
+    pub read_only: bool,
+    pub skill: Option<String>,
 }
 
 impl Proposal {
@@ -39,9 +41,12 @@ impl Proposal {
         factory: &Factory,
         seed: ForkSeed,
         prompt: String,
+        read_only: bool,
+        skill: Option<&str>,
         stop: &Cancel,
     ) -> Result<Self> {
-        let mut plan = factory.plan_orchestration(seed.clone(), &prompt, stop)?;
+        let instructions = skill.map(|name| factory.delegation_skill(name).ok_or("orchestration_skill_grant")).transpose()?;
+        let mut plan = factory.plan_orchestration(seed.clone(), &prompt, read_only, instructions.as_deref(), stop)?;
         if let Some(folder) = plan.read_folder() {
             if !named_folder(&prompt, folder) {
                 return Err("orchestration_read_folder_not_named");
@@ -55,6 +60,8 @@ impl Proposal {
             seed,
             plan,
             digest,
+            read_only,
+            skill: skill.map(str::to_owned),
         })
     }
 }
@@ -168,11 +175,25 @@ pub(super) struct Candidate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RunView {
+    pub id: String,
     pub plan: Plan,
     pub title: String,
     pub done: usize,
     pub reviewing: bool,
+    pub clarification_pending: bool,
     pub agents: Vec<(String, super::carbon::AgentLine)>,
+}
+
+pub(super) struct Clarification {
+    pub text: String,
+    pub acknowledgement: oneshot::Sender<Result<()>>,
+}
+type Clarifications = mpsc::Receiver<Clarification>;
+
+fn accept_clarifications(run: &mut Run, inbox: &mut Clarifications) {
+    while let Ok(message) = inbox.try_recv() {
+        let _ = message.acknowledgement.send(run.clarify(message.text));
+    }
 }
 
 fn publish_progress(
@@ -212,6 +233,7 @@ fn publish_progress(
         })
         .collect();
     let view = RunView {
+        id: run.identity().run.clone(),
         plan: run.plan().clone(),
         title: prompt
             .split_whitespace()
@@ -223,6 +245,7 @@ fn publish_progress(
             .collect(),
         done,
         reviewing,
+        clarification_pending: !run.pending_clarifications().is_empty(),
         agents,
     };
     progress.send_if_modified(|previous| {
@@ -239,6 +262,7 @@ pub(super) fn execute(
     proposal: Proposal,
     stop: &Cancel,
     progress: watch::Sender<Option<RunView>>,
+    inbox: Clarifications,
 ) -> Result<Completed> {
     factory.check_orchestration_context(&proposal.seed.request()?)?;
     proposal.plan.execution_ready()?;
@@ -247,7 +271,7 @@ pub(super) fn execute(
         .enable_time()
         .build()
         .map_err(|_| "orchestration_reactor")?;
-    reactor.block_on(execute_owned(factory, proposal, stop, progress))
+    reactor.block_on(execute_owned(factory, proposal, stop, progress, inbox))
 }
 
 async fn execute_owned(
@@ -255,6 +279,7 @@ async fn execute_owned(
     proposal: Proposal,
     stop: &Cancel,
     progress: watch::Sender<Option<RunView>>,
+    inbox: Clarifications,
 ) -> Result<Completed> {
     let started = now()?;
     let deadline = started + 15 * 60;
@@ -284,7 +309,7 @@ async fn execute_owned(
             return Err(code);
         }
     };
-    schedule(factory, run, candidate, Vec::new(), stop, progress).await
+    schedule(factory, run, candidate, Vec::new(), stop, progress, inbox).await
 }
 
 fn writer_workspace(
@@ -339,6 +364,7 @@ async fn schedule(
     mut active: Vec<Child>,
     stop: &Cancel,
     progress: watch::Sender<Option<RunView>>,
+    mut inbox: Clarifications,
 ) -> Result<Completed> {
     let identity = run.identity().clone();
     let deadline = run.deadline();
@@ -357,6 +383,7 @@ async fn schedule(
                 return Err("orchestration_deadline");
             }
             let mut paused = 0;
+            let previously_active = active.len();
             for index in (0..active.len()).rev() {
                 let receipt = active[index].receipt().await?;
                 let id = &active[index].task.id;
@@ -388,6 +415,7 @@ async fn schedule(
                     paused += 1;
                 }
             }
+            accept_clarifications(&mut run, &mut inbox);
             publish_progress(&progress, &run, &prompt, &details, false);
             if paused > 0 {
                 if paused == active.len() {
@@ -396,13 +424,46 @@ async fn schedule(
                 tokio::time::sleep(Duration::from_millis(40)).await;
                 continue;
             }
+            if run.decisions().last().is_some_and(|note| note.status != ChildStatus::Completed) {
+                return Err("orchestration_scope_confirmation");
+            }
+            if !run.pending_clarifications().is_empty() {
+                if !active.is_empty() && previously_active == active.len() {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    continue;
+                }
+                if !active.is_empty() || !run.ready()?.is_empty() {
+                    let input = Json::parse(&serde_json::json!({
+                        "request": prompt,
+                        "approved_plan": run.plan().encode()?,
+                        "completed": run.plan().steps().iter()
+                            .filter_map(|step| run.result(&step.id).map(|result| (&step.id, result)))
+                            .collect::<BTreeMap<_, _>>(),
+                        "prior_decisions": run.decisions(),
+                        "clarifications": run.pending_clarifications(),
+                    }).to_string())?;
+                    let decision = factory.coordinate_clarification(&source, &input, stop)?;
+                    let approved = decision.status == ChildStatus::Completed;
+                    run.record_decision(decision)?;
+                    if !approved {
+                        return Err("orchestration_scope_confirmation");
+                    }
+                    publish_progress(&progress, &run, &prompt, &details, false);
+                }
+            }
             let slots = factory.orchestration_slots().saturating_sub(active.len());
             let ready: Vec<_> = run.ready()?.into_iter().take(slots).cloned().collect();
             if ready.is_empty() && active.is_empty() {
+                inbox.close();
+                accept_clarifications(&mut run, &mut inbox);
                 break;
             }
             for task in ready {
                 stop.check()?;
+                accept_clarifications(&mut run, &mut inbox);
+                if !run.pending_clarifications().is_empty() {
+                    break;
+                }
                 let workspace = if run.plan().candidate_access(&task) {
                     let worktree = &candidate.as_ref().ok_or("worktree_missing")?.0;
                     worktree.path()
@@ -812,18 +873,14 @@ async fn start_child(
     source: &Request,
     stop: &Cancel,
 ) -> Result<Child> {
-    let writes = if task.access == Access::Write {
-        task.paths.as_slice()
-    } else {
-        &[]
-    };
     let dependencies = dependency_evidence(run, &task)?;
     let created = factory.orchestration_child(
         &run.identity().parent_session,
         workspace,
-        writes,
+        &task,
         source,
         dependencies.as_ref(),
+        run.decisions(),
         stop,
     )?;
     created.runtime.ready().await?;
@@ -861,6 +918,10 @@ fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> String {
         "user_request": prompt,
         "results": results,
     });
+    if !run.clarifications().is_empty() {
+        evidence["user_clarifications"] = serde_json::json!(run.clarifications());
+        evidence["coordinator_decisions"] = serde_json::json!(run.decisions());
+    }
     if let Some(candidate) = candidate {
         evidence["verified_candidate"] = serde_json::json!({
             "commit": candidate.commit,
@@ -1001,10 +1062,14 @@ pub(super) fn archived_plan(
             continue;
         }
         let run = Run::open(&storage.join("ledger"), &identity)?;
-        let prompt = run
+        let mut prompt = run
             .context()
             .map(|context| context.prompt.clone())
             .ok_or("orchestration_context")?;
+        if !run.clarifications().is_empty() {
+            prompt.push_str("\n\nClarifications\n");
+            prompt.push_str(&run.clarifications().join("\n\n"));
+        }
         let candidate = if storage.join("release.json").exists() {
             archived_candidate(factory, &run, &storage, stop).map(Some)
         } else {
@@ -1085,6 +1150,7 @@ pub(super) fn resume(
     identity: RunId,
     stop: &Cancel,
     progress: watch::Sender<Option<RunView>>,
+    inbox: Clarifications,
 ) -> Result<Completed> {
     factory.orchestration_route()?;
     stop.check()?;
@@ -1092,7 +1158,7 @@ pub(super) fn resume(
         .enable_time()
         .build()
         .map_err(|_| "orchestration_reactor")?;
-    reactor.block_on(resume_owned(factory, identity, stop, progress))
+    reactor.block_on(resume_owned(factory, identity, stop, progress, inbox))
 }
 
 async fn resume_owned(
@@ -1100,6 +1166,7 @@ async fn resume_owned(
     identity: RunId,
     stop: &Cancel,
     progress: watch::Sender<Option<RunView>>,
+    inbox: Clarifications,
 ) -> Result<Completed> {
     let storage = run_root(factory, &identity.parent_session).join(&identity.run);
     let mut run = Run::open(&storage.join("ledger"), &identity)?;
@@ -1111,7 +1178,7 @@ async fn resume_owned(
     factory.require_orchestration_route(stop)?;
     let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
     let active = restore_active(factory, &mut run, stop).await?;
-    schedule(factory, run, candidate, active, stop, progress).await
+    schedule(factory, run, candidate, active, stop, progress, inbox).await
 }
 
 async fn restore_active(factory: &Factory, run: &mut Run, stop: &Cancel) -> Result<Vec<Child>> {

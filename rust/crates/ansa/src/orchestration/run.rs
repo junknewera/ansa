@@ -135,6 +135,8 @@ enum Event {
         request: String,
         outcome: Outcome,
     },
+    Clarification { text: String },
+    CoordinatorDecision { through: usize, result: ChildResult },
     Cancelled,
     Continued,
 }
@@ -150,6 +152,9 @@ struct State {
     cancelled: bool,
     expired: bool,
     unresolved: bool,
+    clarifications: Vec<String>,
+    decisions: Vec<ChildResult>,
+    clarified: usize,
     children: BTreeMap<String, Child>,
 }
 
@@ -180,11 +185,17 @@ impl State {
             cancelled: false,
             expired: false,
             unresolved: false,
+            clarifications: Vec::new(),
+            decisions: Vec::new(),
+            clarified: 0,
             children: BTreeMap::new(),
         })
     }
 
     fn can_dispatch(&self) -> Result<()> {
+        if self.decisions.last().is_some_and(|decision| decision.status != ChildStatus::Completed) {
+            return Err("run_scope_confirmation");
+        }
         if !self.approved || self.cancelled || self.expired || self.unresolved {
             return Err("run_dispatch_unavailable");
         }
@@ -218,6 +229,9 @@ impl State {
             }
             Event::Bound { step, binding } => {
                 self.can_dispatch()?;
+                if self.clarified != self.clarifications.len() {
+                    return Err("run_clarification_pending");
+                }
                 let ready = self.plan.ready(&self.progress())?;
                 let task = ready
                     .into_iter()
@@ -301,6 +315,22 @@ impl State {
             }
             Event::Expired { at } if !self.expired && *at >= self.budget.deadline => {
                 self.expired = true
+            }
+            Event::Clarification { text } => {
+                self.can_dispatch()?;
+                if text.trim().is_empty() || self.clarifications.len() >= 64 {
+                    return Err("run_clarification");
+                }
+                self.clarifications.push(text.clone());
+            }
+            Event::CoordinatorDecision { through, result } => {
+                self.can_dispatch()?;
+                if *through <= self.clarified || *through > self.clarifications.len() {
+                    return Err("run_clarification");
+                }
+                result.validate()?;
+                self.clarified = *through;
+                self.decisions.push(result.clone());
             }
             Event::Cancelled if !self.cancelled => self.cancelled = true,
             Event::Continued => self.can_dispatch()?,
@@ -387,6 +417,21 @@ impl Run {
 
     pub(crate) fn deadline(&self) -> u64 {
         self.state.budget.deadline
+    }
+    pub(crate) fn clarify(&mut self, text: String) -> Result<()> {
+        self.commit(Event::Clarification { text })
+    }
+    pub(crate) fn pending_clarifications(&self) -> &[String] {
+        &self.state.clarifications[self.state.clarified..]
+    }
+    pub(crate) fn clarifications(&self) -> &[String] {
+        &self.state.clarifications
+    }
+    pub(crate) fn record_decision(&mut self, result: ChildResult) -> Result<()> {
+        self.commit(Event::CoordinatorDecision { through: self.state.clarifications.len(), result })
+    }
+    pub(crate) fn decisions(&self) -> &[ChildResult] {
+        &self.state.decisions
     }
 
     pub(crate) fn may_continue(&self, now: u64) -> bool {

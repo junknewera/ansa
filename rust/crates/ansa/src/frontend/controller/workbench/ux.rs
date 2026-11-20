@@ -86,6 +86,8 @@ impl Workbench {
                     |view| {
                         if view.reviewing {
                             "Verifying agent changes".into()
+                        } else if view.clarification_pending {
+                            "Coordinator receives the clarification after the current step".into()
                         } else {
                             format!(
                                 "{} · {}/{} agents done",
@@ -110,6 +112,17 @@ impl Workbench {
                 text: "Coordinator is writing the summary".into(),
                 role: "activity".into(),
                 action: None,
+                status: None,
+                edit: None,
+                output: None,
+            });
+        } else if let Some(view) = self.orchestration_views.get(&slot.id)
+            && view.clarification_pending
+        {
+            entries.push(Entry {
+                text: "Plan and saved clarification".into(),
+                role: "activity".into(),
+                action: Some(format!("plan:{}", view.id)),
                 status: None,
                 edit: None,
                 output: None,
@@ -169,7 +182,11 @@ impl Workbench {
             };
             lines.push(format!("{}. {} · {access}", index + 1, step.id));
             lines.extend(step.task.lines().map(str::to_owned));
-            lines.extend(step.paths.iter().cloned());
+            if step.paths.is_empty() {
+                lines.push("Read scope · entire workspace".into());
+            } else {
+                lines.extend(step.paths.iter().cloned());
+            }
             if !step.depends_on.is_empty() {
                 lines.push(format!("After steps {}", step.depends_on.join(", ")));
             }
