@@ -240,6 +240,7 @@ pub struct State {
     context_usage: Option<ContextUsage>,
     pub submits: BTreeMap<String, Receipt>,
     pub turn: Option<SavedTurn>,
+    pub(crate) user_mode: AgentMode,
     pub next_request: usize,
     pub compactions: usize,
     pub initialized: bool,
@@ -267,6 +268,7 @@ impl State {
             context_usage: None,
             submits: BTreeMap::new(),
             turn: None,
+            user_mode: AgentMode::Basic,
             next_request: 0,
             compactions: 0,
             initialized: false,
@@ -580,6 +582,7 @@ impl State {
             context_usage: self.context_usage.clone(),
             submits: BTreeMap::new(),
             turn: self.turn.clone(),
+            user_mode: self.user_mode,
             next_request: self.next_request,
             compactions: self.compactions,
             initialized: self.initialized,
@@ -918,6 +921,8 @@ impl State {
                     event.field("handoff")?.boolean()? && mode == AgentMode::Plan,
                     "session_handoff",
                 )?;
+            } else {
+                self.user_mode = mode;
             }
             let next = Request::load(event.field("next")?)?;
             need(

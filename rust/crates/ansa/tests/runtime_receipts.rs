@@ -605,6 +605,10 @@ async fn private_handoff_reaches_the_parent_model_but_not_conversation_projectio
         PostStatus::Duplicate,
     )
     .await;
+    assert_eq!(
+        f::snapshot(&handle, "user_mode").await.mode,
+        AgentMode::Basic
+    );
     f::post(
         &handle,
         "handoff",

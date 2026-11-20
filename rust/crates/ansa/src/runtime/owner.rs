@@ -293,7 +293,9 @@ impl Owner {
                 && self.recovery.is_none()
                 && !self.storage_failed
                 && self.state.turn.is_some(),
-            mode: current.map_or(AgentMode::Basic, |r| r.mode),
+            mode: current
+                .filter(|receipt| !receipt.internal)
+                .map_or(self.state.user_mode, |receipt| receipt.mode),
             transcript_size: self.state.transcript().len(),
             preview: self.preview.clone(),
         })));
