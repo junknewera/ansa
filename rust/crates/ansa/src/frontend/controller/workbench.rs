@@ -10,7 +10,10 @@ use crate::{
         input::{MouseEvent, MouseKind},
         orchestration::{self, Proposal},
         sessions::{Created, Factory, Kind},
-        theme::{Catalog as ThemeCatalog, Preview as ThemePreview, Store as ThemeStore, Theme},
+        theme::{
+            self, Catalog as ThemeCatalog, PaletteSource, Preview as ThemePreview,
+            Store as ThemeStore, Theme,
+        },
         workspace::{DiffStatus, EditorCommand, FileDocument, FileHost, FileListing},
     },
     orchestration::run::RunId,
@@ -593,6 +596,10 @@ enum Job {
         theme: Theme,
         result: Result<()>,
     },
+    PaletteGenerated {
+        token: u64,
+        result: Result<Theme>,
+    },
     ThemeReload {
         revision: u64,
         result: Result<Theme>,
@@ -660,6 +667,10 @@ enum Menu {
         selected: usize,
     },
     Themes(ThemePreview),
+    Palette {
+        original: Theme,
+        stage: PaletteStage,
+    },
     DraftingPlan,
     Loading(String),
     Sessions {
@@ -682,6 +693,24 @@ enum Menu {
         selected: usize,
         entries: &'static [commands::Command],
     },
+}
+enum PaletteStage {
+    Source,
+    Scheme {
+        source: PaletteSource,
+        selected: usize,
+    },
+    Contrast {
+        source: PaletteSource,
+        scheme: usize,
+    },
+    Generating,
+    Preview(Theme),
+}
+impl PaletteStage {
+    fn editing(&self) -> bool {
+        matches!(self, Self::Source | Self::Contrast { .. })
+    }
 }
 type PreviewRows = std::sync::Arc<Vec<super::super::markdown::Row>>;
 struct PreviewJob {
@@ -1501,9 +1530,13 @@ impl Workbench {
     }
     fn cancel_modal(&mut self) {
         self.planning_context = None;
-        if let Some(Menu::Themes(preview)) = &self.menu {
-            let original = preview.original();
-            self.set_theme(original);
+        match &self.menu {
+            Some(Menu::Themes(preview)) => self.set_theme(preview.original()),
+            Some(Menu::Palette { original, .. }) => {
+                self.set_theme(original.clone());
+                self.navigation_editor.clear();
+            }
+            _ => {}
         }
         self.modal_token = self.modal_token.wrapping_add(1);
         if let Some(stop) = self.modal_stop.take() {
@@ -1559,7 +1592,7 @@ impl Workbench {
         // Enter accepted this preference. Finish its publication even if the
         // user exits; only previews and palette reads are cancellable.
         self.jobs.spawn_blocking(move || {
-            let result = store.save(theme.id());
+            let result = store.save_theme(&theme);
             Job::ThemeSaved {
                 revision,
                 theme,
@@ -1593,6 +1626,65 @@ impl Workbench {
             }
         }
         self.start_theme_save();
+    }
+    fn enter_palette(&mut self, original: Theme, stage: PaletteStage, io: &Io) {
+        let stage = match stage {
+            PaletteStage::Source => {
+                let text = self.navigation_editor.text().unwrap_or_default();
+                match PaletteSource::parse(
+                    text,
+                    &self.factory.settings.cwd,
+                    &self.factory.settings.home,
+                ) {
+                    Ok(source) => {
+                        self.navigation_editor.clear();
+                        PaletteStage::Scheme {
+                            source,
+                            selected: 0,
+                        }
+                    }
+                    Err(_) => {
+                        self.report(io, "Enter an image path or a color such as #c67ca9");
+                        PaletteStage::Source
+                    }
+                }
+            }
+            PaletteStage::Scheme { source, selected } => PaletteStage::Contrast {
+                source,
+                scheme: selected,
+            },
+            PaletteStage::Contrast { source, scheme } => {
+                let value = self.navigation_editor.text().unwrap_or_default().trim();
+                let contrast = if value.is_empty() {
+                    Ok(0)
+                } else {
+                    value.parse::<i8>()
+                };
+                if let Ok(contrast) = contrast
+                    && (-100..=100).contains(&contrast)
+                    && self.can_job(io)
+                {
+                    self.navigation_editor.clear();
+                    let token = self.modal_token;
+                    let stop = Cancel::linked(&self.stop);
+                    self.modal_stop = Some(stop.clone());
+                    self.jobs.spawn_blocking(move || Job::PaletteGenerated {
+                        token,
+                        result: theme::generate(source, scheme, contrast, &stop),
+                    });
+                    PaletteStage::Generating
+                } else {
+                    self.report(io, "Enter a contrast from -100 to 100");
+                    PaletteStage::Contrast { source, scheme }
+                }
+            }
+            PaletteStage::Preview(theme) => {
+                self.commit_theme(theme);
+                return;
+            }
+            PaletteStage::Generating => PaletteStage::Generating,
+        };
+        self.menu = Some(Menu::Palette { original, stage });
     }
     fn prepare_theme(&mut self, now: Instant) {
         self.start_theme_save();
@@ -2387,6 +2479,18 @@ impl Workbench {
                 request: ThemeLoad::Startup,
                 ..
             } => !self.input_closed && !self.terminating && !self.theme_initialized,
+            Job::PaletteGenerated { token, .. } => {
+                !self.input_closed
+                    && !self.terminating
+                    && *token == self.modal_token
+                    && matches!(
+                        &self.menu,
+                        Some(Menu::Palette {
+                            stage: PaletteStage::Generating,
+                            ..
+                        })
+                    )
+            }
             Job::Themes {
                 request: ThemeLoad::Picker { owner, token, .. },
                 ..
@@ -2690,6 +2794,22 @@ impl Workbench {
                 theme,
                 result,
             } => self.saved_theme(revision, theme, result, io),
+            Job::PaletteGenerated { result, .. } => {
+                self.modal_stop = None;
+                if let Some(Menu::Palette { original, .. }) = self.menu.take() {
+                    let stage = match result {
+                        Ok(theme) => {
+                            self.set_theme(theme.clone());
+                            PaletteStage::Preview(theme)
+                        }
+                        Err(code) => {
+                            self.report(io, &format!("Could not generate a palette ({code})"));
+                            PaletteStage::Source
+                        }
+                    };
+                    self.menu = Some(Menu::Palette { original, stage });
+                }
+            }
             Job::GenerationSaved { owner, result } => {
                 if let Err(code) = result
                     && let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner)
@@ -3174,6 +3294,13 @@ impl Workbench {
                 let theme = preview.current();
                 self.set_theme(theme);
             }
+            Some(Menu::Palette {
+                stage: PaletteStage::Scheme { selected, .. },
+                ..
+            }) => {
+                delta(selected, theme::MATUGEN_SCHEMES.len());
+            }
+            Some(Menu::Palette { .. }) => {}
             Some(Menu::Loading(_) | Menu::DraftingPlan) => {}
             Some(Menu::Sessions {
                 entries,
@@ -3276,7 +3403,15 @@ impl Workbench {
                         _ => self.report(io, "Plan cancelled"),
                     }
                 }
+                Menu::Themes(preview) if preview.generating() => {
+                    self.navigation_editor.clear();
+                    self.menu = Some(Menu::Palette {
+                        original: preview.original(),
+                        stage: PaletteStage::Source,
+                    });
+                }
                 Menu::Themes(preview) => self.commit_theme(preview.current()),
+                Menu::Palette { original, stage } => self.enter_palette(original, stage, io),
                 Menu::Loading(title) => self.menu = Some(Menu::Loading(title)),
                 Menu::DraftingPlan => self.menu = Some(Menu::DraftingPlan),
                 Menu::Sessions {
@@ -3384,7 +3519,7 @@ impl Workbench {
         }
     }
     fn mouse(&mut self, mouse: MouseEvent, io: &Io) {
-        if matches!(&self.menu, Some(Menu::Themes(_)))
+        if matches!(&self.menu, Some(Menu::Themes(_) | Menu::Palette { .. }))
             || matches!(&self.menu, Some(Menu::Loading(title)) if title == "/theme")
         {
             if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
@@ -3615,10 +3750,85 @@ impl Workbench {
                             theme.id().into()
                         },
                     })
+                    .chain(std::iter::once(Choice {
+                        label: "Generate with Matugen".into(),
+                        detail: "Image or HEX color".into(),
+                    }))
                     .collect(),
                 selected: preview.selected(),
-                footer: "Enter save · Esc cancel".into(),
+                footer: if preview.generating() {
+                    "Enter continue"
+                } else {
+                    "Enter save"
+                }
+                .to_owned()
+                    + " · Esc cancel",
             },
+            Menu::Palette { stage, .. } => {
+                let editor = &self.navigation_editor;
+                let input = String::from_utf8_lossy(&editor.bytes);
+                let cursor = editor.cursor.min(input.len());
+                let before = input.floor_char_boundary(cursor);
+                let mut draft = format!("{}▏{}", &input[..before], &input[before..]);
+                if draft.chars().count() > 60 {
+                    draft = format!(
+                        "…{}",
+                        draft
+                            .chars()
+                            .rev()
+                            .take(55)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<String>()
+                    );
+                }
+                let (subtitle, items, selected, footer) = match stage {
+                    PaletteStage::Source => (
+                        "Image path or HEX color",
+                        vec![Choice {
+                            label: draft,
+                            detail: String::new(),
+                        }],
+                        0,
+                        "Enter choose scheme",
+                    ),
+                    PaletteStage::Scheme { selected, .. } => (
+                        "Palette scheme",
+                        theme::MATUGEN_SCHEMES
+                            .iter()
+                            .map(|(name, _)| Choice {
+                                label: (*name).into(),
+                                detail: String::new(),
+                            })
+                            .collect(),
+                        *selected,
+                        "Enter set contrast",
+                    ),
+                    PaletteStage::Contrast { .. } => (
+                        "Contrast from -100 to 100 (default 0)",
+                        vec![Choice {
+                            label: draft,
+                            detail: String::new(),
+                        }],
+                        0,
+                        "Enter preview",
+                    ),
+                    PaletteStage::Generating => ("Generating palette…", Vec::new(), 0, ""),
+                    PaletteStage::Preview(_) => ("Palette preview", Vec::new(), 0, "Enter save"),
+                };
+                Popup {
+                    title: "Matugen".into(),
+                    subtitle: subtitle.into(),
+                    items,
+                    selected,
+                    footer: if footer.is_empty() {
+                        "Esc cancel".into()
+                    } else {
+                        format!("{footer} · Esc cancel")
+                    },
+                }
+            }
             Menu::Loading(title) => Popup {
                 title: title.clone(),
                 subtitle: "Loading…".into(),
@@ -4590,6 +4800,14 @@ pub async fn run_attached(
                         }
                         for (position, &byte) in bytes[..count].iter().enumerate() {
                             work.disarm_exit();
+                            if matches!(&work.menu, Some(Menu::Palette { stage, .. }) if stage.editing()) {
+                                match work.navigation_editor.feed(byte, true) {
+                                    Some(Action::Submit | Action::QueueSubmit) => { work.enter(io); }
+                                    Some(Action::Escape) => work.escape(io),
+                                    _ => {}
+                                }
+                                continue;
+                            }
                             // Modal/read-only navigation never edits a draft.
                             if byte.is_ascii() && !work.input_editor().escape_pending() && !work.input_editor().pasting() {
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());

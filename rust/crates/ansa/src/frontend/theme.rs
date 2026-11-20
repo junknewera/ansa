@@ -1,19 +1,174 @@
 //! UI preferences and palettes are independent of model configuration and epochs.
 use crate::auth::Cancel;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 pub type Result<T> = std::result::Result<T, &'static str>;
 const FILE_LIMIT: usize = 16 * 1024;
 const THEME_LIMIT: usize = 32;
+pub(super) const MATUGEN_SCHEMES: &[(&str, &str)] = &[
+    ("Tonal Spot", "scheme-tonal-spot"),
+    ("Vibrant", "scheme-vibrant"),
+    ("Content", "scheme-content"),
+    ("Expressive", "scheme-expressive"),
+    ("Fidelity", "scheme-fidelity"),
+    ("Fruit Salad", "scheme-fruit-salad"),
+    ("Monochrome", "scheme-monochrome"),
+    ("Neutral", "scheme-neutral"),
+    ("Rainbow", "scheme-rainbow"),
+];
+
+pub(super) enum PaletteSource {
+    Color(String),
+    Image(PathBuf),
+}
+impl PaletteSource {
+    pub fn parse(text: &str, directory: &Path, home: &Path) -> Result<Self> {
+        let text = text.trim();
+        if text.starts_with('#') {
+            Color::parse(text)?;
+            return Ok(Self::Color(text.into()));
+        }
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return Err("theme_source");
+        }
+        let path = if let Some(relative) = text.strip_prefix("~/") {
+            home.join(relative)
+        } else {
+            directory.join(text)
+        };
+        let path = path.canonicalize().map_err(|_| "theme_image")?;
+        if !path.is_file() {
+            return Err("theme_image");
+        }
+        Ok(Self::Image(path))
+    }
+}
+
+pub(super) fn generate(
+    source: PaletteSource,
+    scheme: usize,
+    contrast: i8,
+    stop: &Cancel,
+) -> Result<Theme> {
+    if stop.cancelled() {
+        return Err("theme_cancelled");
+    }
+    let config = ansa_linux::local::anonymous_input(b"[config]\n[templates]\n")
+        .map_err(|_| "theme_matugen_setup")?;
+    let mut command = Command::new(option_env!("ANSA_MATUGEN").unwrap_or("matugen"));
+    command
+        .args([
+            "--config",
+            "/proc/self/fd/0",
+            "--dry-run",
+            "--json",
+            "hex",
+            "--old-json-output",
+            "--include-image-in-json",
+            "false",
+            "--mode",
+            "dark",
+            "--source-color-index",
+            "0",
+            "--type",
+            MATUGEN_SCHEMES.get(scheme).ok_or("theme_scheme")?.1,
+            "--contrast",
+            &format!("{:.2}", f64::from(contrast) / 100.0),
+        ])
+        .stdin(config)
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+    match source {
+        PaletteSource::Color(hex) => command.args(["color", "hex", &hex]),
+        PaletteSource::Image(path) => command.arg("image").arg(path),
+    };
+    let mut child = command.spawn().map_err(|_| "theme_matugen_unavailable")?;
+    let result = (|| {
+        let mut output = child.stdout.take().ok_or("theme_matugen_setup")?;
+        ansa_linux::managed::nonblocking(&output).map_err(|_| "theme_matugen_setup")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            if stop.cancelled() {
+                return Err("theme_cancelled");
+            }
+            if Instant::now() >= deadline {
+                return Err("theme_matugen_timeout");
+            }
+            match output.read(&mut buffer) {
+                Ok(0) => {
+                    if let Some(exit) = child.try_wait().map_err(|_| "theme_matugen_exit")? {
+                        return if exit.success() {
+                            from_matugen(&bytes)
+                        } else {
+                            Err("theme_matugen_failed")
+                        };
+                    }
+                }
+                Ok(count) if bytes.len() + count <= FILE_LIMIT * 4 => {
+                    bytes.extend_from_slice(&buffer[..count]);
+                    continue;
+                }
+                Ok(_) => return Err("theme_matugen_output"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return Err("theme_matugen_output"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+fn from_matugen(bytes: &[u8]) -> Result<Theme> {
+    json_guard(bytes)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| "theme_matugen_json")?;
+    let color = |name| {
+        value
+            .get("colors")
+            .and_then(|colors| colors.get(name))
+            .and_then(|modes| modes.get("dark"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("theme_matugen_color")
+            .and_then(Color::parse)
+    };
+    Ok(Theme {
+        id: "matugen".into(),
+        name: "Matugen".into(),
+        palette: Palette {
+            accent: color("primary")?,
+            foreground: color("on_surface")?,
+            muted: color("on_surface_variant")?,
+            background: color("surface")?,
+            input: color("surface_container_high")?,
+            selection: color("secondary_container")?,
+            error: color("error")?,
+            code: color("tertiary")?,
+            rule: color("outline_variant")?,
+            ..Palette::default()
+        },
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Color(u8, u8, u8);
 impl Color {
+    fn hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.0, self.1, self.2)
+    }
     fn parse(text: &str) -> Result<Self> {
         if text.len() != 7
             || !text.starts_with('#')
@@ -136,7 +291,7 @@ impl Theme {
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Colors {
     accent: Option<String>,
@@ -151,7 +306,7 @@ struct Colors {
     code: Option<String>,
     rule: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Custom {
     name: String,
@@ -162,6 +317,7 @@ struct Custom {
 struct Preferences {
     schema_version: usize,
     theme: String,
+    generated: Option<Custom>,
 }
 
 fn identifier(text: &str) -> bool {
@@ -298,10 +454,11 @@ impl Preview {
         self.selected = if older {
             self.selected.saturating_sub(1)
         } else {
-            self.selected
-                .saturating_add(1)
-                .min(self.themes.len().saturating_sub(1))
+            self.selected.saturating_add(1).min(self.themes.len())
         };
+    }
+    pub fn generating(&self) -> bool {
+        self.selected == self.themes.len()
     }
 }
 
@@ -338,7 +495,14 @@ impl Store {
         match read(&self.directory.join("ui.json"), stop) {
             Ok(Some(bytes)) => match serde_json::from_slice::<Preferences>(&bytes) {
                 Ok(prefs) if prefs.schema_version == 1 && selector(&prefs.theme) => {
-                    result.selected = prefs.theme
+                    result.selected = prefs.theme;
+                    if let Some(generated) = prefs.generated
+                        && let Ok(bytes) = serde_json::to_vec(&generated)
+                        && let Ok(mut theme) = custom("matugen", &bytes)
+                    {
+                        theme.id = "matugen".into();
+                        result.themes.push(theme);
+                    }
                 }
                 _ => result
                     .warnings
@@ -417,7 +581,29 @@ impl Store {
         }
         Ok(result)
     }
+    #[cfg(test)]
     pub fn save(&self, id: &str) -> Result<()> {
+        self.save_preference(id, None)
+    }
+    pub fn save_theme(&self, theme: &Theme) -> Result<()> {
+        let generated = if theme.id() == "matugen" {
+            let p = &theme.palette;
+            Some(serde_json::json!({
+                "name": theme.name(),
+                "colors": {
+                    "accent": p.accent.hex(), "foreground": p.foreground.hex(),
+                    "muted": p.muted.hex(), "background": p.background.hex(),
+                    "input": p.input.hex(), "selection": p.selection.hex(),
+                    "success": p.success.hex(), "warning": p.warning.hex(),
+                    "error": p.error.hex(), "code": p.code.hex(), "rule": p.rule.hex()
+                }
+            }))
+        } else {
+            None
+        };
+        self.save_preference(theme.id(), generated)
+    }
+    fn save_preference(&self, id: &str, generated: Option<serde_json::Value>) -> Result<()> {
         if !selector(id) {
             return Err("theme_selector");
         }
@@ -425,7 +611,15 @@ impl Store {
             .map_err(|_| "theme_preferences_directory")?;
         let directory = ansa_linux::fs::private_directory(&self.directory)
             .map_err(|_| "theme_preferences_directory")?;
-        let data = serde_json::json!({"schema_version":1,"theme":id}).to_string();
+        let mut data = serde_json::json!({"schema_version":1,"theme":id});
+        if let Some(palette) = generated {
+            data["generated"] = palette;
+        } else if let Ok(Some(bytes)) = read(&self.directory.join("ui.json"), &Cancel::default())
+            && let Ok(previous) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(palette) = previous.get("generated")
+        {
+            data["generated"] = palette.clone();
+        }
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -436,7 +630,7 @@ impl Store {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        ansa_linux::local::replace_ui(&directory, data.as_bytes(), &suffix)
+        ansa_linux::local::replace_ui(&directory, data.to_string().as_bytes(), &suffix)
             .map_err(|_| "theme_preferences_write")
     }
     pub fn dynamic(&self, stop: &Cancel) -> Result<Theme> {
@@ -636,6 +830,24 @@ mod tests {
         assert_eq!(before, after);
         assert!(store.save("custom:../outside").is_err());
         assert_eq!(store.load(&stop).unwrap().selected().id(), "pink");
+    }
+    #[test]
+    fn matugen_preview_persists_only_after_save_and_can_be_reselected() {
+        if option_env!("ANSA_MATUGEN").is_none() {
+            return;
+        }
+        let root = Root::new();
+        let store = root.store();
+        let stop = Cancel::default();
+        let source = PaletteSource::parse("#c67ca9", &root.0, &root.0).unwrap();
+        let theme = generate(source, 3, 25, &stop).unwrap();
+        assert_ne!(theme.palette.accent, Palette::default().accent);
+        assert_eq!(theme.background_sgr(), "\x1b[49m");
+        assert_eq!(store.load(&stop).unwrap().selected(), Theme::default());
+        store.save_theme(&theme).unwrap();
+        assert_eq!(store.load(&stop).unwrap().selected(), theme);
+        store.save("pink").unwrap();
+        assert_eq!(store.load(&stop).unwrap().find("matugen"), Some(&theme));
     }
     #[test]
     fn preview_cancel_restores_original_palette_without_writing_preferences() {

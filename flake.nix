@@ -41,6 +41,7 @@
           ANSA_AUTH_FIXTURES = ./tests/fixtures/auth;
           ANSA_SESSION_FIXTURES = ./tests/fixtures/sessions;
           ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
+          ANSA_MATUGEN = "${pkgs.matugen}/bin/matugen";
           preBuild = ''
             python3 ${./tests/parity/check_toolchain.py} --workspace .
           '';
@@ -63,6 +64,7 @@
           default = pkgs.mkShell {
             packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh ];
             ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
+            ANSA_MATUGEN = "${pkgs.matugen}/bin/matugen";
             ANSA_TEST_BASH = "${pkgs.bashInteractive}/bin/bash";
           };
           graphics = pkgs.mkShell {
@@ -72,6 +74,7 @@
           quality = pkgs.mkShell {
             packages = [ (pkgs.callPackage ./nix/quality-toolchain.nix {}) (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh ];
             ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
+            ANSA_MATUGEN = "${pkgs.matugen}/bin/matugen";
           };
         });
     };

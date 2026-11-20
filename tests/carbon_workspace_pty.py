@@ -1296,6 +1296,35 @@ def siwc_orchestration(screen, root, cwd):
     return "normal"
 
 
+def matugen_palette(screen, root, cwd):
+    prefs = cwd.parent / ".ansa" / "ui.json"
+
+    def preview():
+        local(screen, "/theme")
+        until(screen, lambda _: "Generate with Matugen" in popup_text(screen), "Matugen in theme picker")
+        screen.send(b"\x1b[B" * 12 + b"\r")
+        until(screen, lambda _: "Image path or HEX color" in popup_text(screen), "Matugen source")
+        screen.send(b"#c67ca9\r")
+        until(screen, lambda _: "Expressive" in popup_text(screen), "Matugen schemes")
+        screen.send(b"\x1b[B" * 3 + b"\r")
+        until(screen, lambda _: "Contrast from -100" in popup_text(screen), "Matugen contrast")
+        screen.send(b"25\r")
+        until(screen, lambda _: "Palette preview" in popup_text(screen), "Generated palette")
+
+    preview()
+    assert not prefs.exists()
+    escape(screen)
+    assert not prefs.exists()
+    preview()
+    screen.send(b"\r")
+    until(screen, lambda frame: "Theme Matugen saved" in frame, "Saved Matugen palette")
+    saved = json.loads(prefs.read_text())
+    assert saved["theme"] == "matugen"
+    assert saved["generated"]["colors"]["accent"].startswith("#")
+    local(screen, "/exit")
+    return "normal"
+
+
 def main():
     cases = [("input-copy-resize", input_and_copy), ("mouse-copy-resize", mouse_copy),
              ("mouse-selection-scroll", selection_scroll),
@@ -1308,6 +1337,7 @@ def main():
              ("new-resume-interrupt", new_resume_and_exit),
              ("native-terminal-panel", native_terminal_panel),
              ("model-effort-pair", model_effort_pair),
+             ("matugen-palette", matugen_palette),
              ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),
              ("orchestration-candidate", orchestration_candidate),
