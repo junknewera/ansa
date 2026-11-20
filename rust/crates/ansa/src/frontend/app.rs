@@ -18,8 +18,9 @@ use crate::{
     protocol::json::Json,
     provider::request::{Binding, Epoch, Request},
     runtime::{Generate, Lease, Limits, Options as RuntimeOptions, Runtime},
+    terminal_host::tools as terminals,
     tools::{
-        files::local_tools_extended,
+        files::{LocalExtensions, local_tools_extended},
         registry::{Definition, Outcome, Policy, Registry},
     },
 };
@@ -514,7 +515,7 @@ fn text_with_providers(
             .then(|| factory.open_terminal_owner(&selected, false))
             .transpose()?;
     if terminal.is_some() {
-        crate::terminal_host::tools::add_agent_instructions(&mut epoch);
+        terminals::add_agent_instructions(&mut epoch);
     }
     let tools = local_tools_extended(
         settings.clone(),
@@ -522,8 +523,15 @@ fn text_with_providers(
         &selected.directory,
         &parsed.auth,
         &std::env::current_exe().map_err(|_| "process_executable")?,
-        editor.clone(),
-        terminal.clone(),
+        LocalExtensions {
+            editor: editor.clone(),
+            shared_writer: terminal.as_ref().map(terminals::workspace_writer),
+        },
+        |registry| {
+            terminal.clone().map_or(Ok(()), |owner| {
+                terminals::register(registry, owner, &selected.directory)
+            })
+        },
     )?;
     let tools = if terminal.is_some() {
         tools.without_tool("run_command")

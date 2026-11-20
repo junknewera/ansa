@@ -137,19 +137,19 @@ pub(crate) fn close(owner: &Owner) -> bool {
     })
 }
 
-pub(crate) fn workspace_writer(
-    owner: &Owner,
-    target: &Path,
-) -> Result<Option<ansa_linux::local::WorkspaceWrite>> {
-    let host = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
-    let root = Path::new(&host.binding().workspace);
-    let Ok(relative) = target.strip_prefix(root) else {
-        return Ok(None);
-    };
-    if host.quarantined() {
-        return Err("terminal_workspace_quarantined");
-    }
-    host.backend.write_descendant(root, relative)
+pub(crate) fn workspace_writer(owner: &Owner) -> crate::tools::files::WorkspaceWriter {
+    let owner = owner.clone();
+    Arc::new(move |target| {
+        let host = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
+        let root = Path::new(&host.binding().workspace);
+        let Ok(relative) = target.strip_prefix(root) else {
+            return Ok(None);
+        };
+        if host.quarantined() {
+            return Err("terminal_workspace_quarantined");
+        }
+        host.backend.write_descendant(root, relative)
+    })
 }
 
 #[derive(Clone, Copy)]

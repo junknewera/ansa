@@ -41,8 +41,16 @@ pub(crate) struct Host {
     pub auth: PathBuf,
     pub session: PathBuf,
     pub editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
-    pub(super) terminal: Option<crate::terminal_host::tools::Owner>,
+    pub(super) shared_writer: Option<WorkspaceWriter>,
     pub(super) scope: Option<TaskScope>,
+}
+
+pub(crate) type WorkspaceWriter =
+    Arc<dyn Fn(&Path) -> Result<Option<ansa_linux::local::WorkspaceWrite>> + Send + Sync>;
+
+pub(crate) struct LocalExtensions {
+    pub editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    pub shared_writer: Option<WorkspaceWriter>,
 }
 
 pub struct TaskScope {
@@ -80,9 +88,8 @@ impl Host {
         &self,
         target: &Path,
     ) -> Result<ansa_linux::local::WorkspaceWrite> {
-        if let Some(terminal) = &self.terminal
-            && let Some(workspace) =
-                crate::terminal_host::tools::workspace_writer(terminal, target)?
+        if let Some(writer) = &self.shared_writer
+            && let Some(workspace) = writer(target)?
         {
             return Ok(workspace);
         }
@@ -338,7 +345,18 @@ pub fn local_tools_with_editor(
     worker: &Path,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
 ) -> Result<Arc<Snapshot>> {
-    local_tools_extended(settings, epoch, session, auth, worker, editor, None)
+    local_tools_extended(
+        settings,
+        epoch,
+        session,
+        auth,
+        worker,
+        LocalExtensions {
+            editor,
+            shared_writer: None,
+        },
+        |_| Ok(()),
+    )
 }
 
 pub(crate) fn local_tools_extended(
@@ -347,16 +365,12 @@ pub(crate) fn local_tools_extended(
     session: &Path,
     auth: &Path,
     worker: &Path,
-    editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
-    terminal: Option<crate::terminal_host::tools::Owner>,
+    extensions: LocalExtensions,
+    extend: impl FnOnce(&mut Registry) -> Result<()>,
 ) -> Result<Arc<Snapshot>> {
-    let mut host = local_host(settings, epoch, session, auth, worker, editor)?;
-    host.terminal = terminal.clone();
-    register_local_tools(Arc::new(host), |registry| {
-        terminal.map_or(Ok(()), |owner| {
-            crate::terminal_host::tools::register(registry, owner, session)
-        })
-    })
+    let mut host = local_host(settings, epoch, session, auth, worker, extensions.editor)?;
+    host.shared_writer = extensions.shared_writer;
+    register_local_tools(Arc::new(host), extend)
 }
 
 pub fn local_task_tools(
@@ -394,7 +408,7 @@ fn local_host(
         settings,
         epoch,
         editor,
-        terminal: None,
+        shared_writer: None,
         scope: None,
     })
 }

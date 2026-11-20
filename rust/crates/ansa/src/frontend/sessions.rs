@@ -12,7 +12,7 @@ use crate::{
         journal_v1::Journal,
     },
     terminal_host::tools as terminals,
-    tools::files::{TaskScope, local_task_tools, local_tools_extended},
+    tools::files::{LocalExtensions, TaskScope, local_task_tools, local_tools_extended},
 };
 use std::{
     collections::BTreeMap,
@@ -765,11 +765,19 @@ impl Factory {
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
-            self.editor
-                .as_ref()
-                .filter(|(directory, _)| directory == &selected.directory)
-                .map(|(_, hub)| hub.clone()),
-            terminal.clone(),
+            LocalExtensions {
+                editor: self
+                    .editor
+                    .as_ref()
+                    .filter(|(directory, _)| directory == &selected.directory)
+                    .map(|(_, hub)| hub.clone()),
+                shared_writer: terminal.as_ref().map(terminals::workspace_writer),
+            },
+            |registry| {
+                terminal.clone().map_or(Ok(()), |owner| {
+                    terminals::register(registry, owner, &selected.directory)
+                })
+            },
         )?;
         // Resume/fork retains the exact saved tool catalogue. Adding a compiled
         // tool only affects new sessions; saved descriptors cannot install code.

@@ -247,7 +247,7 @@ mod tests {
                 auth: settings.directory.join("auth"),
                 session: self.0.join("session"),
                 editor: None,
-                terminal: None,
+                shared_writer: None,
                 scope: None,
                 settings,
             }
