@@ -268,6 +268,9 @@ impl Catalog {
                 .ok_or_else(|| io::Error::other("session_directory"))?,
         )?
         .sync_all()?;
+        Self::open_read_only(path)
+    }
+    pub fn open_read_only(path: &Path) -> io::Result<Self> {
         Ok(Self {
             directory: crate::fs::private_directory(path)?,
         })

@@ -109,7 +109,13 @@ pub fn generate(request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
 }
 
 fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<AdmittedResponse>> {
+    #[cfg(feature = "frontend-test-adapter")]
+    let single = request.final_format().is_none()
+        && std::env::var("ANSA_OFFLINE_EVAL_ARM").as_deref() == Ok("N0");
+    #[cfg(not(feature = "frontend-test-adapter"))]
+    let single = false;
     if request.final_format().is_none()
+        && !single
         && request.epoch.exact_state.text_field("purpose") != Ok("orchestration_summary")
     {
         return Ok(None);
@@ -129,8 +135,9 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         stop.wait(std::time::Duration::from_millis(950));
         stop.check()?;
     }
-    if request.final_format() == Some(FinalFormat::ChildResult) {
+    if request.final_format() == Some(FinalFormat::ChildResult) || single {
         let operation = if user.starts_with("Синтетическая правка отчёта")
+            || (single && user == "ORCHESTRATION_COMMAND_FIXTURE")
         {
             Some(("edit_file", "report.txt", "orch_edit_file_"))
         } else if user.starts_with("Read the review-resume fixture") {
@@ -214,6 +221,16 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
                 };
             }
             serde_json::json!({"status": if success { "completed" } else { "blocked" }, "summary":"Синтетический результат проверки", "findings":[]}).to_string()
+        },
+        None if single && last.is_some_and(|item| {
+            item.text_field("call_id")
+                .is_ok_and(|call| call.starts_with("orch_edit_file_"))
+        }) => {
+            let output = Json::parse(last.ok_or("offline_eval_edit")?.text_field("output")?)?;
+            if output.field("applied").and_then(Json::boolean) != Ok(true) {
+                return Err("offline_eval_edit");
+            }
+            "Offline fixture edit complete.".to_owned()
         },
         None if request.epoch.exact_state.text_field("purpose") == Ok("orchestration_summary") => {
             if user.contains("verified_candidate") {

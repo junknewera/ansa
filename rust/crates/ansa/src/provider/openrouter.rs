@@ -295,12 +295,17 @@ impl OpenRouter {
             RouteCheck::BestEffortCatalog
         };
         let window = self.prepare_route(model, request.effort.as_deref(), check, stop)?;
+        let tokens = request
+            .estimated_tokens()
+            .unwrap_or_else(|| crate::context::estimate_request_tokens(request));
         if let Some(window) = window {
-            let tokens = request
-                .estimated_tokens()
-                .unwrap_or_else(|| crate::context::estimate_request_tokens(request));
             crate::context::require_response_room(tokens, window)?;
         }
+        let attach_context = |response: AdmittedResponse| {
+            response
+                .with_context_window(window)
+                .with_context_estimate(tokens)
+        };
         let mut body = base_body(request, &request.epoch.instructions)?;
         if !request.tools.descriptors.is_empty() {
             body["tools"] = Value::Array(
@@ -319,8 +324,7 @@ impl OpenRouter {
         {
             let response = self.send("POST", API, Some(body.clone()), REQUEST_TIMEOUT_MS, stop)?;
             if choice(&response, model)?["finish_reason"] == "tool_calls" {
-                return decode(request, &response)
-                    .map(|response| response.with_context_window(window));
+                return decode(request, &response).map(attach_context);
             }
             final_choice_for(&response, model)?;
         }
@@ -335,7 +339,7 @@ impl OpenRouter {
         if request.final_format().is_some() && !admitted.calls().is_empty() {
             return Err("openrouter_final_has_tools");
         }
-        Ok(admitted.with_context_window(window))
+        Ok(attach_context(admitted))
     }
 }
 
@@ -562,13 +566,15 @@ pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResp
         ("items", Json::parse(&Value::Array(items).to_string())?),
     ])?;
     let usage = &response["usage"];
-    let tokens = usage["prompt_tokens"].as_u64().and_then(|input| {
-        input
-            .checked_add(usage["completion_tokens"].as_u64()?)
-            .filter(|_| input > 0)
-            .and_then(|total| usize::try_from(total).ok())
+    let count = |value: &Value| usize::try_from(value.as_u64()?).ok();
+    let reported = count(&usage["prompt_tokens"]).and_then(|input| {
+        native::ReportedUsage::new(
+            input,
+            count(&usage["prompt_tokens_details"]["cached_tokens"]),
+            count(&usage["completion_tokens"])?,
+        )
     });
-    native::load(&envelope).map(|response| response.with_token_usage(tokens))
+    native::load(&envelope).map(|response| response.with_reported_usage(reported))
 }
 
 #[cfg(test)]
@@ -613,6 +619,35 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn route_without_catalog_window_keeps_admitted_estimate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let exchange = {
+            let calls = calls.clone();
+            Arc::new(move |request: &HttpRequest, _: &Cancel| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if request.url == CATALOG {
+                    return Ok(reply(json!({"error":"catalog fixture unavailable"})));
+                }
+                assert_eq!(request.url, API);
+                Ok(reply(response("done")))
+            })
+        };
+        let route = OpenRouter::new(
+            Secret::new("synthetic-fixture-key-0123456789".into()),
+            exchange,
+        )
+        .unwrap();
+        let request = request(&route);
+        let estimate = crate::context::estimate_request_tokens(&request);
+        let response = route.generate(&request, &Cancel::default()).unwrap();
+        let response = native::load(&native::save(&response).unwrap()).unwrap();
+        assert_eq!(response.request().estimated_tokens(), Some(estimate));
+        assert!(response.context_budget().is_none());
+        assert!(response.reported_usage().is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -722,7 +757,7 @@ mod tests {
                         assert!(!body.to_string().contains("drop this unstructured response"));
                         let mut value =
                             response(r#"{"status":"completed","summary":"Checked","findings":[]}"#);
-                        value["usage"] = json!({"prompt_tokens":499990,"completion_tokens":10});
+                        value["usage"] = json!({"prompt_tokens":499990,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":31000}});
                         value
                     }
                     _ => panic!("unexpected request"),
@@ -750,6 +785,39 @@ mod tests {
         ));
         let answer = route.generate(&request, &stop).unwrap();
         assert_eq!(answer.child_result().unwrap().summary, "Checked");
+        let usage = native::ReportedUsage::new(499990, Some(31000), 10);
+        assert_eq!(answer.reported_usage(), usage);
+        assert_eq!(
+            native::load(&native::save(&answer).unwrap())
+                .unwrap()
+                .reported_usage(),
+            usage
+        );
+        assert!(tool.reported_usage().is_none());
+        let legacy = native::save(&answer)
+            .unwrap()
+            .without("reported_usage_v1")
+            .unwrap();
+        let legacy = native::load(&legacy).unwrap();
+        assert_eq!(legacy.token_usage(), Some(500_000));
+        assert!(legacy.reported_usage().is_none());
+        for output in [0, 5] {
+            let mut raw = response("known output");
+            raw["usage"] = json!({
+                "prompt_tokens": 0, "completion_tokens": output,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            });
+            let req = self::request(&route);
+            let zero_response = decode(&req, &raw)
+                .unwrap()
+                .with_context_window(Some(1_000_000));
+            let zero_response = native::load(&native::save(&zero_response).unwrap()).unwrap();
+            assert_eq!(
+                zero_response.reported_usage(),
+                native::ReportedUsage::new(0, Some(0), output)
+            );
+            assert_eq!(zero_response.context_budget().unwrap().tokens, None);
+        }
         assert_eq!(
             answer.context_budget(),
             Some(native::ContextBudget {

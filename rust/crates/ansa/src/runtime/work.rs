@@ -417,14 +417,16 @@ impl Workers {
                                         } else {
                                             current.next.clone()
                                         };
-                                    if let Some((tokens, window)) =
-                                        job.state.context_estimate(&request, || {
-                                            (provider_options.model_window)(&request)
-                                        })
-                                    {
+                                    let estimate = job.state.context_estimate(&request, || {
+                                        (provider_options.model_window)(&request)
+                                    });
+                                    let tokens = if let Some((tokens, window)) = estimate {
                                         crate::context::require_response_room(tokens, window)?;
-                                        request.set_context_estimate(tokens);
-                                    }
+                                        tokens
+                                    } else {
+                                        crate::context::estimate_request_tokens(&request)
+                                    };
+                                    request.set_context_estimate(tokens);
                                     let (
                                         sink_gate,
                                         sink_preview,
@@ -454,6 +456,12 @@ impl Workers {
                                         Ok(())
                                     });
                                     let value = generate(&request, &job.stop, update)?;
+                                    let value = if value.context_budget().is_none() {
+                                        value
+                                            .with_context_window(estimate.map(|(_, window)| window))
+                                    } else {
+                                        value
+                                    };
                                     if value.request().save()? != request.save()?
                                         || value.returned_model() != request.binding.returned_model
                                     {
@@ -465,7 +473,9 @@ impl Workers {
                                     if value.calls().is_empty() || provider_options.streaming {
                                         response_text(&value)?;
                                     }
-                                    Ok(ProviderValue::Response(Arc::new(value)))
+                                    Ok(ProviderValue::Response(Arc::new(
+                                        value.with_context_estimate(tokens),
+                                    )))
                                 }
                                 ProviderTask::Compact => {
                                     let request = Request::new(

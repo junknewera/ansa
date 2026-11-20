@@ -1,5 +1,6 @@
 pub mod epoch;
 pub mod legacy_compact;
+pub mod prompt_policy;
 pub mod summary;
 
 use crate::{protocol::json::Json, provider::request::Request};

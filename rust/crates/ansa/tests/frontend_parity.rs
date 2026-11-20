@@ -393,17 +393,20 @@ fn ca_loader_checks_regular_type_size_and_public_symlink() {
     std::fs::write(&path, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
     assert!(ansa::transport::client::read_ca(&path).is_err());
 }
-fn cli(root: &Root, args: &[&str]) -> std::process::Output {
+fn fixture_command(root: &Root, args: &[&str]) -> std::process::Command {
     let home = root.0.join("home");
     std::fs::create_dir_all(&home).unwrap();
-    std::process::Command::new(env!("CARGO_BIN_EXE_ansa"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ansa"));
+    command
         .args(args)
         .arg("--cwd")
         .arg(&home)
         .env("HOME", &home)
-        .env_remove("XDG_STATE_HOME")
-        .output()
-        .unwrap()
+        .env_remove("XDG_STATE_HOME");
+    command
+}
+fn cli(root: &Root, args: &[&str]) -> std::process::Output {
+    fixture_command(root, args).output().unwrap()
 }
 #[test]
 fn executable_runs_real_local_catalog_and_resume() {
@@ -546,4 +549,167 @@ fn right_arrow_completes_only_with_an_open_suggestion() {
         assert!(editor.feed(byte, true).is_none());
     }
     assert_eq!(editor.cursor, 3);
+}
+
+#[test]
+fn executable_exports_validated_journal_without_context_bodies_or_writes() {
+    use std::io::Write;
+
+    let root = Root::new();
+    let marker = "private prompt marker";
+    let first = cli(&root, &["--offline", marker]);
+    assert!(first.status.success(), "{first:?}");
+    let directory = std::fs::read_dir(root.0.join("home/.ansa/sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let snapshot = || {
+        std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name(),
+                    entry
+                        .file_type()
+                        .unwrap()
+                        .is_file()
+                        .then(|| std::fs::read(entry.path()).unwrap()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = snapshot();
+    let run_export = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ansa"))
+            .arg("--export-evidence")
+            .arg(&directory)
+            .env_remove("HOME")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap()
+    };
+    let result = run_export();
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(before, snapshot());
+    assert_eq!(result.stdout, run_export().stdout);
+    let document = std::str::from_utf8(&result.stdout).unwrap();
+    assert!(!document.contains(marker));
+    assert!(!document.contains("OMH_FIXED_VALUE_42"));
+    assert!(!document.contains("offline-fixture"));
+    let evidence = Json::parse(document.trim()).unwrap();
+    assert_eq!(evidence.usize_field("schema_version"), Ok(1));
+    assert!(!evidence.field("seeded").unwrap().boolean().unwrap());
+    assert!(
+        evidence
+            .field("fresh_initial_context")
+            .unwrap()
+            .boolean()
+            .unwrap()
+    );
+    assert_eq!(evidence.text_field("status"), Ok("completed"));
+    assert_eq!(
+        evidence
+            .field("initial_manifest")
+            .unwrap()
+            .text_field("prompt_policy"),
+        Ok("legacy-v1")
+    );
+    let records = evidence.field("records").unwrap().elements().unwrap();
+    assert_eq!(
+        evidence.text_field("journal_head_sha256"),
+        records.last().unwrap().text_field("record_sha256")
+    );
+    let accepted = records
+        .iter()
+        .find(|record| record.text_field("kind") == Ok("accepted"))
+        .unwrap();
+    assert!(!accepted.field("internal").unwrap().boolean().unwrap());
+    assert!(records.iter().any(|record| {
+        record.text_field("kind") == Ok("outcome")
+            && record.text_field("effects") == Ok("known_result")
+            && record.text_field("operation").is_ok()
+    }));
+    assert!(records.iter().any(|record| {
+        record.text_field("kind") == Ok("response")
+            && record.usize_field("estimated_input_tokens").is_ok()
+            && record.text_field("estimate_source") == Ok("dispatch")
+            && record.text_field("context_window_status") == Ok("unknown")
+            && !record.has("reported_usage")
+    }));
+
+    let part = before
+        .keys()
+        .find(|name| name.to_str().unwrap().starts_with("part-"))
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(directory.join(part))
+        .unwrap()
+        .write_all(b"torn")
+        .unwrap();
+    let result = run_export();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+}
+
+#[test]
+fn executable_resumes_profiled_session_without_loading_unread_skill_bodies() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let root = Root::new();
+    let mut operator = fixture_command(&root, &["--harness", "baseline"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let profile = serde_json::json!({"version":1,"guidance":"Pinned project rule","memory":[],"prompt_policy":"handoff-v1",
+        "skills":[{"name":"release","trigger":"For a release","body":"unread-profile-body-1234"}]});
+    operator
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&profile).unwrap())
+        .unwrap();
+    let applied = operator.wait_with_output().unwrap();
+    assert!(applied.status.success(), "{applied:?}");
+    let record: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    let first = cli(&root, &["--offline", "first"]);
+    assert!(first.status.success(), "{first:?}");
+    let second = cli(&root, &["--offline", "--continue", "second"]);
+    assert!(second.status.success(), "{second:?}");
+    assert_eq!(first.stdout, second.stdout);
+    let mut sessions = std::fs::read_dir(root.0.join("home/.ansa/sessions")).unwrap();
+    let session = sessions.next().unwrap().unwrap().path();
+    assert!(sessions.next().is_none());
+    let mut verified = false;
+    for file in std::fs::read_dir(&session).unwrap() {
+        let file = file.unwrap();
+        if file.file_name().to_string_lossy().starts_with("part-") {
+            let bytes = std::fs::read(file.path()).unwrap();
+            let content = String::from_utf8_lossy(&bytes);
+            assert!(!content.contains("unread-profile-body-1234"));
+            verified |= content.contains("read_skill") && content.contains("Pinned project rule");
+        }
+    }
+    assert!(verified);
+    let export = Command::new(env!("CARGO_BIN_EXE_ansa"))
+        .current_dir(session.parent().unwrap())
+        .arg("--export-evidence")
+        .arg(session.file_name().unwrap())
+        .output()
+        .unwrap();
+    assert!(export.status.success(), "{export:?}");
+    let document: serde_json::Value = serde_json::from_slice(&export.stdout).unwrap();
+    let identity = &document["initial_manifest"];
+    assert_eq!(
+        identity["harness_profile"]["revision"],
+        record["activation"]["revision"]
+    );
+    assert_eq!(identity["prompt_policy"], "handoff-v1");
 }

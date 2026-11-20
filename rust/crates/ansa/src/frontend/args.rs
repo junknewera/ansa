@@ -1,12 +1,13 @@
 //! Legacy command-line grammar. Help is dispatched before option parsing.
 use std::{collections::BTreeSet, path::PathBuf};
-pub const HELP: &str = "Usage: ansa [--continue | --session ID] [--cwd PATH] [--model SLUG] [PROMPT]\n       ansa --openrouter [--continue | --session ID] [--cwd PATH]\n       ansa --openrouter-login [--auth-dir PATH] < KEY_FILE\n       ansa --offline [PROMPT]\n       ansa --login | --auth-status | --models | --logout\n       ansa --print-config\nCommands: /status /cancel /resume /exit. Ctrl+C cancels; Ctrl+D finishes accepted work.\n";
+pub const HELP: &str = "Usage: ansa [--continue | --session ID] [--cwd PATH] [--model SLUG] [PROMPT]\n       ansa --openrouter [--continue | --session ID] [--cwd PATH]\n       ansa --openrouter-login [--auth-dir PATH] < KEY_FILE\n       ansa --offline [PROMPT]\n       ansa --login | --auth-status | --models | --logout\n       ansa --print-config\n       ansa --harness ACTION --cwd PROJECT [ARGS...]\n       ansa [--offline] --harness-trial PROPOSAL:ARM [--cwd PATH] [PROMPT]\n       ansa --export-evidence JOURNAL_DIR\nCommands: /status /cancel /resume /exit. Ctrl+C cancels; Ctrl+D finishes accepted work.\n";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub offline: bool,
     pub openrouter: bool,
     pub resume: bool,
     pub print_config: bool,
+    pub harness_trial: Option<String>,
     pub cwd: PathBuf,
     pub auth: PathBuf,
     pub session: String,
@@ -23,6 +24,7 @@ impl Options {
             openrouter: false,
             resume: false,
             print_config: false,
+            harness_trial: None,
             cwd,
             auth,
             session: String::new(),
@@ -58,6 +60,10 @@ impl Options {
                     index += 1;
                     match key.as_str() {
                         "--session" => value.session = next.clone(),
+                        "--harness-trial" => {
+                            crate::harness::trial_parts(next)?;
+                            value.harness_trial = Some(next.clone())
+                        }
                         "--cwd" => value.cwd = next.into(),
                         "--auth-dir" => value.auth = next.into(),
                         "--model" => value.model = Some(next.clone()),
@@ -67,6 +73,11 @@ impl Options {
                     }
                 }
             }
+        }
+        if value.harness_trial.is_some()
+            && (value.resume || !value.session.is_empty() || value.print_config)
+        {
+            return Err("harness_trial_requires_new_session");
         }
         if value.workspace_editor && value.workspace.is_none() {
             return Err("workspace_editor_requires_endpoint");

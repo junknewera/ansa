@@ -1,11 +1,12 @@
 //! Fresh-executable process supervisor. The runtime never forks directly.
+use super::output_spool;
 use crate::{
     config::{n, s},
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::replay::{Effects, Execution},
     tools::{command::ProcessOptions, evidence as v, invocation::Invocation, registry::Outcome},
 };
-use ansa_linux::{fs, process as linux};
+use ansa_linux::{fs, local, process as linux};
 use std::{
     fs::File,
     io::{ErrorKind, Read},
@@ -82,8 +83,19 @@ fn cancelled() -> std::io::Result<bool> {
 struct Output {
     saved: Vec<u8>,
     seen: usize,
+    spool: Option<Vec<u8>>,
+    eof: bool,
 }
 impl Output {
+    fn new(preview: usize, retain: bool) -> Self {
+        Self {
+            saved: Vec::with_capacity(preview),
+            seen: 0,
+            spool: retain.then(Vec::new),
+            eof: false,
+        }
+    }
+
     fn drain(
         &mut self,
         reader: &mut impl Read,
@@ -93,9 +105,16 @@ impl Output {
         let mut chunk = [0; 4096];
         for _ in 0..16 {
             match reader.read(&mut chunk) {
-                Ok(0) => break,
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
                 Ok(count) => {
                     self.seen = self.seen.saturating_add(count);
+                    if let Some(spool) = &mut self.spool {
+                        let retained = count.min(output_spool::STREAM_BYTES - spool.len());
+                        spool.extend_from_slice(&chunk[..retained]);
+                    }
                     let keep = count.min(budget - self.saved.len() - other);
                     self.saved.extend_from_slice(&chunk[..keep]);
                 }
@@ -106,19 +125,23 @@ impl Output {
         }
         Ok(())
     }
+
+    fn fully_inline(&self) -> bool {
+        self.eof && self.seen == self.saved.len() && std::str::from_utf8(&self.saved).is_ok()
+    }
 }
 fn output(
     status: Option<ExitStatus>,
     cancelled: bool,
     timed_out: bool,
-    out: Output,
-    err: Output,
+    [out, err]: [Output; 2],
     spawn_errno: usize,
     clean: bool,
+    spool: Option<Json>,
 ) -> Result<Outcome> {
     let exit = status.map_or(127, |s| s.code().unwrap_or(-1));
     let signal = status.and_then(|s| s.signal()).unwrap_or(0);
-    let body = Json::object(vec![
+    let mut body = Json::object(vec![
         ("exit_code", Json::parse(&exit.to_string())?),
         ("signal", n(signal as usize)),
         (
@@ -131,11 +154,16 @@ fn output(
         ),
         (
             "truncated",
-            Json::parse(if out.seen + err.seen > out.saved.len() + err.saved.len() {
-                "true"
-            } else {
-                "false"
-            })?,
+            Json::parse(
+                if out.seen > out.saved.len()
+                    || err.seen > err.saved.len()
+                    || spool.is_some() && (!out.eof || !err.eof)
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+            )?,
         ),
         ("stdout", s(&fs::utf8_text(&out.saved))?),
         ("stderr", s(&fs::utf8_text(&err.saved))?),
@@ -147,6 +175,9 @@ fn output(
             Json::parse(if clean { "true" } else { "false" })?,
         ),
     ])?;
+    if let Some(spool) = spool {
+        body = body.with("output_spool", spool)?;
+    }
     Ok(Outcome::from_bytes(
         if clean {
             Execution::Succeeded
@@ -161,7 +192,11 @@ fn output(
         body.dump().into_bytes(),
     ))
 }
-fn supervise(spec: &Json, bound: Option<&Json>) -> Result<Outcome> {
+fn supervise(
+    spec: &Json,
+    bound: Option<&Json>,
+    spool: Option<(&Path, &Invocation)>,
+) -> Result<Outcome> {
     linux::preflight(Path::new("/proc")).map_err(|_| "process_privileges")?;
     super::supervisor::capability_probe(
         &std::env::current_exe().map_err(|_| "process_executable")?,
@@ -236,16 +271,10 @@ fn supervise(spec: &Json, bound: Option<&Json>) -> Result<Outcome> {
                     None,
                     false,
                     false,
-                    Output {
-                        saved: vec![],
-                        seen: 0,
-                    },
-                    Output {
-                        saved: vec![],
-                        seen: 0,
-                    },
+                    [Output::new(0, false), Output::new(0, false)],
                     e.raw_os_error().unwrap_or(5) as usize,
                     true,
+                    None,
                 );
             }
         };
@@ -259,14 +288,8 @@ fn supervise(spec: &Json, bound: Option<&Json>) -> Result<Outcome> {
     let mut stderr = primary.child.stderr.take().ok_or("process_output")?;
     ansa_linux::managed::nonblocking(&stdout).map_err(|_| "process_nonblocking")?;
     ansa_linux::managed::nonblocking(&stderr).map_err(|_| "process_nonblocking")?;
-    let mut out = Output {
-        saved: Vec::with_capacity(options.output_bytes),
-        seen: 0,
-    };
-    let mut err = Output {
-        saved: Vec::with_capacity(options.output_bytes),
-        seen: 0,
-    };
+    let mut out = Output::new(options.output_bytes, spool.is_some());
+    let mut err = Output::new(options.output_bytes, spool.is_some());
     let deadline = Instant::now() + Duration::from_millis(options.timeout_ms as u64);
     let pid = linux::Pid::from_raw(primary.child.id() as i32).ok_or("process_pid")?;
     let (cancelled, timed_out) = loop {
@@ -287,7 +310,26 @@ fn supervise(spec: &Json, bound: Option<&Json>) -> Result<Outcome> {
         .map_err(|_| "process_output")?;
     err.drain(&mut stderr, out.saved.len(), options.output_bytes)
         .map_err(|_| "process_output")?;
-    output(status.ok(), cancelled, timed_out, out, err, 0, clean)
+    let spool = spool
+        .map(|(root, invocation)| {
+            output_spool::retain(
+                root,
+                invocation,
+                (out.spool.as_deref().unwrap_or_default(), out.seen, out.eof),
+                (err.spool.as_deref().unwrap_or_default(), err.seen, err.eof),
+                out.fully_inline() && err.fully_inline(),
+            )
+        })
+        .transpose()?;
+    output(
+        status.ok(),
+        cancelled,
+        timed_out,
+        [out, err],
+        0,
+        clean,
+        spool,
+    )
 }
 pub fn process_worker(job: &Path) -> Result<()> {
     process_worker_in(job, false)
@@ -321,8 +363,53 @@ fn process_worker_in(job: &Path, bound_required: bool) -> Result<()> {
     if bound_required && bound.is_none() {
         return Err("process_cwd_binding_missing");
     }
-    let outcome = supervise(&spec, bound).unwrap_or_else(|_| v::unknown());
-    v::publish(&directory, &spec, &outcome)
+    let spool = if output_spool::enabled(&invocation) {
+        Some((job.parent().ok_or("process_job_path")?, &invocation))
+    } else {
+        None
+    };
+    let outcome = supervise(&spec, bound, spool).unwrap_or_else(|_| v::unknown());
+    let can_retry = spool.is_some()
+        && matches!(
+            local::entry_exists(&directory, "result.json.pending"),
+            Ok(false)
+        );
+    let published = v::publish(&directory, &spec, &outcome);
+    if published.is_ok() || !can_retry {
+        return published;
+    }
+    // If the blob used the last free blocks, release it and retry only the
+    // evidence write. Never remove a blob once its receipt may be visible.
+    let Some((root, invocation)) = spool else {
+        return published;
+    };
+    let body = Json::parse(std::str::from_utf8(outcome.output()).map_err(|_| "invalid_utf8")?)?;
+    let id = sha256(invocation.operation.as_bytes());
+    if body
+        .field("output_spool")
+        .and_then(|receipt| receipt.text_field("output_id"))
+        != Ok(id.as_str())
+        || !matches!(local::entry_exists(&directory, "result.json"), Ok(false))
+    {
+        return published;
+    }
+    output_spool::release_unpublished(root, &id)?;
+    if local::entry_exists(&directory, "result.json.pending").map_err(|_| "local_file_publish")? {
+        local::unlink(&directory, "result.json.pending").map_err(|_| "local_file_publish")?;
+    }
+    let inline = body.with(
+        "output_spool",
+        Json::object(vec![("status", s("spool_unavailable")?)])?,
+    )?;
+    v::publish(
+        &directory,
+        &spec,
+        &Outcome::from_bytes(
+            outcome.execution(),
+            outcome.effects(),
+            inline.dump().into_bytes(),
+        ),
+    )
 }
 /// Dispatch before Tokio, configuration, auth or any user-facing frontend.
 pub fn private_entry(args: &[String]) -> Option<Result<()>> {

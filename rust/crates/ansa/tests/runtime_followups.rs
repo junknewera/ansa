@@ -204,6 +204,20 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
         };
         native::load(&saved)
     });
+    let compact: ansa::runtime::Compact = Arc::new(|request, prefix, _| {
+        use ansa::context::legacy_compact::{CompactedContext, summary_request_at};
+        let summary_request = summary_request_at(request, prefix)?;
+        let saved = fixture::saved_response(&summary_request, Some("summary"), 0)
+            .with("context_tokens", Json::parse("95")?)?
+            .with("context_window", Json::parse("1000000")?)?
+            .with(
+                "reported_usage_v1",
+                Json::parse(r#"{"input_tokens":90,"output_tokens":5}"#)?,
+            )?
+            .with("estimated_input_tokens_v1", Json::parse("100")?)?;
+        let response = native::load(&saved)?;
+        CompactedContext::from_summary_at(request.clone(), &response, prefix)
+    });
     let start = || {
         fixture::setup(
             Arc::new(AtomicUsize::new(0)),
@@ -213,7 +227,7 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
             Options {
                 directory: Some(root.journal()),
                 keep_recent_turns: 2,
-                compact: Some(Arc::new(ansa::frontend::offline::compact_retained)),
+                compact: Some(compact.clone()),
                 ..Options::default()
             },
         )
@@ -237,6 +251,37 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
     assert_eq!(fixture::snapshot(&handle, "at_half").await.compactions, 1);
     assert_eq!(calls.load(Ordering::SeqCst), 5);
     fixture::finish(&mut runtime).await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ansa"))
+        .arg("--export-evidence")
+        .arg(root.journal())
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let export = Json::parse(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    let records = export.field("records").unwrap().elements().unwrap();
+    let summary = records
+        .iter()
+        .find(|record| record.text_field("kind") == Ok("compacted"))
+        .unwrap();
+    assert_eq!(summary.usize_field("estimated_input_tokens"), Ok(100));
+    assert_eq!(summary.text_field("estimate_source"), Ok("dispatch"));
+    assert_eq!(summary.usize_field("context_window"), Ok(1_000_000));
+    assert_eq!(
+        summary
+            .field("reported_usage")
+            .unwrap()
+            .usize_field("input_tokens"),
+        Ok(90)
+    );
+    assert_eq!(
+        summary
+            .field("reported_usage")
+            .unwrap()
+            .usize_field("output_tokens"),
+        Ok(5)
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

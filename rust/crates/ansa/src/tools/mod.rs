@@ -10,4 +10,5 @@ pub mod invocation;
 pub mod registry;
 pub mod schema;
 pub mod search;
+pub(crate) mod skills;
 mod workspace;

@@ -956,6 +956,28 @@ def new_resume_and_exit(screen, root, cwd):
     assert "resume_not_available" not in visible(screen)
     escape(screen)
     until(screen, lambda frame: "Project sessions" not in frame, "session picker closed")
+    before_search = journals(root)
+    local(screen, "/sessions search previous_session")
+    until(screen, lambda _: "Search project sessions" in popup_text(screen)
+          and "PREVIOUS_SESSION" in popup_text(screen), "search found the original user message")
+    screen.send(b"\r")
+    until(screen, lambda _: "Saved conversation" in popup_text(screen)
+          and "PREVIOUS_SESSION" in popup_text(screen), "source opened at the archived turn")
+    escape(screen)
+    until(screen, lambda _: "Saved conversation" not in popup_text(screen), "source reader closed")
+    assert journals(root) == before_search, "search or source reading changed the session journal"
+    incomplete = previous.parent / "incomplete_search_journal"
+    incomplete.mkdir(mode=0o700)
+    info = json.loads((previous / "info.json").read_text())
+    info["id"] = incomplete.name
+    (incomplete / "info.json").write_text(json.dumps(info))
+    (incomplete / "info.json").chmod(0o600)
+    local(screen, "/sessions search absent-search-marker")
+    until(screen, lambda _: "Search incomplete" in popup_text(screen)
+          and "some sessions unavailable" in popup_text(screen), "search reports missing journal with zero hits")
+    escape(screen)
+    until(screen, lambda _: "Search project sessions" not in popup_text(screen), "incomplete search closed")
+    assert journals(root) == before_search, "search recovery wrote a journal part"
     local(screen, f"/resume {previous.name}")
     until(screen, lambda frame: "PREVIOUS_SESSION" in screen.vt.line(1), "resume with an ID reopened that conversation")
     screen.send("Черновик Ж界")

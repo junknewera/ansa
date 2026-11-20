@@ -58,3 +58,7 @@ fn runtime_nonzero_continues() {
 fn runtime_process_cancel() {
     f::runtime_loop(true);
 }
+#[test]
+fn retained_output() {
+    f::retained_output();
+}

@@ -59,6 +59,56 @@ impl ContextBudget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportedUsage {
+    input: usize,
+    cached_input: Option<usize>,
+    output: usize,
+}
+
+impl ReportedUsage {
+    pub(crate) fn new(input: usize, cached_input: Option<usize>, output: usize) -> Option<Self> {
+        input.checked_add(output)?;
+        if cached_input.is_some_and(|cached| cached > input) {
+            return None;
+        }
+        Some(Self {
+            input,
+            cached_input,
+            output,
+        })
+    }
+
+    /// Zero input cannot calibrate the size of the preceding context.
+    pub(crate) fn calibration_tokens(self) -> Option<usize> {
+        (self.input > 0).then_some(self.input + self.output)
+    }
+
+    pub(crate) fn save(self) -> Result<Json, &'static str> {
+        let mut fields = vec![
+            ("input_tokens", Json::parse(&self.input.to_string())?),
+            ("output_tokens", Json::parse(&self.output.to_string())?),
+        ];
+        if let Some(cached) = self.cached_input {
+            fields.push(("cached_input_tokens", Json::parse(&cached.to_string())?));
+        }
+        Json::object(fields)
+    }
+
+    fn load(value: &Json) -> Result<Self, &'static str> {
+        Self::new(
+            value.usize_field("input_tokens")?,
+            if value.has("cached_input_tokens") {
+                Some(value.usize_field("cached_input_tokens")?)
+            } else {
+                None
+            },
+            value.usize_field("output_tokens")?,
+        )
+        .ok_or("saved_response_reported_usage")
+    }
+}
+
 /// Persisted response envelope. Loading always reconstructs the SSE lifecycle
 /// and routes it through the same production reducer as a network response.
 pub fn save(response: &AdmittedResponse) -> Result<Json, &'static str> {
@@ -81,6 +131,15 @@ pub fn save(response: &AdmittedResponse) -> Result<Json, &'static str> {
         budget.save(&mut fields)?;
     } else if let Some(tokens) = response.token_usage() {
         fields.push(("measured_context_tokens", Json::parse(&tokens.to_string())?));
+    }
+    if let Some(tokens) = response.request().estimated_tokens() {
+        fields.push((
+            "estimated_input_tokens_v1",
+            Json::parse(&tokens.to_string())?,
+        ));
+    }
+    if let Some(usage) = response.reported_usage() {
+        fields.push(("reported_usage_v1", usage.save()?));
     }
     Json::object_with_limits(fields, Json::JOURNAL_RECORD_BYTES)
 }
@@ -185,17 +244,30 @@ pub fn load(value: &Json) -> Result<AdmittedResponse, &'static str> {
         limits,
     )?;
     let budget = ContextBudget::load(value)?;
-    if value.has("measured_context_tokens") {
+    let response = if value.has("measured_context_tokens") {
         let tokens = value.usize_field("measured_context_tokens")?;
         if budget.is_some() || tokens == 0 {
             return Err("saved_response_context_usage");
         }
-        Ok(response.with_token_usage(Some(tokens)))
+        response.with_token_usage(Some(tokens))
     } else if let Some(budget) = budget {
-        Ok(response
+        response
             .with_token_usage(budget.tokens)
-            .with_context_window(Some(budget.window)))
+            .with_context_window(Some(budget.window))
     } else {
-        Ok(response)
+        response
+    };
+    let response = if value.has("estimated_input_tokens_v1") {
+        response.with_context_estimate(value.usize_field("estimated_input_tokens_v1")?)
+    } else {
+        response
+    };
+    if !value.has("reported_usage_v1") {
+        return Ok(response);
     }
+    let usage = ReportedUsage::load(value.field("reported_usage_v1")?)?;
+    if response.token_usage() != usage.calibration_tokens() {
+        return Err("saved_response_reported_usage");
+    }
+    Ok(response.with_reported_usage(Some(usage)))
 }

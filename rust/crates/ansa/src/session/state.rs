@@ -8,7 +8,7 @@ use super::{
 use crate::{
     context::{
         epoch::compact_epoch, estimate_input_tokens, estimate_request_tokens,
-        legacy_compact::CompactedContext,
+        legacy_compact::CompactedContext, prompt_policy::PromptPolicy,
     },
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::{
@@ -459,6 +459,7 @@ impl State {
         next.with_input_bounds()
     }
     pub fn initialization(&self) -> Result<Json> {
+        PromptPolicy::resolve(&self.configuration.epoch.exact_state)?;
         Json::object(vec![
             ("kind", Json::string("init")?),
             (
@@ -509,6 +510,7 @@ impl State {
         mode: AgentMode,
         internal: bool,
     ) -> Result<Request> {
+        let policy = PromptPolicy::resolve(&self.epoch.exact_state)?;
         let (epoch, tools) = if internal {
             let provenance = Json::object(vec![
                 ("base_epoch", Json::string(&self.epoch.id)?),
@@ -542,8 +544,9 @@ impl State {
                 Epoch {
                     id: sha256(provenance.dump().as_bytes()),
                     instructions: format!(
-                        "{}\nPlan mode: inspect and reason using read-only tools. Do not modify files or execute commands. Provide a concrete plan.",
-                        self.epoch.instructions
+                        "{}\n{}",
+                        self.epoch.instructions,
+                        policy.plan_instruction()
                     ),
                     exact_state: provenance,
                 },
@@ -654,6 +657,7 @@ impl State {
                         == self.configuration.save()?,
                 "session_configuration_mismatch",
             )?;
+            PromptPolicy::resolve(&self.configuration.epoch.exact_state)?;
             if event.has("autocompact_percent") {
                 self.autocompact_percent = autocompact_percent(event)?;
             }

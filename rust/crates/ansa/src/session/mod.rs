@@ -1,7 +1,9 @@
 //! Canonical append-only session v1. No executor or runtime bootstrap.
 pub mod catalog;
 pub mod codec_v1;
+pub(crate) mod evidence;
 pub mod journal_v1;
+pub(crate) mod search;
 pub mod state;
 pub mod store;
 pub mod summary;

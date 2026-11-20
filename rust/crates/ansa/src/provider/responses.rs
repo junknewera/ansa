@@ -5,7 +5,7 @@ use crate::{
         sse::{Event, Limits, Parser},
     },
     provider::{
-        native::{ContextBudget, NativeItem},
+        native::{ContextBudget, NativeItem, ReportedUsage},
         request::Request,
     },
 };
@@ -18,7 +18,7 @@ struct ValidatedResponse {
     model: String,
     items: Vec<NativeItem>,
     calls: Vec<FunctionCall>,
-    tokens: Option<usize>,
+    usage: Option<ReportedUsage>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCall {
@@ -51,6 +51,7 @@ pub struct AdmittedResponse {
     pub(crate) receipt: super::replay::AdmissionReceipt,
     tokens: Option<usize>,
     context_window: Option<usize>,
+    reported_usage: Option<ReportedUsage>,
 }
 impl AdmittedResponse {
     pub fn request(&self) -> &Request {
@@ -79,6 +80,18 @@ impl AdmittedResponse {
     }
     pub(crate) fn with_token_usage(mut self, tokens: Option<usize>) -> Self {
         self.tokens = tokens.filter(|tokens| *tokens > 0);
+        self
+    }
+    pub(crate) fn reported_usage(&self) -> Option<ReportedUsage> {
+        self.reported_usage
+    }
+    pub(crate) fn with_reported_usage(mut self, usage: Option<ReportedUsage>) -> Self {
+        self.tokens = usage.and_then(ReportedUsage::calibration_tokens);
+        self.reported_usage = usage;
+        self
+    }
+    pub(crate) fn with_context_estimate(mut self, tokens: usize) -> Self {
+        self.request.set_context_estimate(tokens);
         self
     }
     pub(crate) fn with_context_window(mut self, window: Option<usize>) -> Self {
@@ -341,7 +354,8 @@ impl Reducer {
             items: value.items,
             calls: value.calls,
             receipt: super::replay::receipt(&self.request)?,
-            tokens: value.tokens,
+            tokens: value.usage.and_then(ReportedUsage::calibration_tokens),
+            reported_usage: value.usage,
             context_window: None,
         })
     }
@@ -740,17 +754,21 @@ impl Reducer {
         // Completion events may arrive in a different order. Executable views
         // follow the ordered native output, as the C++ production builder does.
         calls.sort_by_key(|call| call.output_index);
-        let tokens = terminal.field("usage").ok().and_then(|usage| {
+        let usage = terminal.field("usage").ok().and_then(|usage| {
             let input = usage.usize_field("input_tokens").ok()?;
             let output = usage.usize_field("output_tokens").ok()?;
-            input.checked_add(output).filter(|_| input > 0)
+            let cached = usage
+                .field("input_tokens_details")
+                .and_then(|details| details.usize_field("cached_tokens"))
+                .ok();
+            ReportedUsage::new(input, cached, output)
         });
         Ok(Some(ValidatedResponse {
             id: response_id,
             model: created_model,
             items,
             calls,
-            tokens,
+            usage,
         }))
     }
 }

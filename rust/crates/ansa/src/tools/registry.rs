@@ -240,14 +240,15 @@ impl Snapshot {
                 .definitions
                 .iter()
                 .position(|definition| definition.descriptor.name == descriptor.name)?;
-            if self.definitions[index].descriptor != *descriptor {
-                return None;
+            let mut definition = self.definitions[index].clone();
+            if definition.descriptor != *descriptor {
+                let legacy =
+                    crate::process::output_spool::legacy_descriptor(&definition.descriptor)
+                        .filter(|legacy| legacy == descriptor)?;
+                definition.descriptor = legacy;
             }
             registry
-                .register_with_policy(
-                    self.definitions[index].clone(),
-                    self.policies[index].clone(),
-                )
+                .register_with_policy(definition, self.policies[index].clone())
                 .ok()?;
         }
         let subset = registry.snapshot();

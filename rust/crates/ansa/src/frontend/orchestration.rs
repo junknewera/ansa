@@ -668,6 +668,21 @@ async fn review_candidate(
             run.plan().checks(),
             stop,
         )?);
+        // Stop fixture runs after verification without releasing a branch.
+        #[cfg(feature = "frontend-test-adapter")]
+        if factory.offline
+            && source.binding.account == "offline-fixture"
+            && run
+                .context()
+                .is_some_and(|context| context.prompt == "ORCHESTRATION_COMMAND_FIXTURE")
+            && std::env::var("ANSA_OFFLINE_EVAL_ARM").as_deref() == Ok("N1")
+        {
+            return if failed.is_empty() {
+                Err("offline_eval_verified")
+            } else {
+                Err("offline_eval_check_failed")
+            };
+        }
         let reviewer = Step {
             id: format!("review-{attempt}"),
             task: format!("Независимо проверьте замороженный коммит {}. Прочитайте approved-plan.json, ansa-candidate.diff и нужные файлы из checkout/. Оцените корректность, полноту и риски по критериям каждого шага.", candidate.commit()),
