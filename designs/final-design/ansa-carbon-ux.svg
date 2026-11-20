@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="1664" height="2440" viewBox="0 0 1664 2440">
+<title>ANSA Carbon — terminal interaction system</title><desc>Editable vector mockup with five grouped terminal screens: inspect workspace, model picker, effort picker, child-agent transcript, and searchable history. Proposed ANSA controls, inspired by documented CLI harness interaction patterns.</desc>
+<style>text{font-family:"DejaVu Sans Mono",monospace;} .b{font-weight:700}</style>
+<rect x="0" y="0" width="1664" height="2440" fill="#080c0e"/>
+<text x="32" y="48" font-size="25" fill="#8fe8b1" class="b">ANSA / CARBON</text>
+<text x="32" y="78" font-size="18" fill="#89918f">A quiet terminal. Inspect only what matters.</text>
+<text x="1632" y="50" font-size="16" fill="#89918f"></text>
+<g id="01-inspect-workspace" transform="translate(32 130)">
+<rect x="0" y="0" width="1600" height="940" fill="#0d1113" stroke="#35403c" stroke-width="1"/>
+<text x="24" y="38" font-size="20" fill="#8fe8b1" class="b">ANSA    ~/ansa  ·  feat/retry</text>
+<text x="24" y="65" font-size="14" fill="#89918f">01  INSPECT WORKSPACE / main chat + temporary inspector</text>
+<path d="M24 84H1576" fill="none" stroke="#35403c"/>
+<text x="1092" y="38" font-size="18" fill="#e6e6df">gpt-6.1-sol · high</text>
+<text x="1450" y="65" font-size="14" fill="#8fe8b1" class="b">LIVE</text>
+<path d="M976 106L976 798" fill="none" stroke="#35403c"/>
+<text x="28" y="136" font-size="21" fill="#e6e6df">› Add bounded retries to the API client.</text>
+<text x="28" y="193" font-size="20" fill="#e6e6df">I’ll inspect retry and cancellation paths,</text>
+<text x="28" y="224" font-size="20" fill="#e6e6df">then delegate implementation and review.</text>
+<text x="28" y="285" font-size="17" fill="#89918f">▾ Reasoning summary · 12s</text>
+<text x="52" y="317" font-size="18" fill="#89918f">Checking retry limits and retryable errors.</text>
+<text x="28" y="379" font-size="20" fill="#e6e6df">✓ Read    src/retry.rs</text>
+<text x="740" y="379" font-size="17" fill="#89918f">84 lines</text>
+<text x="28" y="428" font-size="20" fill="#e6e6df">↳ Spawn   3 subagents</text>
+<text x="52" y="459" font-size="17" fill="#89918f">builder · reviewer · researcher</text>
+<text x="28" y="517" font-size="20" fill="#e6e6df">✓ Edit    src/retry.rs</text>
+<text x="733" y="517" font-size="18" fill="#8fe8b1">+18 −3</text>
+<text x="28" y="570" font-size="20" fill="#e6e6df">▾ Bash    cargo test retry</text>
+<text x="754" y="570" font-size="17" fill="#d9bd7c">0:03</text>
+<rect x="52" y="590" width="890" height="151" fill="#111815"/>
+<text x="72" y="623" font-size="17" fill="#89918f">$ cargo test retry -- --nocapture</text>
+<text x="72" y="658" font-size="18" fill="#e6e6df">running 12 tests</text>
+<text x="72" y="691" font-size="17" fill="#8fe8b1">test retry::respects_max_attempts ... ok</text>
+<text x="72" y="722" font-size="17" fill="#89918f">test retry::cancels_during_backoff ...</text>
+<text x="28" y="779" font-size="17" fill="#8fe8b1">● 2 agents active · review pending</text>
+<text x="1004" y="132" font-size="17" fill="#89918f" class="b">AGENTS</text>
+<text x="1420" y="132" font-size="15" fill="#8fe8b1">2 active</text>
+<text x="1004" y="176" font-size="18" fill="#e6e6df">main</text>
+<text x="1285" y="176" font-size="16" fill="#89918f">coordinating</text>
+<text x="1026" y="219" font-size="18" fill="#8fe8b1">├ builder</text>
+<text x="1380" y="219" font-size="16" fill="#8fe8b1">running</text>
+<text x="1050" y="245" font-size="14" fill="#89918f">gpt-6.1-sol · high · 0:42</text>
+<text x="1026" y="283" font-size="18" fill="#e6e6df">├ reviewer</text>
+<text x="1380" y="283" font-size="16" fill="#8fe8b1">running</text>
+<text x="1050" y="309" font-size="14" fill="#89918f">gpt-6-astra · high · 0:31</text>
+<text x="1026" y="347" font-size="18" fill="#e6e6df">└ researcher</text>
+<text x="1380" y="347" font-size="16" fill="#89918f">done</text>
+<text x="1050" y="373" font-size="14" fill="#89918f">gpt-6-luna · medium · 0:18</text>
+<text x="1004" y="410" font-size="14" fill="#89918f">Enter open thread   /agents all</text>
+<path d="M1004 433H1572" fill="none" stroke="#35403c"/>
+<text x="1004" y="466" font-size="18" fill="#e6e6df">src/retry.rs</text>
+<text x="1004" y="496" font-size="15" fill="#89918f">[retry.rs]  tests.py  DESIGN.md</text>
+<text x="1004" y="530" font-size="15" fill="#89918f">Source    Diff    Preview</text>
+<path d="M1004 543H1572" fill="none" stroke="#35403c"/>
+<text x="1004" y="570" font-size="13" fill="#59625f">38</text>
+<text x="1040" y="570" font-size="13" fill="#e6e6df">pub async fn retry&lt;T&gt;(op: T)</text>
+<text x="1004" y="588" font-size="13" fill="#59625f">39</text>
+<text x="1040" y="588" font-size="13" fill="#e6e6df">    -&gt; Result&lt;Response&gt; {</text>
+<text x="1004" y="606" font-size="13" fill="#59625f">40</text>
+<text x="1040" y="606" font-size="13" fill="#8fe8b1">    for attempt in 0..MAX {</text>
+<text x="1004" y="624" font-size="13" fill="#59625f">41</text>
+<text x="1040" y="624" font-size="13" fill="#e6e6df">        match op.call().await {</text>
+<text x="1004" y="642" font-size="13" fill="#59625f">42</text>
+<text x="1040" y="642" font-size="13" fill="#e6e6df">            Ok(value) =&gt; return Ok(value),</text>
+<text x="1004" y="660" font-size="13" fill="#59625f">43</text>
+<text x="1040" y="660" font-size="13" fill="#e6e6df">            Err(e) if e.retryable() =&gt; {</text>
+<text x="1004" y="678" font-size="13" fill="#59625f">44</text>
+<text x="1040" y="678" font-size="13" fill="#8fe8b1">                sleep(backoff(attempt)).await;</text>
+<text x="1004" y="696" font-size="13" fill="#59625f">45</text>
+<text x="1040" y="696" font-size="13" fill="#e6e6df">            }</text>
+<text x="1004" y="714" font-size="13" fill="#59625f">46</text>
+<text x="1040" y="714" font-size="13" fill="#e6e6df">            Err(e) =&gt; return Err(e),</text>
+<text x="1004" y="732" font-size="13" fill="#59625f">47</text>
+<text x="1040" y="732" font-size="13" fill="#e6e6df">        }</text>
+<text x="1004" y="750" font-size="13" fill="#59625f">48</text>
+<text x="1040" y="750" font-size="13" fill="#e6e6df">    }</text>
+<text x="1004" y="768" font-size="13" fill="#59625f">49</text>
+<text x="1040" y="768" font-size="13" fill="#e6e6df">}</text>
+<text x="1004" y="813" font-size="14" fill="#8fe8b1">NORMAL   Rust   42:1   read-only</text>
+<text x="1004" y="840" font-size="13" fill="#89918f">j/k move  / find  :line  e $EDITOR</text>
+<path d="M24 860H1576" fill="none" stroke="#35403c"/>
+<text x="28" y="898" font-size="22" fill="#8fe8b1">› Send guidance…</text>
+<text x="1035" y="898" font-size="15" fill="#89918f">Enter steer   Alt+Enter queue</text>
+<text x="28" y="925" font-size="15" fill="#89918f">gpt-6.1-sol · high    context 18%    2 agents</text>
+<text x="1330" y="925" font-size="14" fill="#89918f">Esc stop   ? help</text>
+</g>
+<text x="32" y="1122" font-size="16" fill="#89918f">COMPOSE / choose the model and its budget</text>
+<text x="848" y="1122" font-size="16" fill="#89918f">EFFORT / separate budget from display</text>
+<g id="02-model-picker" transform="translate(32 1140)">
+<rect x="0" y="0" width="784" height="570" fill="#0d1113" stroke="#35403c" stroke-width="1"/>
+<text x="24" y="38" font-size="20" fill="#8fe8b1" class="b">/model</text>
+<text x="24" y="65" font-size="14" fill="#89918f">02  MODEL PICKER / current agent</text>
+<path d="M24 84H760" fill="none" stroke="#35403c"/>
+<text x="24" y="119" font-size="22" fill="#e6e6df" class="b">Select model</text>
+<text x="24" y="155" font-size="17" fill="#89918f">Search models…</text>
+<path d="M24 173H760" fill="none" stroke="#35403c"/>
+<rect x="20" y="193" width="744" height="56" fill="#121a17"/>
+<text x="35" y="218" font-size="19" fill="#8fe8b1">› gpt-6.1-sol</text>
+<text x="518" y="218" font-size="15" fill="#8fe8b1">current</text>
+<text x="55" y="240" font-size="13" fill="#89918f">OpenAI · available</text>
+<text x="35" y="286" font-size="19" fill="#e6e6df">  gpt-6-astra</text>
+<text x="55" y="309" font-size="13" fill="#89918f">OpenAI · available</text>
+<text x="35" y="353" font-size="19" fill="#e6e6df">  gpt-6-luna</text>
+<text x="55" y="376" font-size="13" fill="#89918f">OpenAI · available</text>
+<path d="M24 402H760" fill="none" stroke="#35403c"/>
+<text x="24" y="435" font-size="17" fill="#e6e6df">Effort       high   ›</text>
+<text x="24" y="469" font-size="17" fill="#e6e6df">Apply to     current agent</text>
+<text x="24" y="500" font-size="14" fill="#89918f">Takes effect on the next turn.</text>
+<path d="M24 524H760" fill="none" stroke="#35403c"/>
+<text x="24" y="546" font-size="14" fill="#89918f">↑↓ select   Enter apply   Esc return</text>
+</g>
+<g id="03-effort-picker" transform="translate(848 1140)">
+<rect x="0" y="0" width="784" height="570" fill="#0d1113" stroke="#35403c" stroke-width="1"/>
+<text x="24" y="38" font-size="20" fill="#8fe8b1" class="b">/effort</text>
+<text x="24" y="65" font-size="14" fill="#89918f">03  REASONING BUDGET / alias: /thinking</text>
+<path d="M24 84H760" fill="none" stroke="#35403c"/>
+<text x="24" y="123" font-size="22" fill="#e6e6df" class="b">Reasoning effort</text>
+<text x="24" y="158" font-size="16" fill="#89918f">gpt-6.1-sol · supported levels</text>
+<rect x="20" y="273" width="744" height="42" fill="#121a17"/>
+<text x="35" y="211" font-size="19" fill="#e6e6df">  low</text>
+<text x="438" y="211" font-size="15" fill="#89918f">faster</text>
+<text x="35" y="257" font-size="19" fill="#e6e6df">  medium</text>
+<text x="438" y="257" font-size="15" fill="#89918f">balanced</text>
+<text x="35" y="303" font-size="19" fill="#8fe8b1">› high</text>
+<text x="438" y="303" font-size="15" fill="#8fe8b1">current</text>
+<text x="35" y="349" font-size="19" fill="#e6e6df">  xhigh</text>
+<text x="438" y="349" font-size="15" fill="#89918f">deeper</text>
+<text x="35" y="395" font-size="19" fill="#e6e6df">  max</text>
+<text x="438" y="395" font-size="15" fill="#89918f">maximum</text>
+<path d="M24 436H760" fill="none" stroke="#35403c"/>
+<text x="24" y="467" font-size="16" fill="#8fe8b1">Reasoning summaries: shown</text>
+<text x="24" y="497" font-size="13" fill="#89918f">Display only · provider summaries when available</text>
+<path d="M24 524H760" fill="none" stroke="#35403c"/>
+<text x="24" y="546" font-size="14" fill="#89918f">↑↓ choose   Enter apply   Esc return</text>
+</g>
+<text x="32" y="1750" font-size="16" fill="#89918f">DELEGATE / every agent has a native transcript</text>
+<text x="848" y="1750" font-size="16" fill="#89918f">HISTORY / read without losing live events</text>
+<g id="04-child-agent-transcript" transform="translate(32 1770)">
+<rect x="0" y="0" width="784" height="570" fill="#0d1113" stroke="#35403c" stroke-width="1"/>
+<text x="24" y="38" font-size="20" fill="#8fe8b1" class="b">main  ›  reviewer</text>
+<text x="24" y="65" font-size="14" fill="#89918f">04  CHILD THREAD / parent chat stays available</text>
+<path d="M24 84H760" fill="none" stroke="#35403c"/>
+<text x="24" y="120" font-size="18" fill="#e6e6df">reviewer · gpt-6-astra · high</text>
+<text x="24" y="150" font-size="15" fill="#8fe8b1">● running · 0:31</text>
+<text x="24" y="195" font-size="17" fill="#e6e6df">› Review retry and cancellation safety.</text>
+<text x="24" y="237" font-size="15" fill="#89918f">▾ Reasoning summary</text>
+<text x="44" y="265" font-size="16" fill="#89918f">Checking cancellation during backoff.</text>
+<text x="24" y="313" font-size="18" fill="#e6e6df">✓ Read   src/retry.rs</text>
+<text x="24" y="350" font-size="18" fill="#e6e6df">✓ Read   tests/retry.py</text>
+<text x="24" y="387" font-size="18" fill="#e6e6df">▾ Bash   cargo test retry::cancel</text>
+<text x="44" y="418" font-size="16" fill="#89918f">running 2 tests…</text>
+<path d="M24 442H760" fill="none" stroke="#35403c"/>
+<text x="24" y="472" font-size="15" fill="#8fe8b1">Parent: main is still running</text>
+<text x="24" y="503" font-size="13" fill="#89918f">Completed and failed threads remain in /agents.</text>
+<path d="M24 524H760" fill="none" stroke="#35403c"/>
+<text x="24" y="546" font-size="14" fill="#89918f">Esc parent   /agents switch   Enter inspect</text>
+</g>
+<g id="05-searchable-history" transform="translate(848 1770)">
+<rect x="0" y="0" width="784" height="570" fill="#0d1113" stroke="#35403c" stroke-width="1"/>
+<text x="24" y="38" font-size="20" fill="#8fe8b1" class="b">main  /  HISTORY</text>
+<text x="24" y="65" font-size="14" fill="#89918f">05  TRANSCRIPT / auto-follow paused</text>
+<path d="M24 84H760" fill="none" stroke="#35403c"/>
+<text x="24" y="119" font-size="19" fill="#e6e6df">/ cancellation</text>
+<text x="24" y="154" font-size="15" fill="#89918f">[All]  User  Tools  Agents</text>
+<text x="609" y="154" font-size="15" fill="#89918f">2 / 7</text>
+<path d="M24 174H760" fill="none" stroke="#35403c"/>
+<text x="24" y="213" font-size="14" fill="#89918f">14:08  you</text>
+<text x="24" y="244" font-size="18" fill="#e6e6df">› Keep cancellation responsive.</text>
+<text x="24" y="291" font-size="14" fill="#89918f">14:08  main</text>
+<text x="24" y="322" font-size="17" fill="#e6e6df">I’ll check each retry boundary.</text>
+<text x="24" y="369" font-size="17" fill="#e6e6df">✓ Read  src/retry.rs  · 84 lines</text>
+<rect x="20" y="391" width="744" height="44" fill="#121a17"/>
+<text x="32" y="420" font-size="16" fill="#8fe8b1">↳ reviewer started · cancellation audit</text>
+<text x="24" y="472" font-size="18" fill="#8fe8b1">↓ 4 new events    G follow</text>
+<text x="24" y="506" font-size="15" fill="#89918f">Saved chats: /sessions</text>
+<path d="M24 524H760" fill="none" stroke="#35403c"/>
+<text x="24" y="546" font-size="14" fill="#89918f">j/k move   / find   n/N match   Esc compose</text>
+</g>
+<text x="32" y="2386" font-size="14" fill="#89918f">PROPOSED ANSA UX · vector text and shapes · no embedded raster assets</text>
+<text x="32" y="2414" font-size="11" fill="#59625f">References: code.claude.com/docs/en/interactive-mode · opencode.ai/docs/tui · learn.chatgpt.com/docs/developer-commands</text>
+</svg>

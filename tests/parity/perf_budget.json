@@ -1,0 +1,234 @@
+{
+  "agreement": {
+    "date": "2026-11-13",
+    "source": "Explicit user acceptance of the proposed thresholds in this session"
+  },
+  "baseline_summary": {
+    "clean-build": {
+      "runtime_maxrss_bytes": {
+        "count": 3,
+        "max": 505536512,
+        "median": 505339904,
+        "min": 505249792,
+        "p95_nearest_rank": 505536512
+      },
+      "sampled_group_rss_bytes": {
+        "count": 3,
+        "max": 779337728,
+        "median": 774631424,
+        "min": 769261568,
+        "p95_nearest_rank": 779337728
+      },
+      "wall_seconds": {
+        "count": 3,
+        "max": 39.612919821,
+        "median": 39.440716453,
+        "min": 38.498877866,
+        "p95_nearest_rank": 39.612919821
+      }
+    },
+    "configure": {
+      "runtime_maxrss_bytes": {
+        "count": 3,
+        "max": 41881600,
+        "median": 41881600,
+        "min": 41844736,
+        "p95_nearest_rank": 41881600
+      },
+      "sampled_group_rss_bytes": {
+        "count": 3,
+        "max": 68243456,
+        "median": 66613248,
+        "min": 66170880,
+        "p95_nearest_rank": 68243456
+      },
+      "wall_seconds": {
+        "count": 3,
+        "max": 1.665948444,
+        "median": 1.506351374,
+        "min": 1.355578415,
+        "p95_nearest_rank": 1.665948444
+      }
+    },
+    "incremental-build": {
+      "runtime_maxrss_bytes": {
+        "count": 9,
+        "max": 303439872,
+        "median": 303329280,
+        "min": 303112192,
+        "p95_nearest_rank": 303439872
+      },
+      "sampled_group_rss_bytes": {
+        "count": 9,
+        "max": 326750208,
+        "median": 326270976,
+        "min": 326115328,
+        "p95_nearest_rank": 326750208
+      },
+      "wall_seconds": {
+        "count": 9,
+        "max": 3.314479531,
+        "median": 3.074913671,
+        "min": 3.009031187,
+        "p95_nearest_rank": 3.314479531
+      }
+    },
+    "offline-demo-cold-binary": {
+      "wall_seconds": {
+        "count": 20,
+        "max": 0.023241437,
+        "median": 0.017035014,
+        "min": 0.014755139,
+        "p95_nearest_rank": 0.022370901
+      }
+    },
+    "offline-demo-rss-cold": {
+      "runtime_maxrss_bytes": {
+        "count": 10,
+        "max": 17956864,
+        "median": 17948672.0,
+        "min": 15851520,
+        "p95_nearest_rank": 17956864
+      }
+    },
+    "offline-demo-rss-warm": {
+      "runtime_maxrss_bytes": {
+        "count": 20,
+        "max": 18014208,
+        "median": 16861184.0,
+        "min": 13881344,
+        "p95_nearest_rank": 17956864
+      }
+    },
+    "offline-demo-warm": {
+      "wall_seconds": {
+        "count": 50,
+        "max": 0.025000632,
+        "median": 0.013332493,
+        "min": 0.009876706,
+        "p95_nearest_rank": 0.017884951
+      }
+    },
+    "self-check-cold-binary": {
+      "wall_seconds": {
+        "count": 20,
+        "max": 0.0180964,
+        "median": 0.0113044825,
+        "min": 0.009427975,
+        "p95_nearest_rank": 0.01684807
+      }
+    },
+    "self-check-rss-cold": {
+      "runtime_maxrss_bytes": {
+        "count": 10,
+        "max": 11833344,
+        "median": 11833344.0,
+        "min": 11702272,
+        "p95_nearest_rank": 11833344
+      }
+    },
+    "self-check-rss-warm": {
+      "runtime_maxrss_bytes": {
+        "count": 20,
+        "max": 11767808,
+        "median": 11767808.0,
+        "min": 11767808,
+        "p95_nearest_rank": 11767808
+      }
+    },
+    "self-check-warm": {
+      "wall_seconds": {
+        "count": 50,
+        "max": 0.018582318,
+        "median": 0.009407351500000001,
+        "min": 0.006496749,
+        "p95_nearest_rank": 0.014943309
+      }
+    }
+  },
+  "binary": {
+    "bytes": 1568624,
+    "path": "/nix/store/rdrn3x238f5q6kvdchsx877hqx3f0swj-ansa-0.1.0/bin/ansa",
+    "sha256": "fd6fb5043be226b09f0d67314a7c1ae08afd4f6bd57579a62b62f127924919b4",
+    "strip_all_bytes": 1378520,
+    "strip_all_sha256": "099174c72c8390613cbf571fb958bc0720c84b0efceb91b3067a87f22f5d2c52"
+  },
+  "budgets": {
+    "build_sampled_descendants_maxrss_bytes": 2147483648,
+    "build_single_process_maxrss_bytes": 2147483648,
+    "clean_build_max_wall_seconds": 79.3,
+    "cli_runtime_maxrss_bytes": {
+      "offline-demo_cold": 23068672,
+      "offline-demo_warm": 23068672,
+      "self-check_cold": 16777216,
+      "self-check_warm": 16777216
+    },
+    "cli_wall_p95_seconds": {
+      "offline-demo_cold": 0.034,
+      "offline-demo_warm": 0.027,
+      "self-check_cold": 0.026,
+      "self-check_warm": 0.023
+    },
+    "incremental_build_max_wall_seconds": 10.0,
+    "installed_binary_bytes": 16777216,
+    "nix_closure_nar_bytes": 100663296,
+    "strip_all_binary_bytes": 8388608
+  },
+  "deferred": {
+    "full_cold_start": "NOT_MEASURED; only executable file-page residency is controlled here",
+    "history_ready_fresh_100_4096": "NOT_MEASURED; M7/M8",
+    "production_first_frame": "NOT_MEASURED; M7/M8 requires controlled synthetic bootstrap filesystem/OS environment",
+    "sse_throughput_allocations_fsync_responsiveness": "NOT_MEASURED; M7/M8",
+    "submit_preview_durable_done_cancel_cleanup": "NOT_MEASURED; M7/M8"
+  },
+  "environment": {
+    "filesystem": "ext4 /dev/nvme0n1p2",
+    "governor": "schedutil, unchanged",
+    "host_load": "Shared interactive host; load observations retained; no claim of exclusive or thermally fixed hardware",
+    "kernel": "7.2.9",
+    "power": "Battery, discharging 83% to 81%; no AC",
+    "thermal": "Per-build before/after observations retained in raw evidence",
+    "timer": {
+      "path": "/nix/store/yyf42wq6x1w3sknclkb29zm0vs2fvk9d-time-1.10/bin/time",
+      "sha256": "4c9751dc0932ea6ef5800d8a393b8c566f10b918568f59c521e052fcd056ce72",
+      "version": "time (GNU Time) 1.10"
+    },
+    "versions": {
+      "cmake": "cmake version 4.4.3",
+      "g++": "g++ (GCC) 16.2.0",
+      "ninja": "1.13.2",
+      "strip": "GNU strip (GNU Binutils) 2.46"
+    }
+  },
+  "evidence": {
+    "directory": "/home/gusevsaint/Workspace/pet/ansa-baselines/m0-resource-7b84446-v2",
+    "measurements_sha256": "b2bc38be20b93e3a0278668d68006854a0bf7e9a160a88af9ea951055063643a",
+    "method_note": "method-note.json",
+    "rejected_attempt": "../m0-resource-7b84446/REJECTED.json",
+    "script_sha256": "9aee318ea58974ed2f18dc1bac2916e2da15ea104c9925fe97210757026e4f26"
+  },
+  "method": {
+    "build": "Release target ansa only, BUILD_TESTING=OFF, -j2, pinned GCC, compiler launcher disabled; configure separate; empty build trees with warm toolchain/filesystem cache",
+    "build_rss": "GNU time max individual process high-water and 20ms sampled sum of owned descendants across Ninja job groups; shared pages double-counted; sampled aggregate is a lower bound, not exact physical RAM peak",
+    "cache": "Warm after one warmup; cold means only owned executable file pages were proven nonresident with mincore; dependency and other OS caches are not controlled cold",
+    "cli_rss": "Separate GNU time 1.10 child high-water samples, excludes Python pre-exec floor; runtime_maxrss_bytes only",
+    "cli_wall": "Direct process launch to pidfd exit readiness; Popen/pidfd overhead included; wait4/reaping excluded; safe CLI forms only",
+    "incremental": "One-comment source edit in main.cpp; each raw log confirms compilation and relink; compare with equivalent entrypoint edit in Rust",
+    "matching": "Compare release with release on same hardware, jobs, cache protocol, workloads and measurement adapters; warm/cold and RSS/timing series stay separate",
+    "samples": "Wall warm 50/cold 20 per CLI; RSS warm 20/cold 10 per CLI; clean builds 3; incremental edits 9",
+    "statistics": "Median/p95-nearest-rank/max retained; n=3/9 builds give descriptive order statistics, not a statistically established tail"
+  },
+  "nix_closure_nar_bytes": 79953072,
+  "policy": {
+    "build_wall": "Maximum clean <= 2 * baseline maximum; incremental <= 3 * baseline maximum; rounded up to 0.1s",
+    "cli_latency": "p95 <= max(1.5 * baseline p95, baseline p95 + 5ms), rounded up to 1ms",
+    "cli_rss": "Maximum <= max(1.25 * baseline maximum, baseline maximum + 4MiB), rounded up to 1MiB",
+    "correctness": "Resource allowances never relax correctness, replay, cancellation or safety limits; no silent budget increases before comparison",
+    "engineering_ceilings": "Installed binary 16MiB, strip-all binary 8MiB, closure 96MiB and build RSS 2GiB are user-approved ceilings, not statistically derived regression estimates. They allow Rust/static-dependency headroom while bounding total footprint and native -j2 build cost."
+  },
+  "rust_scaffold": "No runtime/performance parity claim. tests/parity/run.py perf remains unimplemented/nonzero in M0.",
+  "schema_version": 1,
+  "source_commit": "7b844461c38d9d20fa15fb645db6b36ee8ecfdb1",
+  "status": "FROZEN_M0",
+  "target": "NixOS/aarch64 Lenovo ThinkPad X13s"
+}

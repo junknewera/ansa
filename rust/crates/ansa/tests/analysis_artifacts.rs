@@ -1,0 +1,884 @@
+#[allow(dead_code)]
+#[path = "support/tools_fixture.rs"]
+mod local;
+#[allow(dead_code)]
+mod support {
+    pub mod runtime_fixture;
+}
+use ansa::{
+    config::agent_epoch,
+    protocol::json::Json,
+    provider::{
+        native,
+        replay::{Effects, Execution},
+        request::Request,
+    },
+    runtime::*,
+    session::journal_v1::{Observer, Point},
+    tools::{artifacts::Store, files::local_tools, registry::Snapshot},
+};
+use local::{Root, s};
+use std::{
+    collections::BTreeMap,
+    fs,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+use support::runtime_fixture as f;
+
+fn tools(root: &Root) -> Arc<Snapshot> {
+    let settings = root.settings();
+    local_tools(
+        settings.clone(),
+        agent_epoch(&settings).unwrap(),
+        &root.0.join("session"),
+        &root.0.join("auth"),
+        &local::worker(),
+    )
+    .unwrap()
+}
+fn args(root: &Root, path: &str, key: &str) -> Json {
+    Json::object(vec![
+        ("path", s(path)),
+        ("date_column", s("date")),
+        ("value_column", s("value")),
+        ("report_key", s(key)),
+        ("instruction_token", s(&local::token(root))),
+    ])
+    .unwrap()
+}
+async fn runtime(
+    root: &Root,
+    args: Json,
+    observer: Option<Observer>,
+    calls: Arc<AtomicUsize>,
+) -> Runtime {
+    let tools = tools(root);
+    let configuration = Request::new(
+        ansa::frontend::app::binding(),
+        agent_epoch(&root.settings()).unwrap(),
+        tools.advertisement().clone(),
+        vec![],
+    )
+    .unwrap();
+    let generator: Generate = Arc::new(move |request, _, _| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        if request
+            .input
+            .last()
+            .is_some_and(|item| item.text_field("type").ok() == Some("function_call_output"))
+        {
+            return native::load(&f::saved_response(request, Some("ANALYSIS_DONE"), 0));
+        }
+        native::load(&Json::object(vec![
+            ("request", request.save()?),
+            ("id", s("response")),
+            ("model", s("gpt-6.1-sol")),
+            (
+                "items",
+                Json::array(vec![Json::object(vec![
+                    ("type", s("function_call")),
+                    ("id", s("item")),
+                    ("call_id", s("call")),
+                    ("name", s("python_execute")),
+                    ("namespace", s("omh")),
+                    ("arguments", s(&args.dump())),
+                    ("status", s("completed")),
+                ])?])?,
+            ),
+        ])?)
+    });
+    let runtime = Runtime::new(
+        "session".into(),
+        configuration,
+        tools,
+        generator,
+        Limits {
+            tool_rounds: 4,
+            ..Limits::default()
+        },
+        Options {
+            directory: Some(root.0.join("session")),
+            journal: observer,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    runtime.ready().await.unwrap();
+    runtime
+}
+async fn finished_tool(handle: &Handle) -> Finished {
+    let event = f::until(handle, |p| matches!(p, EventPayload::ToolFinished(_))).await;
+    let EventPayload::ToolFinished(result) = event.payload else {
+        unreachable!()
+    };
+    result
+}
+async fn outcome(handle: &Handle) -> (Json, OperationId) {
+    let result = finished_tool(handle).await;
+    assert_eq!(result.effects, Effects::KnownResult, "{}", result.output);
+    (Json::parse(&result.output).unwrap(), result.operation)
+}
+fn files(path: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(path)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_file() {
+                return None;
+            }
+            Some((
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+            ))
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn monthly_analysis_publishes_exact_table_report_png_and_reopens_without_execution() {
+    let root = Root::new();
+    local::write(
+        &root.cwd().join("data.csv"),
+        "\r\n\ndate,value,note\r\n2026-01-02,0.1,\"Ж,界\"\n\n2026-01-03,0.2,x\n2026-02-01,-0.05,y\n2026-02-02,,missing\n",
+    );
+    let catalog = tools(&root);
+    assert!(catalog.read_only().definition("dataset_inspect").is_some());
+    assert!(catalog.read_only().definition("python_execute").is_none());
+    let inspect = local::invoke(
+        &root,
+        "dataset_inspect",
+        Json::object(vec![
+            ("path", s("data.csv")),
+            ("instruction_token", s(&local::token(&root))),
+        ])
+        .unwrap(),
+    );
+    assert_eq!(inspect.usize_field("rows").unwrap(), 4);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut run = runtime(
+        &root,
+        args(&root, "data.csv", "monthly"),
+        None,
+        calls.clone(),
+    )
+    .await;
+    f::submit(&run.handle(), "analysis", "aggregate", "turn").await;
+    let (result, operation) = outcome(&run.handle()).await;
+    assert_eq!(
+        result.text_field("status").unwrap(),
+        "ready",
+        "{}",
+        result.dump()
+    );
+    assert_eq!(
+        result
+            .field("summary")
+            .unwrap()
+            .text_field("total")
+            .unwrap(),
+        "0.25"
+    );
+    assert_eq!(
+        result
+            .field("summary")
+            .unwrap()
+            .usize_field("missing")
+            .unwrap(),
+        1
+    );
+    f::until(&run.handle(), |p| matches!(p, EventPayload::Done)).await;
+    let store = Store::new(&root.0.join("session")).unwrap();
+    let descriptors = result.field("artifacts").unwrap().elements().unwrap();
+    assert_eq!(descriptors.len(), 3);
+    for descriptor in descriptors {
+        assert_eq!(
+            descriptor.text_field("producer_operation_id").unwrap(),
+            operation.0
+        );
+        store.resolve(descriptor).unwrap();
+    }
+    let table = store.resolve(&descriptors[1]).unwrap();
+    assert_eq!(
+        fs::read_to_string(&table).unwrap(),
+        "month,total\n2026-01,0.3\n2026-02,-0.05\n".replace('\n', "\r\n")
+    );
+    let job = table.parent().unwrap();
+    let before = files(job);
+    local::write(&root.cwd().join("data.csv"), "date,value\n2026-01-01,2\n");
+    f::submit(
+        &run.handle(),
+        "refine",
+        "refine monthly report",
+        "turn_refine",
+    )
+    .await;
+    let (refined, _) = outcome(&run.handle()).await;
+    assert_eq!(
+        refined
+            .field("summary")
+            .unwrap()
+            .text_field("total")
+            .unwrap(),
+        "2"
+    );
+    let revisions = refined.field("artifacts").unwrap().elements().unwrap();
+    for (old, new) in descriptors.iter().zip(revisions) {
+        assert_eq!(
+            old.text_field("artifact_id").unwrap(),
+            new.text_field("artifact_id").unwrap()
+        );
+        assert_ne!(
+            old.text_field("revision").unwrap(),
+            new.text_field("revision").unwrap()
+        );
+        store.resolve(old).unwrap();
+        store.resolve(new).unwrap();
+    }
+    f::until(&run.handle(), |p| matches!(p, EventPayload::Done)).await;
+    f::finish(&mut run).await;
+    let resumed_calls = Arc::new(AtomicUsize::new(0));
+    let mut reopened = runtime(
+        &root,
+        args(&root, "data.csv", "monthly"),
+        None,
+        resumed_calls.clone(),
+    )
+    .await;
+    for descriptor in descriptors {
+        store.resolve(descriptor).unwrap();
+    }
+    assert_eq!(files(job), before);
+    assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    for key in ["unfinished_one", "unfinished_two"] {
+        let revision = ansa::protocol::legacy_json_v1::sha256(key.as_bytes());
+        ansa_linux::fs::create_private(&root.0.join("session/artifacts").join(revision)).unwrap();
+    }
+    assert!(matches!(store.reserve(), Err("artifact_quota")));
+    assert_eq!(files(job), before, "quota deleted referenced originals");
+    let alias = root.cwd().join("linked-table.csv");
+    fs::hard_link(&table, &alias).unwrap();
+    assert!(matches!(
+        store.resolve(&descriptors[1]),
+        Err("artifact_file_permissions")
+    ));
+    fs::remove_file(alias).unwrap();
+    let forged = descriptors[1]
+        .with("storage_ref", s("../outside.csv"))
+        .unwrap();
+    assert!(matches!(store.resolve(&forged), Err("artifact_descriptor")));
+    let foreign = Store::new(&root.0.join("different_session")).unwrap();
+    assert!(matches!(
+        foreign.resolve(&descriptors[1]),
+        Err("artifact_descriptor")
+    ));
+    fs::write(&table, "CORRUPTED").unwrap();
+    assert!(matches!(
+        store.resolve(&descriptors[1]),
+        Err("artifact_corrupt")
+    ));
+    fs::remove_file(store.resolve(&descriptors[2]).unwrap()).unwrap();
+    assert!(matches!(
+        store.resolve(&descriptors[2]),
+        Err("artifact_missing")
+    ));
+    assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
+    f::finish(&mut reopened).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completed_worker_with_lost_outcome_is_reconciled_after_restart_without_rerun() {
+    let root = Root::new();
+    local::write(
+        &root.cwd().join("data.csv"),
+        "date,value\n2026-01-01,12.3\n",
+    );
+    let fail = Arc::new(AtomicBool::new(true));
+    let inject = fail.clone();
+    let observer = Arc::new(move |point, kind: &str| {
+        if point == Point::BeforeWrite && kind == "outcome" && inject.swap(false, Ordering::SeqCst)
+        {
+            Err("injected_outcome_failure")
+        } else {
+            Ok(())
+        }
+    });
+    let mut run = runtime(
+        &root,
+        args(&root, "data.csv", "recover"),
+        Some(observer),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    f::submit(&run.handle(), "analysis", "aggregate", "turn").await;
+    let (result, _) = outcome(&run.handle()).await;
+    loop {
+        match f::event(&run.handle()).await.payload {
+            EventPayload::FrontendSnapshot(s) if s.storage_failed => break,
+            EventPayload::RuntimeError { diagnostic, .. } => {
+                assert_eq!(diagnostic, "injected_outcome_failure")
+            }
+            _ => {}
+        }
+    }
+    let store = Store::new(&root.0.join("session")).unwrap();
+    let descriptors = result.field("artifacts").unwrap().elements().unwrap();
+    let report = store.resolve(&descriptors[0]).unwrap();
+    let before = files(report.parent().unwrap());
+    f::finish(&mut run).await;
+    fs::remove_file(report.parent().unwrap().join("receipt.json")).unwrap();
+    local::write(&root.cwd().join("data.csv"), "date,value\n2026-01-01,999\n");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut reopened = runtime(
+        &root,
+        args(&root, "data.csv", "recover"),
+        None,
+        calls.clone(),
+    )
+    .await;
+    let snapshot = f::snapshot(&reopened.handle(), "recovered").await;
+    assert!(!snapshot.storage_failed);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(files(report.parent().unwrap()), before);
+    for descriptor in descriptors {
+        store.resolve(descriptor).unwrap();
+    }
+    let journal = fs::read_dir(root.0.join("session"))
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            p.file_name()?
+                .to_str()?
+                .starts_with("part-")
+                .then(|| fs::read_to_string(p).unwrap())
+        })
+        .collect::<String>();
+    assert!(journal.contains("12.3") && journal.contains("outcome"));
+    f::finish(&mut reopened).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_commits_saved_pre_start_cancel_without_starting_a_worker() {
+    let root = Root::new();
+    local::write(&root.cwd().join("data.csv"), "date,value\n2026-01-01,1\n");
+    let observer = Arc::new(|point, kind: &str| {
+        if point == Point::BeforeWrite && kind == "outcome" {
+            Err("injected_outcome_failure")
+        } else {
+            Ok(())
+        }
+    });
+    let input = args(&root, "data.csv", "cancelled");
+    let mut run = runtime(
+        &root,
+        input.clone(),
+        Some(observer),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let handle = run.handle();
+    f::submit(&handle, "analysis", "aggregate", "turn").await;
+    let (result, operation) = outcome(&handle).await;
+    loop {
+        match f::event(&handle).await.payload {
+            EventPayload::FrontendSnapshot(s) if s.storage_failed => break,
+            EventPayload::RuntimeError { diagnostic, .. } => {
+                assert_eq!(diagnostic, "injected_outcome_failure")
+            }
+            _ => {}
+        }
+    }
+    let store = Store::new(&root.0.join("session")).unwrap();
+    let descriptor = &result.field("artifacts").unwrap().elements().unwrap()[0];
+    let report = store.resolve(descriptor).unwrap();
+    f::finish(&mut run).await;
+
+    // Recreate the exact persisted state at the cancellation boundary using
+    // the real admitted invocation and prepared inputs. No scheduler race.
+    let job = report.parent().unwrap();
+    let process = root
+        .0
+        .join("session/operations")
+        .join(job.file_name().unwrap());
+    fs::remove_dir_all(&process).unwrap();
+    for name in ["report.md", "chart.png", "summary.json"] {
+        fs::remove_file(job.join(name)).unwrap();
+    }
+    fs::remove_dir_all(job.join("mpl-cache")).unwrap();
+    let receipt_path = job.join("receipt.json");
+    let ready = Json::parse(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    let saved = ready.with("result", Json::parse(r#"{"status":"cancelled","error":"analysis_cancelled","process":{"error":"cancelled"}}"#).unwrap()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    fs::write(&receipt_path, saved.dump()).unwrap();
+    let mut reopened = runtime(&root, input.clone(), None, calls.clone()).await;
+    let failed = f::snapshot(&reopened.handle(), "contradictory_output").await;
+    assert_eq!(failed.recovery_operation, Some(operation.clone()));
+    f::finish(&mut reopened).await;
+    fs::remove_file(job.join("table.csv")).unwrap();
+
+    let forged = saved
+        .with(
+            "invocation",
+            ready
+                .field("invocation")
+                .unwrap()
+                .with("call", s("wrong_call"))
+                .unwrap(),
+        )
+        .unwrap();
+    fs::write(&receipt_path, forged.dump()).unwrap();
+    let mut reopened = runtime(&root, input.clone(), None, calls.clone()).await;
+    let failed = f::snapshot(&reopened.handle(), "forged_receipt").await;
+    assert_eq!(failed.recovery_operation, Some(operation.clone()));
+    assert_eq!(failed.diagnostic, "operation_recovery_failed");
+    f::finish(&mut reopened).await;
+
+    fs::write(&receipt_path, saved.dump()).unwrap();
+    let mut reopened = runtime(&root, input, None, calls.clone()).await;
+    let recovered = f::snapshot(&reopened.handle(), "recovered_cancel").await;
+    assert!(recovered.recovery_operation.is_none(), "{recovered:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!process.exists());
+    let journal = fs::read_dir(root.0.join("session"))
+        .unwrap()
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            path.file_name()?
+                .to_str()?
+                .starts_with("part-")
+                .then(|| fs::read_to_string(path).unwrap())
+        })
+        .collect::<String>();
+    assert_eq!(
+        journal.matches("analysis_cancelled").count(),
+        1,
+        "{journal}"
+    );
+    f::finish(&mut reopened).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_or_missing_dataset_is_known_and_does_not_start_a_worker() {
+    let root = Root::new();
+    for (index, path) in ["missing.csv", "invalid.csv", "nested/data.csv"]
+        .into_iter()
+        .enumerate()
+    {
+        if index == 1 {
+            local::write(&root.cwd().join(path), "date,value\n\"unterminated");
+        }
+        if index == 2 {
+            fs::create_dir(root.cwd().join("nested")).unwrap();
+            local::write(
+                &root.cwd().join("nested/AGENTS.md"),
+                &"x".repeat(64 * 1024 + 1),
+            );
+            local::write(&root.cwd().join(path), "date,value\n2026-01-01,1\n");
+        }
+        let mut run = runtime(
+            &root,
+            args(&root, path, "invalid"),
+            None,
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        f::submit(
+            &run.handle(),
+            &format!("analysis_{index}"),
+            "aggregate",
+            &format!("turn_{index}"),
+        )
+        .await;
+        let event = finished_tool(&run.handle()).await;
+        assert_eq!(event.effects, Effects::KnownResult);
+        let result = Json::parse(&event.output).unwrap();
+        if index == 2 {
+            assert_eq!(event.execution, Execution::Succeeded);
+            assert_eq!(result.text_field("status"), Ok("instructions_required"));
+            assert_eq!(result.field("executed").unwrap().boolean(), Ok(false));
+            let instructions = result.field("instructions").unwrap().elements().unwrap();
+            assert_eq!(
+                instructions
+                    .last()
+                    .unwrap()
+                    .text_field("text")
+                    .unwrap()
+                    .len(),
+                64 * 1024 + 1
+            );
+        } else {
+            assert_eq!(event.execution, Execution::Failed);
+            assert!(result.has("error"));
+        }
+        f::until(&run.handle(), |p| matches!(p, EventPayload::Done)).await;
+        assert!(!root.0.join("session/artifacts").exists());
+        assert!(
+            fs::read_dir(root.0.join("session/operations"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        f::finish(&mut run).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_nonzero_and_cancellation_have_distinct_known_execution_status() {
+    let root = Root::new();
+    local::write(
+        &root.cwd().join("bad-date.csv"),
+        "date,value\n2026-13-01,1\n",
+    );
+    let mut run = runtime(
+        &root,
+        args(&root, "bad-date.csv", "invalid_date"),
+        None,
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    f::submit(&run.handle(), "bad", "aggregate", "turn_bad").await;
+    let event = f::until(&run.handle(), |p| {
+        matches!(p, EventPayload::ToolFinished(_))
+    })
+    .await;
+    let EventPayload::ToolFinished(failed) = event.payload else {
+        unreachable!()
+    };
+    assert_eq!(failed.effects, Effects::KnownResult);
+    assert_eq!(failed.execution, ansa::provider::replay::Execution::Failed);
+    assert_eq!(
+        Json::parse(&failed.output)
+            .unwrap()
+            .text_field("error")
+            .unwrap(),
+        "analysis_failed"
+    );
+    f::until(&run.handle(), |p| matches!(p, EventPayload::Done)).await;
+    f::finish(&mut run).await;
+
+    let root = Root::new();
+    local::write(
+        &root.cwd().join("data.csv"),
+        &format!("date,value\n{}", "2026-01-01,1\n".repeat(50000)),
+    );
+    let mut run = runtime(
+        &root,
+        args(&root, "data.csv", "cancelled"),
+        None,
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let target = f::submit(&run.handle(), "cancelled", "aggregate", "turn_cancelled").await;
+    let event = f::until(&run.handle(), |p| matches!(p, EventPayload::ToolStarted(_))).await;
+    let EventPayload::ToolStarted(started) = event.payload else {
+        unreachable!()
+    };
+    let revision = ansa::protocol::legacy_json_v1::sha256(started.operation.0.as_bytes());
+    let started_path = root
+        .0
+        .join("session/operations")
+        .join(revision)
+        .join("started.json");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !started_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("analysis did not start");
+    f::post(
+        &run.handle(),
+        "cancel",
+        CommandPayload::Cancel(target),
+        "turn_cancelled",
+        PostStatus::Accepted,
+    )
+    .await;
+    let event = f::until(&run.handle(), |p| {
+        matches!(p, EventPayload::ToolFinished(_))
+    })
+    .await;
+    let EventPayload::ToolFinished(cancelled) = event.payload else {
+        unreachable!()
+    };
+    assert_eq!(cancelled.effects, Effects::KnownResult);
+    assert_eq!(
+        cancelled.execution,
+        ansa::provider::replay::Execution::Cancelled
+    );
+    assert_eq!(
+        Json::parse(&cancelled.output)
+            .unwrap()
+            .text_field("error")
+            .unwrap(),
+        "analysis_cancelled"
+    );
+    f::finish(&mut run).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn corrupt_recovery_inputs_and_outputs_are_unavailable_and_never_reexecuted() {
+    for filename in [
+        "parameters.json",
+        "worker.py",
+        "input.csv",
+        "table.csv",
+        "chart.png",
+        "leading-empty.csv",
+    ] {
+        let root = Root::new();
+        local::write(
+            &root.cwd().join("data.csv"),
+            "\r\ndate,value\n2026-01-01,1\n",
+        );
+        let observer = Arc::new(|point, kind: &str| {
+            if point == Point::BeforeWrite && kind == "outcome" {
+                Err("injected_outcome_failure")
+            } else {
+                Ok(())
+            }
+        });
+        let mut run = runtime(
+            &root,
+            args(&root, "data.csv", "corrupt"),
+            Some(observer),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        f::submit(&run.handle(), "analysis", "aggregate", "turn").await;
+        let (result, _) = outcome(&run.handle()).await;
+        loop {
+            if matches!(f::event(&run.handle()).await.payload,EventPayload::FrontendSnapshot(s) if s.storage_failed)
+            {
+                break;
+            }
+        }
+        f::finish(&mut run).await;
+        let store = Store::new(&root.0.join("session")).unwrap();
+        let descriptors = result.field("artifacts").unwrap().elements().unwrap();
+        let report = store.resolve(&descriptors[0]).unwrap();
+        let job = report.parent().unwrap();
+        fs::remove_file(job.join("receipt.json")).unwrap();
+        if filename == "leading-empty.csv" {
+            // Change the prefix and both local manifests consistently. The
+            // original worker proof must still reject the changed source hash.
+            let path = job.join("analysis.json");
+            let saved = Json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+            let hash = ansa::protocol::legacy_json_v1::sha256(b"\ndate,value\n2026-01-01,1\n");
+            fs::write(&path, saved.with("input_sha256", s(&hash)).unwrap().dump()).unwrap();
+            let path = job.join("parameters.json");
+            let parameters = Json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+            fs::write(
+                &path,
+                parameters.with("source_sha256", s(&hash)).unwrap().dump(),
+            )
+            .unwrap();
+        }
+        let damaged = if filename == "parameters.json" {
+            br#"{"date_column":"date","value_column":"other"}"#.as_slice()
+        } else if filename == "leading-empty.csv" {
+            b"\n".as_slice()
+        } else {
+            b"CORRUPTED"
+        };
+        fs::write(job.join(filename), damaged).unwrap();
+        let before = files(job);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reopened = runtime(
+            &root,
+            args(&root, "data.csv", "corrupt"),
+            None,
+            calls.clone(),
+        )
+        .await;
+        let view = f::snapshot(&reopened.handle(), "failed_recovery").await;
+        assert_eq!(view.state, "paused", "{filename}: {view:?}");
+        assert!(view.recovery_operation.is_some(), "{filename}: {view:?}");
+        assert_eq!(
+            view.diagnostic, "operation_recovery_failed",
+            "{filename}: {view:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            files(job),
+            before,
+            "{filename}: recovery changed a consumed job"
+        );
+        assert!(store.resolve(&descriptors[0]).is_err());
+        f::finish(&mut reopened).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn artifact_bridge_requires_canonical_outcome_and_reads_after_recovery_without_compute() {
+    use ansa::frontend::bridge::Bridge;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    async fn reply(
+        runtime: &mut Runtime,
+        bridge: &mut Bridge,
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        kind: &str,
+        id: Option<&str>,
+    ) -> Json {
+        tokio::time::timeout(std::time::Duration::from_secs(3),async {
+            let mut line=vec![];
+            loop {tokio::select! {
+                event=runtime.next_event()=>bridge.publish(&event.unwrap()),
+                count=reader.read_until(b'\n',&mut line)=>{
+                    assert!(count.unwrap()>0);
+                    let value=Json::parse(std::str::from_utf8(&line).unwrap()).unwrap();line.clear();
+                    if value.text_field("type").ok()==Some(kind) && id.is_none_or(|id|value.text_field("id").ok()==Some(id)) {return value;}
+                }
+            }}
+        }).await.expect("artifact bridge response")
+    }
+    let root = Root::new();
+    local::write(&root.cwd().join("data.csv"), "date,value\n2026-01-01,1\n");
+    let observer = Arc::new(|point, kind: &str| {
+        if point == Point::BeforeWrite && kind == "outcome" {
+            Err("injected_outcome_failure")
+        } else {
+            Ok(())
+        }
+    });
+    let mut run = runtime(
+        &root,
+        args(&root, "data.csv", "bridge"),
+        Some(observer),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await;
+    let store = Store::new(&root.0.join("session")).unwrap();
+    let mut bridge = Bridge::start_with_artifacts(
+        &root.0.join("bridge"),
+        run.handle(),
+        None,
+        Some(store.clone()),
+    )
+    .unwrap();
+    f::submit(&run.handle(), "analysis", "aggregate", "turn").await;
+    let event = f::until(&run.handle(), |p| {
+        matches!(p, EventPayload::ToolFinished(_))
+    })
+    .await;
+    bridge.publish(&event);
+    let EventPayload::ToolFinished(ref finished) = event.payload else {
+        unreachable!()
+    };
+    let result = Json::parse(&finished.output).unwrap();
+    let descriptor = result.field("artifacts").unwrap().elements().unwrap()[0].clone();
+    loop {
+        if matches!(f::event(&run.handle()).await.payload,EventPayload::FrontendSnapshot(s) if s.storage_failed)
+        {
+            break;
+        }
+    }
+    for recovered in [false, true] {
+        let stream = tokio::net::UnixStream::connect(bridge.socket())
+            .await
+            .unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(b"{\"version\":1,\"role\":\"viewer\",\"client\":\"artifact_viewer\"}\n")
+            .await
+            .unwrap();
+        reply(&mut run, &mut bridge, &mut reader, "welcome", None).await;
+        let wire = |id: &str, kind: &str, fields: Vec<(&str, Json)>| {
+            let mut base = vec![
+                ("version", local::n(1)),
+                ("session", s(&run.handle().session().0)),
+                ("incarnation", s(&run.handle().incarnation().0)),
+                ("id", s(id)),
+                ("kind", s(kind)),
+            ];
+            base.extend(fields);
+            format!("{}\n", Json::object(base).unwrap().dump())
+        };
+        let read = wire(
+            "read",
+            "artifact_read",
+            vec![
+                (
+                    "artifact_id",
+                    descriptor.field("artifact_id").unwrap().clone(),
+                ),
+                ("revision", descriptor.field("revision").unwrap().clone()),
+            ],
+        );
+        writer.write_all(read.as_bytes()).await.unwrap();
+        assert_eq!(
+            reply(&mut run, &mut bridge, &mut reader, "error", Some("read"))
+                .await
+                .text_field("code")
+                .unwrap(),
+            "artifact_not_committed"
+        );
+        let catalog = Json::object(vec![
+            ("version", local::n(1)),
+            ("session", s(&run.handle().session().0)),
+            ("incarnation", s(&run.handle().incarnation().0)),
+            ("id", s("catalog")),
+            ("kind", s("artifact_catalog")),
+            ("before", local::n(0)),
+            ("limit", local::n(64)),
+            ("forward", Json::parse("false").unwrap()),
+        ])
+        .unwrap();
+        writer
+            .write_all(format!("{}\n", catalog.dump()).as_bytes())
+            .await
+            .unwrap();
+        let page = reply(
+            &mut run,
+            &mut bridge,
+            &mut reader,
+            "artifact_catalog",
+            Some("catalog"),
+        )
+        .await;
+        assert_eq!(
+            page.field("artifacts").unwrap().elements().unwrap().len(),
+            if recovered { 3 } else { 0 }
+        );
+        if recovered {
+            writer.write_all(read.as_bytes()).await.unwrap();
+            let file = reply(&mut run, &mut bridge, &mut reader, "artifact", Some("read")).await;
+            assert_eq!(file.field("descriptor").unwrap(), &descriptor);
+            assert!(
+                file.text_field("content")
+                    .unwrap()
+                    .contains("# Monthly totals")
+            );
+            assert_eq!(
+                file.text_field("path").unwrap(),
+                store.resolve(&descriptor).unwrap().to_str().unwrap()
+            );
+            break;
+        }
+        bridge.shutdown().await;
+        f::finish(&mut run).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        run = runtime(
+            &root,
+            args(&root, "data.csv", "bridge"),
+            None,
+            calls.clone(),
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        bridge = Bridge::start_with_artifacts(
+            &root.0.join("bridge"),
+            run.handle(),
+            None,
+            Some(store.clone()),
+        )
+        .unwrap();
+    }
+    bridge.shutdown().await;
+    f::finish(&mut run).await;
+}

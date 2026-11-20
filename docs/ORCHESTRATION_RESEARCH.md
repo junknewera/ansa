@@ -1,5 +1,7 @@
 # ANSA — native self-hosted orchestration через direct SIWC Responses
 
+Исходный материал [PR #3](https://github.com/junknewera/ansa/pull/3). Состояние на дату предложения сохранено в [журнале этой ветки](https://github.com/junknewera/ansa/blob/ed40ff8d98637789de9e80eb4a516365f0f717e8/docs/PROJECT_STATE.md). Текущая реализация и результаты проверок описаны в [сводке по пяти предложениям](PROJECT_STATE.md#реализация-пяти-proposal-после-разбора-требований).
+
 Дата исходного исследования и обязательной архитектурной коррекции: **13 ноября 2026, Europe/Moscow**. Product decision принят пользователем; interfaces, lifecycle additions и roadmap ниже — **PROPOSED**, implementation отсутствует. Это исправление существующего docs-only PR #3, не новый аудит и не изменение Rust migration M0–M10.
 
 ## Обновление состояния — 15 ноября 2026

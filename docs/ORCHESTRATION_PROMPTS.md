@@ -1,5 +1,7 @@
 # D6 — Prompts для native ANSA orchestration
 
+Исходный материал [PR #3](https://github.com/junknewera/ansa/pull/3). Состояние на дату предложения сохранено в [журнале этой ветки](https://github.com/junknewera/ansa/blob/ed40ff8d98637789de9e80eb4a516365f0f717e8/docs/PROJECT_STATE.md). Текущая реализация и результаты проверок описаны в [сводке по пяти предложениям](PROJECT_STATE.md#реализация-пяти-proposal-после-разбора-требований).
+
 **Статус: PROPOSED; только архитектурные контракты будущих запусков.** Этот документ не запускает implementation и не предоставляет новые permissions. Runtime состоит только из native ANSA sessions, собственного agent loop, ToolRegistry, process/file tools, durable journals и собственного SIWC adapter к официальному Responses API. Codex допустим как внешний инструмент разработчика для выполнения prompt № 1; он не является runtime dependency, worker backend или механизмом review/continuation. Платный API route и автоматический fallback на него в этом решении отсутствуют.
 
 `ChildSessionBinding`, task/attempt structures, orchestration commands и evidence projections ниже — **предлагаемые** элементы. Их наличие нельзя предполагать в текущем repository. Используй реальные post-migration contracts; не создавай универсальную абстракцию executor backends. Все `{{...}}` заполняет deterministic owner из canonical task state и утверждённой policy. Незаполненная identity, SHA, scope, budget или permissions означает blocker, а не приглашение модели угадать значение.

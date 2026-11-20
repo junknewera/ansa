@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "suite": "e2e",
+  "tty_flood_repeats": 3,
+  "compare_ids": [
+    "pipeline-basic-1",
+    "pipeline-basic-3",
+    "pipeline-plan-1",
+    "pipeline-plan-3",
+    "compact-basic",
+    "compact-plan",
+    "bounded-resume",
+    "switch-basic-cpp",
+    "switch-basic-rust",
+    "switch-plan-cpp",
+    "switch-plan-rust",
+    "restart-resume-cpp",
+    "restart-resume-rust"
+  ],
+  "fault_ids": [
+    "crash-accepted-1-cpp",
+    "crash-accepted-1-rust",
+    "crash-response-1-cpp",
+    "crash-response-1-rust",
+    "crash-response-2-cpp",
+    "crash-response-2-rust",
+    "crash-intent-1-cpp",
+    "crash-intent-1-rust",
+    "crash-intent-2-cpp",
+    "crash-intent-2-rust",
+    "crash-outcome-1-cpp",
+    "crash-outcome-1-rust",
+    "crash-outcome-2-cpp",
+    "crash-outcome-2-rust",
+    "crash-continued-1-cpp",
+    "crash-continued-1-rust",
+    "crash-continued-2-cpp",
+    "crash-continued-2-rust",
+    "crash-done-1-cpp",
+    "crash-done-1-rust",
+    "race-composition-0",
+    "race-composition-1",
+    "race-composition-2",
+    "race-composition-3",
+    "race-composition-4",
+    "race-composition-5",
+    "race-composition-6",
+    "race-composition-7",
+    "race-composition-8",
+    "race-composition-9",
+    "race-composition-10",
+    "race-composition-11",
+    "race-composition-12",
+    "race-composition-13",
+    "race-composition-14",
+    "race-composition-15",
+    "race-composition-16",
+    "race-composition-17",
+    "race-composition-18",
+    "race-composition-19"
+  ],
+  "components": [
+    [
+      "M1",
+      "risk"
+    ],
+    [
+      "M2",
+      "protocol"
+    ],
+    [
+      "M3",
+      "auth"
+    ],
+    [
+      "M4",
+      "sessions"
+    ],
+    [
+      "M5",
+      "runtime"
+    ],
+    [
+      "M6",
+      "tools"
+    ],
+    [
+      "M7",
+      "frontend"
+    ]
+  ]
+}

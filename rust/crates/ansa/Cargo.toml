@@ -1,0 +1,76 @@
+[package]
+name = "ansa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+protocol-test-adapter = []
+auth-test-adapter = []
+session-test-adapter = []
+runtime-test-adapter = []
+tools-test-adapter = []
+frontend-test-adapter = ["protocol-test-adapter"]
+e2e-test-adapter = ["ansa-linux/fixture-e2e", "protocol-test-adapter"]
+orchestration-pilot = []
+
+[[example]]
+name = "orchestration_pilot"
+required-features = ["orchestration-pilot"]
+
+[[example]]
+name = "e2e_adapter"
+required-features = ["e2e-test-adapter"]
+
+[[example]]
+name = "frontend_adapter"
+required-features = ["frontend-test-adapter"]
+
+[[example]]
+name = "tools_adapter"
+required-features = ["tools-test-adapter"]
+
+[[example]]
+name = "runtime_adapter"
+required-features = ["runtime-test-adapter"]
+
+[[example]]
+name = "session_adapter"
+required-features = ["session-test-adapter"]
+
+[[example]]
+name = "protocol_adapter"
+required-features = ["protocol-test-adapter"]
+
+[[example]]
+name = "auth_adapter"
+required-features = ["auth-test-adapter"]
+
+[[bin]]
+name = "ansa"
+path = "src/bin/ansa.rs"
+
+[dependencies]
+ansa-linux = { path = "../ansa-linux" }
+serde.workspace = true
+serde_json.workspace = true
+ring.workspace = true
+oauth2.workspace = true
+base64.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+hyper-rustls.workspace = true
+rustls.workspace = true
+tower-service.workspace = true
+pulldown-cmark.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+vt100.workspace = true
+png = "0.18.1"
+
+[dev-dependencies]
+tokio-rustls.workspace = true

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "reference_source": "742d29cae55cfd993d3ce817962fbabdcccb6a99",
+  "reference_tag": "migration/m9-cutover",
+  "reference_binary_sha256": "420c80f7e7b9787e1b6eba18097f0ec97d3b25cc11630b4b0f1a840f88206ff0",
+  "capture_command": [
+    "ansa",
+    "--offline-jsonl",
+    "--session",
+    "OWNED_TEMP/journal"
+  ],
+  "files": {
+    "part-00000000000000000000.log": "7730256e87240621887007eba9311fab1ce619671cd099ff8cd531002b97ee27"
+  },
+  "record_kinds": [
+    "init",
+    "accepted",
+    "response",
+    "intent",
+    "outcome",
+    "continued",
+    "response",
+    "done"
+  ],
+  "transcript": [
+    {
+      "turn": "turn",
+      "request_id": "request_1",
+      "role": "user",
+      "text": "question",
+      "state": "completed",
+      "mode": "basic"
+    },
+    {
+      "turn": "turn",
+      "request_id": "request_1",
+      "role": "assistant",
+      "text": "OMH_TOOL_OK:OMH_FIXED_VALUE_42",
+      "state": "completed",
+      "mode": "basic"
+    }
+  ]
+}

@@ -63,11 +63,15 @@ struct Temp {
 class Key {
     std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key_{nullptr, EVP_PKEY_free};
 public:
-    Key() {
+    explicit Key(int bits = 2048, std::string exponent = "65537") {
         auto context = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr), EVP_PKEY_CTX_free);
         EVP_PKEY* key = nullptr;
         check(context && EVP_PKEY_keygen_init(context.get()) == 1 &&
-              EVP_PKEY_CTX_set_rsa_keygen_bits(context.get(), 2048) == 1 &&
+              EVP_PKEY_CTX_set_rsa_keygen_bits(context.get(), bits) == 1, "fixture key generation");
+        BIGNUM* raw_exponent = nullptr;
+        check(BN_dec2bn(&raw_exponent, exponent.c_str()) == static_cast<int>(exponent.size()), "fixture exponent");
+        auto e = std::unique_ptr<BIGNUM, decltype(&BN_free)>(raw_exponent, BN_free);
+        check(EVP_PKEY_CTX_set1_rsa_keygen_pubexp(context.get(), e.get()) == 1 &&
               EVP_PKEY_keygen(context.get(), &key) == 1, "fixture key generation");
         key_.reset(key);
     }
@@ -86,7 +90,10 @@ public:
     }
     std::string sign(const Json& claims, std::string_view algorithm = "RS256") const {
         const auto header = Json::object({{"alg", Json::string(algorithm)}, {"kid", Json::string("fixture_key")}});
-        const auto message = base64url(header.dump()) + "." + base64url(claims.dump());
+        return sign_raw(header.dump(), claims.dump());
+    }
+    std::string sign_raw(std::string_view header, std::string_view payload) const {
+        const auto message = base64url(header) + "." + base64url(payload);
         auto context = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>(EVP_MD_CTX_new(), EVP_MD_CTX_free);
         check(context && EVP_DigestSignInit(context.get(), nullptr, EVP_sha256(), nullptr, key_.get()) == 1, "fixture sign");
         std::size_t length = 0;
@@ -111,7 +118,7 @@ struct Mock {
     std::uint64_t now = 1800000000;
     std::string nonce, challenge, redirect, host;
     std::atomic<unsigned> refreshes{0}, inference{0}, revokes{0}, grants{0}, catalogs{0};
-    bool available_model = false;
+    bool available_model = false, malformed_catalog_tail = false;
     std::vector<std::string> issued_refresh, revoked_refresh;
     bool permission = true, revoke_failure = false, crash_refresh = false, block_refresh = false;
     std::atomic<bool> refresh_entered = false;
@@ -149,7 +156,7 @@ struct Mock {
                 check(fields.at("code") == "fixture_code" && fields.at("redirect_uri") == redirect &&
                       pkce_challenge(fields.at("code_verifier")) == challenge, "PKCE/code/redirect mismatch");
             }
-            const auto renewable = "fixture_refresh_" + std::to_string(grants.load()) + "_" + std::to_string(refreshes.load());
+            const auto renewable = "fixture_refresh_" + std::to_string(grants.load()) + "_" + std::to_string(refreshes.load()) + "_" + std::to_string(now);
             issued_refresh.push_back(renewable);
             return reply(Json::object({{"access_token", Json::string("fixture_access_" + std::to_string(refreshes.load()))},
                 {"refresh_token", Json::string(renewable)},
@@ -165,7 +172,8 @@ struct Mock {
         if (request.url.ends_with("/responses")) { ++inference; return {{500, {"application/json"}}, "{}"}; }
         if (request.url.ends_with("/models")) {
             ++catalogs;
-            return reply(Json::parse(available_model ? R"({"models":[{"slug":"fixture-model","visibility":"list"}]})" : R"({"models":[]})"));
+            return reply(Json::parse(!available_model ? R"({"models":[]})" : malformed_catalog_tail ?
+                R"({"models":[{"slug":"fixture-model","visibility":"list"},{}]})" : R"({"models":[{"slug":"fixture-model","visibility":"list"}]})"));
         }
         throw std::runtime_error("unexpected fixture endpoint");
     }
@@ -230,6 +238,11 @@ void jwt_validation() {
     rejects([&] { verify_id_token(key.sign(good), duplicate, "fixture_client", "nonce", now); });
     check(pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") ==
         "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "RFC PKCE oracle");
+    const std::string callback = "GET /auth/callback?state=fixture_state&code=fixture_code HTTP/1.1\r\nHost: 127.0.0.1:4321\r\n";
+    check(auth_callback_fields(callback + "\r\n", "fixture_state", 4321).text("code") == "fixture_code", "valid callback");
+    rejects([&] { auth_callback_fields(callback + "Host: attacker.invalid\r\n\r\n", "fixture_state", 4321); });
+    rejects([&] { auth_callback_fields(callback + "host: 127.0.0.1:4321\r\n\r\n", "fixture_state", 4321); });
+    rejects([&] { auth_callback_fields(callback + "\r\n", "wrong_state", 4321); });
 }
 void lifecycle() {
     Temp temp;
@@ -271,6 +284,7 @@ void lazy_authorization() {
     rejects([&] { auth.check_dispatch(0, {}); });
     check(mock.refreshes == 1 && mock.catalogs == 1 && mock.inference == 0, "missing model did not fail closed");
     mock.available_model = true;
+    mock.malformed_catalog_tail = true;
     auth.check_dispatch(0, {});
     auth.check_dispatch(0, {});
     check(mock.catalogs == 2 && auth.session() == original.session, "catalog was not cached after refresh");
@@ -293,6 +307,24 @@ void permissions() {
     check(manager->status().logged_in && !manager->status().plan_enabled, "identity-only grant not preserved");
     rejects([&] { manager->access(); });
     check(mock.inference == 0, "missing grant reached inference");
+    rejects([&]{ (void)mock.manager(std::filesystem::path(temp.path.string()+std::string("\0suffix",7))); });
+    const auto credentials=temp.path/"credentials.json", held=temp.root/"held.json", alias=temp.root/"alias";
+    check(::chmod(credentials.c_str(),0644)==0,"fixture chmod");
+    rejects([&]{ (void)manager->status(); });
+    check(::chmod(credentials.c_str(),0600)==0,"fixture chmod");
+    check(::link(credentials.c_str(),alias.c_str())==0,"fixture hardlink");
+    rejects([&]{ (void)manager->status(); });
+    check(::unlink(alias.c_str())==0,"fixture unlink");
+    check(::rename(credentials.c_str(),held.c_str())==0 && ::symlink(held.c_str(),credentials.c_str())==0,"fixture symlink");
+    rejects([&]{ (void)manager->status(); });
+    check(::unlink(credentials.c_str())==0 && ::rename(held.c_str(),credentials.c_str())==0,"fixture restore");
+    check(::unlink(credentials.c_str())==0 && ::mkfifo(credentials.c_str(),0600)==0,"fixture fifo");
+    rejects([&]{ (void)manager->status(); });
+    check(::unlink(credentials.c_str())==0,"fixture unlink");
+    const auto marker=temp.path/"signed-out";
+    check(::mkfifo(marker.c_str(),0600)==0,"fixture marker fifo");
+    rejects([&]{ (void)manager->logout(); });
+    check(::unlink(marker.c_str())==0,"fixture unlink");
 }
 void refresh_crash() {
     Temp temp;

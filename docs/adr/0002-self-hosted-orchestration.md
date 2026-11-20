@@ -1,5 +1,7 @@
 # ADR 0002 — Native ANSA Orchestrate через direct SIWC Responses
 
+Исходный материал [PR #3](https://github.com/junknewera/ansa/pull/3). Состояние на дату предложения сохранено в [журнале этой ветки](https://github.com/junknewera/ansa/blob/ed40ff8d98637789de9e80eb4a516365f0f717e8/docs/PROJECT_STATE.md). Текущая реализация и результаты проверок описаны в [сводке по пяти предложениям](../PROJECT_STATE.md#реализация-пяти-proposal-после-разбора-требований).
+
 Дата: 2026-11-13. Статус product decision: **ACCEPTED — обязательное требование пользователя**. Детали implementation contracts и roadmap: **PROPOSED**. Scope: архитектура и будущий план, без implementation/live authorization.
 
 DECISION: Native ANSA multi-agent orchestration via direct SIWC Responses. No Codex runtime dependency.
