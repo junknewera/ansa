@@ -74,6 +74,10 @@ fn command(c: &RuntimeCommand) -> Result<Json> {
             ("model", s(&v.model)),
             ("effort", v.effort.as_deref().map_or_else(null, s)),
         ]),
+        CommandPayload::SetAutocompact(percent) => f.extend([
+            ("type", s("autocompact")),
+            ("percent", n(usize::from(*percent))),
+        ]),
         CommandPayload::GetContext => f.push(("type", s("context"))),
         CommandPayload::GetMessageReceipt(v) => {
             f.extend([("type", s("message_receipt_query")), ("target", s(&v.0))])
@@ -336,6 +340,7 @@ fn events() -> Result<Json> {
         ],
         history_items: 5,
         compactions: 2,
+        autocompact_percent: 50,
         storage_failed: false,
         durable: true,
         resume_available: true,

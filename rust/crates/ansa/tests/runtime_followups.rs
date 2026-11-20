@@ -240,6 +240,121 @@ async fn autocompact_reaches_half_window_even_after_reopen() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn coordinator_without_summarizer_keeps_its_history_at_the_threshold() {
+    let large = "a".repeat(14 * 1024);
+    let expected = large.clone();
+    let provider: Generate = Arc::new(move |request, _, _| {
+        assert!(has_user(request, &expected));
+        native::load(
+            &fixture::saved_response(request, Some("done"), 0)
+                .with("context_tokens", Json::parse("600000")?)?
+                .with("context_window", Json::parse("1000000")?)?,
+        )
+    });
+    let mut runtime = fixture::setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider,
+        Limits::default(),
+        Options::default(),
+    )
+    .await;
+    let handle = runtime.handle();
+    for (id, text) in [("A", large.as_str()), ("B", "B"), ("C", "C"), ("D", "D")] {
+        fixture::submit(&handle, id, text, id).await;
+        fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    }
+    assert_eq!(
+        fixture::snapshot(&handle, "coordinator").await.compactions,
+        0
+    );
+    fixture::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn autocompact_selection_survives_reopen_and_controls_next_submit() {
+    let root = fixture::Root::new();
+    let large = "a".repeat(14 * 1024);
+    let expected = large.clone();
+    let provider: Generate = Arc::new(move |request, _, _| {
+        let last = request.input.last().unwrap().text_field("content")?;
+        if last == "D" {
+            assert!(has_user(request, &expected));
+        } else if last == "E" {
+            assert!(!has_user(request, &expected));
+            assert!(has_user(request, "C") && has_user(request, "D"));
+        }
+        native::load(
+            &fixture::saved_response(request, Some("done"), 0)
+                .with("context_tokens", Json::parse("600000")?)?
+                .with("context_window", Json::parse("1000000")?)?,
+        )
+    });
+    let start = |default| {
+        fixture::setup(
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            provider.clone(),
+            Limits::default(),
+            Options {
+                directory: Some(root.journal()),
+                keep_recent_turns: 2,
+                compact: Some(Arc::new(ansa::frontend::offline::compact_retained)),
+                autocompact_percent: Some(default),
+                ..Options::default()
+            },
+        )
+    };
+    let mut runtime = start(85).await;
+    let handle = runtime.handle();
+    assert_eq!(
+        fixture::snapshot(&handle, "initial")
+            .await
+            .autocompact_percent,
+        85
+    );
+    let select = |handle: &Handle, id: &'static str, percent, status| {
+        let handle = handle.clone();
+        async move {
+            fixture::post(
+                &handle,
+                id,
+                CommandPayload::SetAutocompact(percent),
+                "idle",
+                status,
+            )
+            .await;
+        }
+    };
+    select(&handle, "high", 90, PostStatus::Accepted).await;
+    for (id, text) in [("A", large.as_str()), ("B", "B"), ("C", "C"), ("D", "D")] {
+        fixture::submit(&handle, id, text, id).await;
+        fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    }
+    assert_eq!(
+        fixture::snapshot(&handle, "below_high").await.compactions,
+        0
+    );
+    select(&handle, "low", 60, PostStatus::Accepted).await;
+    fixture::finish(&mut runtime).await;
+
+    let mut runtime = start(100).await;
+    let handle = runtime.handle();
+    assert_eq!(
+        fixture::snapshot(&handle, "restored")
+            .await
+            .autocompact_percent,
+        60
+    );
+    select(&handle, "low", 60, PostStatus::Duplicate).await;
+    select(&handle, "low", 61, PostStatus::CommandConflict).await;
+    fixture::submit(&handle, "E", "E", "E").await;
+    fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    assert_eq!(fixture::snapshot(&handle, "at_low").await.compactions, 1);
+    fixture::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn autocompact_estimates_the_known_window_without_usage_after_reopen() {
     let root = fixture::Root::new();
     let older = "a".repeat(14 * 1024);

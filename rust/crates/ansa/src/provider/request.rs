@@ -50,6 +50,20 @@ impl PartialEq for Request {
             && self.final_format == other.final_format
     }
 }
+pub(crate) fn openrouter_model_id(value: &str) -> bool {
+    let Some((author, model)) = value.split_once('/') else {
+        return false;
+    };
+    let component = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 127
+            && s.as_bytes()[0].is_ascii_alphanumeric()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    component(author) && component(model)
+}
+
 impl Request {
     pub const MAX_ITEMS: usize = Json::FRAME_NODES;
     pub fn new(
@@ -60,8 +74,8 @@ impl Request {
     ) -> Result<Self, &'static str> {
         let supported = binding.provider == "openai-siwc"
             || binding.provider == "openrouter"
-                && binding.requested_model == OPENROUTER_MODEL
-                && binding.returned_model == OPENROUTER_MODEL
+                && openrouter_model_id(&binding.requested_model)
+                && binding.returned_model == binding.requested_model
             || cfg!(feature = "orchestration-pilot") && binding.provider == "openrouter-test";
         if !supported
             || binding.requested_model.is_empty()

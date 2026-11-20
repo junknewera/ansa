@@ -34,6 +34,12 @@ pub(super) fn handoff_content(text: &str) -> String {
     )
 }
 
+fn autocompact_percent(event: &Json) -> Result<u8> {
+    let percent = event.usize_field("autocompact_percent")?;
+    need((1..=100).contains(&percent), "autocompact_range")?;
+    Ok(percent as u8)
+}
+
 pub(super) fn displayed_handoff_question(text: &str) -> Option<String> {
     let evidence = Json::parse(text).ok()?;
     let marked = evidence.field("show_approved_plan").and_then(Json::boolean) == Ok(true);
@@ -55,6 +61,7 @@ pub struct ForkSeed {
 struct ForkContext {
     completed_starts: Arc<Vec<usize>>,
     budget: Option<ContextBudget>,
+    autocompact_percent: u8,
 }
 impl PartialEq for ForkSeed {
     fn eq(&self, other: &Self) -> bool {
@@ -246,6 +253,8 @@ pub struct State {
     pub initialized: bool,
     pub generation: GenerationSelection,
     pub generation_commands: BTreeMap<String, GenerationSelection>,
+    pub autocompact_percent: u8,
+    pub autocompact_commands: BTreeMap<String, u8>,
     pub followups: Vec<Arc<Followup>>,
     pub fork_source: Option<SessionId>,
     pub timeline: Arc<super::timeline::Timeline>,
@@ -273,6 +282,8 @@ impl State {
             compactions: 0,
             initialized: false,
             generation_commands: BTreeMap::new(),
+            autocompact_percent: 50,
+            autocompact_commands: BTreeMap::new(),
             followups: vec![],
             fork_source: None,
             timeline: Arc::default(),
@@ -388,6 +399,7 @@ impl State {
             context: Arc::new(ForkContext {
                 completed_starts: self.completed_starts.clone(),
                 budget,
+                autocompact_percent: self.autocompact_percent,
             }),
         })
     }
@@ -461,8 +473,18 @@ impl State {
             ("configuration", self.configuration.save()?),
         ])
     }
-    pub(crate) fn initialization_with_seed(&self, seed: Option<&ForkSeed>) -> Result<Json> {
-        let init = self.initialization()?;
+    pub(crate) fn initialization_with_seed(
+        &self,
+        seed: Option<&ForkSeed>,
+        autocompact_percent: Option<u8>,
+    ) -> Result<Json> {
+        let mut init = self.initialization()?;
+        if let Some(percent) =
+            autocompact_percent.or_else(|| seed.map(|seed| seed.context.autocompact_percent))
+            && percent != 50
+        {
+            init = init.with("autocompact_percent", num(percent.into())?)?;
+        }
         if let Some(seed) = seed {
             need(
                 self.configuration.final_format().is_none(),
@@ -588,6 +610,8 @@ impl State {
             initialized: self.initialized,
             generation: self.generation.clone(),
             generation_commands: self.generation_commands.clone(),
+            autocompact_percent: self.autocompact_percent,
+            autocompact_commands: self.autocompact_commands.clone(),
             followups: self.followups.clone(),
             fork_source: self.fork_source.clone(),
             timeline: self.timeline.clone(),
@@ -630,6 +654,9 @@ impl State {
                         == self.configuration.save()?,
                 "session_configuration_mismatch",
             )?;
+            if event.has("autocompact_percent") {
+                self.autocompact_percent = autocompact_percent(event)?;
+            }
             self.initialized = true;
             if version == 2 {
                 let fork = event.field("fork_seed")?;
@@ -733,6 +760,22 @@ impl State {
             self.timeline = Arc::new(super::timeline::Timeline::load(event.field("timeline")?)?);
             return Ok(None);
         }
+        if kind == "autocompact_selected" {
+            let id = event.text_field("command")?;
+            let percent = autocompact_percent(event)?;
+            need(
+                valid_id(id)
+                    && self.autocompact_commands.len() < 4096
+                    && !self.autocompact_commands.contains_key(id)
+                    && !self.generation_commands.contains_key(id)
+                    && !submits.contains_key(id)
+                    && !self.followups.iter().any(|m| m.command.0 == id),
+                "autocompact_selection",
+            )?;
+            self.autocompact_percent = percent;
+            self.autocompact_commands.insert(id.into(), percent);
+            return Ok(None);
+        }
         if kind == "generation_selected" {
             let id = event.text_field("command")?;
             let model = event.text_field("model")?;
@@ -749,6 +792,7 @@ impl State {
                     && effort.as_ref().is_none_or(|e| valid_id(e))
                     && self.generation_commands.len() < 4096
                     && !self.generation_commands.contains_key(id)
+                    && !self.autocompact_commands.contains_key(id)
                     && !submits.contains_key(id)
                     && !self.followups.iter().any(|m| m.command.0 == id),
                 "generation_selection",
@@ -786,7 +830,8 @@ impl State {
                     && self.pending_followups().count() < 16
                     && !self.followups.iter().any(|m| m.command.0 == command)
                     && !submits.contains_key(command)
-                    && !self.generation_commands.contains_key(command),
+                    && !self.generation_commands.contains_key(command)
+                    && !self.autocompact_commands.contains_key(command),
                 "session_followup",
             )?;
             self.followups.push(Arc::new(Followup {
@@ -900,6 +945,7 @@ impl State {
                     && !text.is_empty()
                     && !submits.contains_key(id)
                     && !self.generation_commands.contains_key(id)
+                    && !self.autocompact_commands.contains_key(id)
                     && !self.followups.iter().any(|m| m.command.0 == id)
                     && submits.len() < 65536
                     && event.usize_field("request_number")?

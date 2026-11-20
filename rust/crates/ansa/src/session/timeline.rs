@@ -110,6 +110,17 @@ impl Default for Timeline {
     }
 }
 impl Timeline {
+    pub(crate) fn current_tool(
+        &self,
+        turn: &TurnId,
+        request: &RequestId,
+        operation: &str,
+    ) -> Option<&ToolDetail> {
+        if &self.turn != turn || &self.request != request {
+            return None;
+        }
+        self.names.get(operation)
+    }
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -120,7 +120,8 @@ impl Handle {
             CommandPayload::Submit(_)
             | CommandPayload::Handoff(_)
             | CommandPayload::Steer(_)
-            | CommandPayload::SetGeneration(_) => &self.submits,
+            | CommandPayload::SetGeneration(_)
+            | CommandPayload::SetAutocompact(_) => &self.submits,
         };
         let (reply, receiver) = oneshot::channel();
         match sender.try_send(Envelope { command, reply }) {

@@ -71,6 +71,7 @@ pub struct Options {
     pub model_window: ModelWindow,
     pub journal: Option<Observer>,
     pub keep_recent_turns: usize,
+    pub autocompact_percent: Option<u8>,
     pub check_dispatch: CheckDispatch,
     pub tool_guard: ToolGuard,
     pub plan_guard: Option<PlanGuard>,
@@ -89,6 +90,7 @@ impl Default for Options {
             model_window: Arc::new(|_| None),
             journal: None,
             keep_recent_turns: 0,
+            autocompact_percent: None,
             check_dispatch: Arc::new(|_, _| Ok(())),
             tool_guard: Arc::new(|_| Ok(Lease::default())),
             plan_guard: None,
@@ -121,6 +123,30 @@ pub struct ChildAttempt {
     text_sha256: String,
     state: ChildAttemptState,
     latest_tool: Option<(String, Option<String>)>,
+    tool_evidence: Option<ChildToolEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChildToolEvidence {
+    pub(crate) command: String,
+    pub(crate) request: String,
+    pub(crate) outcomes: usize,
+    pub(crate) dispatched: usize,
+    pub(crate) receipts: Vec<ChildToolReceipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChildToolReceipt {
+    operation: String,
+    tool: String,
+    target: String,
+    dispatched: bool,
+    execution: String,
+    effects: String,
+    output_bytes: usize,
+    output_excerpt: String,
 }
 
 impl ChildAttempt {
@@ -152,6 +178,9 @@ impl ChildAttempt {
         self.latest_tool
             .as_ref()
             .map(|(name, target)| (name.as_str(), target.as_deref()))
+    }
+    pub(crate) fn tool_evidence(&self) -> Option<&ChildToolEvidence> {
+        self.tool_evidence.as_ref()
     }
     pub fn into_state(self) -> ChildAttemptState {
         self.state

@@ -728,6 +728,37 @@ impl Workbench {
             .report(io, "Applying model and reasoning effort…");
         true
     }
+    pub(super) fn apply_autocompact(&mut self, percent: u8, io: &Io) -> bool {
+        if !self.can_job(io) {
+            return false;
+        }
+        let slot = &mut self.slots[self.current];
+        let command = slot
+            .state
+            .command(&slot.handle, CommandPayload::SetAutocompact(percent));
+        let handle = slot.handle.clone();
+        let owner = slot.id.clone();
+        let factory = self.factory.clone();
+        let selected_at = SystemTime::now();
+        self.jobs.spawn(async move {
+            let result = match handle.post(command).await {
+                Ok(PostStatus::Accepted) => tokio::task::spawn_blocking(move || {
+                    factory.save_autocompact(selected_at, percent)
+                })
+                .await
+                .unwrap_or(Err("autocompact_preferences_write")),
+                Ok(PostStatus::Duplicate) => Ok(()),
+                Ok(PostStatus::Closed) => Err("runtime_closed"),
+                Ok(PostStatus::QueueFull) => Err("command_queue_full"),
+                Ok(PostStatus::CommandIdLimit) => Err("submit_id_limit"),
+                Ok(_) => Err("autocompact_selection"),
+                Err(code) => Err(code),
+            };
+            Job::AutocompactSaved { owner, result }
+        });
+        slot.state.report(io, "Applying autocompact percentage…");
+        true
+    }
     fn terminal_dimensions(&self) -> Option<(u16, u16)> {
         // A key can arrive after the Files footer has been written but before
         // the writer acknowledges the whole frame. Use the newest geometry.

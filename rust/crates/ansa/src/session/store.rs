@@ -33,8 +33,17 @@ impl Store {
         observe: Option<Observer>,
         seed: Option<&ForkSeed>,
         existing: Option<DirectoryIdentity>,
+        autocompact_percent: Option<u8>,
     ) -> Result<Self> {
-        Self::open_seeded_with_replay(path, state, observe, seed, existing, |_| Ok(()))
+        Self::open_seeded_with_replay(
+            path,
+            state,
+            observe,
+            seed,
+            existing,
+            autocompact_percent,
+            |_| Ok(()),
+        )
     }
     pub fn open_with_replay(
         path: &Path,
@@ -42,7 +51,7 @@ impl Store {
         observe: Option<Observer>,
         replay: impl FnMut(&Json) -> Result<()>,
     ) -> Result<Self> {
-        Self::open_seeded_with_replay(path, state, observe, None, None, replay)
+        Self::open_seeded_with_replay(path, state, observe, None, None, None, replay)
     }
     fn open_seeded_with_replay(
         path: &Path,
@@ -50,6 +59,7 @@ impl Store {
         observe: Option<Observer>,
         seed: Option<&ForkSeed>,
         existing: Option<DirectoryIdentity>,
+        autocompact_percent: Option<u8>,
         mut replay: impl FnMut(&Json) -> Result<()>,
     ) -> Result<Self> {
         let replay_state = |event: &Json| {
@@ -62,7 +72,7 @@ impl Store {
         };
         let diagnostic = journal.diagnostic();
         if diagnostic.is_empty() && journal.empty() {
-            let init = state.initialization_with_seed(seed)?;
+            let init = state.initialization_with_seed(seed, autocompact_percent)?;
             let mut next = state.clone();
             next.apply(&init)?;
             journal.append(&init)?;

@@ -12,6 +12,7 @@ use crate::{
     session::{
         codec_v1::{Invocation, SavedResult, response_text, save_response},
         state::{Receipt as SubmitReceipt, State},
+        transcript::ToolDetail,
     },
     tools::registry::Snapshot as Tools,
 };
@@ -24,6 +25,35 @@ struct PendingStore {
     identity: Identity,
     kind: Kind,
     known: Option<SavedResult>,
+}
+
+fn child_tool_receipt(saved: &SavedResult, detail: Option<&ToolDetail>) -> ChildToolReceipt {
+    let result = &saved.result;
+    let tool = detail.map_or("unknown", |detail| detail.name.as_str());
+    let local_evidence = matches!(
+        tool,
+        "read_file" | "list_directory" | "search_files" | "edit_file"
+    );
+    let output_excerpt = if local_evidence {
+        result.output().chars().take(200).collect()
+    } else {
+        String::new()
+    };
+    let target = detail
+        .filter(|_| local_evidence)
+        .map_or_else(String::new, |detail| {
+            detail.target.chars().take(160).collect()
+        });
+    ChildToolReceipt {
+        operation: result.operation_id().into(),
+        tool: tool.into(),
+        target,
+        dispatched: saved.dispatched,
+        execution: format!("{:?}", result.execution()),
+        effects: format!("{:?}", result.effects()),
+        output_bytes: result.output().len(),
+        output_excerpt,
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolTask {
@@ -60,6 +90,7 @@ pub(crate) struct Owner {
     control_replies: BTreeMap<String, oneshot::Sender<Result<PostStatus>>>,
     control_commands: BTreeMap<String, RuntimeCommand>,
     selections: VecDeque<RuntimeCommand>,
+    autocompact_selections: VecDeque<RuntimeCommand>,
     selecting: Option<RuntimeCommand>,
     selection_stop: Option<Cancel>,
     deferred_completions: VecDeque<Completion>,
@@ -141,6 +172,7 @@ impl Owner {
             control_replies: BTreeMap::new(),
             control_commands: BTreeMap::new(),
             selections: VecDeque::new(),
+            autocompact_selections: VecDeque::new(),
             selecting: None,
             selection_stop: None,
             deferred_completions: VecDeque::new(),
@@ -259,6 +291,7 @@ impl Owner {
         self.emit(EventPayload::FrontendSnapshot(Box::new(Snapshot {
             timeline_size: self.state.timeline.len(),
             generation: self.state.generation.clone(),
+            autocompact_percent: self.state.autocompact_percent,
             followups: self
                 .state
                 .followups
@@ -378,6 +411,7 @@ impl Owner {
             return Err("child_journal_read_only");
         }
         let journal = self.journal_identity.ok_or("child_requires_journal")?;
+        let mut tool_evidence = None;
         let state = match self.state.submits.get(&lookup.command.0) {
             Some(receipt) => {
                 Self::match_child_submit(receipt, lookup)?;
@@ -399,6 +433,28 @@ impl Owner {
                 let final_response = if receipt.state == "completed" {
                     if turn.stage != "completed" {
                         return Err("child_completion_not_current");
+                    }
+                    if quiescent {
+                        let results: Vec<_> =
+                            turn.previous_results.iter().chain(&turn.results).collect();
+                        tool_evidence = Some(ChildToolEvidence {
+                            command: receipt.command.0.clone(),
+                            request: receipt.request.0.clone(),
+                            outcomes: results.len(),
+                            dispatched: results.iter().filter(|saved| saved.dispatched).count(),
+                            receipts: results
+                                .iter()
+                                .skip(results.len().saturating_sub(12))
+                                .map(|saved| {
+                                    let detail = self.state.timeline.current_tool(
+                                        &receipt.turn,
+                                        &receipt.request,
+                                        saved.result.operation_id(),
+                                    );
+                                    child_tool_receipt(saved, detail)
+                                })
+                                .collect(),
+                        });
                     }
                     Some(turn.response.clone().ok_or("child_completion_missing")?)
                 } else {
@@ -423,6 +479,10 @@ impl Owner {
                     .state
                     .generation_commands
                     .contains_key(&lookup.command.0)
+                    || self
+                        .state
+                        .autocompact_commands
+                        .contains_key(&lookup.command.0)
                     || self
                         .state
                         .followups
@@ -460,6 +520,7 @@ impl Owner {
                     }
                     Activity::Finished(_) => None,
                 }),
+            tool_evidence,
             state,
         })
     }
@@ -802,7 +863,9 @@ impl Owner {
         if matches!(status, Ok(PostStatus::Accepted))
             && matches!(
                 command.payload,
-                CommandPayload::Steer(_) | CommandPayload::SetGeneration(_)
+                CommandPayload::Steer(_)
+                    | CommandPayload::SetGeneration(_)
+                    | CommandPayload::SetAutocompact(_)
             )
         {
             // Admission is acknowledged only after the durable queued/selection
@@ -887,6 +950,10 @@ impl Owner {
                         .state
                         .generation_commands
                         .contains_key(&command.command.0)
+                    || self
+                        .state
+                        .autocompact_commands
+                        .contains_key(&command.command.0)
                 {
                     return Ok(PostStatus::CommandConflict);
                 }
@@ -933,6 +1000,10 @@ impl Owner {
                 if self.receipts.contains_key(&command.command.0)
                     || self
                         .state
+                        .autocompact_commands
+                        .contains_key(&command.command.0)
+                    || self
+                        .state
                         .followups
                         .iter()
                         .any(|m| m.command == command.command)
@@ -958,6 +1029,42 @@ impl Owner {
                 }
                 self.selections.push_back(command.clone());
             }
+            CommandPayload::SetAutocompact(percent) => {
+                let id = &command.command.0;
+                if let Some(previous) = self.state.autocompact_commands.get(id) {
+                    return Ok(if previous == percent {
+                        PostStatus::Duplicate
+                    } else {
+                        PostStatus::CommandConflict
+                    });
+                }
+                if self.receipts.contains_key(id)
+                    || self.state.generation_commands.contains_key(id)
+                    || self
+                        .state
+                        .followups
+                        .iter()
+                        .any(|m| m.command == command.command)
+                {
+                    return Ok(PostStatus::CommandConflict);
+                }
+                if self.storage_failed {
+                    return Err("journal_read_only");
+                }
+                let reserved = self.autocompact_selections.len()
+                    + usize::from(
+                        self.storing
+                            .as_ref()
+                            .is_some_and(|pending| pending.kind == Kind::AutocompactSelected),
+                    );
+                if self.state.autocompact_commands.len() + reserved >= 4096 {
+                    return Ok(PostStatus::CommandIdLimit);
+                }
+                if reserved >= 4 {
+                    return Ok(PostStatus::QueueFull);
+                }
+                self.autocompact_selections.push_back(command.clone());
+            }
             CommandPayload::GetContext => {
                 self.emit(EventPayload::ContextSnapshot {
                     command: command.command.clone(),
@@ -980,6 +1087,10 @@ impl Owner {
                     .state
                     .generation_commands
                     .contains_key(&command.command.0)
+                    || self
+                        .state
+                        .autocompact_commands
+                        .contains_key(&command.command.0)
                     || self
                         .state
                         .followups
@@ -1161,6 +1272,7 @@ impl Owner {
         self.owned_intent = false;
         self.pending_pause = None;
         let limits = self.limits;
+        let can_compact = self.options.compact.is_some();
         let keep = self.options.keep_recent_turns;
         let model_window = self.options.model_window.clone();
         self.persist(
@@ -1169,12 +1281,16 @@ impl Owner {
             Box::new(move |state| {
                 let next = state.request_for_input(&submitted.text, submitted.mode, internal)?;
                 let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;
-                let compact = !inherited_incomplete_turn
+                let compact = can_compact
+                    && !inherited_incomplete_turn
                     && state.completed_context_turns() > keep
                     && state.compaction_prefix().is_some()
                     && state
                         .context_estimate(&next, || model_window(&next))
-                        .is_some_and(|(tokens, window)| tokens >= window.div_ceil(2));
+                        .is_some_and(|(tokens, window)| {
+                            tokens as u128 * 100
+                                >= window as u128 * u128::from(state.autocompact_percent)
+                        });
                 let mut fields = vec![
                     ("kind", Json::string("accepted")?),
                     ("command", Json::string(&receipt.command.0)?),
@@ -1298,6 +1414,23 @@ impl Owner {
                 }
             }
             return Ok(());
+        }
+        if !self.shutting_down
+            && self.closing.mode.load(Ordering::Acquire) != 2
+            && let Some(command) = self.autocompact_selections.pop_front()
+        {
+            let CommandPayload::SetAutocompact(percent) = command.payload else {
+                return Err("autocompact_selection");
+            };
+            return self.record(
+                workers,
+                Kind::AutocompactSelected,
+                "autocompact_selected",
+                vec![
+                    ("command", Json::string(&command.command.0)?),
+                    ("autocompact_percent", number(usize::from(percent))?),
+                ],
+            );
         }
         if !self.shutting_down
             && self.closing.mode.load(Ordering::Acquire) != 2
@@ -1588,6 +1721,18 @@ impl Owner {
                     .map(|id| Ok(CommandId(id.text()?.into())))
                     .collect::<Result<Vec<_>>>()?;
                 self.emit(EventPayload::FollowupDelivered { commands });
+                self.snapshot(None);
+            }
+            Kind::AutocompactSelected => {
+                let command: CommandId = receipt.event().text_field("command")?.into();
+                self.control_commands.remove(&command.0);
+                if let Some(reply) = self.control_replies.remove(&command.0) {
+                    let _ = reply.send(Ok(PostStatus::Accepted));
+                }
+                self.emit(EventPayload::AutocompactSelected {
+                    command,
+                    percent: self.state.autocompact_percent,
+                });
                 self.snapshot(None);
             }
             Kind::GenerationSelected => {
@@ -2104,6 +2249,7 @@ impl Owner {
                     .new_followups
                     .drain(..)
                     .chain(self.selections.drain(..))
+                    .chain(self.autocompact_selections.drain(..))
                 {
                     self.control_commands.remove(&command.command.0);
                     if let Some(reply) = self.control_replies.remove(&command.command.0) {
@@ -2261,4 +2407,46 @@ impl Drop for Owner {
         self.gate.cancel();
         self.turn_stop.cancel();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn child_receipts_preserve_scoped_read_evidence_and_omit_command_output() {
+    use crate::{
+        provider::replay::{Execution, ToolResult},
+        session::transcript::ToolPhase,
+    };
+
+    let saved = SavedResult {
+        result: ToolResult::new(
+            "fixture-operation".into(),
+            "fixture-call".into(),
+            "a".repeat(300),
+            Execution::Succeeded,
+            Effects::KnownResult,
+        ),
+        dispatched: true,
+    };
+    let mut detail = ToolDetail {
+        operation: "fixture-operation".into(),
+        name: "read_file".into(),
+        call: "fixture-call".into(),
+        purpose: "Fixture read".into(),
+        target: "fixture.txt".into(),
+        phase: ToolPhase::Prepared,
+        content_start: 0,
+        continued: false,
+        last_chunk: true,
+    };
+    let read = child_tool_receipt(&saved, Some(&detail));
+    assert_eq!(read.operation, "fixture-operation");
+    assert_eq!(read.target, "fixture.txt");
+    assert_eq!(read.execution, "Succeeded");
+    assert_eq!(read.effects, "KnownResult");
+    assert_eq!(read.output_excerpt.len(), 200);
+    detail.name = "run_command".into();
+    let shell = child_tool_receipt(&saved, Some(&detail));
+    assert_eq!(shell.output_bytes, 300);
+    assert!(shell.output_excerpt.is_empty());
+    assert!(shell.target.is_empty());
 }

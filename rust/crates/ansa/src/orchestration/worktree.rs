@@ -440,6 +440,18 @@ impl Worktree {
         stop: &Cancel,
     ) -> Result<PathBuf> {
         let storage = self.path.parent().ok_or("worktree_storage")?;
+        self.frozen_view_in(frozen, storage, name, plan, referenced, stop)
+    }
+
+    pub(crate) fn frozen_view_in(
+        &self,
+        frozen: &Frozen,
+        storage: &Path,
+        name: &str,
+        plan: &str,
+        referenced: bool,
+        stop: &Cancel,
+    ) -> Result<PathBuf> {
         let path = storage.join(name);
         if path.exists() && !path.join("ansa-candidate.diff").exists() && !referenced {
             let retained = storage.join(format!("interrupted-{name}"));

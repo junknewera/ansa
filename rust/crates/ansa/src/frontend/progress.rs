@@ -321,6 +321,7 @@ mod tests {
             tools: vec![],
             history_items: 0,
             compactions: 0,
+            autocompact_percent: 50,
             storage_failed: false,
             durable: true,
             resume_available: false,

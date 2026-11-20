@@ -341,16 +341,21 @@ pub fn exchange(request: &HttpRequest, stop: &Cancel) -> Result<HttpReply> {
 }
 pub(crate) fn openrouter_exchange(request: &HttpRequest, stop: &Cancel) -> Result<HttpReply> {
     let uri: Uri = request.url.parse().map_err(|_| "url_invalid")?;
+    let role_catalog = request.url == crate::openrouter::ROLE_CATALOG;
+    let model_endpoint = uri
+        .path()
+        .strip_prefix("/api/v1/models/")
+        .and_then(|path| path.strip_suffix("/endpoints"))
+        .is_some_and(crate::provider::request::openrouter_model_id);
     if uri.scheme_str() != Some("https")
         || uri.authority().map(|value| value.as_str()) != Some("openrouter.ai")
-        || uri.query().is_some()
-        || !matches!(
-            (request.method, uri.path()),
-            (
-                "GET",
-                "/api/v1/key" | "/api/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints"
-            ) | ("POST", "/api/v1/chat/completions")
-        )
+        || (uri.query().is_some() && !role_catalog)
+        || !(request.method == "GET"
+            && (role_catalog || model_endpoint || uri.path() == "/api/v1/key")
+            || request.method == "POST"
+                && uri.path() == "/api/v1/chat/completions"
+                && uri.query().is_none())
+        || (request.bearer.is_some() && (role_catalog || model_endpoint))
     {
         return Err("openrouter_endpoint");
     }

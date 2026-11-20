@@ -175,6 +175,9 @@ pub(crate) fn read(
                 summary.entry.parent = Some(source.into());
                 return Ok(());
             }
+            if kind == "autocompact_selected" {
+                return Ok(());
+            }
             if kind == "generation_selected" {
                 need(
                     valid_id(event.text_field("command")?)

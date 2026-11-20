@@ -384,6 +384,27 @@ impl State {
         }
         let mut words = text.split_whitespace();
         let first = words.next();
+        if first == Some("/autocompact") {
+            let argument = text.trim_start()["/autocompact".len()..].trim();
+            let accepted = match super::commands::autocompact_percent(argument) {
+                Ok(Some(percent)) => {
+                    self.post(handle, CommandPayload::SetAutocompact(percent), replies)
+                }
+                Ok(None) => {
+                    let status = self.snapshot.as_ref().map_or_else(
+                        || "Loading conversation settings".into(),
+                        |view| format!("Autocompact: {}%", view.autocompact_percent),
+                    );
+                    self.report(io, &format!("{status}\n"));
+                    true
+                }
+                Err(message) => {
+                    self.report(io, &format!("{message}\n"));
+                    false
+                }
+            };
+            return (accepted, false);
+        }
         if matches!(first, Some("/model" | "/thinking" | "/effort")) {
             let Some(value) = words.next() else {
                 self.report(
@@ -661,6 +682,15 @@ impl State {
             EventPayload::FollowupQueued { .. } => {}
             EventPayload::FollowupDelivered { commands } => {
                 self.delivery_event(event.request.as_ref(), commands);
+            }
+            EventPayload::AutocompactSelected { percent, .. } => {
+                if let Some(view) = &mut self.snapshot {
+                    view.autocompact_percent = *percent;
+                }
+                self.report(
+                    io,
+                    &format!("Autocompact: {percent}% applies to future messages\n"),
+                );
             }
             EventPayload::GenerationSelected { selection, .. } => {
                 if let Some(view) = &mut self.snapshot {

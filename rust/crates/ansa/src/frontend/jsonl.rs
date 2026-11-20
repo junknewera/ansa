@@ -96,6 +96,9 @@ pub fn decode(line: &str) -> Result<RuntimeCommand> {
                 Some(json.text_field("effort")?.into())
             },
         }),
+        "autocompact" => CommandPayload::SetAutocompact(
+            u8::try_from(json.usize_field("percent")?).map_err(|_| "autocompact_range")?,
+        ),
         "context" => CommandPayload::GetContext,
         "resume" => CommandPayload::Resume(json.text_field("target")?.into()),
         "snapshot" => CommandPayload::GetSnapshot(json.field("after_sequence")?.index()? as u64),
@@ -258,6 +261,13 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                 Json::array(commands.iter().map(|c| s(&c.0)).collect()).expect("bounded commands"),
             )],
         ),
+        EventPayload::AutocompactSelected { command, percent } => (
+            "autocompact_selected",
+            vec![
+                ("command_id", s(&command.0)),
+                ("percent", n(u64::from(*percent))),
+            ],
+        ),
         EventPayload::GenerationSelected { command, selection } => (
             "generation_selected",
             vec![
@@ -330,6 +340,7 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                     ),
                     ("history_items", n(v.history_items as u64)),
                     ("compactions", n(v.compactions as u64)),
+                    ("autocompact_percent", n(u64::from(v.autocompact_percent))),
                     ("storage_failed", b(v.storage_failed)),
                     ("durable", b(v.durable)),
                     ("resume_available", b(v.resume_available)),

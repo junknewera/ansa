@@ -98,6 +98,23 @@ pub fn entry_exists(directory: &File, name: &str) -> io::Result<bool> {
     }
 }
 
+pub fn publish_directory(directory: &File, pending: &str, name: &str) -> io::Result<()> {
+    if [pending, name]
+        .into_iter()
+        .any(|value| value.is_empty() || matches!(value, "." | "..") || value.contains(['/', '\0']))
+    {
+        return Err(io::Error::other("local_file_name"));
+    }
+    rustix::fs::renameat_with(
+        directory,
+        pending,
+        directory,
+        name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
+    directory.sync_all()
+}
+
 pub fn create(directory: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
     if name.contains('/') || name.contains('\0') {
         return Err(io::Error::other("local_file_name"));
@@ -181,6 +198,10 @@ pub fn replace_ui(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()
 
 pub fn replace_generation(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()> {
     replace_preference(directory, "generation.json", bytes, suffix)
+}
+
+pub fn replace_autocompact(directory: &File, bytes: &[u8], suffix: &str) -> io::Result<()> {
+    replace_preference(directory, "autocompact.json", bytes, suffix)
 }
 
 fn replace_preference(directory: &File, name: &str, bytes: &[u8], suffix: &str) -> io::Result<()> {
