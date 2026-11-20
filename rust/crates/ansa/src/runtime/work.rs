@@ -40,6 +40,10 @@ impl Identity {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
+    Queued,
+    Steered,
+    GenerationSelected,
+    AutocompactSelected,
     Accepted,
     Response,
     Intent,
@@ -65,6 +69,9 @@ pub(crate) struct Receipt {
     durable: bool,
 }
 impl Receipt {
+    pub fn event(&self) -> &Json {
+        &self.event
+    }
     pub fn intent(self) -> Result<DurableIntent> {
         if self.kind != Kind::Intent {
             return Err("intent_receipt_kind");
@@ -82,12 +89,13 @@ pub(crate) struct Stored {
     pub state: Arc<State>,
     pub result: Result<Receipt>,
     pub known: Option<SavedResult>,
+    pub rejected_frame: bool,
 }
 pub(crate) struct Ready {
     pub state: Arc<State>,
+    pub journal_identity: Option<DirectoryIdentity>,
     pub diagnostic: &'static str,
     pub requires_resume: bool,
-    pub profile_bytes: usize,
 }
 pub(crate) enum ProviderTask {
     Generate,
@@ -135,17 +143,28 @@ pub(crate) enum ToolValue {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthTask {
+    SelectGeneration,
     Generate,
     Compact,
     BeforeIntent,
     ToolLease,
 }
 pub(crate) struct AuthJob {
+    pub selection: Option<GenerationSelection>,
+    pub request: Option<Request>,
     pub identity: Identity,
     pub stop: Cancel,
     pub task: AuthTask,
 }
+pub(crate) enum PlanTarget {
+    Submit(RuntimeCommand),
+    Resume(CommandId),
+}
 pub(crate) enum Completion {
+    Plan {
+        target: PlanTarget,
+        result: Result<Box<dyn Send>>,
+    },
     Stored(Stored),
     Provider {
         identity: Identity,
@@ -171,6 +190,7 @@ pub(crate) struct Workers {
     pub tool: Option<blocking::SyncSender<ToolJob>>,
     pub auth: Option<blocking::SyncSender<AuthJob>>,
     pub release: Option<blocking::SyncSender<Identity>>,
+    pub plan: Option<blocking::SyncSender<PlanTarget>>,
     joins: Vec<JoinHandle<()>>,
 }
 fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -199,13 +219,11 @@ fn outcome(invocation: &Invocation, value: crate::tools::registry::Outcome) -> S
         ),
         dispatched: true,
     };
-    if value.output.len() > 128 * 1024
-        || value.execution == Execution::Succeeded && value.effects != Effects::KnownResult
-    {
+    if value.execution == Execution::Succeeded && value.effects != Effects::KnownResult {
         return fallback();
     }
     match String::from_utf8(value.output) {
-        Ok(output) => SavedResult {
+        Ok(output) if Json::text_fits_frame(&output) => SavedResult {
             result: ToolResult::new(
                 invocation.operation.clone(),
                 invocation.call.clone(),
@@ -215,7 +233,7 @@ fn outcome(invocation: &Invocation, value: crate::tools::registry::Outcome) -> S
             ),
             dispatched: true,
         },
-        Err(_) => fallback(),
+        _ => fallback(),
     }
 }
 impl Workers {
@@ -236,8 +254,30 @@ impl Workers {
             tool: None,
             auth: None,
             release: None,
+            plan: None,
             joins: vec![],
         };
+        if let Some(check) = options.plan_guard.clone() {
+            let (sender, receiver) = blocking::sync_channel::<PlanTarget>(1);
+            workers.plan = Some(sender);
+            let output = done.clone();
+            workers.joins.push(
+                thread::Builder::new()
+                    .name("ansa-plan-workspace".into())
+                    .spawn(move || {
+                        while let Ok(target) = receiver.recv() {
+                            let result = guarded(|| check());
+                            if output
+                                .blocking_send(Completion::Plan { target, result })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .map_err(|_| "plan_worker")?,
+            );
+        }
         let (sender, receiver) = blocking::sync_channel::<StoreJob>(1);
         workers.store = Some(sender);
         let channel = done.clone();
@@ -247,26 +287,36 @@ impl Workers {
                 .name("ansa-journal".into())
                 .spawn(move || {
                     let initialized = guarded(|| {
-                        let profile_bytes = initial.configuration.json()?.dump().len();
+                        initial.configuration.json()?;
                         if let Some(path) = &init_options.directory {
-                            let store = Store::open(path, initial, init_options.journal.clone())?;
+                            let store = Store::open_with_seed(
+                                path,
+                                initial,
+                                init_options.journal.clone(),
+                                init_options.fork_seed.as_ref(),
+                                init_options.existing_journal,
+                                init_options.autocompact_percent,
+                            )?;
                             let ready = Ready {
                                 state: store.state().clone(),
+                                journal_identity: Some(store.identity()?),
                                 diagnostic: store.diagnostic(),
                                 requires_resume: store.requires_resume(),
-                                profile_bytes,
                             };
                             Ok((Some(store), ready))
                         } else {
                             let mut state = initial;
-                            state.apply(&state.initialization()?)?;
+                            state.apply(&state.initialization_with_seed(
+                                init_options.fork_seed.as_ref(),
+                                init_options.autocompact_percent,
+                            )?)?;
                             Ok((
                                 None,
                                 Ready {
                                     state: Arc::new(state),
+                                    journal_identity: None,
                                     diagnostic: "",
                                     requires_resume: false,
-                                    profile_bytes,
                                 },
                             ))
                         }
@@ -282,11 +332,19 @@ impl Workers {
                     }
                     while let Ok(job) = receiver.recv() {
                         let mut known = None;
+                        let mut built = false;
                         let result = if poisoned {
                             Err("journal_read_only")
                         } else {
                             guarded(|| {
                                 let event = (job.build)(&state)?;
+                                if matches!(
+                                    job.kind,
+                                    Kind::Accepted | Kind::Response | Kind::Compacted
+                                ) {
+                                    crate::session::journal_v1::check_record_frame(&event)?;
+                                }
+                                built = true;
                                 if let Some(backend) = &mut store {
                                     let result = backend.commit(&event);
                                     known = backend.known_outcome().cloned();
@@ -305,7 +363,19 @@ impl Workers {
                                 })
                             })
                         };
-                        if result.is_err() {
+                        let rejected_frame = !poisoned
+                            && matches!(
+                                job.kind,
+                                Kind::Accepted | Kind::Response | Kind::Compacted
+                            )
+                            && !built
+                            && matches!(
+                                result,
+                                Err("json_build_limit"
+                                    | "json_structure_limit"
+                                    | "request_context")
+                            );
+                        if result.is_err() && !rejected_frame {
                             poisoned = true;
                         }
                         let value = Stored {
@@ -314,6 +384,7 @@ impl Workers {
                             state: state.clone(),
                             result,
                             known,
+                            rejected_frame,
                         };
                         if channel.blocking_send(Completion::Stored(value)).is_err() {
                             break;
@@ -340,11 +411,22 @@ impl Workers {
                             let current = job.state.turn.as_ref().ok_or("runtime_turn")?;
                             match job.task {
                                 ProviderTask::Generate => {
-                                    let request = if let Some(response) = &current.tools_response {
-                                        next_request(response, &current.results)?
+                                    let mut request =
+                                        if let Some(response) = &current.tools_response {
+                                            next_request(response, &current.results)?
+                                        } else {
+                                            current.next.clone()
+                                        };
+                                    let estimate = job.state.context_estimate(&request, || {
+                                        (provider_options.model_window)(&request)
+                                    });
+                                    let tokens = if let Some((tokens, window)) = estimate {
+                                        crate::context::require_response_room(tokens, window)?;
+                                        tokens
                                     } else {
-                                        current.next.clone()
+                                        crate::context::estimate_request_tokens(&request)
                                     };
+                                    request.set_context_estimate(tokens);
                                     let (
                                         sink_gate,
                                         sink_preview,
@@ -374,6 +456,12 @@ impl Workers {
                                         Ok(())
                                     });
                                     let value = generate(&request, &job.stop, update)?;
+                                    let value = if value.context_budget().is_none() {
+                                        value
+                                            .with_context_window(estimate.map(|(_, window)| window))
+                                    } else {
+                                        value
+                                    };
                                     if value.request().save()? != request.save()?
                                         || value.returned_model() != request.binding.returned_model
                                     {
@@ -385,23 +473,40 @@ impl Workers {
                                     if value.calls().is_empty() || provider_options.streaming {
                                         response_text(&value)?;
                                     }
-                                    Ok(ProviderValue::Response(Arc::new(value)))
+                                    Ok(ProviderValue::Response(Arc::new(
+                                        value.with_context_estimate(tokens),
+                                    )))
                                 }
                                 ProviderTask::Compact => {
                                     let request = Request::new(
-                                        job.state.configuration.binding.clone(),
-                                        job.state.epoch.clone(),
+                                        current.next.binding.clone(),
+                                        current.next.epoch.clone(),
                                         job.state.configuration.tools.clone(),
                                         job.state.history.clone(),
-                                    )?;
+                                    )?
+                                    .with_effort(current.next.effort.clone())?;
+                                    let prefix = match job.state.compaction_prefix() {
+                                        Some(prefix) => prefix,
+                                        None => {
+                                            crate::context::legacy_compact::summary_prefix_size(
+                                                &request,
+                                            )?
+                                        }
+                                    };
                                     let value = provider_options
                                         .compact
                                         .as_ref()
                                         .ok_or("compaction_unavailable")?(
-                                        &request, &job.stop
+                                        &request, prefix, &job.stop,
                                     )?;
                                     if value.request().save()? != request.save()? {
                                         return Err("compaction_request_mismatch");
+                                    }
+                                    if value
+                                        .summary_prefix()?
+                                        .is_some_and(|retained| retained != prefix)
+                                    {
+                                        return Err("compaction_boundary_mismatch");
                                     }
                                     if value.output()?.len() + 1
                                         >= crate::session::state::COMPACT_ITEM_THRESHOLD
@@ -409,8 +514,8 @@ impl Workers {
                                         return Err("compaction_item_limit");
                                     }
                                     if value.output()?.len() >= request.input.len()
-                                        && Json::array(value.output()?.to_vec())?.dump().len()
-                                            >= Json::array(request.input.clone())?.dump().len()
+                                        && crate::context::estimate_input_tokens(value.output()?)
+                                            >= crate::context::estimate_input_tokens(&request.input)
                                     {
                                         return Err("compaction_no_progress");
                                     }
@@ -563,10 +668,27 @@ impl Workers {
                         let identity = job.identity.clone();
                         let mut lease = None;
                         let result = guarded(|| {
+                            if job.task == AuthTask::SelectGeneration {
+                                if job.stop.cancelled() {
+                                    return Err("generation_cancelled");
+                                }
+                                (options.select_generation)(
+                                    job.selection.as_ref().ok_or("generation_selection")?,
+                                    &job.stop,
+                                )?;
+                                return Ok(Cancel::default());
+                            }
                             if job.stop.cancelled() || !gate.begin(&job.identity, None) {
                                 return Err("generation_cancelled");
                             }
                             (options.check_dispatch)(job.identity.resume_epoch, &job.stop)?;
+                            if let Some(request) = &job.request {
+                                (options.check_request)(
+                                    request,
+                                    job.identity.resume_epoch,
+                                    &job.stop,
+                                )?;
+                            }
                             if job.stop.cancelled() || !gate.active(&job.identity) {
                                 return Err("generation_cancelled");
                             }
@@ -621,6 +743,7 @@ impl Drop for Workers {
         self.tool.take();
         self.auth.take();
         self.release.take();
+        self.plan.take();
         for join in self.joins.drain(..) {
             let _ = join.join();
         }

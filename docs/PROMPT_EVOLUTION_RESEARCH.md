@@ -1,5 +1,7 @@
 # Эволюция промптов агентных harness: исходники, причины и evidence
 
+Исходный материал [PR #18](https://github.com/junknewera/ansa/pull/18). Состояние на дату предложения сохранено в [журнале этой ветки](https://github.com/junknewera/ansa/blob/68f1be312a3e766968d743c234d44d27cc9b46ba/docs/PROJECT_STATE.md). Текущая реализация и результаты проверок описаны в [сводке по пяти предложениям](PROJECT_STATE.md#реализация-пяти-proposal-после-разбора-требований).
+
 Срез публичных исходников и GitHub metadata: **2026-11-15**. Исследование для
 ANSA на baseline [a6f2031](https://github.com/junknewera/ansa/commit/a6f203173969c72f9b9e9b0a8ad873958215db6d).
 Это исследовательский proposal: runtime, production prompts, journal codecs и

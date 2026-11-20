@@ -2,9 +2,9 @@
 use super::{
     Result,
     codec_v1::{Invocation, SavedResult},
-    journal_v1::{Journal, Observer},
+    journal_v1::{DirectoryIdentity, Journal, Observer},
     need,
-    state::State,
+    state::{ForkSeed, State},
 };
 use crate::protocol::json::Json;
 use std::{
@@ -27,31 +27,63 @@ impl Store {
     pub fn open(path: &Path, state: State, observe: Option<Observer>) -> Result<Self> {
         Self::open_with_replay(path, state, observe, |_| Ok(()))
     }
+    pub(crate) fn open_with_seed(
+        path: &Path,
+        state: State,
+        observe: Option<Observer>,
+        seed: Option<&ForkSeed>,
+        existing: Option<DirectoryIdentity>,
+        autocompact_percent: Option<u8>,
+    ) -> Result<Self> {
+        Self::open_seeded_with_replay(
+            path,
+            state,
+            observe,
+            seed,
+            existing,
+            autocompact_percent,
+            |_| Ok(()),
+        )
+    }
     pub fn open_with_replay(
+        path: &Path,
+        state: State,
+        observe: Option<Observer>,
+        replay: impl FnMut(&Json) -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_seeded_with_replay(path, state, observe, None, None, None, replay)
+    }
+    fn open_seeded_with_replay(
         path: &Path,
         mut state: State,
         observe: Option<Observer>,
+        seed: Option<&ForkSeed>,
+        existing: Option<DirectoryIdentity>,
+        autocompact_percent: Option<u8>,
         mut replay: impl FnMut(&Json) -> Result<()>,
     ) -> Result<Self> {
-        let mut journal = Journal::open(
-            path,
-            |event| {
-                state.apply(event)?;
-                replay(event)
-            },
-            observe,
-        )?;
+        let replay_state = |event: &Json| {
+            state.apply(event)?;
+            replay(event)
+        };
+        let mut journal = match existing {
+            Some(identity) => Journal::open_existing(path, identity, replay_state, observe)?,
+            None => Journal::open(path, replay_state, observe)?,
+        };
         let diagnostic = journal.diagnostic();
         if diagnostic.is_empty() && journal.empty() {
-            let init = state.initialization()?;
+            let init = state.initialization_with_seed(seed, autocompact_percent)?;
+            let mut next = state.clone();
+            next.apply(&init)?;
             journal.append(&init)?;
-            state.apply(&init)?;
+            state = next;
             replay(&init)?;
         }
-        let recovered_pause = state
-            .turn
-            .as_ref()
-            .is_some_and(|t| t.stage != "completed" && t.stage != "cancelled");
+        let recovered_pause = state.pending_followups().next().is_some()
+            || state
+                .turn
+                .as_ref()
+                .is_some_and(|t| t.stage != "completed" && t.stage != "cancelled");
         Ok(Self {
             journal,
             state: Arc::new(state),
@@ -62,6 +94,9 @@ impl Store {
     }
     pub fn state(&self) -> &Arc<State> {
         &self.state
+    }
+    pub(crate) fn identity(&self) -> Result<DirectoryIdentity> {
+        self.journal.identity()
     }
     pub fn diagnostic(&self) -> &'static str {
         self.diagnostic

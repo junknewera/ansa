@@ -2,7 +2,7 @@
 use super::{
     dispatch::Gate,
     outbox::Outbox,
-    shutdown::{Closing, Envelope, Mailboxes},
+    shutdown::{ChildLookup, Closing, Envelope, Mailboxes},
     work::*,
     *,
 };
@@ -11,7 +11,8 @@ use crate::{
     provider::replay::Effects,
     session::{
         codec_v1::{Invocation, SavedResult, response_text, save_response},
-        state::{COMPACT_ITEM_THRESHOLD, Receipt as SubmitReceipt, State},
+        state::{Receipt as SubmitReceipt, State},
+        transcript::ToolDetail,
     },
     tools::registry::Snapshot as Tools,
 };
@@ -25,6 +26,35 @@ struct PendingStore {
     kind: Kind,
     known: Option<SavedResult>,
 }
+
+fn child_tool_receipt(saved: &SavedResult, detail: Option<&ToolDetail>) -> ChildToolReceipt {
+    let result = &saved.result;
+    let tool = detail.map_or("unknown", |detail| detail.name.as_str());
+    let local_evidence = matches!(
+        tool,
+        "read_file" | "list_directory" | "search_files" | "edit_file"
+    );
+    let output_excerpt = if local_evidence {
+        result.output().chars().take(200).collect()
+    } else {
+        String::new()
+    };
+    let target = detail
+        .filter(|_| local_evidence)
+        .map_or_else(String::new, |detail| {
+            detail.target.chars().take(160).collect()
+        });
+    ChildToolReceipt {
+        operation: result.operation_id().into(),
+        tool: tool.into(),
+        target,
+        dispatched: saved.dispatched,
+        execution: format!("{:?}", result.execution()),
+        effects: format!("{:?}", result.effects()),
+        output_bytes: result.output().len(),
+        output_excerpt,
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolTask {
     Prepare,
@@ -33,6 +63,7 @@ enum ToolTask {
 }
 pub(crate) struct Owner {
     state: Arc<State>,
+    journal_identity: Option<DirectoryIdentity>,
     tools: Arc<Tools>,
     plan_tools: Arc<Tools>,
     limits: Limits,
@@ -48,7 +79,6 @@ pub(crate) struct Owner {
     initialized: bool,
     starting: bool,
     recovery_attempted: bool,
-    profile_bytes: usize,
     phase: String,
     diagnostic: String,
     storage_failed: bool,
@@ -56,9 +86,19 @@ pub(crate) struct Owner {
     recovery: Option<OperationId>,
     receipts: BTreeMap<String, SubmitReceipt>,
     queued: VecDeque<RuntimeCommand>,
+    new_followups: VecDeque<RuntimeCommand>,
+    control_replies: BTreeMap<String, oneshot::Sender<Result<PostStatus>>>,
+    control_commands: BTreeMap<String, RuntimeCommand>,
+    selections: VecDeque<RuntimeCommand>,
+    autocompact_selections: VecDeque<RuntimeCommand>,
+    selecting: Option<RuntimeCommand>,
+    selection_stop: Option<Cancel>,
+    deferred_completions: VecDeque<Completion>,
     pending_receipt: Option<SubmitReceipt>,
     cancelling: Option<CommandId>,
     resuming: Option<CommandId>,
+    plan_admission_pending: bool,
+    plan_workspace: Option<Box<dyn Send>>,
     generation: u64,
     resume_epoch: u64,
     preview_sequence: u64,
@@ -84,7 +124,7 @@ fn number(n: usize) -> Result<Json> {
 fn transition(turn: &TurnId, kind: &str, mut fields: Vec<(&str, Json)>) -> Result<Json> {
     fields.push(("kind", Json::string(kind)?));
     fields.push(("turn", Json::string(&turn.0)?));
-    Json::object(fields)
+    Json::object_with_limits(fields, crate::session::journal_v1::MAX_RECORD)
 }
 impl Owner {
     #[allow(clippy::too_many_arguments)]
@@ -120,17 +160,27 @@ impl Owner {
             initialized: false,
             starting: true,
             recovery_attempted: false,
-            profile_bytes: 0,
             phase: "loading".into(),
             diagnostic: String::new(),
             storage_failed: false,
             recovered_pause: false,
             recovery: None,
+            journal_identity: None,
             receipts: BTreeMap::new(),
             queued: VecDeque::new(),
+            new_followups: VecDeque::new(),
+            control_replies: BTreeMap::new(),
+            control_commands: BTreeMap::new(),
+            selections: VecDeque::new(),
+            autocompact_selections: VecDeque::new(),
+            selecting: None,
+            selection_stop: None,
+            deferred_completions: VecDeque::new(),
             pending_receipt: None,
             cancelling: None,
             resuming: None,
+            plan_admission_pending: false,
+            plan_workspace: None,
             generation: 0,
             resume_epoch: 0,
             preview_sequence: 0,
@@ -172,7 +222,7 @@ impl Owner {
         Ok(Identity {
             incarnation: self.incarnation.clone(),
             turn: self.turn(),
-            request: self.request().ok_or("runtime_request")?,
+            request: self.request().unwrap_or_else(|| "control".into()),
             resume_epoch: self.resume_epoch,
             generation: self.generation,
         })
@@ -196,6 +246,7 @@ impl Owner {
             || self.provider.is_some()
             || self.tool.is_some()
             || self.auth.is_some()
+            || self.plan_admission_pending
     }
     fn can_cancel(&self) -> bool {
         self.request().is_some()
@@ -238,6 +289,20 @@ impl Owner {
             .as_ref()
             .or_else(|| self.state.turn.as_ref().map(|t| &t.receipt));
         self.emit(EventPayload::FrontendSnapshot(Box::new(Snapshot {
+            timeline_size: self.state.timeline.len(),
+            generation: self.state.generation.clone(),
+            autocompact_percent: self.state.autocompact_percent,
+            followups: self
+                .state
+                .followups
+                .iter()
+                .rev()
+                .take(32)
+                .map(|message| message.as_ref().clone())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
             through_sequence: 0,
             state: self.phase.clone(),
             request: self.request(),
@@ -261,10 +326,214 @@ impl Owner {
                 && self.recovery.is_none()
                 && !self.storage_failed
                 && self.state.turn.is_some(),
-            mode: current.map_or(AgentMode::Basic, |r| r.mode),
+            mode: current
+                .filter(|receipt| !receipt.internal)
+                .map_or(self.state.user_mode, |receipt| receipt.mode),
             transcript_size: self.state.transcript().len(),
             preview: self.preview.clone(),
         })));
+    }
+    fn message_receipt(&self, command: &CommandId) -> Option<MessageReceiptInfo> {
+        if let Some(receipt) = self.receipts.get(&command.0) {
+            if receipt.internal {
+                return None;
+            }
+            let state = if self.request().as_ref() == Some(&receipt.request) {
+                self.phase.clone()
+            } else {
+                receipt.state.clone()
+            };
+            let admission_durable = self.options.directory.is_some()
+                && !self.storage_failed
+                && self.state.submits.contains_key(&command.0);
+            return Some(MessageReceiptInfo {
+                kind: MessageKind::Submit,
+                turn: receipt.turn.clone(),
+                request: (!receipt.request.0.is_empty()).then(|| receipt.request.clone()),
+                state_durable: admission_durable
+                    && self
+                        .state
+                        .submits
+                        .get(&command.0)
+                        .is_some_and(|r| r.state == state),
+                state,
+                mode: Some(receipt.mode),
+                text_sha256: crate::protocol::legacy_json_v1::sha256(receipt.text.as_bytes()),
+                admission_durable,
+            });
+        }
+        if let Some(message) = self.state.followups.iter().find(|m| m.command == *command) {
+            let source = self
+                .state
+                .submits
+                .values()
+                .find(|r| r.request == message.target);
+            return Some(MessageReceiptInfo {
+                kind: MessageKind::Steer,
+                turn: source
+                    .map(|r| r.turn.clone())
+                    .unwrap_or_else(|| self.turn()),
+                request: Some(message.target.clone()),
+                state: message.state.clone(),
+                mode: source.map(|r| r.mode),
+                text_sha256: crate::protocol::legacy_json_v1::sha256(message.text.as_bytes()),
+                admission_durable: self.options.directory.is_some() && !self.storage_failed,
+                state_durable: self.options.directory.is_some() && !self.storage_failed,
+            });
+        }
+        if let Some(pending) = self.control_commands.get(&command.0)
+            && let CommandPayload::Steer(message) = &pending.payload
+        {
+            return Some(MessageReceiptInfo {
+                kind: MessageKind::Steer,
+                turn: pending.turn.clone(),
+                request: Some(message.target.clone()),
+                state: "queued".into(),
+                mode: self
+                    .state
+                    .submits
+                    .values()
+                    .find(|r| r.request == message.target)
+                    .map(|r| r.mode),
+                admission_durable: false,
+                text_sha256: crate::protocol::legacy_json_v1::sha256(message.text.as_bytes()),
+                state_durable: false,
+            });
+        }
+        None
+    }
+
+    fn child_attempt(&self, lookup: &ChildLookup) -> Result<ChildAttempt> {
+        if !self.initialized || self.starting {
+            return Err("runtime_not_ready");
+        }
+        if self.storage_failed {
+            return Err("child_journal_read_only");
+        }
+        let journal = self.journal_identity.ok_or("child_requires_journal")?;
+        let mut tool_evidence = None;
+        let state = match self.state.submits.get(&lookup.command.0) {
+            Some(receipt) => {
+                Self::match_child_submit(receipt, lookup)?;
+                let turn = self
+                    .state
+                    .turn
+                    .as_ref()
+                    .filter(|turn| {
+                        turn.receipt.command == lookup.command
+                            && turn.receipt.request == receipt.request
+                    })
+                    .ok_or("child_attempt_not_current")?;
+                let quiescent = !self.busy()
+                    && self.pending_outcome.is_none()
+                    && self.cancelling.is_none()
+                    && self.resuming.is_none()
+                    && self.plan_workspace.is_none()
+                    && !self.owned_intent;
+                let final_response = if receipt.state == "completed" {
+                    if turn.stage != "completed" {
+                        return Err("child_completion_not_current");
+                    }
+                    if quiescent {
+                        let results: Vec<_> =
+                            turn.previous_results.iter().chain(&turn.results).collect();
+                        tool_evidence = Some(ChildToolEvidence {
+                            command: receipt.command.0.clone(),
+                            request: receipt.request.0.clone(),
+                            outcomes: results.len(),
+                            dispatched: results.iter().filter(|saved| saved.dispatched).count(),
+                            receipts: results
+                                .iter()
+                                .skip(results.len().saturating_sub(12))
+                                .map(|saved| {
+                                    let detail = self.state.timeline.current_tool(
+                                        &receipt.turn,
+                                        &receipt.request,
+                                        saved.result.operation_id(),
+                                    );
+                                    child_tool_receipt(saved, detail)
+                                })
+                                .collect(),
+                        });
+                    }
+                    Some(turn.response.clone().ok_or("child_completion_missing")?)
+                } else {
+                    None
+                };
+                ChildAttemptState::Durable {
+                    request: receipt.request.clone(),
+                    state: receipt.state.clone(),
+                    quiescent,
+                    resume_required: self.recovered_pause || turn.paused,
+                    recovery_required: self.recovery.is_some()
+                        || quiescent && self.state.unknown_operation().is_some(),
+                    final_response,
+                }
+            }
+            None => match self.receipts.get(&lookup.command.0) {
+                Some(receipt) => {
+                    Self::match_child_submit(receipt, lookup)?;
+                    ChildAttemptState::Pending
+                }
+                None if self
+                    .state
+                    .generation_commands
+                    .contains_key(&lookup.command.0)
+                    || self
+                        .state
+                        .autocompact_commands
+                        .contains_key(&lookup.command.0)
+                    || self
+                        .state
+                        .followups
+                        .iter()
+                        .any(|item| item.command == lookup.command) =>
+                {
+                    return Err("child_submit_conflict");
+                }
+                None => ChildAttemptState::Missing,
+            },
+        };
+        Ok(ChildAttempt {
+            session: self.state.session.clone(),
+            incarnation: self.incarnation.clone(),
+            journal,
+            command: lookup.command.clone(),
+            turn: lookup.turn.clone(),
+            mode: lookup.submit.mode,
+            text_sha256: crate::protocol::legacy_json_v1::sha256(lookup.submit.text.as_bytes()),
+            latest_tool: self
+                .activity
+                .iter()
+                .rev()
+                .find_map(|activity| match activity {
+                    Activity::Started(tool) => {
+                        let target = self
+                            .state
+                            .turn
+                            .as_ref()
+                            .and_then(|turn| turn.intent.as_ref())
+                            .filter(|intent| intent.operation == tool.operation.0)
+                            .and_then(|intent| intent.arguments.text_field("path").ok())
+                            .map(|path| path.chars().take(120).collect());
+                        Some((tool.name.clone(), target))
+                    }
+                    Activity::Finished(_) => None,
+                }),
+            tool_evidence,
+            state,
+        })
+    }
+
+    fn match_child_submit(receipt: &SubmitReceipt, lookup: &ChildLookup) -> Result<()> {
+        if receipt.internal
+            || receipt.turn != lookup.turn
+            || receipt.mode != lookup.submit.mode
+            || *receipt.text != lookup.submit.text
+        {
+            return Err("child_submit_conflict");
+        }
+        Ok(())
     }
     fn finish_preview(&mut self, state: &str, final_text: bool) {
         if let Some(preview) = &mut self.preview
@@ -319,7 +588,42 @@ impl Owner {
             None,
         );
     }
+
+    fn reject_plan(&mut self, command: &RuntimeCommand, code: &str) {
+        // This Submit was queued but never reached the durable admission.
+        self.receipts.remove(&command.command.0);
+        self.reject(command, code);
+    }
     fn fail(&mut self, code: &'static str) {
+        if let Some(stop) = &self.selection_stop {
+            stop.cancel();
+        }
+        for (_, reply) in std::mem::take(&mut self.control_replies) {
+            let _ = reply.send(Err(code));
+        }
+        self.control_commands.clear();
+        // A provider/auth completion can be parked behind the failing journal
+        // write. It has already returned, so do not retain a fictitious busy
+        // worker that would prevent bounded shutdown.
+        while let Some(done) = self.deferred_completions.pop_front() {
+            match done {
+                Completion::Provider { identity, .. }
+                    if self.provider.as_ref() == Some(&identity) =>
+                {
+                    self.provider = None
+                }
+                Completion::Auth { identity, task, .. }
+                    if self
+                        .auth
+                        .as_ref()
+                        .is_some_and(|(active, kind, _)| *active == identity && *kind == task) =>
+                {
+                    self.auth = None;
+                    self.selecting = None;
+                }
+                _ => {}
+            }
+        }
         self.storage_failed = true;
         self.diagnostic = if crate::provider::contracts::valid_id(code) {
             code.into()
@@ -328,6 +632,7 @@ impl Owner {
         };
         self.gate.cancel();
         self.turn_stop.cancel();
+        self.tools.signal_cancel();
         self.finish_preview("discarded", false);
         if self.phase != "cancelled" {
             self.phase = "paused".into();
@@ -415,11 +720,34 @@ impl Owner {
     fn authorize(&mut self, workers: &Workers, task: AuthTask) -> Result<()> {
         let identity = self.identity()?;
         self.gate.allow(&identity)?;
+        let request = if matches!(task, AuthTask::Generate | AuthTask::Compact) {
+            let current = self.state.turn.as_ref().ok_or("runtime_turn")?;
+            Some(if task == AuthTask::Generate {
+                if let Some(response) = &current.tools_response {
+                    match crate::session::codec_v1::next_request(response, &current.results) {
+                        Ok(request) => request,
+                        Err("json_build_limit" | "json_structure_limit" | "request_context") => {
+                            self.pause("request_frame_limit");
+                            return self.advance(workers);
+                        }
+                        Err(code) => return Err(code),
+                    }
+                } else {
+                    current.next.clone()
+                }
+            } else {
+                current.next.clone()
+            })
+        } else {
+            None
+        };
         workers
             .auth
             .as_ref()
             .ok_or("auth_worker_closed")?
             .try_send(AuthJob {
+                selection: None,
+                request,
                 identity: identity.clone(),
                 stop: self.turn_stop.clone(),
                 task,
@@ -515,10 +843,14 @@ impl Owner {
         self.gate.cancel();
         self.drain_started();
         self.turn_stop.cancel();
+        self.tools.signal_cancel();
         self.finish_preview("discarded", false);
         self.cancelling = Some(command);
         self.phase = "cancelled".into();
         self.pending_pause = None;
+        if self.state.pending_followups().next().is_some() && self.recovery.is_none() {
+            self.recovered_pause = false;
+        }
         if self.storage_failed {
             let command = self.cancelling.take().expect("owned cancel");
             self.emit(EventPayload::Cancelled { command });
@@ -528,21 +860,259 @@ impl Owner {
     fn admit(&mut self, envelope: Envelope) -> Result<()> {
         let command = envelope.command;
         let status = self.admit_inner(&command);
-        let _ = envelope.reply.send(status);
+        if matches!(status, Ok(PostStatus::Accepted))
+            && matches!(
+                command.payload,
+                CommandPayload::Steer(_)
+                    | CommandPayload::SetGeneration(_)
+                    | CommandPayload::SetAutocompact(_)
+            )
+        {
+            // Admission is acknowledged only after the durable queued/selection
+            // record. Cancel and snapshot use independent mailboxes meanwhile.
+            self.control_commands
+                .insert(command.command.0.clone(), command.clone());
+            self.control_replies
+                .insert(command.command.0, envelope.reply);
+        } else {
+            let _ = envelope.reply.send(status);
+        }
         Ok(())
     }
     fn admit_inner(&mut self, command: &RuntimeCommand) -> Result<PostStatus> {
         if self.closing.mode.load(Ordering::Acquire) != 0 {
             return Ok(PostStatus::Closed);
         }
+        if self.options.inspect_only
+            && !matches!(
+                command.payload,
+                CommandPayload::GetSnapshot(_)
+                    | CommandPayload::GetTranscript(_)
+                    | CommandPayload::GetTimeline(_)
+                    | CommandPayload::GetMessageReceipt(_)
+            )
+        {
+            return Err("archive_only");
+        }
+        if let Some(pending) = self.control_commands.get(&command.command.0) {
+            return Ok(
+                if pending.payload == command.payload && pending.turn == command.turn {
+                    PostStatus::QueueFull
+                } else {
+                    PostStatus::CommandConflict
+                },
+            );
+        }
         match &command.payload {
-            CommandPayload::Submit(submitted) => {
+            CommandPayload::GetMessageReceipt(target) => {
+                self.emit(EventPayload::MessageReceipt {
+                    query: command.command.clone(),
+                    command: target.clone(),
+                    receipt: self.message_receipt(target).map(Box::new),
+                    ready: self.initialized && !self.starting && self.phase != "loading",
+                    storage_failed: self.storage_failed,
+                    recovery_required: self.recovery.is_some(),
+                });
+            }
+            CommandPayload::Steer(message) => {
+                if let Some(previous) = self
+                    .state
+                    .followups
+                    .iter()
+                    .find(|m| m.command == command.command)
+                {
+                    let turn_matches = self
+                        .state
+                        .submits
+                        .values()
+                        .any(|r| r.request == previous.target && r.turn == command.turn);
+                    return Ok(
+                        if previous.target == message.target
+                            && previous.text == message.text
+                            && turn_matches
+                        {
+                            PostStatus::Duplicate
+                        } else {
+                            PostStatus::CommandConflict
+                        },
+                    );
+                }
+                if self
+                    .new_followups
+                    .iter()
+                    .any(|c| c.command == command.command)
+                    || self.control_replies.contains_key(&command.command.0)
+                {
+                    return Ok(PostStatus::QueueFull);
+                }
+                if self.receipts.contains_key(&command.command.0)
+                    || self
+                        .state
+                        .generation_commands
+                        .contains_key(&command.command.0)
+                    || self
+                        .state
+                        .autocompact_commands
+                        .contains_key(&command.command.0)
+                {
+                    return Ok(PostStatus::CommandConflict);
+                }
+                if !self.state.turn.as_ref().is_some_and(|turn| {
+                    turn.receipt.request == message.target && turn.receipt.turn == command.turn
+                }) || self.pending_receipt.is_some()
+                {
+                    return Ok(PostStatus::StaleTarget);
+                }
+                if self.storage_failed {
+                    return Err("journal_read_only");
+                }
+                // An admitted command remains reserved while it is waiting,
+                // selected by advance(), or in the journal worker. Popping it
+                // from the deque does not release its durable queue slot.
+                let reserved = self
+                    .control_commands
+                    .values()
+                    .filter(|c| {
+                        matches!(c.payload, CommandPayload::Steer(_))
+                            && !self.state.followups.iter().any(|m| m.command == c.command)
+                    })
+                    .count();
+                if self.state.followups.len() + reserved >= 4096 {
+                    return Ok(PostStatus::CommandIdLimit);
+                }
+                if self.state.pending_followups().count() + reserved >= self.limits.commands.min(16)
+                {
+                    return Ok(PostStatus::QueueFull);
+                }
+                self.new_followups.push_back(command.clone());
+            }
+            CommandPayload::SetGeneration(selection) => {
+                if let Some(previous) = self.state.generation_commands.get(&command.command.0) {
+                    return Ok(if previous == selection {
+                        PostStatus::Duplicate
+                    } else {
+                        PostStatus::CommandConflict
+                    });
+                }
+                if self.control_replies.contains_key(&command.command.0) {
+                    return Ok(PostStatus::QueueFull);
+                }
+                if self.receipts.contains_key(&command.command.0)
+                    || self
+                        .state
+                        .autocompact_commands
+                        .contains_key(&command.command.0)
+                    || self
+                        .state
+                        .followups
+                        .iter()
+                        .any(|m| m.command == command.command)
+                {
+                    return Ok(PostStatus::CommandConflict);
+                }
+                if self.storage_failed {
+                    return Err("journal_read_only");
+                }
+                let reserved = self
+                    .control_commands
+                    .values()
+                    .filter(|c| {
+                        matches!(c.payload, CommandPayload::SetGeneration(_))
+                            && !self.state.generation_commands.contains_key(&c.command.0)
+                    })
+                    .count();
+                if self.state.generation_commands.len() + reserved >= 4096 {
+                    return Ok(PostStatus::CommandIdLimit);
+                }
+                if reserved >= 4 {
+                    return Ok(PostStatus::QueueFull);
+                }
+                self.selections.push_back(command.clone());
+            }
+            CommandPayload::SetAutocompact(percent) => {
+                let id = &command.command.0;
+                if let Some(previous) = self.state.autocompact_commands.get(id) {
+                    return Ok(if previous == percent {
+                        PostStatus::Duplicate
+                    } else {
+                        PostStatus::CommandConflict
+                    });
+                }
+                if self.receipts.contains_key(id)
+                    || self.state.generation_commands.contains_key(id)
+                    || self
+                        .state
+                        .followups
+                        .iter()
+                        .any(|m| m.command == command.command)
+                {
+                    return Ok(PostStatus::CommandConflict);
+                }
+                if self.storage_failed {
+                    return Err("journal_read_only");
+                }
+                let reserved = self.autocompact_selections.len()
+                    + usize::from(
+                        self.storing
+                            .as_ref()
+                            .is_some_and(|pending| pending.kind == Kind::AutocompactSelected),
+                    );
+                if self.state.autocompact_commands.len() + reserved >= 4096 {
+                    return Ok(PostStatus::CommandIdLimit);
+                }
+                if reserved >= 4 {
+                    return Ok(PostStatus::QueueFull);
+                }
+                self.autocompact_selections.push_back(command.clone());
+            }
+            CommandPayload::GetContext => {
+                self.emit(EventPayload::ContextSnapshot {
+                    command: command.command.clone(),
+                    seed: self.state.fork_seed()?,
+                });
+            }
+            CommandPayload::GetTimeline(query) => {
+                let page = self.state.timeline.page(query.clone());
+                self.emit(EventPayload::TimelinePage(TranscriptPage {
+                    begin: page.begin,
+                    end: page.end,
+                    total: page.total,
+                    entries: page.entries,
+                    query: page.query,
+                }));
+            }
+            CommandPayload::Submit(submitted) | CommandPayload::Handoff(submitted) => {
+                let internal = matches!(command.payload, CommandPayload::Handoff(_));
+                if self
+                    .state
+                    .generation_commands
+                    .contains_key(&command.command.0)
+                    || self
+                        .state
+                        .autocompact_commands
+                        .contains_key(&command.command.0)
+                    || self
+                        .state
+                        .followups
+                        .iter()
+                        .any(|m| m.command == command.command)
+                    || self.control_replies.contains_key(&command.command.0)
+                {
+                    return Ok(PostStatus::CommandConflict);
+                }
                 if let Some(receipt) = self.receipts.get(&command.command.0) {
                     if *receipt.text != submitted.text
                         || receipt.turn != command.turn
                         || receipt.mode != submitted.mode
+                        || receipt.internal != internal
                     {
                         return Ok(PostStatus::CommandConflict);
+                    }
+                    if internal
+                        && (!self.state.submits.contains_key(&command.command.0)
+                            || self.storage_failed)
+                    {
+                        return Ok(PostStatus::QueueFull);
                     }
                     let state = if self.request().as_ref() == Some(&receipt.request) {
                         self.phase.clone()
@@ -578,6 +1148,7 @@ impl Owner {
                         text: Arc::new(submitted.text.clone()),
                         state: "queued".into(),
                         mode: submitted.mode,
+                        internal,
                     },
                 );
                 self.queued.push_back(command.clone());
@@ -618,7 +1189,7 @@ impl Owner {
                 {
                     return Ok(PostStatus::StaleTarget);
                 }
-                if self.resuming.is_some() {
+                if self.resuming.is_some() || self.plan_admission_pending {
                     return Ok(PostStatus::QueueFull);
                 }
                 if self.storage_failed || self.recovery.is_some() {
@@ -666,9 +1237,18 @@ impl Owner {
             );
             return Ok(());
         }
-        let CommandPayload::Submit(submitted) = command.payload else {
-            return Err("submit_contract");
+        if matches!(&command.payload, CommandPayload::Submit(submitted) | CommandPayload::Handoff(submitted) if submitted.mode == AgentMode::Plan)
+            && !self.tools.plan_ready()
+        {
+            self.reject_plan(&command, "terminal_workspace_busy");
+            return Ok(());
+        }
+        let (submitted, internal) = match command.payload {
+            CommandPayload::Submit(submitted) => (submitted, false),
+            CommandPayload::Handoff(submitted) => (submitted, true),
+            _ => return Err("submit_contract"),
         };
+        self.tools.begin_turn();
         let request_number = self.state.next_request + 1;
         let request = RequestId(format!("request_{request_number}"));
         let run = format!("{}_{}", self.incarnation.0, request.0);
@@ -692,23 +1272,26 @@ impl Owner {
         self.owned_intent = false;
         self.pending_pause = None;
         let limits = self.limits;
+        let can_compact = self.options.compact.is_some();
         let keep = self.options.keep_recent_turns;
-        let profile = self.profile_bytes;
+        let model_window = self.options.model_window.clone();
         self.persist(
             workers,
             Kind::Accepted,
             Box::new(move |state| {
-                let next = state.request_for(&submitted.text, submitted.mode)?;
-                let users = state
-                    .history
-                    .iter()
-                    .filter(|v| v.has("role") && v.text_field("role").is_ok_and(|r| r == "user"))
-                    .count();
-                let compact = users > keep
-                    && (next.input.len() >= COMPACT_ITEM_THRESHOLD
-                        || state.history_bytes + receipt.text.len() * 6 + profile
-                            >= limits.compact_bytes);
-                Json::object(vec![
+                let next = state.request_for_input(&submitted.text, submitted.mode, internal)?;
+                let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;
+                let compact = can_compact
+                    && !inherited_incomplete_turn
+                    && state.completed_context_turns() > keep
+                    && state.compaction_prefix().is_some()
+                    && state
+                        .context_estimate(&next, || model_window(&next))
+                        .is_some_and(|(tokens, window)| {
+                            tokens as u128 * 100
+                                >= window as u128 * u128::from(state.autocompact_percent)
+                        });
+                let mut fields = vec![
                     ("kind", Json::string("accepted")?),
                     ("command", Json::string(&receipt.command.0)?),
                     ("turn", Json::string(&receipt.turn.0)?),
@@ -731,7 +1314,11 @@ impl Owner {
                     ),
                     ("round_limit", number(limits.tool_rounds)?),
                     ("call_limit", number(limits.tool_calls)?),
-                ])
+                ];
+                if internal {
+                    fields.push(("handoff", Json::parse("true")?));
+                }
+                Json::object_with_limits(fields, crate::session::journal_v1::MAX_RECORD)
             }),
             None,
         )?;
@@ -751,13 +1338,7 @@ impl Owner {
             }
             return Ok(());
         }
-        if self.cancelling.is_some()
-            && self
-                .state
-                .turn
-                .as_ref()
-                .is_some_and(|t| t.stage != "cancelled")
-        {
+        if self.cancelling.is_some() && self.state.turn.is_some() {
             return self.record(workers, Kind::Cancel, "cancel", vec![]);
         }
         if let Some(outcome) = self.pending_outcome.take() {
@@ -782,10 +1363,37 @@ impl Owner {
         if self.tool.is_none() && self.phase == "cancelled" {
             self.release_auth(workers)?;
         }
+        if let Some(done) = self.deferred_completions.pop_front() {
+            self.completed(workers, done)?;
+            // A consumed completion can remove the last worker without
+            // producing another wake (e.g. late provider success after Cancel).
+            // Continue the bounded owner transition instead of parking B until
+            // an unrelated frontend command happens to arrive.
+            return self.advance(workers);
+        }
+        if !self.starting
+            && let Some(command) = self.new_followups.pop_front()
+        {
+            let CommandPayload::Steer(message) = command.payload else {
+                return Err("steer_contract");
+            };
+            return self.record(
+                workers,
+                Kind::Queued,
+                "queued",
+                vec![
+                    ("command", Json::string(&command.command.0)?),
+                    ("target", Json::string(&message.target.0)?),
+                    ("text", Json::string(&message.text)?),
+                ],
+            );
+        }
         if self.starting {
             if !self.recovery_attempted {
                 self.recovery_attempted = true;
-                if let Some(invocation) = self.state.turn.as_ref().and_then(|t| t.intent.clone())
+                if !self.options.inspect_only
+                    && let Some(invocation) =
+                        self.state.turn.as_ref().and_then(|t| t.intent.clone())
                     && self
                         .tools
                         .policy(&invocation.name)
@@ -807,11 +1415,84 @@ impl Owner {
             }
             return Ok(());
         }
+        if !self.shutting_down
+            && self.closing.mode.load(Ordering::Acquire) != 2
+            && let Some(command) = self.autocompact_selections.pop_front()
+        {
+            let CommandPayload::SetAutocompact(percent) = command.payload else {
+                return Err("autocompact_selection");
+            };
+            return self.record(
+                workers,
+                Kind::AutocompactSelected,
+                "autocompact_selected",
+                vec![
+                    ("command", Json::string(&command.command.0)?),
+                    ("autocompact_percent", number(usize::from(percent))?),
+                ],
+            );
+        }
+        if !self.shutting_down
+            && self.closing.mode.load(Ordering::Acquire) != 2
+            && self.auth.is_none()
+            && let Some(command) = self.selections.pop_front()
+        {
+            let CommandPayload::SetGeneration(selection) = &command.payload else {
+                return Err("generation_selection");
+            };
+            let identity = self.identity()?;
+            let stop = Cancel::default();
+            workers
+                .auth
+                .as_ref()
+                .ok_or("auth_worker_closed")?
+                .try_send(AuthJob {
+                    selection: Some(selection.clone()),
+                    request: None,
+                    identity: identity.clone(),
+                    stop: stop.clone(),
+                    task: AuthTask::SelectGeneration,
+                })
+                .map_err(|_| "auth_queue_full")?;
+            self.selection_stop = Some(stop);
+            self.auth = Some((identity, AuthTask::SelectGeneration, false));
+            self.selecting = Some(command);
+            return Ok(());
+        }
         if self.busy() {
             return Ok(());
         }
+        if self.state.pending_followups().next().is_some()
+            && self.owned_intent
+            && let Some(intent) = self.state.turn.as_ref().and_then(|t| t.intent.as_ref())
+        {
+            self.pending_outcome = Some(not_started(intent));
+            self.permit = None;
+            return self.advance(workers);
+        }
         if let Some(command) = self.resuming.take() {
             if self.phase != "paused" || self.recovery.is_some() {
+                return Ok(());
+            }
+            let plan_mode = self
+                .state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.receipt.mode == AgentMode::Plan);
+            if plan_mode && !self.tools.plan_ready() {
+                self.emit(EventPayload::RuntimeError {
+                    command: Some(command),
+                    diagnostic: "terminal_workspace_busy".into(),
+                });
+                return Ok(());
+            }
+            if plan_mode
+                && self.plan_workspace.is_none()
+                && let Some(plan) = &workers.plan
+            {
+                plan.try_send(PlanTarget::Resume(command))
+                    .map_err(|_| "plan_worker_queue")?;
+                self.plan_admission_pending = true;
                 return Ok(());
             }
             self.resuming = Some(command.clone());
@@ -832,10 +1513,54 @@ impl Owner {
                 vec![("diagnostic", Json::string(code)?)],
             );
         }
+        if !self.shutting_down
+            && !self.recovered_pause
+            && self.recovery.is_none()
+            && self.state.pending_followups().next().is_some()
+        {
+            let messages = self.state.pending_followups().cloned().collect::<Vec<_>>();
+            let turn = self.turn();
+            self.finish_preview("discarded", false);
+            return self.persist(
+                workers,
+                Kind::Steered,
+                Box::new(move |state| {
+                    let commands = Json::array(
+                        messages
+                            .iter()
+                            .map(|m| Json::string(&m.command.0))
+                            .collect::<Result<Vec<_>>>()?,
+                    )?;
+                    match state
+                        .followup_request(&messages)
+                        .and_then(|request| request.save())
+                    {
+                        Ok(next) => transition(
+                            &turn,
+                            "steered",
+                            vec![("commands", commands), ("next", next)],
+                        ),
+                        Err("json_build_limit" | "json_structure_limit" | "request_context") => {
+                            transition(&turn, "steer_rejected", vec![("commands", commands)])
+                        }
+                        Err(code) => Err(code),
+                    }
+                }),
+                None,
+            );
+        }
         if self.available()
             && self.closing.mode.load(Ordering::Acquire) != 2
             && let Some(command) = self.queued.pop_front()
         {
+            if matches!(&command.payload, CommandPayload::Submit(value) | CommandPayload::Handoff(value) if value.mode == AgentMode::Plan)
+                && let Some(plan) = &workers.plan
+            {
+                plan.try_send(PlanTarget::Submit(command))
+                    .map_err(|_| "plan_worker_queue")?;
+                self.plan_admission_pending = true;
+                return Ok(());
+            }
             return self.submit(workers, command);
         }
         if !self.can_act() {
@@ -871,6 +1596,20 @@ impl Owner {
                     .as_ref()
                     .is_some_and(|r| current.results.len() == r.calls().len())
                 {
+                    match crate::session::codec_v1::next_request(
+                        current
+                            .tools_response
+                            .as_ref()
+                            .expect("matched tool response"),
+                        &current.results,
+                    ) {
+                        Ok(_) => {}
+                        Err("json_build_limit" | "json_structure_limit" | "request_context") => {
+                            self.pause("request_frame_limit");
+                            return self.advance(workers);
+                        }
+                        Err(code) => return Err(code),
+                    }
                     self.plan = None;
                     return self.record(workers, Kind::Continued, "continued", vec![]);
                 }
@@ -899,6 +1638,35 @@ impl Owner {
             return Ok(());
         }
         let pending = self.storing.take().expect("matched store job");
+        if done.rejected_frame {
+            if done.kind != Kind::Accepted {
+                if self.cancelling.is_none() {
+                    self.pause("request_frame_limit");
+                }
+                return Ok(());
+            }
+            let submitted = self.pending_receipt.take().ok_or("submit_receipt")?;
+            self.receipts.remove(&submitted.command.0);
+            self.plan_workspace = None;
+            self.phase = self
+                .state
+                .turn
+                .as_ref()
+                .map_or_else(|| "idle".into(), |turn| turn.stage.clone());
+            self.emit_at(
+                EventPayload::RuntimeError {
+                    command: Some(submitted.command),
+                    diagnostic: "request_frame_limit".into(),
+                },
+                submitted.turn.clone(),
+                None,
+            );
+            if let Some(command) = self.cancelling.take() {
+                self.emit_at(EventPayload::Cancelled { command }, submitted.turn, None);
+            }
+            self.snapshot(None);
+            return Ok(());
+        }
         let receipt = match done.result {
             Ok(receipt) => receipt,
             Err(code) => {
@@ -919,6 +1687,66 @@ impl Owner {
         }
         self.pending_receipt = None;
         match done.kind {
+            Kind::Queued => {
+                let command: CommandId = receipt.event().text_field("command")?.into();
+                self.control_commands.remove(&command.0);
+                if let Some(reply) = self.control_replies.remove(&command.0) {
+                    let _ = reply.send(Ok(PostStatus::Accepted));
+                }
+                self.emit(EventPayload::FollowupQueued { command });
+                self.snapshot(None);
+            }
+            Kind::Steered => {
+                if receipt.event().text_field("kind")? == "steer_rejected" {
+                    self.emit(EventPayload::RuntimeError {
+                        command: None,
+                        diagnostic: "followup_frame_limit".into(),
+                    });
+                    self.snapshot(None);
+                    return Ok(());
+                }
+                self.turn_stop = Cancel::default();
+                self.gate.reset();
+                self.resume_epoch += 1;
+                self.plan = None;
+                self.permit = None;
+                self.pending_pause = None;
+                self.diagnostic.clear();
+                self.phase = "generating".into();
+                let commands = receipt
+                    .event()
+                    .field("commands")?
+                    .elements()?
+                    .iter()
+                    .map(|id| Ok(CommandId(id.text()?.into())))
+                    .collect::<Result<Vec<_>>>()?;
+                self.emit(EventPayload::FollowupDelivered { commands });
+                self.snapshot(None);
+            }
+            Kind::AutocompactSelected => {
+                let command: CommandId = receipt.event().text_field("command")?.into();
+                self.control_commands.remove(&command.0);
+                if let Some(reply) = self.control_replies.remove(&command.0) {
+                    let _ = reply.send(Ok(PostStatus::Accepted));
+                }
+                self.emit(EventPayload::AutocompactSelected {
+                    command,
+                    percent: self.state.autocompact_percent,
+                });
+                self.snapshot(None);
+            }
+            Kind::GenerationSelected => {
+                let command: CommandId = receipt.event().text_field("command")?.into();
+                self.control_commands.remove(&command.0);
+                if let Some(reply) = self.control_replies.remove(&command.0) {
+                    let _ = reply.send(Ok(PostStatus::Accepted));
+                }
+                self.emit(EventPayload::GenerationSelected {
+                    command,
+                    selection: self.state.generation.clone(),
+                });
+                self.snapshot(None);
+            }
             Kind::Accepted => {
                 if self.phase != "cancelled" {
                     self.phase = self
@@ -967,6 +1795,7 @@ impl Owner {
                 }
             }
             Kind::Done => {
+                self.plan_workspace = None;
                 self.phase = "completed".into();
                 self.finish_preview("committed", true);
                 if let Some(response) = self.state.turn.as_ref().and_then(|t| t.response.as_ref()) {
@@ -979,6 +1808,7 @@ impl Owner {
                 self.snapshot(None);
             }
             Kind::Pause => {
+                self.plan_workspace = None;
                 self.phase = "paused".into();
                 self.diagnostic = self
                     .state
@@ -998,6 +1828,7 @@ impl Owner {
                 self.snapshot(None);
             }
             Kind::Cancel => {
+                self.plan_workspace = None;
                 self.phase = "cancelled".into();
                 if let Some(command) = self.cancelling.take() {
                     self.emit(EventPayload::Cancelled { command });
@@ -1031,6 +1862,23 @@ impl Owner {
         Ok(())
     }
     fn completed(&mut self, workers: &Workers, done: Completion) -> Result<()> {
+        if self.storing.is_some()
+            && matches!(
+                &done,
+                Completion::Provider { .. }
+                    | Completion::Plan { .. }
+                    | Completion::Auth {
+                        task: AuthTask::BeforeIntent | AuthTask::SelectGeneration,
+                        ..
+                    }
+            )
+        {
+            if self.deferred_completions.len() >= 3 {
+                return Err("runtime_completion_limit");
+            }
+            self.deferred_completions.push_back(done);
+            return Ok(());
+        }
         // A biased select is only priority at poll time. Started can be sent
         // after that poll but before Completion becomes ready. Every executor
         // sends Started before its completion, so consume it while the exact
@@ -1039,6 +1887,49 @@ impl Owner {
             self.drain_started();
         }
         match done {
+            Completion::Plan { target, result } => {
+                self.plan_admission_pending = false;
+                if self.shutting_down
+                    || self.storage_failed
+                    || self.closing.mode.load(Ordering::Acquire) == 2
+                {
+                    return Ok(());
+                }
+                match (target, result) {
+                    (PlanTarget::Submit(command), Ok(lease)) => {
+                        if self.tools.plan_ready() {
+                            self.plan_workspace = Some(lease);
+                            self.submit(workers, command)?;
+                        } else {
+                            self.reject_plan(&command, "terminal_workspace_busy");
+                        }
+                    }
+                    (PlanTarget::Submit(command), Err(code)) => self.reject_plan(&command, code),
+                    (PlanTarget::Resume(command), Ok(lease))
+                        if self.phase == "paused"
+                            && self.recovery.is_none()
+                            && self.tools.plan_ready() =>
+                    {
+                        self.plan_workspace = Some(lease);
+                        self.resuming = Some(command);
+                    }
+                    (PlanTarget::Resume(command), Err(code)) => {
+                        self.emit(EventPayload::RuntimeError {
+                            command: Some(command),
+                            diagnostic: code.into(),
+                        })
+                    }
+                    (PlanTarget::Resume(command), Ok(_))
+                        if self.phase == "paused" && self.recovery.is_none() =>
+                    {
+                        self.emit(EventPayload::RuntimeError {
+                            command: Some(command),
+                            diagnostic: "terminal_workspace_busy".into(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
             Completion::Stored(value) => self.stored(value)?,
             Completion::Provider { identity, result } => {
                 if self.provider.as_ref() != Some(&identity) {
@@ -1091,10 +1982,13 @@ impl Owner {
                                     "compacted",
                                     vec![(
                                         "compaction",
-                                        Json::object(vec![
-                                            ("request", value.request().save()?),
-                                            ("native", value.native().clone()),
-                                        ])?,
+                                        Json::object_with_limits(
+                                            vec![
+                                                ("request", value.request().save()?),
+                                                ("native", value.native().clone()),
+                                            ],
+                                            crate::session::journal_v1::MAX_RECORD,
+                                        )?,
                                     )],
                                 )
                             }),
@@ -1164,6 +2058,52 @@ impl Owner {
                 } else {
                     self.auth = None;
                 }
+                if task == AuthTask::SelectGeneration {
+                    self.selection_stop = None;
+                    let command = self.selecting.take().ok_or("generation_selection")?;
+                    if self.shutting_down || self.storage_failed {
+                        self.control_commands.remove(&command.command.0);
+                        if let Some(reply) = self.control_replies.remove(&command.command.0) {
+                            let _ = reply.send(if self.storage_failed {
+                                Err("journal_read_only")
+                            } else {
+                                Ok(PostStatus::Closed)
+                            });
+                        }
+                        return Ok(());
+                    }
+                    match result {
+                        Err(code) => {
+                            self.control_commands.remove(&command.command.0);
+                            if let Some(reply) = self.control_replies.remove(&command.command.0) {
+                                let _ = reply.send(Err(code));
+                            }
+                            self.reject(&command, code);
+                        }
+                        Ok(_) => {
+                            let CommandPayload::SetGeneration(selection) = command.payload else {
+                                return Err("generation_selection");
+                            };
+                            self.record(
+                                workers,
+                                Kind::GenerationSelected,
+                                "generation_selected",
+                                vec![
+                                    ("command", Json::string(&command.command.0)?),
+                                    ("model", Json::string(&selection.model)?),
+                                    (
+                                        "effort",
+                                        selection.effort.as_ref().map_or_else(
+                                            || Json::parse("null"),
+                                            |value| Json::string(value),
+                                        )?,
+                                    ),
+                                ],
+                            )?;
+                        }
+                    }
+                    return Ok(());
+                }
                 if !self.can_act() {
                     if holding {
                         self.release_auth(workers)?;
@@ -1182,9 +2122,17 @@ impl Owner {
                         self.pause(code);
                     }
                     Ok(stop) => match task {
-                        AuthTask::Generate => self.provider(workers, ProviderTask::Generate)?,
+                        AuthTask::SelectGeneration => unreachable!("selection handled above"),
+                        AuthTask::Generate => {
+                            if self.state.pending_followups().next().is_none() {
+                                self.provider(workers, ProviderTask::Generate)?;
+                            }
+                        }
                         AuthTask::Compact => self.provider(workers, ProviderTask::Compact)?,
                         AuthTask::BeforeIntent => {
+                            if self.state.pending_followups().next().is_some() {
+                                return Ok(());
+                            }
                             let current = self.state.turn.as_ref().ok_or("runtime_turn")?;
                             let invocation = self
                                 .plan
@@ -1200,7 +2148,7 @@ impl Owner {
                             )?;
                         }
                         AuthTask::ToolLease => {
-                            if stop.cancelled() {
+                            if stop.cancelled() || self.state.pending_followups().next().is_some() {
                                 let intent = self
                                     .state
                                     .turn
@@ -1208,7 +2156,9 @@ impl Owner {
                                     .and_then(|t| t.intent.as_ref())
                                     .ok_or("runtime_intent")?;
                                 self.pending_outcome = Some(not_started(intent));
-                                self.pause("auth_required");
+                                if stop.cancelled() {
+                                    self.pause("auth_required");
+                                }
                                 self.release_auth(workers)?;
                             } else {
                                 self.execute(workers, stop)?;
@@ -1290,6 +2240,23 @@ impl Owner {
         loop {
             if self.closing.mode.load(Ordering::Acquire) == 2 && !self.shutting_down {
                 self.shutting_down = true;
+                if let Some(stop) = &self.selection_stop {
+                    stop.cancel();
+                }
+                // Commands not yet assigned to a journal write have no durable
+                // admission. Release their callers; never start a new catalog
+                // validation while shutting down.
+                for command in self
+                    .new_followups
+                    .drain(..)
+                    .chain(self.selections.drain(..))
+                    .chain(self.autocompact_selections.drain(..))
+                {
+                    self.control_commands.remove(&command.command.0);
+                    if let Some(reply) = self.control_replies.remove(&command.command.0) {
+                        let _ = reply.send(Ok(PostStatus::Closed));
+                    }
+                }
                 self.queued.clear();
                 if self.can_cancel() {
                     self.cancel("shutdown".into());
@@ -1321,6 +2288,7 @@ impl Owner {
             enum Action {
                 Boot(std::result::Result<Result<Ready>, oneshot::error::RecvError>),
                 Command(Option<Envelope>),
+                Child(Option<ChildLookup>),
                 Start(Option<(Identity, Started)>),
                 Complete(Option<Completion>),
                 Preview(std::result::Result<(), watch::error::RecvError>),
@@ -1333,6 +2301,7 @@ impl Owner {
                 value=&mut boot,if !self.initialized=>Action::Boot(value),
                 value=self.done.recv()=>Action::Complete(value),
                 value=self.mail.snapshot.recv()=>Action::Command(value),
+                value=self.mail.child.recv()=>Action::Child(value),
                 value=self.mail.transcript.recv()=>Action::Command(value),
                 value=self.mail.resume.recv()=>Action::Command(value),
                 value=self.mail.submits.recv()=>Action::Command(value),
@@ -1346,7 +2315,7 @@ impl Owner {
                             return Err("session_command_limit");
                         }
                         self.state = ready.state;
-                        self.profile_bytes = ready.profile_bytes;
+                        self.journal_identity = ready.journal_identity;
                         self.diagnostic = ready.diagnostic.into();
                         self.storage_failed = !ready.diagnostic.is_empty();
                         self.recovered_pause = ready.requires_resume;
@@ -1386,6 +2355,12 @@ impl Owner {
                 },
                 Action::Command(Some(value)) => self.admit(value),
                 Action::Command(None) => Err("runtime_mailbox_closed"),
+                Action::Child(Some(lookup)) => {
+                    let result = self.child_attempt(&lookup);
+                    let _ = lookup.reply.send(result);
+                    Ok(())
+                }
+                Action::Child(None) => Err("runtime_mailbox_closed"),
                 Action::Start(Some((identity, value))) => {
                     self.started(identity, value);
                     Ok(())
@@ -1427,7 +2402,52 @@ impl Owner {
 }
 impl Drop for Owner {
     fn drop(&mut self) {
+        if let Some(stop) = &self.selection_stop {
+            stop.cancel();
+        }
         self.gate.cancel();
         self.turn_stop.cancel();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn child_receipts_preserve_scoped_read_evidence_and_omit_command_output() {
+    use crate::{
+        provider::replay::{Execution, ToolResult},
+        session::transcript::ToolPhase,
+    };
+
+    let saved = SavedResult {
+        result: ToolResult::new(
+            "fixture-operation".into(),
+            "fixture-call".into(),
+            "a".repeat(300),
+            Execution::Succeeded,
+            Effects::KnownResult,
+        ),
+        dispatched: true,
+    };
+    let mut detail = ToolDetail {
+        operation: "fixture-operation".into(),
+        name: "read_file".into(),
+        call: "fixture-call".into(),
+        purpose: "Fixture read".into(),
+        target: "fixture.txt".into(),
+        phase: ToolPhase::Prepared,
+        content_start: 0,
+        continued: false,
+        last_chunk: true,
+    };
+    let read = child_tool_receipt(&saved, Some(&detail));
+    assert_eq!(read.operation, "fixture-operation");
+    assert_eq!(read.target, "fixture.txt");
+    assert_eq!(read.execution, "Succeeded");
+    assert_eq!(read.effects, "KnownResult");
+    assert_eq!(read.output_excerpt.len(), 200);
+    detail.name = "run_command".into();
+    let shell = child_tool_receipt(&saved, Some(&detail));
+    assert_eq!(shell.output_bytes, 300);
+    assert!(shell.output_excerpt.is_empty());
+    assert!(shell.target.is_empty());
 }

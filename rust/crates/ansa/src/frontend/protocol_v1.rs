@@ -1,7 +1,8 @@
 //! Shared owning CLI/TUI events. This is not a second source of session truth.
 pub use crate::provider::contracts::{
-    AgentMode, CommandId, CommandPayload, EventPayload, GetTranscript, OperationId, RequestId,
-    RuntimeCommand, RuntimeEvent, RuntimeIncarnation, SessionId, Submit, TurnId, validate_command,
+    AgentMode, CommandId, CommandPayload, EventPayload, Followup, GenerationSelection,
+    GetTranscript, MessageKind, MessageReceiptInfo, OperationId, RequestId, RuntimeCommand,
+    RuntimeEvent, RuntimeIncarnation, SessionId, Steer, Submit, TurnId, validate_command,
     validate_event,
 };
 use crate::provider::replay::{Effects, Execution};
@@ -49,6 +50,10 @@ pub struct TranscriptPage {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
+    pub timeline_size: usize,
+    pub generation: GenerationSelection,
+    pub autocompact_percent: u8,
+    pub followups: Vec<Followup>,
     pub through_sequence: u64,
     pub state: String,
     pub request: Option<RequestId>,
