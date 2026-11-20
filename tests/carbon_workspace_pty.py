@@ -1221,11 +1221,12 @@ def openrouter_orchestration(screen, root, cwd):
     assert "Follow-up recommendation" in visible(screen)
     screen.send(b"\r")
     until(screen, lambda frame: "0/1 agents" in frame, "read-only plan starts despite a post-report recommendation")
-    screen.send("keep draft\r")
-    until(screen, lambda frame: "Draft · send after the task finishes" in frame and "keep draft" in screen.vt.line(-4),
-          "draft retained while helper runs")
+    screen.send("keep draft")
+    until(screen, lambda frame: "keep draft" in screen.vt.line(-4), "draft retained while helper runs")
+    assert "Draft · send after the task finishes" not in visible(screen)
     held_child.unlink()
-    until(screen, lambda frame: "Coordinator is writing the summary" in frame, "summary phase comes from coordinator state")
+    until(screen, lambda frame: "Coordinator is writing the summary" in frame
+          and "Draft · send after the task finishes" in frame, "summary phase comes from coordinator state")
     held_summary.unlink()
     until(screen, lambda frame: "OPENROUTER_CARBON_DONE" in frame, "coordinator summary", timeout=15)
     until(screen, lambda frame: "Coordinator is writing the summary" not in frame and "Approved plan" in frame,

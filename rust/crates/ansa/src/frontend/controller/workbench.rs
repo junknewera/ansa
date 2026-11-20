@@ -4316,8 +4316,7 @@ impl Workbench {
             animate: self.animation_enabled(),
             animation_frame: Self::animation_frame(),
             draft_notice: !slot.state.editor.bytes.is_empty()
-                && (self.collecting_orchestration()
-                    || self.orchestration_summary.contains_key(&slot.id)),
+                && self.orchestration_summary.contains_key(&slot.id),
             interrupt_hint: if !slot.state.editor.bytes.is_empty() {
                 "Ctrl+C clear draft"
             } else if self.collecting_orchestration() || slot.interruptible() {
