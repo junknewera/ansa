@@ -5,7 +5,16 @@ pub mod summary;
 use crate::{protocol::json::Json, provider::request::Request};
 
 pub(crate) fn estimate_text_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4)
+    let units: usize = text
+        .chars()
+        .map(|character| match character {
+            c if c.is_ascii_alphanumeric() || c == ' ' => 1,
+            c if c.is_ascii() => 3,
+            c if u32::from(c) >= 0x1f000 => 8,
+            _ => 4,
+        })
+        .sum();
+    units.div_ceil(4)
 }
 
 pub(crate) fn estimate_request_tokens(request: &Request) -> usize {
@@ -21,10 +30,22 @@ pub(crate) fn estimate_request_tokens(request: &Request) -> usize {
             })
             .sum::<usize>()
         + request
-            .input
-            .iter()
-            .map(estimate_item_tokens)
-            .sum::<usize>()
+            .final_format()
+            .and_then(|format| format.format().ok())
+            .map_or(0, |format| estimate_text_tokens(&format.dump()))
+        + estimate_input_tokens(&request.input)
+}
+
+pub(crate) fn estimate_input_tokens(items: &[Json]) -> usize {
+    items.iter().map(estimate_item_tokens).sum()
+}
+
+pub(crate) fn require_response_room(tokens: usize, window: usize) -> Result<(), &'static str> {
+    let reserve = (window / 4).clamp(1, 4096);
+    if tokens > window.saturating_sub(reserve) {
+        return Err("model_context_limit");
+    }
+    Ok(())
 }
 
 fn estimate_item_tokens(item: &Json) -> usize {

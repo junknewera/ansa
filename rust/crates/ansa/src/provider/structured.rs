@@ -3,7 +3,6 @@ use crate::{protocol::json::Json, provider::native::NativeItem};
 use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, &'static str>;
-const RESULT_BYTES: usize = 12 * 1024;
 const MAX_FINDINGS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,12 +31,9 @@ pub struct ChildResult {
 
 impl ChildResult {
     pub(crate) fn validate(&self) -> Result<()> {
-        if !valid_text(&self.summary, 4096)
+        if !valid_text(&self.summary)
             || self.findings.len() > MAX_FINDINGS
-            || self
-                .findings
-                .iter()
-                .any(|finding| !valid_text(finding, 2048))
+            || self.findings.iter().any(|finding| !valid_text(finding))
         {
             return Err("child_result_limit");
         }
@@ -65,7 +61,7 @@ impl FinalFormat {
         }
     }
 
-    pub(super) fn format(self) -> Result<Json> {
+    pub(crate) fn format(self) -> Result<Json> {
         let mut schema = match self {
             Self::ChildResult => Json::parse(
                 r#"{"type":"object","properties":{"status":{"type":"string","enum":["completed","changes_requested","blocked"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}}},"required":["status","summary","findings"],"additionalProperties":false}"#,
@@ -108,8 +104,8 @@ impl FinalFormat {
         if self != Self::ChildResult {
             return Err("child_result_format_required");
         }
-        let parsed: ChildResult = serde_json::from_str(terminal_text(items, RESULT_BYTES)?)
-            .map_err(|_| "child_result_schema")?;
+        let parsed: ChildResult =
+            serde_json::from_str(terminal_text(items)?).map_err(|_| "child_result_schema")?;
         parsed.validate()?;
         Ok(parsed)
     }
@@ -118,7 +114,7 @@ impl FinalFormat {
         if self == Self::ChildResult {
             return Err("plan_result_format_required");
         }
-        let text = terminal_text(items, 64 * 1024)?;
+        let text = terminal_text(items)?;
         let value = Json::parse(text)?;
         value.field("checks")?.elements()?;
         value.field("manual_checks")?.elements()?;
@@ -155,7 +151,7 @@ fn require_property(schema: Json, name: &str, value: Json) -> Result<Json> {
         .with("required", Json::array(required)?)
 }
 
-fn terminal_text(items: &[NativeItem], limit: usize) -> Result<&str> {
+fn terminal_text(items: &[NativeItem]) -> Result<&str> {
     let mut result = None;
     for item in items {
         let item = item.value();
@@ -171,9 +167,6 @@ fn terminal_text(items: &[NativeItem], limit: usize) -> Result<&str> {
                 return Err("child_result_shape");
             }
             let text = part.text_field("text")?;
-            if text.len() > limit {
-                return Err("child_result_limit");
-            }
             result = Some(text);
         }
     }
@@ -196,9 +189,8 @@ pub(super) fn reject_refusal(items: &[NativeItem]) -> Result<()> {
     Ok(())
 }
 
-fn valid_text(text: &str, limit: usize) -> bool {
+fn valid_text(text: &str) -> bool {
     !text.trim().is_empty()
-        && text.len() <= limit
         && text
             .chars()
             .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))

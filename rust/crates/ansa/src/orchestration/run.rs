@@ -161,9 +161,10 @@ impl State {
             || !valid_id(&header.identity.run)
             || !(1..=64).contains(&budget.submissions)
             || budget.deadline <= budget.started_at
-            || header.context.as_ref().is_some_and(|context| {
-                context.prompt.is_empty() || context.prompt.len() > 16 * 1024
-            })
+            || header
+                .context
+                .as_ref()
+                .is_some_and(|context| context.prompt.is_empty())
         {
             return Err("run_configuration");
         }

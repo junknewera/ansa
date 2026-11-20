@@ -131,9 +131,7 @@ impl History {
             entries.find(found)
         };
         if let Some((offset, entry)) = selected {
-            // User Submit has the same 16 KiB bound as the editor. Unsupported
-            // legacy entries are not silently truncated or auto-submitted.
-            if entry.text.len() > 16 * 1024 {
+            if entry.text.len() > super::input::MAX_COMPOSER_BYTES {
                 self.pending = None;
                 self.target = self.selected;
                 return;
@@ -281,13 +279,18 @@ mod tests {
     #[test]
     fn overflow_cannot_be_healed_by_history_recall() {
         let mut editor = Editor::default();
-        for _ in 0..16 * 1024 + 1 {
-            editor.feed(b'x', true);
-        }
+        editor
+            .bytes
+            .resize(crate::frontend::input::MAX_COMPOSER_BYTES, b'x');
+        editor.cursor = editor.bytes.len();
+        editor.feed(b'x', true);
         let mut history = History::default();
         history.navigate(true, &mut editor, 5);
         assert!(history.query().is_none());
         assert!(editor.overflow);
-        assert_eq!(editor.bytes.len(), 16 * 1024);
+        assert_eq!(
+            editor.bytes.len(),
+            crate::frontend::input::MAX_COMPOSER_BYTES
+        );
     }
 }

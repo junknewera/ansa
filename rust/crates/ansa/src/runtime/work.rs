@@ -88,6 +88,7 @@ pub(crate) struct Stored {
     pub state: Arc<State>,
     pub result: Result<Receipt>,
     pub known: Option<SavedResult>,
+    pub rejected_frame: bool,
 }
 pub(crate) struct Ready {
     pub state: Arc<State>,
@@ -217,13 +218,11 @@ fn outcome(invocation: &Invocation, value: crate::tools::registry::Outcome) -> S
         ),
         dispatched: true,
     };
-    if value.output.len() > 128 * 1024
-        || value.execution == Execution::Succeeded && value.effects != Effects::KnownResult
-    {
+    if value.execution == Execution::Succeeded && value.effects != Effects::KnownResult {
         return fallback();
     }
     match String::from_utf8(value.output) {
-        Ok(output) => SavedResult {
+        Ok(output) if Json::text_fits_frame(&output) => SavedResult {
             result: ToolResult::new(
                 invocation.operation.clone(),
                 invocation.call.clone(),
@@ -233,7 +232,7 @@ fn outcome(invocation: &Invocation, value: crate::tools::registry::Outcome) -> S
             ),
             dispatched: true,
         },
-        Err(_) => fallback(),
+        _ => fallback(),
     }
 }
 impl Workers {
@@ -330,11 +329,19 @@ impl Workers {
                     }
                     while let Ok(job) = receiver.recv() {
                         let mut known = None;
+                        let mut built = false;
                         let result = if poisoned {
                             Err("journal_read_only")
                         } else {
                             guarded(|| {
                                 let event = (job.build)(&state)?;
+                                if matches!(
+                                    job.kind,
+                                    Kind::Accepted | Kind::Response | Kind::Compacted
+                                ) {
+                                    crate::session::journal_v1::check_record_frame(&event)?;
+                                }
+                                built = true;
                                 if let Some(backend) = &mut store {
                                     let result = backend.commit(&event);
                                     known = backend.known_outcome().cloned();
@@ -353,7 +360,19 @@ impl Workers {
                                 })
                             })
                         };
-                        if result.is_err() {
+                        let rejected_frame = !poisoned
+                            && matches!(
+                                job.kind,
+                                Kind::Accepted | Kind::Response | Kind::Compacted
+                            )
+                            && !built
+                            && matches!(
+                                result,
+                                Err("json_build_limit"
+                                    | "json_structure_limit"
+                                    | "request_context")
+                            );
+                        if result.is_err() && !rejected_frame {
                             poisoned = true;
                         }
                         let value = Stored {
@@ -362,6 +381,7 @@ impl Workers {
                             state: state.clone(),
                             result,
                             known,
+                            rejected_frame,
                         };
                         if channel.blocking_send(Completion::Stored(value)).is_err() {
                             break;
@@ -388,11 +408,20 @@ impl Workers {
                             let current = job.state.turn.as_ref().ok_or("runtime_turn")?;
                             match job.task {
                                 ProviderTask::Generate => {
-                                    let request = if let Some(response) = &current.tools_response {
-                                        next_request(response, &current.results)?
-                                    } else {
-                                        current.next.clone()
-                                    };
+                                    let mut request =
+                                        if let Some(response) = &current.tools_response {
+                                            next_request(response, &current.results)?
+                                        } else {
+                                            current.next.clone()
+                                        };
+                                    if let Some((tokens, window)) =
+                                        job.state.context_estimate(&request, || {
+                                            (provider_options.model_window)(&request)
+                                        })
+                                    {
+                                        crate::context::require_response_room(tokens, window)?;
+                                        request.set_context_estimate(tokens);
+                                    }
                                     let (
                                         sink_gate,
                                         sink_preview,
@@ -472,8 +501,8 @@ impl Workers {
                                         return Err("compaction_item_limit");
                                     }
                                     if value.output()?.len() >= request.input.len()
-                                        && Json::array(value.output()?.to_vec())?.dump().len()
-                                            >= Json::array(request.input.clone())?.dump().len()
+                                        && crate::context::estimate_input_tokens(value.output()?)
+                                            >= crate::context::estimate_input_tokens(&request.input)
                                     {
                                         return Err("compaction_no_progress");
                                     }

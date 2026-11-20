@@ -82,7 +82,7 @@ pub fn save(response: &AdmittedResponse) -> Result<Json, &'static str> {
     } else if let Some(tokens) = response.token_usage() {
         fields.push(("measured_context_tokens", Json::parse(&tokens.to_string())?));
     }
-    Json::object(fields)
+    Json::object_with_limits(fields, Json::JOURNAL_RECORD_BYTES)
 }
 
 pub fn load(value: &Json) -> Result<AdmittedResponse, &'static str> {

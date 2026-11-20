@@ -1143,14 +1143,19 @@ pub async fn summary(cancelled: bool) {
         Ok(result)
     });
     let count = Arc::new(AtomicUsize::new(0));
+    let generate: Generate = Arc::new(|request, _, _| {
+        let response = model(request, 1)?;
+        native::load(
+            &native::save(&response)?
+                .with("context_tokens", Json::parse("6000")?)?
+                .with("context_window", Json::parse("10000")?)?,
+        )
+    });
     let mut runtime = setup(
         count.clone(),
         None,
-        generator(1),
-        Limits {
-            compact_bytes: 300,
-            ..Limits::default()
-        },
+        generate,
+        Limits::default(),
         Options {
             directory: Some(root.journal()),
             compact: Some(compact),
@@ -1241,16 +1246,18 @@ pub async fn summary_budget() {
         {
             held.hold(stop);
         }
-        model(request, 0)
+        let response = model(request, 0)?;
+        native::load(
+            &native::save(&response)?
+                .with("context_tokens", Json::parse("3000")?)?
+                .with("context_window", Json::parse("10000")?)?,
+        )
     });
     let mut runtime = setup(
         Arc::new(AtomicUsize::new(0)),
         None,
         provider,
-        Limits {
-            compact_bytes: 12 * 1024,
-            ..Limits::default()
-        },
+        Limits::default(),
         Options {
             directory: Some(root.journal()),
             compact: Some(compact),

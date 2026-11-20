@@ -280,6 +280,7 @@ impl Slot {
                 .pending_draft
                 .as_ref()
                 .is_some_and(|(pending, _, _)| *pending == id)
+                && (!submit || code.is_some())
             {
                 let (_, bytes, cursor) = self
                     .state
@@ -1752,10 +1753,6 @@ impl Workbench {
             || text.to_owned(),
             |previous| format!("{previous}\n\nClarification: {text}"),
         );
-        if prompt.len() > 16 * 1024 {
-            self.report(io, "The request and its clarifications are too long");
-            return false;
-        }
         self.cancel_modal();
         let token = self.modal_token;
         let slot = &mut self.slots[self.current];
@@ -2247,6 +2244,7 @@ impl Workbench {
             EventPayload::CommandAccepted { command, .. }
                 if slot.follow_accepted_submit.as_ref() == Some(command) =>
             {
+                slot.state.pending_draft = None;
                 slot.follow_accepted_submit = None;
                 slot.show_latest();
             }
@@ -2256,6 +2254,7 @@ impl Workbench {
                     && slot.follow_accepted_submit.is_some()
                     && slot.follow_accepted_submit == snapshot.submit =>
             {
+                slot.state.pending_draft = None;
                 slot.follow_accepted_submit = None;
                 slot.show_latest();
             }
@@ -2264,6 +2263,10 @@ impl Workbench {
                 ..
             } if slot.follow_accepted_submit.as_ref() == Some(command) => {
                 slot.follow_accepted_submit = None;
+                if let Some((_, bytes, cursor)) = slot.state.pending_draft.take() {
+                    slot.state.editor.bytes = bytes;
+                    slot.state.editor.cursor = cursor;
+                }
             }
             EventPayload::ResyncRequired { .. } => {
                 slot.resync = true;

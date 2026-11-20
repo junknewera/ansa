@@ -51,6 +51,17 @@ impl<'de> Deserialize<'de> for Entries<'de> {
 }
 
 impl Json {
+    pub const FRAME_BYTES: usize = 16 * 1024 * 1024;
+    pub(crate) const JOURNAL_RECORD_BYTES: usize = 32 * 1024 * 1024;
+    pub const FRAME_NODES: usize = 131072;
+
+    pub(crate) fn text_fits_frame(text: &str) -> bool {
+        quoted_bytes(text) <= Self::FRAME_BYTES
+    }
+    pub(crate) fn quoted_size(text: &str) -> usize {
+        quoted_bytes(text)
+    }
+
     fn owned(value: Value) -> Self {
         let (bytes, nodes, depth) = match &value {
             Value::Null => (4, 1, 0),
@@ -101,13 +112,13 @@ impl Json {
         if self.0.depth >= 64 {
             return Err("json_depth_limit");
         }
-        if self.0.nodes > 131072 {
+        if self.0.nodes > Self::FRAME_NODES {
             return Err("json_structure_limit");
         }
         Ok(self)
     }
     pub fn parse(input: &str) -> Result<Self, &'static str> {
-        Self::parse_with_limits(input, 16 * 1024 * 1024, 64, 131072)
+        Self::parse_with_limits(input, Self::FRAME_BYTES, 64, Self::FRAME_NODES)
     }
     pub fn parse_with_limits(
         input: &str,
@@ -241,7 +252,7 @@ impl Json {
     }
 
     pub fn string(text: &str) -> Result<Self, &'static str> {
-        Self::string_with_limits(text, 16 * 1024 * 1024)
+        Self::string_with_limits(text, Self::FRAME_BYTES)
     }
     pub fn string_with_limits(text: &str, max_bytes: usize) -> Result<Self, &'static str> {
         if quoted_bytes(text) > max_bytes {
@@ -250,7 +261,7 @@ impl Json {
         Ok(Self::owned(Value::String(text.to_owned())))
     }
     pub fn object(entries: Vec<(&str, Json)>) -> Result<Self, &'static str> {
-        Self::object_with_limits(entries, 16 * 1024 * 1024)
+        Self::object_with_limits(entries, Self::FRAME_BYTES)
     }
     pub fn object_with_limits(
         entries: Vec<(&str, Json)>,
@@ -286,7 +297,7 @@ impl Json {
         .constructed(max_bytes)
     }
     pub fn array(values: Vec<Json>) -> Result<Self, &'static str> {
-        Self::owned(Value::Array(values)).constructed(16 * 1024 * 1024)
+        Self::owned(Value::Array(values)).constructed(Self::FRAME_BYTES)
     }
     pub fn field(&self, key: &str) -> Result<&Json, &'static str> {
         if let Value::Object(entries) = self.value() {

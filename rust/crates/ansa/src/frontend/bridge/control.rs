@@ -204,7 +204,7 @@ impl Control {
             return Ok(self.command(id, turn.into(), CommandPayload::Cancel(target.into())));
         }
         let text = value.text_field("text")?;
-        if text.trim().is_empty() || text.len() > 16 * 1024 || text.contains('\0') {
+        if text.trim().is_empty() || text.contains('\0') {
             return Err("submit_size");
         }
         let target = value.field("target")?;

@@ -517,15 +517,12 @@ fn bracketed_paste_keeps_multiline_content_out_of_action_dispatch() {
     assert_eq!(editor.text().unwrap(), "first\n/exit\nlast");
     assert_eq!(editor.feed(b'\r', true), Some(Action::Submit));
     editor.clear();
-    let paste = [
-        b"\x1b[200~".as_slice(),
-        vec![b'x'; 16385].as_slice(),
-        b"\x1b[201~".as_slice(),
-    ]
-    .concat();
-    assert!(feed(&mut editor, &paste).is_empty());
+    let frame = ansa::frontend::input::MAX_COMPOSER_BYTES;
+    editor.bytes.resize(frame - 1, b'x');
+    editor.cursor = editor.bytes.len();
+    assert!(feed(&mut editor, b"\x1b[200~xy\x1b[201~").is_empty());
     assert!(editor.overflow);
-    assert_eq!(editor.bytes.len(), 16384);
+    assert_eq!(editor.bytes.len(), frame);
     assert_eq!(editor.feed(127, true), None);
     assert_eq!(editor.feed(b'\r', true), Some(Action::Overflow));
 }

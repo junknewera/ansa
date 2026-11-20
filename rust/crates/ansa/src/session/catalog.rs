@@ -135,6 +135,14 @@ impl Catalog {
     /// Derived display observations only. A shared byte budget prevents a large
     /// catalogue from multiplying per-journal limits into unbounded I/O.
     pub fn summaries(&self, stop: &crate::auth::Cancel) -> Result<Vec<SessionSummary>> {
+        self.summaries_with_catalog(stop, None)
+    }
+
+    pub(crate) fn summaries_with_catalog(
+        &self,
+        stop: &crate::auth::Cancel,
+        compiled: Option<&crate::tools::registry::Snapshot>,
+    ) -> Result<Vec<SessionSummary>> {
         let mut budget = 64 * 1024 * 1024;
         let mut summaries = Vec::new();
         for entry in self.entries_checked(|| stop.check())? {
@@ -144,6 +152,7 @@ impl Catalog {
                 entry,
                 &mut budget,
                 stop,
+                compiled,
             )?);
         }
         Ok(summaries)

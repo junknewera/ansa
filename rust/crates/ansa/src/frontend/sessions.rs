@@ -260,7 +260,10 @@ impl Factory {
         self.settings.catalog(self.profile())?.entries()
     }
     pub fn summaries(&self, stop: &Cancel) -> Result<Vec<crate::session::catalog::SessionSummary>> {
-        self.settings.catalog(self.profile())?.summaries(stop)
+        let compiled = crate::tools::files::summary_catalog(&self.settings)?;
+        self.settings
+            .catalog(self.profile())?
+            .summaries_with_catalog(stop, Some(&compiled))
     }
     pub(super) fn artifacts(&self, id: &str) -> Result<crate::tools::artifacts::Store> {
         let selected = self.settings.catalog(self.profile())?.explicit(id)?;
@@ -913,7 +916,6 @@ impl Factory {
             tools,
             generate,
             Limits {
-                compact_bytes: self.settings.compact_bytes,
                 tool_rounds: self.settings.tool_rounds,
                 tool_calls: self.settings.tool_calls,
                 ..Limits::default()

@@ -427,7 +427,7 @@ async fn schedule(
         };
         Ok(Completed {
             id: identity.run,
-            evidence: evidence(&run, &prompt, release.as_ref())?,
+            evidence: evidence(&run, &prompt, release.as_ref()),
             candidate: release,
         })
     }
@@ -461,7 +461,7 @@ fn dependency_evidence(run: &Run, task: &Step) -> Result<Option<Json>> {
     }
     let values = task.depends_on.iter().map(|id| {
         let result = run.result(id).ok_or("orchestration_dependency_missing")?;
-        Ok(serde_json::json!({ "step": id, "summary": result.summary.chars().take(256).collect::<String>(), "findings": result.findings.iter().take(2).map(|text| text.chars().take(160).collect::<String>()).collect::<Vec<_>>() }))
+        Ok(serde_json::json!({ "step": id, "summary": result.summary, "findings": result.findings }))
     }).collect::<Result<Vec<_>>>()?;
     Ok(Some(Json::parse(
         &serde_json::Value::Array(values).to_string(),
@@ -849,17 +849,13 @@ async fn start_child(
     Ok(child)
 }
 
-fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> Result<String> {
-    // Limit contribution from each child so the final parent input stays
-    // within its native cap even when every step returns the maximum.
-    let results: Vec<_> = run.plan().steps().iter().map(|step| {
-        let outcome = run.result(&step.id).map(|result| serde_json::json!({
-            "status": result.status,
-            "summary": result.summary.chars().take(96).collect::<String>(),
-            "findings": result.findings.iter().take(2).map(|finding| finding.chars().take(40).collect::<String>()).collect::<Vec<_>>(),
-        }));
-        serde_json::json!({ "step": step.id, "outcome": outcome })
-    }).collect();
+fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> String {
+    let results: Vec<_> = run
+        .plan()
+        .steps()
+        .iter()
+        .map(|step| serde_json::json!({ "step": step.id, "outcome": run.result(&step.id) }))
+        .collect();
     let mut evidence = serde_json::json!({
         "show_approved_plan": true,
         "user_request": prompt,
@@ -874,28 +870,7 @@ fn evidence(run: &Run, prompt: &str, candidate: Option<&Candidate>) -> Result<St
             "command_checks_passed": run.plan().command_checks().len(),
         });
     }
-    let input = evidence.to_string();
-    if input.len() <= 16 * 1024 {
-        return Ok(input);
-    }
-    let text: Vec<_> = prompt.chars().collect();
-    let mut keep = text.len() / 2;
-    while keep > 0 {
-        let excerpt = text
-            .iter()
-            .take(keep / 2)
-            .chain(['\n', '…', '\n'].iter())
-            .chain(text.iter().skip(text.len() - keep.div_ceil(2)))
-            .collect::<String>();
-        evidence["user_request"] = excerpt.into();
-        evidence["user_request_excerpt"] = true.into();
-        let input = evidence.to_string();
-        if input.len() <= 16 * 1024 {
-            return Ok(input);
-        }
-        keep /= 2;
-    }
-    Err("orchestration_summary_limit")
+    evidence.to_string()
 }
 
 fn now() -> Result<u64> {

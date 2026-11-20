@@ -11,7 +11,7 @@ use crate::{
     provider::replay::Effects,
     session::{
         codec_v1::{Invocation, SavedResult, response_text, save_response},
-        state::{COMPACT_ITEM_THRESHOLD, Receipt as SubmitReceipt, State},
+        state::{Receipt as SubmitReceipt, State},
     },
     tools::registry::Snapshot as Tools,
 };
@@ -93,7 +93,7 @@ fn number(n: usize) -> Result<Json> {
 fn transition(turn: &TurnId, kind: &str, mut fields: Vec<(&str, Json)>) -> Result<Json> {
     fields.push(("kind", Json::string(kind)?));
     fields.push(("turn", Json::string(&turn.0)?));
-    Json::object(fields)
+    Json::object_with_limits(fields, crate::session::journal_v1::MAX_RECORD)
 }
 impl Owner {
     #[allow(clippy::too_many_arguments)]
@@ -661,7 +661,14 @@ impl Owner {
             let current = self.state.turn.as_ref().ok_or("runtime_turn")?;
             Some(if task == AuthTask::Generate {
                 if let Some(response) = &current.tools_response {
-                    crate::session::codec_v1::next_request(response, &current.results)?
+                    match crate::session::codec_v1::next_request(response, &current.results) {
+                        Ok(request) => request,
+                        Err("json_build_limit" | "json_structure_limit" | "request_context") => {
+                            self.pause("request_frame_limit");
+                            return self.advance(workers);
+                        }
+                        Err(code) => return Err(code),
+                    }
                 } else {
                     current.next.clone()
                 }
@@ -881,7 +888,10 @@ impl Owner {
                 {
                     return Ok(PostStatus::CommandConflict);
                 }
-                if self.request().as_ref() != Some(&message.target) || self.turn() != command.turn {
+                if !self.state.turn.as_ref().is_some_and(|turn| {
+                    turn.receipt.request == message.target && turn.receipt.turn == command.turn
+                }) || self.pending_receipt.is_some()
+                {
                     return Ok(PostStatus::StaleTarget);
                 }
                 if self.storage_failed {
@@ -1150,32 +1160,20 @@ impl Owner {
         self.pending_pause = None;
         let limits = self.limits;
         let keep = self.options.keep_recent_turns;
+        let model_window = self.options.model_window.clone();
         self.persist(
             workers,
             Kind::Accepted,
             Box::new(move |state| {
                 let next = state.request_for_input(&submitted.text, submitted.mode, internal)?;
                 let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;
-                let compact = if internal
-                    || inherited_incomplete_turn
-                    || state.completed_context_turns() <= keep
-                {
-                    false
-                } else if state.compaction_prefix().is_some() {
-                    if next.input.len() >= COMPACT_ITEM_THRESHOLD {
-                        true
-                    } else if let Some(compact) = state.context_at_half(&next, &submitted.text) {
-                        compact
-                            || next.binding.provider == "openrouter"
-                                && next.json()?.dump().len()
-                                    >= crate::openrouter::MAX_REQUEST_BYTES * 3 / 4
-                    } else {
-                        next.json()?.dump().len() >= limits.compact_bytes
-                    }
-                } else {
-                    false
-                };
-                let event = Json::object(vec![
+                let compact = !inherited_incomplete_turn
+                    && state.completed_context_turns() > keep
+                    && state.compaction_prefix().is_some()
+                    && state
+                        .context_estimate(&next, || model_window(&next))
+                        .is_some_and(|(tokens, window)| tokens >= window.div_ceil(2));
+                let mut fields = vec![
                     ("kind", Json::string("accepted")?),
                     ("command", Json::string(&receipt.command.0)?),
                     ("turn", Json::string(&receipt.turn.0)?),
@@ -1198,12 +1196,11 @@ impl Owner {
                     ),
                     ("round_limit", number(limits.tool_rounds)?),
                     ("call_limit", number(limits.tool_calls)?),
-                ])?;
+                ];
                 if internal {
-                    event.with("handoff", Json::parse("true")?)
-                } else {
-                    Ok(event)
+                    fields.push(("handoff", Json::parse("true")?));
                 }
+                Json::object_with_limits(fields, crate::session::journal_v1::MAX_RECORD)
             }),
             None,
         )?;
@@ -1393,22 +1390,26 @@ impl Owner {
                 workers,
                 Kind::Steered,
                 Box::new(move |state| {
-                    transition(
-                        &turn,
-                        "steered",
-                        vec![
-                            (
-                                "commands",
-                                Json::array(
-                                    messages
-                                        .iter()
-                                        .map(|m| Json::string(&m.command.0))
-                                        .collect::<Result<Vec<_>>>()?,
-                                )?,
-                            ),
-                            ("next", state.followup_request(&messages)?.save()?),
-                        ],
-                    )
+                    let commands = Json::array(
+                        messages
+                            .iter()
+                            .map(|m| Json::string(&m.command.0))
+                            .collect::<Result<Vec<_>>>()?,
+                    )?;
+                    match state
+                        .followup_request(&messages)
+                        .and_then(|request| request.save())
+                    {
+                        Ok(next) => transition(
+                            &turn,
+                            "steered",
+                            vec![("commands", commands), ("next", next)],
+                        ),
+                        Err("json_build_limit" | "json_structure_limit" | "request_context") => {
+                            transition(&turn, "steer_rejected", vec![("commands", commands)])
+                        }
+                        Err(code) => Err(code),
+                    }
                 }),
                 None,
             );
@@ -1460,6 +1461,20 @@ impl Owner {
                     .as_ref()
                     .is_some_and(|r| current.results.len() == r.calls().len())
                 {
+                    match crate::session::codec_v1::next_request(
+                        current
+                            .tools_response
+                            .as_ref()
+                            .expect("matched tool response"),
+                        &current.results,
+                    ) {
+                        Ok(_) => {}
+                        Err("json_build_limit" | "json_structure_limit" | "request_context") => {
+                            self.pause("request_frame_limit");
+                            return self.advance(workers);
+                        }
+                        Err(code) => return Err(code),
+                    }
                     self.plan = None;
                     return self.record(workers, Kind::Continued, "continued", vec![]);
                 }
@@ -1488,6 +1503,35 @@ impl Owner {
             return Ok(());
         }
         let pending = self.storing.take().expect("matched store job");
+        if done.rejected_frame {
+            if done.kind != Kind::Accepted {
+                if self.cancelling.is_none() {
+                    self.pause("request_frame_limit");
+                }
+                return Ok(());
+            }
+            let submitted = self.pending_receipt.take().ok_or("submit_receipt")?;
+            self.receipts.remove(&submitted.command.0);
+            self.plan_workspace = None;
+            self.phase = self
+                .state
+                .turn
+                .as_ref()
+                .map_or_else(|| "idle".into(), |turn| turn.stage.clone());
+            self.emit_at(
+                EventPayload::RuntimeError {
+                    command: Some(submitted.command),
+                    diagnostic: "request_frame_limit".into(),
+                },
+                submitted.turn.clone(),
+                None,
+            );
+            if let Some(command) = self.cancelling.take() {
+                self.emit_at(EventPayload::Cancelled { command }, submitted.turn, None);
+            }
+            self.snapshot(None);
+            return Ok(());
+        }
         let receipt = match done.result {
             Ok(receipt) => receipt,
             Err(code) => {
@@ -1518,6 +1562,14 @@ impl Owner {
                 self.snapshot(None);
             }
             Kind::Steered => {
+                if receipt.event().text_field("kind")? == "steer_rejected" {
+                    self.emit(EventPayload::RuntimeError {
+                        command: None,
+                        diagnostic: "followup_frame_limit".into(),
+                    });
+                    self.snapshot(None);
+                    return Ok(());
+                }
                 self.turn_stop = Cancel::default();
                 self.gate.reset();
                 self.resume_epoch += 1;
@@ -1782,10 +1834,13 @@ impl Owner {
                                     "compacted",
                                     vec![(
                                         "compaction",
-                                        Json::object(vec![
-                                            ("request", value.request().save()?),
-                                            ("native", value.native().clone()),
-                                        ])?,
+                                        Json::object_with_limits(
+                                            vec![
+                                                ("request", value.request().save()?),
+                                                ("native", value.native().clone()),
+                                            ],
+                                            crate::session::journal_v1::MAX_RECORD,
+                                        )?,
                                     )],
                                 )
                             }),

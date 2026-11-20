@@ -4,12 +4,12 @@ use ansa_linux::{fs, local};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fs::File, path::Path};
 
-use crate::protocol::legacy_json_v1::sha256;
+use crate::protocol::{json::Json, legacy_json_v1::sha256};
 
 pub(super) type Result<T> = std::result::Result<T, &'static str>;
 const HEADER: &str = "init.json";
 const MAX_RECORDS: u16 = 240;
-const MAX_BYTES: usize = 160 * 1024;
+const MAX_BYTES: usize = Json::FRAME_BYTES;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

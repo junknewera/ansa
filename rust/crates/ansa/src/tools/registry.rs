@@ -266,6 +266,32 @@ impl Snapshot {
         self.filtered(|_, policy| policy.read_only)
     }
 
+    pub(crate) fn verified_plan_tools(&self, saved: &Advertisement) -> Option<Advertisement> {
+        let mut registry = Registry::new();
+        for descriptor in &saved.descriptors {
+            let Some(index) = self
+                .definitions
+                .iter()
+                .position(|d| d.descriptor.name == descriptor.name)
+            else {
+                continue;
+            };
+            if !self.policies[index].read_only {
+                continue;
+            }
+            if self.definitions[index].descriptor != *descriptor {
+                return None;
+            }
+            registry
+                .register_with_policy(
+                    self.definitions[index].clone(),
+                    self.policies[index].clone(),
+                )
+                .ok()?;
+        }
+        Some(registry.snapshot().advertisement.clone())
+    }
+
     pub(crate) fn named_tools(&self, names: &[&str]) -> Arc<Self> {
         self.filtered(|definition, _| names.contains(&definition.descriptor.name.as_str()))
     }

@@ -1,6 +1,7 @@
 #[path = "../src/protocol/error.rs"]
 pub mod error;
 #[path = "../src/protocol/json.rs"]
+#[allow(dead_code)] // The wire-size projection is exercised by frontend_parity.
 pub mod json;
 #[path = "../src/protocol/legacy_json_v1.rs"]
 pub mod legacy_json_v1;
@@ -12,6 +13,7 @@ mod protocol {
 #[path = "../src/transport/http.rs"]
 pub mod http_impl;
 #[path = "../src/provider/mod.rs"]
+#[allow(dead_code)] // Source copy has no runtime token accounting.
 pub mod provider;
 #[path = "../src/tools/mod.rs"]
 #[allow(dead_code)] // Source copy intentionally exercises M2 without the M5 owner.

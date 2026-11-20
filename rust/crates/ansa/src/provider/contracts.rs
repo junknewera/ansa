@@ -5,7 +5,7 @@
 //! use ansa::provider::contracts::{SessionId, TurnId};
 //! fn wrong_identity(session: SessionId) -> TurnId { session }
 //! ```
-use crate::provider::replay::Effects;
+use crate::{protocol::json::Json, provider::replay::Effects};
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -199,7 +199,7 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         }
         CommandPayload::GetMessageReceipt(id) if !valid_id(&id.0) => Err("command_id"),
         CommandPayload::Submit(submit) | CommandPayload::Handoff(submit) => {
-            if submit.text.is_empty() || submit.text.len() > 16 * 1024 {
+            if submit.text.is_empty() || !Json::text_fits_frame(&submit.text) {
                 return Err("submit_size");
             }
             if submit.mode != AgentMode::Basic && submit.mode != AgentMode::Plan {
@@ -215,7 +215,7 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         CommandPayload::Steer(message) => {
             if !valid_id(&message.target.0)
                 || message.text.is_empty()
-                || message.text.len() > 16 * 1024
+                || !Json::text_fits_frame(&message.text)
             {
                 return Err("steer_contract");
             }

@@ -98,8 +98,13 @@ impl ProcessRunner {
     }
 
     pub fn new(root: &Path, worker: &Path) -> Result<Self> {
+        let runner = Self::configured(root, worker)?;
+        ansa_linux::fs::create_private(&runner.root).map_err(|_| "local_directory_permissions")?;
+        Ok(runner)
+    }
+
+    pub(crate) fn configured(root: &Path, worker: &Path) -> Result<Self> {
         let root = std::path::absolute(root).map_err(|_| "local_directory_path")?;
-        ansa_linux::fs::create_private(&root).map_err(|_| "local_directory_permissions")?;
         let worker = worker.canonicalize().map_err(|_| "process_worker_path")?;
         Ok(Self { root, worker })
     }

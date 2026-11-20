@@ -1,5 +1,5 @@
 //! Bounded terminal editor. Paste contents never become terminal actions.
-const LIMIT: usize = 16 * 1024;
+pub const MAX_COMPOSER_BYTES: usize = crate::protocol::json::Json::FRAME_BYTES;
 const PASTE_END: &[u8] = b"\x1b[201~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +59,7 @@ impl Editor {
         if self.overflow
             || begin > end
             || end > self.bytes.len()
-            || self.bytes.len() - (end - begin) + value.len() > LIMIT
+            || self.bytes.len() - (end - begin) + value.len() > MAX_COMPOSER_BYTES
         {
             return false;
         }
@@ -103,7 +103,7 @@ impl Editor {
         self.paste
     }
     fn insert(&mut self, ch: u8) {
-        if !self.overflow && self.bytes.len() < LIMIT {
+        if !self.overflow && self.bytes.len() < MAX_COMPOSER_BYTES {
             self.cursor = self.cursor.min(self.bytes.len());
             self.bytes.insert(self.cursor, ch);
             self.cursor += 1;

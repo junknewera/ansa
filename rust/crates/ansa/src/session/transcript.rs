@@ -100,7 +100,7 @@ impl Transcript {
             block
                 .entries
                 .last()
-                .is_some_and(|entry| entry.request == *request)
+                .is_some_and(|entry| entry.request == *request && entry.state != "rejected")
         }) else {
             return;
         };

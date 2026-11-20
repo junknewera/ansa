@@ -18,15 +18,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-const TOOL_RESULT_BYTES: usize = 120 * 1024;
-
 pub(crate) fn result(value: Json) -> Outcome {
-    let text = value.dump();
-    Outcome::succeeded(if text.len() > TOOL_RESULT_BYTES {
-        r#"{"error":"tool_output_limit"}"#.into()
-    } else {
-        text
-    })
+    Outcome::succeeded(value.dump())
 }
 pub(crate) fn error(code: &str) -> Outcome {
     result(Json::object(vec![("error", s(code).expect("diagnostic"))]).expect("diagnostic object"))
@@ -163,9 +156,6 @@ impl Host {
             ("instructions", Json::array(added)?),
         ])?
         .dump();
-        if output.len() > TOOL_RESULT_BYTES {
-            return Err("instruction_size_limit");
-        }
         Ok(Some(Outcome::succeeded(output)))
     }
     pub fn list(&self, args: &Json, stop: &Cancel) -> Result<Outcome> {
@@ -371,6 +361,25 @@ pub(crate) fn local_tools_extended(
     let mut host = local_host(settings, epoch, session, auth, worker, extensions.editor)?;
     host.shared_writer = extensions.shared_writer;
     register_local_tools(Arc::new(host), extend)
+}
+
+pub(crate) fn summary_catalog(settings: &AgentSettings) -> Result<Arc<Snapshot>> {
+    let worker = std::env::current_exe().map_err(|_| "process_executable")?;
+    let host = Host {
+        settings: settings.clone(),
+        epoch: Epoch {
+            id: "summary_catalog".into(),
+            instructions: String::new(),
+            exact_state: Json::object(vec![])?,
+        },
+        processes: ProcessRunner::configured(&settings.directory.join("operations"), &worker)?,
+        auth: settings.directory.join("auth"),
+        session: settings.directory.clone(),
+        editor: None,
+        shared_writer: None,
+        scope: None,
+    };
+    Ok(register_local_tools(Arc::new(host), |_| Ok(()))?.read_only())
 }
 
 pub fn local_task_tools(
