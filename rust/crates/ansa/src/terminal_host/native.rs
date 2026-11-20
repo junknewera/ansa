@@ -315,6 +315,20 @@ impl NativeBackend {
             workspace_claim: None,
         }
     }
+
+    pub(super) fn write_descendant(
+        &self,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<Option<ansa_linux::local::WorkspaceWrite>, &'static str> {
+        if self.stop.quarantined.load(Ordering::Acquire) {
+            return Err("terminal_workspace_quarantined");
+        }
+        self.workspace_claim
+            .as_ref()
+            .map(|claim| claim.write_descendant(root, relative))
+            .transpose()
+    }
 }
 
 impl Backend for NativeBackend {
@@ -583,7 +597,7 @@ fn worker() -> io::Result<()> {
         }
     };
     drop(directory);
-    let mut terminal = WorkerTerminal::new(reader, launch.size);
+    let mut terminal = WorkerTerminal::new(reader, launch.size, launch.session_lifetime());
     let handling = (|| {
         wire::write(
             &mut socket,
@@ -682,10 +696,11 @@ struct WorkerTerminal {
     output: Retained,
     sequence: u64,
     exit: Option<Exit>,
+    continuous: bool,
 }
 
 impl WorkerTerminal {
-    fn new(reader: wire::Reader, size: Size) -> Self {
+    fn new(reader: wire::Reader, size: Size, continuous: bool) -> Self {
         Self {
             reader,
             parser: vt100::Parser::new(nonzero(size.rows), nonzero(size.columns), 0),
@@ -693,13 +708,18 @@ impl WorkerTerminal {
             output: Retained::default(),
             sequence: 1,
             exit: None,
+            continuous,
         }
     }
 
     fn drain(&mut self, pty: &PtySession) -> io::Result<Drain> {
         let mut chunk = [0; 4096];
         for _ in 0..4 {
-            let available = (MAX_OUTPUT - self.output.through).min(chunk.len() as u64) as usize;
+            let available = if self.continuous {
+                chunk.len()
+            } else {
+                (MAX_OUTPUT - self.output.through).min(chunk.len() as u64) as usize
+            };
             if available == 0 {
                 return Ok(Drain::Limit);
             }
@@ -760,9 +780,10 @@ fn worker_loop(
     launch: &Launch,
 ) -> io::Result<End> {
     let mut input_bytes = 0;
-    let lifetime = Instant::now() + Duration::from_secs(u64::from(launch.lifetime_seconds));
+    let started = Instant::now();
+    let lifetime = Duration::from_secs(u64::from(launch.lifetime_seconds));
     let idle_duration = Duration::from_secs(u64::from(launch.idle_seconds));
-    let mut idle = Instant::now() + idle_duration;
+    let mut last_input = started;
     loop {
         let drain = terminal.drain(pty)?;
         if matches!(drain, Drain::Limit) {
@@ -771,7 +792,9 @@ fn worker_loop(
         if matches!(drain, Drain::Eof) || pty.exited()? {
             return Ok(End::Automatic(EndReason::ProgramExited));
         }
-        if Instant::now() >= lifetime.min(idle) {
+        if !launch.session_lifetime()
+            && (started.elapsed() >= lifetime || last_input.elapsed() >= idle_duration)
+        {
             return Ok(End::Automatic(EndReason::Deadline));
         }
         let Some(request) = terminal.reader.poll(socket, terminal.sequence)? else {
@@ -797,13 +820,16 @@ fn worker_loop(
             Request::Input { bytes } => {
                 if bytes.is_empty()
                     || bytes.len() > MAX_INPUT
-                    || input_bytes + bytes.len() > super::MAX_TERMINAL_INPUT
+                    || !launch.session_lifetime()
+                        && input_bytes + bytes.len() > super::MAX_TERMINAL_INPUT
                 {
                     Effect::NotStarted
                 } else {
-                    input_bytes += bytes.len();
-                    idle = Instant::now() + idle_duration;
-                    deliver(pty, &bytes, lifetime.min(idle))
+                    input_bytes = input_bytes.saturating_add(bytes.len());
+                    last_input = Instant::now();
+                    let deadline = (!launch.session_lifetime())
+                        .then(|| (started + lifetime).min(last_input + idle_duration));
+                    deliver(pty, &bytes, deadline)
                 }
             }
             Request::Resize { size } => {
@@ -828,8 +854,9 @@ fn worker_loop(
     }
 }
 
-fn deliver(pty: &PtySession, input: &[u8], deadline: Instant) -> Effect {
-    let until = (Instant::now() + WRITE_BUDGET).min(deadline);
+fn deliver(pty: &PtySession, input: &[u8], deadline: Option<Instant>) -> Effect {
+    let budget = Instant::now() + WRITE_BUDGET;
+    let until = deadline.map_or(budget, |deadline| budget.min(deadline));
     let mut count = 0;
     while count < input.len() && Instant::now() < until {
         match pty.write(&input[count..]) {

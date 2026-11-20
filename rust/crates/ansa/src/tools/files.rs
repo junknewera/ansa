@@ -41,6 +41,7 @@ pub(crate) struct Host {
     pub auth: PathBuf,
     pub session: PathBuf,
     pub editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
+    pub(super) terminal: Option<crate::terminal_host::tools::Owner>,
     pub(super) scope: Option<TaskScope>,
 }
 
@@ -75,6 +76,23 @@ impl TaskScope {
 }
 
 impl Host {
+    pub(super) fn workspace_writer(
+        &self,
+        target: &Path,
+    ) -> Result<ansa_linux::local::WorkspaceWrite> {
+        if let Some(terminal) = &self.terminal
+            && let Some(workspace) =
+                crate::terminal_host::tools::workspace_writer(terminal, target)?
+        {
+            return Ok(workspace);
+        }
+        ansa_linux::local::WorkspaceWrite::acquire(
+            &self.settings.directory.join("terminal-workspaces"),
+            &self.settings.cwd,
+            target,
+        )
+    }
+
     pub(crate) fn protected_path(&self, path: &Path) -> bool {
         ansa_linux::fs::protected_path(path)
             || path.starts_with(&self.auth)
@@ -320,22 +338,25 @@ pub fn local_tools_with_editor(
     worker: &Path,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
 ) -> Result<Arc<Snapshot>> {
-    local_tools_extended(settings, epoch, session, auth, worker, editor, |_| Ok(()))
+    local_tools_extended(settings, epoch, session, auth, worker, editor, None)
 }
 
-pub fn local_tools_extended(
+pub(crate) fn local_tools_extended(
     settings: AgentSettings,
     epoch: Epoch,
     session: &Path,
     auth: &Path,
     worker: &Path,
     editor: Option<Arc<crate::tools::editor_context::EditorHub>>,
-    extend: impl FnOnce(&mut Registry) -> Result<()>,
+    terminal: Option<crate::terminal_host::tools::Owner>,
 ) -> Result<Arc<Snapshot>> {
-    register_local_tools(
-        Arc::new(local_host(settings, epoch, session, auth, worker, editor)?),
-        extend,
-    )
+    let mut host = local_host(settings, epoch, session, auth, worker, editor)?;
+    host.terminal = terminal.clone();
+    register_local_tools(Arc::new(host), |registry| {
+        terminal.map_or(Ok(()), |owner| {
+            crate::terminal_host::tools::register(registry, owner, session)
+        })
+    })
 }
 
 pub fn local_task_tools(
@@ -373,6 +394,7 @@ fn local_host(
         settings,
         epoch,
         editor,
+        terminal: None,
         scope: None,
     })
 }

@@ -63,6 +63,7 @@
           default = pkgs.mkShell {
             packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt pkgs.clippy (analysisFor pkgs) pkgs.gitMinimal pkgs.zsh ];
             ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
+            ANSA_TEST_BASH = "${pkgs.bashInteractive}/bin/bash";
           };
           graphics = pkgs.mkShell {
             packages = [ (analysisFor pkgs) pkgs.kitty pkgs.ghostty pkgs.weston pkgs.imagemagick pkgs.dbus ];

@@ -8,12 +8,9 @@ use crate::{
         request::Descriptor,
     },
     terminal_host::{
-        FileJournal, Host, Lifecycle, OperationStatus,
+        FileJournal, Host, HostMode, Lifecycle, OperationStatus,
         native::{MAX_READ, NativeBackend},
-        protocol::{
-            Action, Binding, Effect, Id, Intent, Launch, MAX_IDLE_SECONDS, MAX_INPUT,
-            MAX_LIFETIME_SECONDS, Size, Writer, sha256,
-        },
+        protocol::{Action, Binding, Effect, Id, Intent, Launch, MAX_INPUT, Size, Writer},
     },
     tools::{
         invocation::Invocation,
@@ -23,7 +20,8 @@ use crate::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
-    path::Path,
+    collections::BTreeMap,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -33,21 +31,19 @@ pub(crate) type Owner = Arc<Mutex<Host<FileJournal, NativeBackend>>>;
 pub(crate) fn add_agent_instructions(epoch: &mut crate::provider::request::Epoch) {
     epoch.instructions = epoch.instructions.replacen(
         "Tools are non-interactive; ",
-        "Use run_command for non-interactive commands when available. ",
+        "Use the conversation terminal for shell commands. ",
         1,
     );
     epoch.instructions.push_str(concat!(
-        "\n\nWhen the managed terminal tools are advertised, use them for shell environments, interactive ",
-        "programs, and connections that should stay open between messages. Call terminal_list first and reuse ",
-        "a suitable live terminal in this conversation. Use its current terminal ID and writer epoch. ",
-        "Run commands for that workflow in the same terminal, including after a follow-up from the user. ",
+        "\n\nWhen terminal tools are advertised, use the conversation's one terminal for shell commands, ",
+        "interactive programs, and connections. Call terminal_list first. If no terminal exists, ",
+        "open an interactive shell in the working directory. Reuse its current terminal ID and writer epoch ",
+        "across commands and user messages. Check the active program and working directory before entering commands. ",
         "A terminal_input receipt confirms byte delivery. Check the output to tell when the command finishes. ",
-        "Keep the terminal open across replies while the workflow needs that environment. Close it when the ",
-        "workflow is finished or the user asks to close it. Close an exited terminal before opening its ",
+        "Set lifetime_seconds=0 and idle_seconds=0 to keep the terminal for the conversation. ",
+        "Keep the terminal open across replies to preserve the shell environment. Close it when the ",
+        "user asks. Close an exited terminal before opening its ",
         "replacement. Handle terminal operations through tools while the user stays in the conversation."
-    ));
-    epoch.instructions.push_str(&format!(
-        " For a shell kept across replies, use lifetime_seconds={MAX_LIFETIME_SECONDS} and idle_seconds={MAX_IDLE_SECONDS}. Both must be positive and idle_seconds may not exceed lifetime_seconds."
     ));
 }
 
@@ -58,23 +54,78 @@ pub(crate) fn open_for(
     restoring: bool,
 ) -> Result<Owner> {
     let session = Id::try_from(session.to_owned())?;
-    let binding = Binding {
-        host: Id::try_from(format!("attached_{}", sha256(session.as_str().as_bytes())))?,
-        workspace: crate::config::path_text(&settings.cwd)?.to_owned(),
-        scope: session.clone(),
-        session,
-    };
-    let backend = NativeBackend::new(
-        std::env::current_exe().map_err(|_| "process_executable")?,
-        settings.directory.join("terminal-workspaces"),
-    );
-    let path = directory.join("terminal-host-v1");
-    let host = if restoring {
-        Host::restore_file(&path, binding, backend)?
-    } else {
-        Host::create_file(&path, binding, backend)?
-    };
+    let binding = Binding::attached(session, crate::config::path_text(&settings.cwd)?.to_owned());
+    let executable = std::env::current_exe().map_err(|_| "process_executable")?;
+    let registry = settings.directory.join("terminal-workspaces");
+    let backend = || NativeBackend::new(executable.clone(), registry.clone());
+    let mut archived = BTreeMap::new();
+    let mut next_generation = 1;
+    if restoring {
+        let last = terminal_store_generation(directory)?;
+        for generation in 1..=last {
+            let path = terminal_store_path(directory, generation);
+            let mut previous =
+                Host::restore_in_mode(&path, binding.clone(), backend(), HostMode::Conversation)?;
+            if previous
+                .operations
+                .keys()
+                .any(|id| archived.contains_key(id))
+            {
+                return Err("terminal_store_chain");
+            }
+            if !previous.recovery().is_some_and(|value| value.closure_known) {
+                if generation != last {
+                    return Err("terminal_store_chain");
+                }
+                previous.archived_operations = archived;
+                return Ok(Arc::new(Mutex::new(previous)));
+            }
+            archived.append(&mut previous.operations);
+        }
+        next_generation = last + 1;
+    }
+    let path = terminal_store_path(directory, next_generation);
+    let mut host = Host::create_in_mode(&path, binding, backend(), HostMode::Conversation)?;
+    host.archived_operations = archived;
     Ok(Arc::new(Mutex::new(host)))
+}
+
+const TERMINAL_STORE: &str = "terminal-host-v1";
+
+fn terminal_store_path(directory: &Path, generation: usize) -> PathBuf {
+    if generation == 1 {
+        directory.join(TERMINAL_STORE)
+    } else {
+        directory.join(format!("{TERMINAL_STORE}-{generation}"))
+    }
+}
+
+fn terminal_store_generation(directory: &Path) -> Result<usize> {
+    let directory =
+        ansa_linux::fs::private_directory(directory).map_err(|_| "terminal_store_chain")?;
+    let (names, more) =
+        ansa_linux::local::names(&directory, 8192).map_err(|_| "terminal_store_chain")?;
+    if more {
+        return Err("terminal_store_chain");
+    }
+    let mut generations = Vec::new();
+    for name in names.iter().filter_map(|name| name.to_str()) {
+        if name == TERMINAL_STORE {
+            generations.push(1);
+        } else if let Some(suffix) = name.strip_prefix("terminal-host-v1-") {
+            let number: usize = suffix.parse().map_err(|_| "terminal_store_chain")?;
+            if number < 2 || number.to_string() != suffix {
+                return Err("terminal_store_chain");
+            }
+            generations.push(number);
+        }
+    }
+    generations.sort_unstable();
+    let last = generations.len();
+    if last == 0 || generations.into_iter().ne(1..=last) {
+        return Err("terminal_store_chain");
+    }
+    Ok(last)
 }
 
 pub(crate) fn close(owner: &Owner) -> bool {
@@ -84,6 +135,21 @@ pub(crate) fn close(owner: &Owner) -> bool {
         }
         super::daemon::close_owned(&mut host) && host.seal_clean().is_ok()
     })
+}
+
+pub(crate) fn workspace_writer(
+    owner: &Owner,
+    target: &Path,
+) -> Result<Option<ansa_linux::local::WorkspaceWrite>> {
+    let host = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
+    let root = Path::new(&host.binding().workspace);
+    let Ok(relative) = target.strip_prefix(root) else {
+        return Ok(None);
+    };
+    if host.quarantined() {
+        return Err("terminal_workspace_quarantined");
+    }
+    host.backend.write_descendant(root, relative)
 }
 
 #[derive(Clone, Copy)]

@@ -95,11 +95,7 @@ impl Host {
         {
             return Err("file_edit_limit");
         }
-        let mut workspace = ansa_linux::local::WorkspaceWrite::acquire(
-            &self.settings.directory.join("terminal-workspaces"),
-            &self.settings.cwd,
-            path.parent().ok_or("file_path")?,
-        )?;
+        let mut workspace = self.workspace_writer(path.parent().ok_or("file_path")?)?;
         let snapshot = ansa_linux::file_edit::Snapshot::open_in(&path, workspace.directory())?;
         let existed = snapshot.before().is_some();
         let before = std::str::from_utf8(snapshot.before().unwrap_or_default())
@@ -251,6 +247,7 @@ mod tests {
                 auth: settings.directory.join("auth"),
                 session: self.0.join("session"),
                 editor: None,
+                terminal: None,
                 scope: None,
                 settings,
             }

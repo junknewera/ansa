@@ -5,7 +5,7 @@ use ansa::terminal_host::{
 };
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
@@ -196,7 +196,11 @@ fn workspace_claim_releases_only_after_known_durable_close() {
         fx.binding.workspace.clone(),
         Effect::NotStarted,
     );
+    let mut nested_writer = known_writer.write_descendant(Path::new(""), None).unwrap();
+    nested_writer.begin(&"b".repeat(64)).unwrap();
     known_writer.finish().unwrap();
+    assert!(matches!(admit(), Err("terminal_workspace_busy")));
+    nested_writer.finish().unwrap();
     let terminal = fx.shell("first", fx.binding.workspace.clone(), Effect::Applied);
     assert!(matches!(admit(), Err("terminal_workspace_busy")));
     assert!(matches!(

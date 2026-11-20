@@ -32,7 +32,7 @@ def until(screen, predicate, label, timeout=6):
 
 
 def start(binary, root, home, cwd, extra=None, argv_extra=(), model="gpt-6.1-sol"):
-    shell = shutil.which("bash")
+    shell = os.environ.get("ANSA_TEST_BASH") or shutil.which("bash")
     assert shell, "fixture requires Bash prompt integration"
     screen = Pty(str(binary), root, home, cwd, "", True, size=(100, 32),
                  argv=["--offline", "--cwd", str(cwd), *argv_extra],
@@ -648,6 +648,37 @@ def normal_exit(screen, root, cwd):
 def terminal_interrupt_and_app_escape(screen, root, cwd):
     before = journals(root)
     terminal(screen)
+    screen.send("printf token > draft-result")
+    until(screen, lambda frame: "draft-result" in frame and shell_ready(screen), "Bash has an unfinished command")
+    screen.send(b"\x1b[D" * len("n > draft-result"))
+    screen.send(b"\x04")
+    escape(screen)
+    until(screen, lambda frame: "q terminal" in frame and "Esc files" not in frame, "Escape leaves Bash prompt")
+    assert not (cwd / "draft-result").exists(), "leaving the panel ran the command"
+    screen.send("q")
+    until(screen, lambda frame: "draft-result" in frame and shell_ready(screen), "Bash retains the command")
+    screen.send("X\r")
+    until(screen, lambda frame: (cwd / "draft-result").exists() and shell_ready(screen), "resumed command executes")
+    assert (cwd / "draft-result").read_text() == "tokeX", "reopening the panel moved the cursor"
+    screen.send("if true; then\r")
+    until(screen, lambda frame: "if true; then" in frame and shell_ready(screen), "Bash continuation prompt")
+    escape(screen)
+    until(screen, lambda frame: "q terminal" in frame and "Esc files" not in frame, "Escape leaves continuation prompt")
+    screen.send("q")
+    until(screen, lambda frame: shell_ready(screen), "Bash retained the continuation prompt")
+    screen.send("printf OK > draft-multiline; fi\r")
+    until(screen, lambda frame: (cwd / "draft-multiline").exists() and shell_ready(screen), "resumed continuation executes")
+    screen.send("printf %s 'first")
+    screen.send(b"\x16\n")
+    screen.send("second' > draft-quoted")
+    until(screen, lambda frame: "draft-quoted" in frame and shell_ready(screen), "Bash retains a quoted line break")
+    escape(screen)
+    until(screen, lambda frame: "q terminal" in frame and "Esc files" not in frame, "Escape leaves quoted multiline input")
+    screen.send("q")
+    until(screen, lambda frame: "draft-quoted" in frame and shell_ready(screen), "Bash retains quoted multiline input")
+    screen.send("\r")
+    until(screen, lambda frame: (cwd / "draft-quoted").exists() and shell_ready(screen), "resumed quoted command executes")
+    assert (cwd / "draft-quoted").read_text() == "first\nsecond"
     screen.send("printf ready > cancel-ready; sleep 30; printf bad > cancel-late\r")
     until(screen, lambda frame: (cwd / "cancel-ready").exists() and not shell_ready(screen), "real foreground process ready")
     screen.send(b"\x03")
@@ -735,21 +766,18 @@ def outer_eof_cleans_terminal(screen, root, cwd):
 def native_terminal_panel(screen, root, cwd):
     home = root / "home"
     catalog = home / ".ansa/sessions"
-    before = set(catalog.iterdir())
-    rejected = Pty(screen.child.args[0], root, home, home, "", True,
-                   argv=["--offline", "--native-terminals"])
-    rejected.vt = Terminal(80, 24)
-    screen.additional_screens = [("home-rejected", rejected)]
-    rejected.result = rejected.finish()
-    assert rejected.result["exit"] == 2 and rejected.result["termios_restored"]
-    assert "Use --cwd to select a project".encode() in rejected.raw
-    assert set(catalog.iterdir()) == before, "invalid workspace created a session"
+    started_from_home = start(screen.child.args[0], root, home, home)
+    screen.additional_screens = [("home-startup", started_from_home)]
+    assert "Agent terminal" not in visible(started_from_home)
+    local(started_from_home, "/exit")
+    started_from_home.result = started_from_home.finish()
+    assert started_from_home.result["exit"] == 0 and started_from_home.result["termios_restored"]
     screen.send("/term")
     until(screen, lambda frame: "/terminals" in body(screen), "native terminal command completion")
     screen.send(b"\t\r")
     until(screen, lambda frame: "Agent terminal" in frame and "The agent has not opened a terminal yet" in frame,
           "managed terminal panel in the normal Carbon entry point")
-    session, = (root / "home/.ansa/sessions").glob("*/terminal-host-v1/terminal-v1.json")
+    session, = catalog.glob("*/terminal-host-v1/terminal-v1.json")
     escape(screen)
     until(screen, lambda frame: "Agent terminal" not in frame, "Esc returned to the chat")
     screen.send("TERMINAL_DEMO\r")
@@ -768,10 +796,19 @@ def native_terminal_panel(screen, root, cwd):
     local(resumed, "/plan")
     resumed.send("SEALED_PLAN\r")
     until(resumed, lambda frame: completed(root, "SEALED_PLAN"), "Plan admitted after a clean restart")
+    local(resumed, "/plan")
+    resumed.send("TERMINAL_DEMO\r")
+    restarted_host = session.parents[1] / "terminal-host-v1-2"
+    until(resumed, lambda frame: (restarted_host / "0001.json").is_file(),
+          "reopened conversation can start a fresh shell")
+    local(resumed, "/terminals")
+    until(resumed, lambda frame: "ANSA_TERMINAL_READY" in body(resumed), "reopened shell is live")
+    escape(resumed)
     local(resumed, "/exit")
     resumed.result = resumed.finish()
     assert resumed.result["exit"] == 0 and resumed.result["termios_restored"]
-    live_terminal_opt_in(screen, root, cwd)
+    assert (restarted_host / "closed-v1.json").is_file()
+    live_terminal_default(screen, root, cwd)
     return "normal"
 
 
@@ -792,7 +829,7 @@ def seed_siwc(home):
     return auth
 
 
-def live_terminal_opt_in(screen, root, cwd):
+def live_terminal_default(screen, root, cwd):
     home = root / "live-home"
     auth = seed_siwc(home)
 
@@ -813,9 +850,9 @@ def live_terminal_opt_in(screen, root, cwd):
             screen.additional_screens.append((label, child))
             return child
 
-        for enabled in (False, True):
+        for legacy_flag in (False, True):
             before = set(catalog.iterdir()) if catalog.exists() else set()
-            child = launch(f"live-startup-{enabled}", ["--native-terminals"] if enabled else [])
+            child = launch(f"live-startup-{legacy_flag}", ["--native-terminals"] if legacy_flag else [])
             until(child, lambda _: ready(child), "ordinary Carbon startup with synthetic auth")
             local(child, "/exit")
             child.result = child.finish()
@@ -824,16 +861,16 @@ def live_terminal_opt_in(screen, root, cwd):
             init, = session_cases.decode({p.name: p.read_bytes() for p in session.glob("part-*.log")})
             assert init["kind"] == "init", "idle Carbon submitted work"
             config = init["configuration"]
-            terminal_tools = {tool["name"] for tool in config["tools"]["descriptors"]
-                              if tool["name"].startswith("terminal_")}
-            assert ("terminal_create" in terminal_tools) if enabled else not terminal_tools
+            tools = {tool["name"] for tool in config["tools"]["descriptors"]}
+            assert "terminal_create" in tools and "run_command" not in tools
             instructions = config["epoch"]["instructions"]
-            assert ("Call terminal_list first" in instructions) == enabled
-            if enabled:
-                assert "lifetime_seconds=1800 and idle_seconds=300" in instructions
-        child = launch("live-restore-without-opt-in", ["--session", session.name])
+            assert "Call terminal_list first" in instructions
+            assert "lifetime_seconds=0 and idle_seconds=0" in instructions
+        child = launch("live-restore", ["--session", session.name])
+        until(child, lambda _: ready(child), "resume a managed conversation without flags")
+        local(child, "/exit")
         child.result = child.finish()
-        assert child.result["exit"] == 1 and b"native_terminal_opt_in_required" in child.raw
+        assert child.result["exit"] == 0 and child.result["termios_restored"]
         assert not select.select([listener], [], [], 0)[0], "provider connection during startup"
 
 
@@ -872,7 +909,7 @@ def completion_and_help(screen, root, cwd):
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/thinking", "/theme", "/files", "/agents", "/sessions",
-                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit"}
+                "/new", "/fork", "/btw", "/plan", "/pr", "/copy", "/resume", "/help", "/exit", "/terminals"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert "/run" not in visible(screen), "removed /run remains advertised"
@@ -1309,7 +1346,6 @@ def main():
                 editor.write_text('#!/bin/sh\nkill -STOP $$\nprintf resumed > after-stop\n')
             editor.chmod(0o700)
             editor_path = cwd / "does-not-exist" if name == "editor-missing" else editor
-            extra = ["--native-terminals"] if name == "native-terminal-panel" else []
             if name in ("openrouter-orchestration", "siwc-orchestration"):
                 home.chmod(0o700)
                 cwd.chmod(0o700)
@@ -1323,7 +1359,7 @@ def main():
                              argv=["--frontend-fixture", str(root), adapter])
                 screen.vt = Terminal(100, 32)
             else:
-                screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)}, argv_extra=extra)
+                screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)})
             try:
                 normal = case(screen, root, cwd) == "normal"
                 result = screen.finish(None if normal else signal.SIGTERM)

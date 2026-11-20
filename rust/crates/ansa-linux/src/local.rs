@@ -58,7 +58,7 @@ fn read_impl(
 }
 pub fn names(directory: &File, limit: usize) -> io::Result<(Vec<std::ffi::OsString>, bool)> {
     use std::os::unix::ffi::OsStrExt;
-    if !(1..=256).contains(&limit) {
+    if !(1..=8192).contains(&limit) {
         return Err(io::Error::other("local_directory_limit"));
     }
     let mut names = Vec::new();
@@ -75,6 +75,29 @@ pub fn names(directory: &File, limit: usize) -> io::Result<(Vec<std::ffi::OsStri
     }
     Ok((names, false))
 }
+
+pub fn count_names(directory: &File, excluded: &[&str], limit: usize) -> io::Result<usize> {
+    let mut count = 0;
+    for entry in rustix::fs::Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if !matches!(name, b"." | b"..") && !excluded.iter().any(|value| name == value.as_bytes()) {
+            count += 1;
+            if count == limit {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+pub fn entry_exists(directory: &File, name: &str) -> io::Result<bool> {
+    match rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(true),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn create(directory: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
     if name.contains('/') || name.contains('\0') {
         return Err(io::Error::other("local_file_name"));
@@ -262,22 +285,40 @@ fn workspace_entry(registry: &Path, workspace: &File) -> io::Result<(File, (u64,
 }
 
 fn ensure_no_writers(directory: &File, roots_only: bool) -> Result<(), &'static str> {
+    ensure_no_other_writers(directory, roots_only, None, None)
+}
+
+fn ensure_no_other_writers(
+    directory: &File,
+    roots_only: bool,
+    operation: Option<&str>,
+    terminal_marker: Option<&[u8]>,
+) -> Result<(), &'static str> {
+    let owned = operation.map(|operation| writer_marker(operation, !roots_only));
+    if let Some((name, operation)) = owned.as_deref().zip(operation)
+        && read(directory, name, 64)
+            .map_err(|_| "terminal_workspace_evidence")?
+            .as_deref()
+            != Some(operation.as_bytes())
+    {
+        return Err("terminal_workspace_quarantined");
+    }
     let (entries, more) = names(directory, 256).map_err(|_| "terminal_workspace_evidence")?;
     if more
         || entries.iter().any(|entry| {
             let name = entry.as_encoded_bytes();
-            name.starts_with(ROOT_WRITER_PREFIX.as_bytes())
-                || !roots_only
-                    && (name.starts_with(WRITER_PREFIX.as_bytes())
-                        || name.starts_with(b"ordinary-writer-"))
+            owned.as_ref().is_none_or(|owned| name != owned.as_bytes())
+                && (name.starts_with(ROOT_WRITER_PREFIX.as_bytes())
+                    || !roots_only
+                        && (name.starts_with(WRITER_PREFIX.as_bytes())
+                            || name.starts_with(b"ordinary-writer-")))
         })
     {
         return Err("terminal_workspace_quarantined");
     }
-    if read(directory, ACTIVE_TERMINAL_SCOPE, 8192)
-        .map_err(|_| "terminal_workspace_evidence")?
-        .is_some()
-    {
+    let active =
+        read(directory, ACTIVE_TERMINAL_SCOPE, 8192).map_err(|_| "terminal_workspace_evidence")?;
+    if active.as_deref() != terminal_marker {
         return Err("terminal_workspace_quarantined");
     }
     Ok(())
@@ -287,8 +328,10 @@ fn ensure_no_writers(directory: &File, roots_only: bool) -> Result<(), &'static 
 /// a shared lock on eligible ancestors and an exclusive lock at each write root.
 pub struct WorkspaceWrite {
     directory: File,
-    scopes: Vec<WriteScope>,
+    registry: std::path::PathBuf,
+    scopes: Vec<std::sync::Arc<WriteScope>>,
     operation: Option<String>,
+    writer: bool,
 }
 
 struct WriteScope {
@@ -326,8 +369,61 @@ impl WorkspaceWrite {
         let directory = open_workspace_tree(registry, target, &mut scopes, writer)?;
         Ok(Self {
             directory,
+            registry: registry.to_path_buf(),
             scopes,
             operation: None,
+            writer,
+        })
+    }
+
+    /// Open a path covered by an existing writer lease. Both operations
+    /// retain the same locks, and each publishes its own recovery marker.
+    pub fn write_descendant(
+        &self,
+        relative: &Path,
+        terminal_marker: Option<&[u8]>,
+    ) -> Result<Self, &'static str> {
+        if !self.writer {
+            return Err("terminal_workspace_evidence");
+        }
+        let operation = self
+            .operation
+            .as_deref()
+            .ok_or("terminal_workspace_evidence")?;
+        for scope in &self.scopes {
+            ensure_no_other_writers(
+                &scope.record,
+                !scope.root,
+                Some(operation),
+                terminal_marker.filter(|_| scope.root),
+            )?;
+        }
+        let mut directory = self
+            .directory
+            .try_clone()
+            .map_err(|_| "terminal_workspace_identity")?;
+        let mut scopes = self.scopes.clone();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return Err("terminal_workspace_identity");
+            };
+            directory = crate::fs::open_relative_directory(&directory, Path::new(name))
+                .map_err(|_| "terminal_workspace_identity")?;
+            hold_scope(
+                &self.registry,
+                &directory,
+                components.peek().is_none(),
+                &mut scopes,
+                true,
+            )?;
+        }
+        Ok(Self {
+            directory,
+            registry: self.registry.clone(),
+            scopes,
+            operation: None,
+            writer: true,
         })
     }
 
@@ -362,7 +458,7 @@ impl WorkspaceWrite {
             return Ok(());
         };
         let mut known = true;
-        for scope in &self.scopes {
+        for scope in self.scopes.iter() {
             known &= remove_writer(&scope.record, &operation, scope.root).is_ok();
         }
         known.then_some(()).ok_or("terminal_workspace_evidence")
@@ -410,7 +506,7 @@ pub fn reconcile_writer(
 fn open_workspace_tree(
     registry: &Path,
     target: &Path,
-    scopes: &mut Vec<WriteScope>,
+    scopes: &mut Vec<std::sync::Arc<WriteScope>>,
     writer: bool,
 ) -> Result<File, &'static str> {
     let mut directory = crate::fs::open_nofollow(Path::new("/"), read_flags())
@@ -430,7 +526,7 @@ fn hold_scope(
     registry: &Path,
     directory: &File,
     root: bool,
-    scopes: &mut Vec<WriteScope>,
+    scopes: &mut Vec<std::sync::Arc<WriteScope>>,
     writer: bool,
 ) -> Result<(), &'static str> {
     let (record, identity) =
@@ -455,13 +551,13 @@ fn hold_scope(
         None
     };
     ensure_no_writers(&record, !root)?;
-    scopes.push(WriteScope {
+    scopes.push(std::sync::Arc::new(WriteScope {
         record,
         _lock: lock,
         _presence: presence,
         identity,
         root,
-    });
+    }));
     Ok(())
 }
 

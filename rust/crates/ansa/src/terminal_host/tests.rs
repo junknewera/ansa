@@ -277,6 +277,7 @@ fn publication_faults_and_restart_preserve_known_facts_without_resending() {
             records,
             Tail::End,
             false,
+            HostMode::Bounded,
         )
         .unwrap();
         assert_eq!(recovered.terminals()[&terminal].lifecycle, Lifecycle::Lost);
@@ -495,6 +496,88 @@ fn bound_file_evidence_rejects_concurrent_or_corrupt_open() {
     assert_eq!(
         host.execute(Writer::Agent, intent, &[]),
         Ok(OperationStatus::Durable(Effect::Applied))
+    );
+
+    let conversation_store = Temp(temp.0.with_extension("conversation"));
+    let conversation = Binding::attached(id("session"), "/work".into());
+    let fixture = Fixture::default();
+    let mut host = Host::create_in_mode(
+        &conversation_store.0,
+        conversation.clone(),
+        fixture.clone(),
+        HostMode::Conversation,
+    )
+    .unwrap();
+    host.bind_runtime().unwrap();
+    let Action::Create { mut launch } = self::launch() else {
+        unreachable!()
+    };
+    launch.lifetime_seconds = 0;
+    launch.idle_seconds = 0;
+    let terminal = conversation.terminal_id(&id("open"));
+    let intent = |name: &str, terminal: &Id, epoch, action| Intent {
+        binding: conversation.clone(),
+        ..op(name, terminal, Writer::Agent, epoch, action)
+    };
+    let start = intent(
+        "open",
+        &terminal,
+        0,
+        Action::Create {
+            launch: launch.clone(),
+        },
+    );
+    let mut bounded = Host::new(conversation.clone(), fixture.clone(), fixture.clone()).unwrap();
+    assert_eq!(
+        bounded.execute(Writer::Agent, start.clone(), &[]),
+        Err("terminal_create_admission")
+    );
+    assert_eq!(
+        host.execute(Writer::Agent, start, &[]),
+        Ok(OperationStatus::Durable(Effect::Applied))
+    );
+    let second = intent(
+        "second",
+        &conversation.terminal_id(&id("second")),
+        0,
+        Action::Create { launch },
+    );
+    assert_eq!(
+        host.execute(Writer::Agent, second, &[]),
+        Err("terminal_create_admission")
+    );
+    for index in 0..MAX_OPERATIONS {
+        let resize = Action::Resize {
+            size: Size {
+                rows: 25,
+                columns: 80,
+            },
+        };
+        let request = intent(&format!("resize_{index}"), &terminal, 1, resize);
+        assert_eq!(
+            host.execute(Writer::Agent, request, &[]),
+            Ok(OperationStatus::Durable(Effect::Applied))
+        );
+    }
+    let close = intent("close", &terminal, 1, Action::Close);
+    assert_eq!(
+        host.execute(Writer::Agent, close.clone(), &[]),
+        Ok(OperationStatus::Durable(Effect::Applied))
+    );
+    assert!(host.terminals().is_empty());
+    host.seal_clean().unwrap();
+    drop(host);
+    let restored = Host::restore_in_mode(
+        &conversation_store.0,
+        conversation,
+        fixture,
+        HostMode::Conversation,
+    )
+    .unwrap();
+    assert!(restored.recovery().unwrap().closure_known);
+    assert_eq!(
+        restored.matching_receipt(&close, &[]),
+        Ok(Some(OperationStatus::Durable(Effect::Applied)))
     );
 }
 

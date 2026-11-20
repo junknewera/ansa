@@ -404,17 +404,11 @@ fn text_with_providers(
         std::env::current_dir().map_err(|_| "file_access_failed")?,
         default_auth,
     )?;
-    if parsed.native_terminals
-        && (parsed.prompt.is_some()
-            || !std::io::stdin().is_terminal()
-            || !std::io::stdout().is_terminal())
-    {
-        return Err("native_terminal_requires_carbon");
-    }
-    let mut settings = load_agent_settings(&parsed.cwd, &home()?)?;
-    let use_saved_generation = parsed.prompt.is_none()
+    let interactive = parsed.prompt.is_none()
         && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
+        && std::io::stdout().is_terminal();
+    let mut settings = load_agent_settings(&parsed.cwd, &home()?)?;
+    let use_saved_generation = interactive
         && !parsed.resume
         && parsed.session.is_empty()
         && parsed.model.is_none()
@@ -442,12 +436,6 @@ fn text_with_providers(
     if parsed.print_config {
         write_json(&settings.effective()?)?;
         return Ok(0);
-    }
-    if parsed.native_terminals && settings.directory.starts_with(&settings.cwd) {
-        eprintln!(
-            "The working directory contains ansa data. Use --cwd to select a project for the persistent terminal."
-        );
-        return Ok(2);
     }
     let mut bound = binding();
     bound.requested_model = settings.model.clone();
@@ -484,7 +472,7 @@ fn text_with_providers(
         bound.account.clone(),
         workspace_auth,
     )
-    .with_native_terminals(parsed.native_terminals);
+    .with_carbon_frontend(interactive);
     if let Some(route) = openrouter {
         factory = factory.with_openrouter(route);
     }
@@ -521,9 +509,10 @@ fn text_with_providers(
     if let Some(editor) = &editor {
         factory = factory.with_editor(selected.directory.clone(), editor.clone());
     }
-    let terminal = (parsed.native_terminals && !parsed.resume && parsed.session.is_empty())
-        .then(|| factory.open_terminal_owner(&selected, false))
-        .transpose()?;
+    let terminal =
+        (!parsed.resume && parsed.session.is_empty() && factory.new_main_uses_terminal())
+            .then(|| factory.open_terminal_owner(&selected, false))
+            .transpose()?;
     if terminal.is_some() {
         crate::terminal_host::tools::add_agent_instructions(&mut epoch);
     }
@@ -534,12 +523,13 @@ fn text_with_providers(
         &parsed.auth,
         &std::env::current_exe().map_err(|_| "process_executable")?,
         editor.clone(),
-        |registry| {
-            terminal.clone().map_or(Ok(()), |owner| {
-                crate::terminal_host::tools::register(registry, owner, &selected.directory)
-            })
-        },
+        terminal.clone(),
     )?;
+    let tools = if terminal.is_some() {
+        tools.without_tool("run_command")
+    } else {
+        tools
+    };
     let configuration =
         Request::new(bound, epoch, tools.advertisement().clone(), vec![])?.with_effort(effort)?;
     options.directory = Some(selected.directory.clone());
@@ -610,13 +600,17 @@ fn text_with_providers(
         return Err("workspace_requires_tty");
     }
     let context = format!("{}  {}", settings.cwd.display(), settings.model);
-    reactor()?.block_on(controller::run(
+    let result = reactor()?.block_on(controller::run(
         &mut runtime,
         &mut io,
         parsed.prompt.as_deref(),
         false,
         &context,
-    ))
+    ));
+    if result.is_ok() && factory.has_terminal_owners() && !factory.close_terminals() {
+        return Err("terminal_cleanup_unknown");
+    }
+    result
 }
 
 #[cfg(feature = "frontend-test-adapter")]
