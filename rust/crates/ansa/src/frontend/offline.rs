@@ -132,14 +132,16 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
     if request.final_format() == Some(FinalFormat::ChildResult) {
         let operation = if user.starts_with("Синтетическая правка отчёта")
         {
-            Some(("edit_file", "report.txt"))
+            Some(("edit_file", "report.txt", "orch_edit_file_"))
+        } else if user.starts_with("Read the review-resume fixture") {
+            Some(("read_file", "report.txt", "orch_read_report_"))
         } else if user.starts_with("Независимо проверьте замороженный коммит")
         {
-            Some(("read_file", "ansa-candidate.diff"))
+            Some(("read_file", "ansa-candidate.diff", "orch_read_file_"))
         } else {
-            None
+            review_resume_probe(last)?.map(|(path, call_prefix)| ("read_file", path, call_prefix))
         };
-        if let Some((name, path)) = operation {
+        if let Some((name, path, call_prefix)) = operation {
             let base = if request.epoch.exact_state.has("base_state") {
                 request.epoch.exact_state.field("base_state")?
             } else {
@@ -154,7 +156,7 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
             let item = obj(vec![
                 ("type", s("function_call")),
                 ("id", s(&format!("item_{}", &id[..24]))),
-                ("call_id", s(&format!("orch_{name}_{}", &id[..24]))),
+                ("call_id", s(&format!("{call_prefix}{}", &id[..24]))),
                 ("namespace", s("omh")),
                 ("name", s(name)),
                 ("arguments", s(&args.to_string())),
@@ -173,6 +175,12 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder) if user == "ORCHESTRATION_LONG_PLAN_FIXTURE" => serde_json::json!({
             "schema_version": 1, "summary": "Проверить перенос длинного плана", "checks":[], "manual_checks":[], "steps": [
                 {"id":"long", "task":format!("{}VISIBLE_END_OF_STEP", "длинная строка ".repeat(130)), "access":"read", "paths":[], "depends_on":[], "acceptance":"Прочитать строку целиком"}
+            ]
+        }).to_string(),
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder) if user == "ORCHESTRATION_REVIEW_RESUME_FIXTURE" => serde_json::json!({
+            "schema_version":1, "summary":"Verify review-resume fixture", "checks":[{"path":"report.txt","contains":"after fixture review-resume"}], "manual_checks":[], "steps":[
+                {"id":"read","task":"Read the review-resume fixture","access":"read","paths":["report.txt"],"depends_on":[],"acceptance":"Report contains before fixture"},
+                {"id":"edit","task":"Синтетическая правка отчёта","access":"write","paths":["report.txt"],"depends_on":["read"],"acceptance":"Report contains after fixture"}
             ]
         }).to_string(),
         Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_BLOCKED_WRITE_FIXTURE") => serde_json::json!({
@@ -197,6 +205,10 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
                 let call = last.text_field("call_id")?;
                 success = if call.starts_with("orch_edit_file_") {
                     output.field("applied").and_then(Json::boolean) == Ok(true)
+                } else if call.starts_with("orch_read_report_") {
+                    output.text_field("content").is_ok_and(|text| text == "before fixture review-resume\n")
+                } else if call.starts_with("orch_review_checkout_") {
+                    output.text_field("content").is_ok_and(|text| text == "after fixture review-resume\n")
                 } else {
                     call.starts_with("orch_read_file_") && output.text_field("content").is_ok_and(|diff| diff.contains("-before fixture") && diff.contains("+after fixture"))
                 };
@@ -216,7 +228,10 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         .final_format()
         .is_some_and(FinalFormat::has_command_checks)
     {
-        let checks = if user == "ORCHESTRATION_COMMAND_FIXTURE" {
+        let checks = if matches!(
+            user,
+            "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_REVIEW_RESUME_FIXTURE"
+        ) {
             serde_json::json!([{"argv":["./check.sh"]}])
         } else {
             serde_json::json!([])
@@ -244,6 +259,34 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         ),
     ]);
     orchestration_response(request, &id, item).map(Some)
+}
+
+fn review_resume_probe(last: Option<&Json>) -> Result<Option<(&'static str, &'static str)>> {
+    let Some(last) = last.filter(|item| item.text_field("type") == Ok("function_call_output"))
+    else {
+        return Ok(None);
+    };
+    let call = last.text_field("call_id")?;
+    if call.starts_with("orch_read_file_") {
+        let output = Json::parse(last.text_field("output")?)?;
+        if output
+            .text_field("content")
+            .is_ok_and(|diff| diff.contains("+after fixture review-resume"))
+        {
+            return Ok(Some(("approved-plan.json", "orch_review_plan_")));
+        }
+    }
+    if call.starts_with("orch_review_plan_") {
+        let output = Json::parse(last.text_field("output")?)?;
+        if output
+            .text_field("content")
+            .is_ok_and(|plan| plan.contains("Verify review-resume fixture"))
+        {
+            return Ok(Some(("checkout/report.txt", "orch_review_checkout_")));
+        }
+        return Err("fixture_review_plan");
+    }
+    Ok(None)
 }
 
 fn orchestration_response(request: &Request, id: &str, item: Json) -> Result<AdmittedResponse> {

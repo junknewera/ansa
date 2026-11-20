@@ -92,6 +92,7 @@ impl Phase<'_> {
         // A later turn can already be current in the same native journal.
         // The sealed durable outcome of the earlier phase remains its receipt.
         if let Some(result) = phase.recorded_result(&task.id) {
+            phase.check_continuation(now()?)?;
             return Ok(PhaseResult {
                 result: result.clone(),
                 session: previous.ok_or("orchestration_plus_phase_identity")?,
@@ -157,6 +158,7 @@ impl Phase<'_> {
                 }
                 phase.bind(&id, &proof)?;
             }
+            phase.check_continuation(now()?)?;
             let session = PhaseSession {
                 id: proof.session().0.clone(),
                 store: proof.journal(),
@@ -170,6 +172,9 @@ impl Phase<'_> {
                         .ok_or("run_child_evidence_missing")?
                         .clone(),
                 });
+            }
+            if phase.child_cancelled(&id) {
+                return Err("orchestration_candidate_child_cancelled");
             }
             let status = match proof.state() {
                 ChildAttemptState::Missing => {
@@ -240,11 +245,18 @@ impl Phase<'_> {
             }
         }
         .await;
-        if result.is_ok()
-            || result
-                .as_ref()
-                .is_err_and(|code| *code == "orchestration_paused")
+        if result
+            .as_ref()
+            .is_err_and(|code| *code == "orchestration_paused")
         {
+            child.park().await?;
+            if self.stop.cancelled() {
+                return phase.cancel().and(Err("run_cancelled"));
+            }
+            if phase.submissions_exhausted() {
+                return Err("run_budget");
+            }
+        } else if result.is_ok() {
             child.runtime.shutdown().await?;
         } else {
             let cancelled = phase.cancel();
@@ -609,6 +621,13 @@ pub(super) async fn schedule(
             candidate: release,
         })
     }.await;
+    if result
+        .as_ref()
+        .is_err_and(|code| *code == "orchestration_paused")
+        && stop.cancelled()
+    {
+        return run.cancel().and(Err("run_cancelled"));
+    }
     if result
         .as_ref()
         .is_err_and(|code| *code != "orchestration_paused")

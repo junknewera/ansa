@@ -660,6 +660,33 @@ impl Run {
         self.state.can_dispatch().is_ok() && now < self.state.budget.deadline
     }
 
+    pub(crate) fn check_continuation(&self, now: u64) -> Result<()> {
+        if now >= self.deadline() {
+            return Err("orchestration_deadline");
+        }
+        if self.state.unresolved {
+            return Err("orchestration_effect_unknown");
+        }
+        if self.state.cancelled {
+            return Err("run_cancelled");
+        }
+        self.state.can_dispatch()
+    }
+
+    pub(crate) fn submissions_exhausted(&self) -> bool {
+        self.state.posts >= self.state.budget.submissions
+    }
+
+    pub(crate) fn child_cancelled(&self, step: &str) -> bool {
+        matches!(
+            self.state
+                .children
+                .get(step)
+                .and_then(|child| child.outcome.as_ref()),
+            Some(Outcome::Cancelled)
+        )
+    }
+
     pub(crate) fn original_children(
         &self,
     ) -> impl Iterator<Item = (&str, &str, DirectoryIdentity)> {

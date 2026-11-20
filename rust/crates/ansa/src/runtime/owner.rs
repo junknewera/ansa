@@ -1808,6 +1808,7 @@ impl Owner {
                 self.snapshot(None);
             }
             Kind::Pause => {
+                self.plan_workspace = None;
                 self.phase = "paused".into();
                 self.diagnostic = self
                     .state

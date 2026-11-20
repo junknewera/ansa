@@ -179,6 +179,13 @@ impl Child {
             .await
     }
 
+    async fn park(&mut self) -> Result<()> {
+        // The scheduler has observed a durable, quiescent pause. An aborting
+        // shutdown would append Cancel and make the same turn unrecoverable.
+        self.runtime.close_input();
+        self.runtime.join().await
+    }
+
     async fn stop(&mut self, run: &mut Run) -> Result<()> {
         if let Ok(receipt) = self.receipt().await
             && let ChildAttemptState::Durable {
@@ -492,6 +499,11 @@ async fn schedule(
                     );
                 }
                 run.observe(id, &receipt)?;
+                if matches!(receipt.state(), ChildAttemptState::Durable {
+                    quiescent: true, recovery_required: true, ..
+                }) {
+                    return Err("orchestration_effect_unknown");
+                }
                 if !run.active().any(|active_id| active_id == id) {
                     active.swap_remove(index).runtime.shutdown().await?;
                 } else if matches!(
@@ -592,7 +604,10 @@ async fn schedule(
         .is_err_and(|code| *code == "orchestration_paused")
     {
         for child in &mut active {
-            child.runtime.shutdown().await?;
+            child.park().await?;
+        }
+        if stop.cancelled() {
+            return run.cancel().and(Err("run_cancelled"));
         }
     } else if result.is_err() {
         stop_children(&mut run, &mut active).await?;
@@ -911,6 +926,9 @@ async fn run_candidate_phase(
     if let Some(result) = phase.result(&task.id) {
         return Ok(result.clone());
     }
+    if phase.child_cancelled(&task.id) {
+        return Err("orchestration_candidate_child_cancelled");
+    }
     let mut child = match original.pop() {
         Some(child) => child,
         None => start_child(factory, &mut phase, task, path, source, stop).await?,
@@ -923,6 +941,7 @@ async fn run_candidate_phase(
             }
             let proof = child.receipt().await?;
             phase.observe(&child.task.id, &proof)?;
+            phase.check_continuation(now()?)?;
             if !phase.active().any(|id| id == child.task.id) {
                 return phase
                     .result(&child.task.id)
@@ -944,11 +963,15 @@ async fn run_candidate_phase(
         }
     }
     .await;
-    if result.is_ok()
-        || result
-            .as_ref()
-            .is_err_and(|code| *code == "orchestration_paused")
-    {
+    if result == Err("orchestration_paused") {
+        child.park().await?;
+        if stop.cancelled() {
+            return phase.cancel().and(Err("run_cancelled"));
+        }
+        if phase.submissions_exhausted() {
+            return Err("run_budget");
+        }
+    } else if result.is_ok() {
         child.runtime.shutdown().await?;
     } else {
         let cancelled = phase.cancel();
@@ -1355,6 +1378,7 @@ async fn resume_owned(
     if !run.pending_clarifications().is_empty() && run.active_plus_task().is_none() {
         return Err("orchestration_clarification_needs_review");
     }
+    run.check_continuation(now()?)?;
     if !continuable(&run, now()?) {
         return Err("orchestration_continuation_unavailable");
     }
@@ -1413,9 +1437,7 @@ async fn restore_active(factory: &Factory, run: &mut Run, stop: &Cancel) -> Resu
             .map(|(step, receipt)| (step.as_str(), receipt))
             .collect::<Vec<_>>(),
     )?;
-    if !run.may_continue(now()?) {
-        return Err("orchestration_continuation_unavailable");
-    }
+    run.check_continuation(now()?)?;
     let mut active = Vec::new();
     let startup = async {
         for (mut child, (_, proof)) in children.into_iter().zip(receipts) {
