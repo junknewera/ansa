@@ -503,3 +503,4 @@ Request profile следует [официальному SIWC Preview contract](
 
 - Нативная оркестрация через вход ChatGPT. [Исследование](docs/ORCHESTRATION_RESEARCH.md), [ADR 0002](docs/adr/0002-self-hosted-orchestration.md), [промпты](docs/ORCHESTRATION_PROMPTS.md).
 - Диагностическая эскалация и варианты распределения ролей. [Предложение](docs/LOOP_ENGINEERING.md), [ADR 0003](docs/adr/0003-gpt-diagnostic-escalation.md), [промпты](docs/LOOP_ENGINEERING_PROMPTS.md).
+- Профили, учёт контекста и проверка изменений harness. [Исходное предложение](docs/HARNESS_EVOLUTION_PROPOSAL.md).
