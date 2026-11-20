@@ -32,6 +32,13 @@ enum StreamAdmission<'a> {
 struct RoutePolicy<'a> {
     local_only: bool,
     admission: StreamAdmission<'a>,
+    mcp: Option<&'a mut McpExchange>,
+}
+pub(crate) struct McpExchange {
+    pub version: Option<String>,
+    pub session: Option<String>,
+    pub response_session: Option<String>,
+    pub response_id: Option<usize>,
 }
 fn tls() -> Result<rustls::ClientConfig> {
     let path = std::env::var_os("SSL_CERT_FILE")
@@ -151,6 +158,7 @@ fn perform(
         RoutePolicy {
             local_only: false,
             admission,
+            mcp: None,
         },
     )
 }
@@ -188,7 +196,15 @@ fn perform_route(
             let h2=stream.connected().is_negotiated_h2();let wire=Arc::new(AtomicUsize::new(0));
             let stream=hyper_util::rt::TokioIo::new(Counted {inner:hyper_util::rt::TokioIo::new(stream),bytes:wire.clone(),limit:if h2 {usize::MAX}else{request.body_limit+64*1024}});
             let budget=Arc::new(Mutex::new(HeaderBudget::default()));let (failure,mut failed)=tokio::sync::watch::channel(false);let _failure_lifetime=failure.clone();
-            let mut builder=Request::builder().method(request.method).uri(if h2 {uri.to_string()}else{uri.path_and_query().map_or("/",|v|v.as_str()).to_owned()}).header("host",uri.authority().ok_or("url_invalid")?.as_str()).header("accept",if sink.is_some(){"text/event-stream"}else{"application/json"});
+            let mut builder=Request::builder().method(request.method).uri(if h2 {uri.to_string()}else{uri.path_and_query().map_or("/",|v|v.as_str()).to_owned()}).header("host",uri.authority().ok_or("url_invalid")?.as_str());
+            let mut mcp = policy.mcp;
+            if let Some(mcp) = mcp.as_ref() {
+                builder=builder.header("accept", "application/json, text/event-stream");
+                if let Some(version) = &mcp.version {builder=builder.header("mcp-protocol-version",version);}
+                if let Some(session) = &mcp.session {builder=builder.header("mcp-session-id",session);}
+            } else {
+                builder=builder.header("accept",if sink.is_some(){"text/event-stream"}else{"application/json"});
+            }
             if !request.content_type.is_empty(){builder=builder.header("content-type",request.content_type);}
             if let Some(bearer)=&request.bearer {builder=builder.header("authorization",format!("Bearer {}",bearer.expose()));}
             let mut req=builder.body(Full::new(Bytes::copy_from_slice(request.body.expose().as_bytes()))).map_err(|_|"http_request")?;
@@ -209,6 +225,17 @@ fn perform_route(
             };
             if !budget.lock().map_err(|_|"http_budget")?.observe(reply.headers(),true){return Err("http_header_limit");}
             let head=head(reply.headers(),reply.status().as_u16())?;
+            if let Some(mcp) = mcp.as_mut() {
+                let mut sessions = reply.headers().get_all("mcp-session-id").iter();
+                if let Some(session) = sessions.next() {
+                    let session = session.to_str().map_err(|_| "mcp_session")?;
+                    if session.is_empty() || !session.bytes().all(|b| (0x21..=0x7e).contains(&b))
+                        || sessions.next().is_some() {
+                        return Err("mcp_session");
+                    }
+                    mcp.response_session = Some(session.into());
+                }
+            }
             if sink.is_some() {
                 if head.status!=200 {return Err(match head.status {401=>"auth_required",403=>"provider_policy_denied",429=>"provider_usage_limit",_=>"provider_http_failure"});}
                 match policy.admission {
@@ -216,16 +243,36 @@ fn perform_route(
                     StreamAdmission::SiwcResponses(value) => super::http::admit_request(&head, request.url, request.method, value, true)?,
                 }
             }
+            let response_id = mcp.as_ref().and_then(|mcp| mcp.response_id);
+            let mut mcp_sse = response_id.filter(|_| super::http::validate_head(&head).is_ok()).map(|id| {
+                (id, crate::protocol::sse::Parser::new(crate::protocol::sse::Limits {
+                    line: request.body_limit, event: request.body_limit, ..Default::default()
+                }))
+            });
             let mut bytes=Vec::new();let mut count=0;
             while let Some(frame)=reply.body_mut().frame().await {
                 let frame=frame.map_err(|_|"http_transfer")?;
                 if let Some(data)=frame.data_ref() {
                     count+=data.len();if count>request.body_limit{return Err("http_body_limit");}
-                    if let Some(sink)=&mut sink {sink(data)?;}else{bytes.extend_from_slice(data);}
+                    if let Some((id, parser)) = &mut mcp_sse {
+                        parser.feed(data)?;
+                        for event in parser.take() {
+                            if event.data.is_empty() { continue; }
+                            let message = Json::parse(&event.data)?;
+                            if message.usize_field("id").ok() == Some(*id) {
+                                return Ok(HttpReply {head, body: event.data});
+                            }
+                            if message.has("method") && message.has("id") { return Err("mcp_server_request"); }
+                            if message.text_field("method").ok() == Some("notifications/tools/list_changed") {
+                                return Err("mcp_tools_changed");
+                            }
+                        }
+                    } else if let Some(sink)=&mut sink {sink(data)?;}else{bytes.extend_from_slice(data);}
                 }
                 if let Some(trailers)=frame.trailers_ref() && (trailers.contains_key(hyper::header::CONTENT_TYPE) || !budget.lock().map_err(|_|"http_budget")?.observe(trailers,false)){return Err("forbidden_trailer");}
             }
             if !h2 && wire.load(Ordering::Relaxed).saturating_sub(count)>64*1024 {return Err("wire_header_limit");}
+            if mcp_sse.is_some() { return Err("mcp_missing_response"); }
             Ok(HttpReply {head,body:String::from_utf8(bytes).map_err(|_|"http_body_utf8")?})
         };
         let result=tokio::select! {biased; _=cancelled(stop)=>Err("auth_cancelled"), result=tokio::time::timeout(Duration::from_millis(request.timeout_ms),transfer)=>result.unwrap_or(Err("http_timeout"))};
@@ -279,6 +326,7 @@ pub fn fixture_stream(
         RoutePolicy {
             local_only: true,
             admission: StreamAdmission::Strict,
+            mcp: None,
         },
     )
     .map(|_| ())
@@ -311,8 +359,37 @@ pub(crate) fn openrouter_exchange(request: &HttpRequest, stop: &Cancel) -> Resul
         RoutePolicy {
             local_only: false,
             admission: StreamAdmission::Strict,
+            mcp: None,
         },
     )
+}
+pub(crate) fn mcp_exchange(
+    request: &HttpRequest,
+    stop: &Cancel,
+    fields: &mut McpExchange,
+) -> Result<HttpReply> {
+    let uri: Uri = request.url.parse().map_err(|_| "mcp_endpoint")?;
+    let host = uri.host().ok_or("mcp_endpoint")?;
+    let local = matches!(host, "127.0.0.1" | "[::1]");
+    if uri.authority().is_none_or(|authority| authority.as_str().contains('@'))
+        || !matches!(uri.scheme_str(), Some("https"))
+            && !(local && uri.scheme_str() == Some("http")) {
+        return Err("mcp_endpoint");
+    }
+    let tls = if uri.scheme_str() == Some("http") {
+        rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .map_err(|_| "tls_configuration")?
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth()
+    } else {
+        tls()?
+    };
+    perform_route(request, stop, None, uri, tls, None, RoutePolicy {
+        local_only: local,
+        admission: StreamAdmission::Strict,
+        mcp: Some(fields),
+    })
 }
 pub fn stream(
     value: &Json,

@@ -52,6 +52,7 @@ pub struct Factory {
     pub offline: bool,
     account: String,
     initial_effort: Option<String>,
+    stop: Cancel,
     auth: Option<Arc<AuthManager>>,
     editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
     carbon_terminal: bool,
@@ -80,6 +81,7 @@ impl Factory {
             offline,
             account,
             initial_effort: None,
+            stop: Cancel::default(),
             auth,
             editor: None,
             carbon_terminal: false,
@@ -93,6 +95,10 @@ impl Factory {
         // Keep the terminal evidence store outside its workspace.
         self.carbon_terminal =
             interactive && !self.settings.directory.starts_with(&self.settings.cwd);
+        self
+    }
+    pub(super) fn with_stop(mut self, stop: Cancel) -> Self {
+        self.stop = stop;
         self
     }
 
@@ -845,7 +851,17 @@ impl Factory {
             |registry| {
                 terminal.clone().map_or(Ok(()), |owner| {
                     terminals::register(registry, owner, &selected.directory)
-                })
+                })?;
+                if kind != Kind::Console {
+                    crate::mcp::register(
+                        registry,
+                        &self.settings.directory,
+                        &self.settings.cwd,
+                        source_configuration.as_ref().map(|request| &request.tools),
+                        &self.stop,
+                    )?;
+                }
+                Ok(())
             },
         )?;
         // Resume/fork retains the exact saved tool catalogue. Adding a compiled

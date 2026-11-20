@@ -939,6 +939,8 @@ impl Workbench {
     ) -> Result<Self> {
         let files = FileHost::new(&factory.settings, &factory.auth_path)?;
         let theme_store = ThemeStore::new(&factory.settings.home, &factory.settings.directory);
+        let stop = Cancel::default();
+        let factory = factory.with_stop(stop.clone());
         let (sender, events) = mpsc::channel(64);
         let mut value = Self {
             factory,
@@ -960,7 +962,7 @@ impl Workbench {
             events,
             sender,
             jobs: JoinSet::new(),
-            stop: Cancel::default(),
+            stop,
             pending_context: BTreeMap::new(),
             planning_context: None,
             orchestration_stop: None,

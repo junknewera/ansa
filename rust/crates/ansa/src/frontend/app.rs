@@ -527,6 +527,8 @@ fn text_with_providers(
     if terminal.is_some() {
         terminals::add_agent_instructions(&mut epoch);
     }
+    // Mask signals before MCP and runtime workers inherit the process mask.
+    let mut io = Io::open(parsed.prompt.is_none())?;
     let tools = local_tools_extended(
         settings.clone(),
         epoch.clone(),
@@ -540,7 +542,11 @@ fn text_with_providers(
         |registry| {
             terminal.clone().map_or(Ok(()), |owner| {
                 terminals::register(registry, owner, &selected.directory)
-            })
+            })?;
+            if !parsed.resume && parsed.session.is_empty() {
+                crate::mcp::register(registry, &settings.directory, &settings.cwd, None, &Cancel::default())?;
+            }
+            Ok(())
         },
     )?;
     let tools = if terminal.is_some() {
@@ -562,8 +568,6 @@ fn text_with_providers(
             }
         });
     }
-    // Signals must be blocked before starting owner and output threads.
-    let mut io = Io::open(parsed.prompt.is_none())?;
     let (mut runtime, root_kind, parent) = if parsed.resume || !parsed.session.is_empty() {
         let restored = factory.resume(&selected.id)?;
         (restored.runtime, restored.kind, restored.parent)
