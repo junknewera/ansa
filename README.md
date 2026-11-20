@@ -368,7 +368,7 @@ nix develop --no-update-lock-file .#quality -c python -B tests/parity/quality.py
 
 Каталоги evidence должны быть новыми, code checkpoint чистым. Сначала закончить
 сборки и replay mutants, затем выполнять чувствительные к времени PTY/fault gates.
-Carbon workspace проверяется в 27 production PTY-сценариях и двух проверках
+Carbon workspace проверяется в 29 production PTY-сценариях и двух проверках
 заблокированного вывода при передаче терминала редактору. Возврат после редактора
 восстанавливает основной экран, курсор, стили, termios и флаги дескрипторов.
 `tests/carbon_visual_pty.py` добавляет три цветных сценария в обоих профилях:

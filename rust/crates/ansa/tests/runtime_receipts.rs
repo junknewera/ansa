@@ -59,6 +59,132 @@ fn parts(root: &f::Root) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn parked_plan_resumes_the_same_request_after_a_tool_budget_pause() {
+    struct Lease(Arc<AtomicUsize>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let root = f::Root::new();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let leases = Arc::new(AtomicUsize::new(0));
+    let active_leases = leases.clone();
+    let options = Options {
+        directory: Some(root.journal()),
+        plan_guard: Some(Arc::new(move || {
+            assert_eq!(active_leases.fetch_add(1, Ordering::SeqCst), 0);
+            Ok(Box::new(Lease(active_leases.clone())))
+        })),
+        ..Options::default()
+    };
+    let limits = Limits {
+        tool_rounds: 1,
+        ..Limits::default()
+    };
+    let make_runtime = |generate: Generate, options| {
+        let tools = f::tools(executions.clone(), None, false);
+        Runtime::new(
+            "review".into(),
+            f::configuration(&tools).with_final_format(Some(FinalFormat::ChildResult)),
+            tools,
+            generate,
+            limits,
+            options,
+        )
+        .unwrap()
+    };
+    let last_request = Arc::new(std::sync::Mutex::new(None));
+    let captured = last_request.clone();
+    let mut runtime = make_runtime(
+        Arc::new(move |request, _, _| {
+            *captured.lock().unwrap() = Some(request.save()?);
+            native::load(&f::saved_response(request, None, 1))
+        }),
+        options.clone(),
+    );
+    runtime.ready().await.unwrap();
+    let submit = Submit {
+        mode: AgentMode::Plan,
+        text: "Inspect the frozen candidate".into(),
+    };
+    let handle = runtime.handle();
+    f::post(
+        &handle,
+        "assignment",
+        CommandPayload::Submit(submit.clone()),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    let paused = f::until(&handle, |payload| {
+        matches!(payload, EventPayload::RuntimeError { diagnostic, .. } if diagnostic == "tool_round_limit")
+    })
+    .await;
+    let request = paused.request.unwrap();
+    let receipt = handle
+        .child_attempt("assignment".into(), "task".into(), submit.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        receipt.state(),
+        ChildAttemptState::Durable {
+            quiescent: true,
+            resume_required: true,
+            recovery_required: false,
+            ..
+        }
+    ));
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    let before = parts(&root);
+    f::finish(&mut runtime).await;
+    assert_eq!(parts(&root), before, "parking wrote a native transition");
+
+    let expected = last_request.lock().unwrap().take().unwrap();
+    let mut restored = make_runtime(
+        Arc::new(move |request, _, _| {
+            assert_eq!(request.save()?, expected);
+            native::load(&f::saved_response(
+                request,
+                Some(r#"{"status":"completed","summary":"Reviewed the candidate","findings":[]}"#),
+                0,
+            ))
+        }),
+        Options {
+            existing_journal: Some(receipt.journal()),
+            ..options
+        },
+    );
+    restored.ready().await.unwrap();
+    let handle = restored.handle();
+    f::post(
+        &handle,
+        "resume-assignment-2",
+        CommandPayload::Resume(request.clone()),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    let completed = f::until(&handle, |payload| matches!(payload, EventPayload::Done)).await;
+    assert_eq!(completed.request.as_ref(), Some(&request));
+    let finished = handle
+        .child_attempt("assignment".into(), "task".into(), submit)
+        .await
+        .unwrap();
+    assert_eq!(finished.journal(), receipt.journal());
+    assert!(matches!(
+        finished.state(),
+        ChildAttemptState::Durable { request: id, state, quiescent: true, .. }
+            if id == &request && state == "completed"
+    ));
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    f::finish(&mut restored).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn message_lookup_survives_restart_without_generation_execution_or_journal_writes() {
     let root = f::Root::new();
     let count = Arc::new(AtomicUsize::new(0));

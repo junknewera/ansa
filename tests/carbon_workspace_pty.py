@@ -1209,6 +1209,108 @@ def orchestration_candidate(screen, root, cwd):
     return "normal"
 
 
+def orchestration_review_resume(screen, root, cwd, exhausted=False):
+    def git(*args, path=cwd):
+        return subprocess.check_output(["git", *args], cwd=path, text=True).strip()
+
+    def reviewer_records():
+        for directory in (root / "home/.ansa/sessions").iterdir():
+            rows = session_cases.decode({path.name: path.read_bytes()
+                                         for path in directory.glob("part-*.log")})
+            if any(row["kind"] == "accepted" and
+                   row["text"].startswith("Независимо проверьте замороженный коммит")
+                   for row in rows):
+                yield directory, rows
+
+    report = cwd / "report.txt"
+    report.write_text("before fixture review-resume\n")
+    check_marker = root / "check-ran"
+    check = cwd / "check.sh"
+    check.write_text('#!/bin/sh\nset -eu\ngrep -qx "after fixture review-resume" report.txt\n'
+                     f'printf x >> "{check_marker}"\n')
+    check.chmod(0o700)
+    git("init", "-q")
+    git("add", "report.txt", "check.sh")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "fixture")
+    original = git("rev-parse", "HEAD")
+    previous_status = git("status", "--short")
+    screen.send(b"\t\t")
+    until(screen, lambda _: "Orchestration" in screen.vt.line(-2), "ordinary orchestration mode")
+    screen.send("ORCHESTRATION_REVIEW_RESUME_FIXTURE\r")
+    until(screen, lambda frame: "./check.sh" in frame and "Verify review-resume fixture" in frame,
+          "review and command require approval")
+    assert not check_marker.exists()
+    screen.send(b"\r")
+    store = root / "home/.ansa/orchestration"
+    until(screen, lambda frame: "Agent paused" in frame and "resume with /sessions" in frame and any(
+        row["kind"] == "pause" and row.get("diagnostic") == "tool_round_limit"
+        for _, rows in reviewer_records() for row in rows),
+        "read-only reviewer paused at the tool round limit", timeout=15)
+    checkout, = store.glob("*/*/checkout")
+    run = checkout.parent
+    frozen = (run / "candidate-0").read_text()
+    assert git("show", f"{frozen}:report.txt", path=checkout) == "after fixture review-resume"
+    assert check_marker.read_text() == "x"
+    (reviewer, paused), = reviewer_records()
+    reads = ["ansa-candidate.diff", "approved-plan.json", "checkout/report.txt"]
+    rounds = 1 if exhausted else 2
+    assert [row["invocation"]["arguments"]["path"] for row in paused
+            if row["kind"] == "intent"] == reads[:rounds]
+    assert sum(row["kind"] == "outcome" for row in paused) == rounds
+    assert not any(row["kind"] in ("cancel", "done") for row in paused)
+    local(screen, "/exit")
+    assert screen.finish()["exit"] == 0
+
+    restarted = start(screen.child.args[0], root, root / "home", cwd,
+                      argv_extra=["--session", run.parent.name])
+    screen.additional_screens = [("restart", restarted)]
+    local(restarted, "/sessions")
+    until(restarted, lambda frame: "Resume orchestration" in frame, "saved run can resume")
+    restarted.send(b"\r")
+    expected = "Plan stopped (run_budget)" if exhausted else "ansa-result готова"
+    until(restarted, lambda frame: expected in frame or "run_step_unavailable" in frame,
+          "explicit reviewer resume", timeout=15)
+    assert expected in visible(restarted), visible(restarted)
+    if exhausted:
+        assert not (run / "release.json").exists()
+        assert not (run / "summary-admitted").exists()
+        assert subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/ansa-result"],
+                              cwd=checkout, check=False).returncode == 1
+        before = journals(root)
+        local(restarted, "/sessions")
+        until(restarted, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame,
+              "session picker after reviewer exhaustion")
+        assert "Resume orchestration" not in visible(restarted)
+        escape(restarted)
+        assert journals(root) == before, "Session picker continued an exhausted review"
+    else:
+        until(restarted, lambda _: (run / "summary-admitted").is_file(), "durable candidate acceptance")
+        assert git("rev-parse", "ansa-result", path=checkout) == frozen
+    assert git("rev-parse", "HEAD") == original and git("status", "--short") == previous_status
+    assert report.read_text() == "before fixture review-resume\n"
+    assert check_marker.read_text() == "x", "Resume repeated the required command"
+    (resumed_reviewer, resumed), = reviewer_records()
+    assert resumed_reviewer == reviewer and resumed[:len(paused)] == paused
+    assert [row["kind"] for row in resumed[len(paused):] if row["kind"] in
+            ("accepted", "resume", "cancel", "pause", "done")] == [
+        "resume", "pause" if exhausted else "done",
+    ]
+    if exhausted:
+        assert resumed[-1]["diagnostic"] == "tool_round_limit"
+    assert [row["invocation"]["arguments"]["path"] for row in resumed[len(paused):]
+            if row["kind"] == "intent"] == reads[rounds:2 * rounds]
+    edit_intents = [row for row in records(root)
+                    if row["kind"] == "intent" and row["invocation"]["name"] == "edit_file"]
+    assert len(edit_intents) == 1, "Resume dispatched another edit"
+    edit_operation = edit_intents[0]["invocation"]["operation"]
+    edit_outcome, = [row["result"] for row in records(root)
+                     if row["kind"] == "outcome" and row["result"]["operation"] == edit_operation]
+    assert json.loads(edit_outcome["output"])["applied"]
+    restarted.result = restarted.finish(signal.SIGTERM)
+    assert restarted.result["exit"] == 143 and restarted.result["termios_restored"]
+    return "normal"
+
+
 def openrouter_orchestration(screen, root, cwd):
     until(screen, lambda frame: "deepseek/deepseek-v4.1-flash-1017" in frame
           and screen.vt.line(-4).startswith("›"), "pinned OpenRouter model")
@@ -1460,6 +1562,8 @@ def main():
              ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),
              ("orchestration-candidate", orchestration_candidate),
+             ("orchestration-review-resume", orchestration_review_resume),
+             ("orchestration-review-resume-exhausted", lambda *a: orchestration_review_resume(*a, True)),
              ("active-plan-clarification", active_plan_clarification),
              ("terminal-interrupt-app-escape", terminal_interrupt_and_app_escape),
              ("terminal-eof-exit", terminal_eof_and_exit),
@@ -1515,6 +1619,13 @@ def main():
                              argv=["--frontend-fixture", str(root), adapter])
                 screen.vt = Terminal(*size)
             else:
+                if name.startswith("orchestration-review-resume"):
+                    directory = home / ".ansa"
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    config = directory / "config.json"
+                    rounds = 1 if name.endswith("-exhausted") else 2
+                    config.write_text(json.dumps({"schema_version": 1, "tool_rounds": rounds, "tool_calls": 4}))
+                    config.chmod(0o600)
                 screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)})
             try:
                 normal = case(screen, root, cwd) == "normal"
