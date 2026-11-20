@@ -342,10 +342,10 @@ pub(super) fn authorized_with_cancel(
                 provider.context_window(request),
             )
         };
+        let tokens = request
+            .estimated_tokens()
+            .unwrap_or_else(|| crate::context::estimate_request_tokens(request));
         if let Some(window) = window {
-            let tokens = request
-                .estimated_tokens()
-                .unwrap_or_else(|| crate::context::estimate_request_tokens(request));
             crate::context::require_response_room(tokens, window)?;
         }
         generate_auth
@@ -357,7 +357,11 @@ pub(super) fn authorized_with_cancel(
                     let _ = preview(text);
                 })),
             )
-            .map(|response| response.with_context_window(window))
+            .map(|response| {
+                response
+                    .with_context_window(window)
+                    .with_context_estimate(tokens)
+            })
     });
     let compact_generate = generate.clone();
     let options = RuntimeOptions {
@@ -484,6 +488,7 @@ fn text_with_providers(
         workspace_auth,
     )
     .with_carbon_frontend(interactive);
+    factory.harness_trial = parsed.harness_trial;
     if let Some(route) = openrouter {
         factory = factory.with_openrouter(route);
     }
@@ -498,6 +503,14 @@ fn text_with_providers(
     let mut epoch = agent_epoch(&settings)?;
     if parsed.resume && !parsed.session.is_empty() {
         return Err("session_selection_conflict");
+    }
+    let profile = if parsed.resume || !parsed.session.is_empty() {
+        None
+    } else {
+        crate::harness::select(&settings, None, factory.harness_trial.as_deref())?
+    };
+    if let Some(profile) = &profile {
+        profile.attach(&mut epoch)?;
     }
     let catalog = settings.catalog(factory.profile())?;
     let selected = if !parsed.session.is_empty() {
@@ -543,6 +556,9 @@ fn text_with_providers(
             terminal.clone().map_or(Ok(()), |owner| {
                 terminals::register(registry, owner, &selected.directory)
             })?;
+            if let Some(profile) = &profile {
+                crate::tools::skills::register(registry, Some(profile.clone()))?;
+            }
             if !parsed.resume && parsed.session.is_empty() {
                 crate::mcp::register(
                     registry,
@@ -1195,6 +1211,25 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         "--live-jsonl" => live_jsonl(&args[1..]),
+        "--export-evidence" => {
+            let [_, directory] = args else {
+                return Err("evidence_export_options");
+            };
+            let absolute = std::path::absolute(directory).map_err(|_| "evidence_export_options")?;
+            let path = absolute.as_path();
+            let catalog = crate::tools::files::summary_catalog(
+                &crate::config::AgentSettings::defaults(path, path),
+            )?;
+            let fixture = pure_tools()?;
+            let export = crate::session::evidence::export(path, &catalog, &fixture)?;
+            write_json(&export)?;
+            Ok(0)
+        }
+        "--harness" => {
+            let result = crate::harness::cli(&args[1..], &home()?)?;
+            write_json(&Json::parse(&result.to_string())?)?;
+            Ok(0)
+        }
         "--openrouter-login" => match &args[1..] {
             [] => save_openrouter(&openrouter_auth_path()?),
             [flag, directory] if flag == "--auth-dir" => save_openrouter(Path::new(directory)),

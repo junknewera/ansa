@@ -37,7 +37,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/sessions",
-        description: "Open a saved conversation",
+        description: "Open a saved conversation, or search with /sessions search QUERY",
     },
     Command {
         name: "/new",

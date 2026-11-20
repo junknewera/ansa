@@ -18,7 +18,10 @@ use crate::{
     },
     orchestration::{profile::RoleProfile, run::RunId},
     protocol::json::Json,
-    session::catalog::SessionSummary,
+    session::{
+        catalog::SessionSummary,
+        search::{Hit, Matches},
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -625,6 +628,17 @@ enum Job {
         result: Result<Vec<SessionSummary>>,
         plans: orchestration::PlanLinks,
     },
+    SessionSearch {
+        owner: String,
+        token: u64,
+        result: Result<Matches>,
+    },
+    SessionSearchSource {
+        owner: String,
+        token: u64,
+        hit: Hit,
+        result: Result<Vec<(String, String)>>,
+    },
     CachedModels {
         result: Result<Option<Json>>,
     },
@@ -702,6 +716,15 @@ enum Menu {
         resume_target: Option<RequestId>,
         continuation: Option<(RunId, String)>,
         clarification: Option<RunId>,
+    },
+    SessionSearch {
+        matches: Matches,
+        selected: usize,
+    },
+    SessionSearchSource {
+        hit: Hit,
+        lines: Vec<Choice>,
+        selected: usize,
     },
     Models {
         models: Vec<(String, String, Vec<String>)>,
@@ -1758,6 +1781,42 @@ impl Workbench {
             result: factory.summaries(&Cancel::default()),
         });
     }
+    fn search_sessions(&mut self, query: &str, io: &Io) {
+        if !self.can_job(io) {
+            return;
+        }
+        let factory = self.factory.clone();
+        self.cancel_modal();
+        let token = self.modal_token;
+        let owner = self.slots[self.current].id.clone();
+        let stop = Cancel::linked(&self.stop);
+        let query = query.to_owned();
+        self.modal_stop = Some(stop.clone());
+        self.menu = Some(Menu::Loading("Search project sessions".into()));
+        self.jobs.spawn_blocking(move || Job::SessionSearch {
+            result: factory.search(&query, &stop),
+            owner,
+            token,
+        });
+    }
+    fn open_session_search_source(&mut self, hit: Hit, io: &Io) {
+        if !self.can_job(io) {
+            return;
+        }
+        let factory = self.factory.clone();
+        self.cancel_modal();
+        let token = self.modal_token;
+        let owner = self.slots[self.current].id.clone();
+        let stop = Cancel::linked(&self.stop);
+        self.modal_stop = Some(stop.clone());
+        self.menu = Some(Menu::Loading("Saved conversation".into()));
+        self.jobs.spawn_blocking(move || Job::SessionSearchSource {
+            result: factory.search_source(&hit, &stop),
+            owner,
+            token,
+            hit,
+        });
+    }
     fn resume_target(&self) -> Option<RequestId> {
         self.slots[self.current]
             .state
@@ -2131,6 +2190,14 @@ impl Workbench {
                         result: factory.summaries(&stop),
                     });
                 }
+                (true, false)
+            }
+            "/sessions" if argument == "search" => {
+                self.report(io, "Enter a query with /sessions search QUERY");
+                (true, false)
+            }
+            "/sessions" if argument.split_whitespace().next() == Some("search") => {
+                self.search_sessions(argument["search".len()..].trim(), io);
                 (true, false)
             }
             "/sessions" | "/resume" => {
@@ -2621,6 +2688,8 @@ impl Workbench {
                     && *token == self.modal_token
             }
             Job::Sessions { owner, token, .. }
+            | Job::SessionSearch { owner, token, .. }
+            | Job::SessionSearchSource { owner, token, .. }
             | Job::Models { owner, token, .. }
             | Job::RoleModels { owner, token, .. }
             | Job::RoleModelsSaved { owner, token, .. } => {
@@ -2655,6 +2724,8 @@ impl Workbench {
         if matches!(
             &job,
             Job::Sessions { .. }
+                | Job::SessionSearch { .. }
+                | Job::SessionSearchSource { .. }
                 | Job::Themes {
                     request: ThemeLoad::Picker { .. },
                     ..
@@ -3058,6 +3129,37 @@ impl Workbench {
                     })
                 }
                 Err(code) => self.report(io, &format!("Could not load sessions: {code}")),
+            },
+            Job::SessionSearch { result, .. } => match result {
+                Ok(matches) => {
+                    self.menu = Some(Menu::SessionSearch {
+                        matches,
+                        selected: 0,
+                    })
+                }
+                Err(code) => self.report(io, &format!("Could not search sessions: {code}")),
+            },
+            Job::SessionSearchSource { hit, result, .. } => match result {
+                Ok(records) => {
+                    let mut lines = Vec::new();
+                    for (anchor, text) in records {
+                        lines.push(Choice {
+                            label: anchor,
+                            detail: String::new(),
+                        });
+                        let chars: Vec<_> = text.chars().collect();
+                        lines.extend(chars.chunks(52).map(|chunk| Choice {
+                            label: chunk.iter().collect(),
+                            detail: String::new(),
+                        }));
+                    }
+                    self.menu = Some(Menu::SessionSearchSource {
+                        hit,
+                        lines,
+                        selected: 0,
+                    });
+                }
+                Err(code) => self.report(io, &format!("Could not open saved conversation: {code}")),
             },
             Job::CachedSummaries { result } => {
                 if let Ok(summaries) = result {
@@ -3509,6 +3611,10 @@ impl Workbench {
                     + usize::from(continuation.is_some())
                     + usize::from(clarification.is_some()),
             ),
+            Some(Menu::SessionSearch { matches, selected }) => delta(selected, matches.hits.len()),
+            Some(Menu::SessionSearchSource {
+                lines, selected, ..
+            }) => delta(selected, lines.len()),
             Some(Menu::Models { models, selected }) => delta(selected, models.len()),
             Some(Menu::Efforts {
                 values, selected, ..
@@ -3643,6 +3749,12 @@ impl Workbench {
                         self.resume(entry.entry.id.clone(), io);
                     }
                 }
+                Menu::SessionSearch { matches, selected } => {
+                    if let Some(hit) = matches.hits.into_iter().nth(selected) {
+                        self.open_session_search_source(hit, io);
+                    }
+                }
+                source @ Menu::SessionSearchSource { .. } => self.menu = Some(source),
                 Menu::Models { models, selected } => {
                     self.choose_model_effort(models, selected);
                 }
@@ -4088,6 +4200,45 @@ impl Workbench {
                     .collect(),
                 selected: *selected,
                 footer: "Enter open · Esc back".into(),
+            },
+            Menu::SessionSearch { matches, selected } => Popup {
+                title: "Search project sessions".into(),
+                subtitle: match (
+                    matches.limit_reached,
+                    matches.unavailable,
+                    matches.hits.is_empty(),
+                ) {
+                    (true, true, _) => "Search incomplete · limits and unavailable sessions",
+                    (true, false, _) => "Search incomplete · search limit reached",
+                    (false, true, _) => "Search incomplete · some sessions unavailable",
+                    (false, false, true) => "No matching messages or outcomes",
+                    (false, false, false) => "Choose a matching conversation",
+                }
+                .into(),
+                items: matches
+                    .hits
+                    .iter()
+                    .map(|hit| Choice {
+                        label: hit.snippet.clone(),
+                        detail: format!(
+                            "{} · {} / {} / {}",
+                            hit.source, hit.session, hit.turn, hit.sequence
+                        ),
+                    })
+                    .collect(),
+                selected: *selected,
+                footer: "Enter open · Esc back".into(),
+            },
+            Menu::SessionSearchSource {
+                hit,
+                lines,
+                selected,
+            } => Popup {
+                title: "Saved conversation".into(),
+                subtitle: format!("{} / {} / {}", hit.session, hit.turn, hit.sequence),
+                items: lines.clone(),
+                selected: *selected,
+                footer: "Up/Down scroll · Esc close".into(),
             },
             Menu::Models { models, selected } => Popup {
                 title: "/model".into(),

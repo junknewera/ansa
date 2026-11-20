@@ -82,6 +82,16 @@ pub fn inspect_read_only(
     check: impl Fn() -> Result<()>,
     mut replay: impl FnMut(&Json) -> Result<()>,
 ) -> Result<()> {
+    inspect_records_read_only(path, budget, check, |_, _, event| replay(event))?;
+    Ok(())
+}
+
+pub(super) fn inspect_records_read_only(
+    path: &Path,
+    budget: &mut usize,
+    check: impl Fn() -> Result<()>,
+    mut replay: impl FnMut(u64, &str, &Json) -> Result<()>,
+) -> Result<String> {
     use ansa_linux::journal::{ReadIdentity, ReadOnly};
     check()?;
     let files = ReadOnly::open(path).map_err(|_| "journal_directory_open")?;
@@ -150,7 +160,7 @@ pub fn inspect_read_only(
                     && envelope.text_field("previous")? == previous_record,
                 "journal_sequence",
             )?;
-            replay(envelope.field("event")?)?;
+            replay(sequence, &hash, envelope.field("event")?)?;
             previous_record = hash;
             offset += length;
         }
@@ -179,7 +189,7 @@ pub fn inspect_read_only(
             "journal_write_conflict",
         )?;
     }
-    Ok(())
+    Ok(previous_record)
 }
 fn read(file: &mut File, count: usize) -> Result<Vec<u8>> {
     let mut value = Vec::with_capacity(count.min(65536));

@@ -18,6 +18,13 @@ pub mod provider;
 #[path = "../src/tools/mod.rs"]
 #[allow(dead_code)] // Source copy intentionally exercises M2 without the M5 owner.
 pub mod tools;
+// File-tool admission reuses the same compiled spool descriptor and page reader.
+#[path = "../src/process/output_spool.rs"]
+#[allow(dead_code)]
+pub(crate) mod output_spool;
+mod process {
+    pub(crate) use super::output_spool;
+}
 pub use ansa::{auth, orchestration};
 #[path = "../src/config/mod.rs"]
 #[allow(dead_code)]

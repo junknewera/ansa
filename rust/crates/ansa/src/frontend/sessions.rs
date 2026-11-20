@@ -54,6 +54,7 @@ pub struct Factory {
     account: String,
     initial_effort: Option<String>,
     initial_autocompact: Option<u8>,
+    pub(super) harness_trial: Option<String>,
     stop: Cancel,
     auth: Option<Arc<AuthManager>>,
     editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
@@ -84,6 +85,7 @@ impl Factory {
             account,
             initial_effort: None,
             initial_autocompact: None,
+            harness_trial: None,
             stop: Cancel::default(),
             auth,
             editor: None,
@@ -322,6 +324,44 @@ impl Factory {
         self.settings
             .catalog(self.profile())?
             .summaries_with_catalog(stop, Some(&compiled))
+    }
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        stop: &Cancel,
+    ) -> Result<crate::session::search::Matches> {
+        self.search_catalog()?.search(
+            query,
+            &self.account,
+            self.search_provider(),
+            crate::tools::files::summary_catalog(&self.settings)?.as_ref(),
+            stop,
+        )
+    }
+    pub(crate) fn search_source(
+        &self,
+        hit: &crate::session::search::Hit,
+        stop: &Cancel,
+    ) -> Result<Vec<(String, String)>> {
+        self.search_catalog()?.search_source(
+            hit,
+            &self.account,
+            self.search_provider(),
+            crate::tools::files::summary_catalog(&self.settings)?.as_ref(),
+            stop,
+        )
+    }
+    fn search_catalog(&self) -> Result<crate::session::catalog::Catalog> {
+        crate::session::catalog::Catalog::open_read_only(
+            &self.settings.directory.join("sessions"),
+            &self.settings.cwd,
+            self.profile(),
+        )
+    }
+    fn search_provider(&self) -> &str {
+        self.openrouter
+            .as_ref()
+            .map_or("openai-siwc", |route| route.binding().provider.as_str())
     }
     pub(super) fn artifacts(&self, id: &str) -> Result<crate::tools::artifacts::Store> {
         let selected = self.settings.catalog(self.profile())?.explicit(id)?;
@@ -1056,6 +1096,15 @@ impl Factory {
         {
             return Err("session_configuration_mismatch");
         }
+        let profile = if kind == Kind::Console {
+            None
+        } else {
+            crate::harness::select(
+                &self.settings,
+                source_configuration.as_ref(),
+                self.harness_trial.as_deref(),
+            )?
+        };
         let wants_terminals = source_configuration.as_ref().map_or(
             kind == Kind::Main && self.new_main_uses_terminal(),
             |source| {
@@ -1087,6 +1136,9 @@ impl Factory {
                 terminal.clone().map_or(Ok(()), |owner| {
                     terminals::register(registry, owner, &selected.directory)
                 })?;
+                if let Some(profile) = &profile {
+                    crate::tools::skills::register(registry, Some(profile.clone()))?;
+                }
                 if kind != Kind::Console {
                     crate::mcp::register(
                         registry,
@@ -1132,6 +1184,11 @@ impl Factory {
             .as_ref()
             .map(|r| r.epoch.clone())
             .unwrap_or(initial_epoch);
+        if base.is_none()
+            && let Some(profile) = &profile
+        {
+            profile.attach(&mut epoch)?;
+        }
         if base.is_none() && terminal.is_some() {
             terminals::add_agent_instructions(&mut epoch);
         }
@@ -1450,7 +1507,16 @@ fn base_state(value: &Json) -> Result<Json> {
         } else if value.has("base") {
             value = value.field("base")?;
         } else {
-            let mut value = value.clone();
+            // The saved profile is independently checked by digest and project scope.
+            let mut value = if value.has("harness_profile") {
+                value
+                    .without("harness_profile")?
+                    .without("prompt_policy")?
+                    .without("base_instructions_sha256")?
+                    .without("harness_trial")?
+            } else {
+                value.clone()
+            };
             if value.has("local_console_parent") {
                 value = value.without("local_console_parent")?;
             }

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod config;
 pub mod context;
 pub mod frontend;
+mod harness;
 mod mcp;
 #[path = "provider/openrouter.rs"]
 mod openrouter;

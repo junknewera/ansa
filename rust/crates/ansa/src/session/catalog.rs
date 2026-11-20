@@ -30,6 +30,100 @@ impl Catalog {
             profile: profile.into(),
         })
     }
+    pub(crate) fn open_read_only(root: &Path, cwd: &Path, profile: &str) -> Result<Self> {
+        Ok(Self {
+            files: ansa_linux::journal::Catalog::open_read_only(root)
+                .map_err(|_| "local_directory_permissions")?,
+            root: root.into(),
+            cwd: cwd.to_str().ok_or("session_workspace_mismatch")?.into(),
+            profile: profile.into(),
+        })
+    }
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        account: &str,
+        provider: &str,
+        compiled: &crate::tools::registry::Snapshot,
+        stop: &crate::auth::Cancel,
+    ) -> Result<super::search::Matches> {
+        self.search_bounded(query, account, provider, compiled, stop, 64 * 1024 * 1024)
+    }
+    pub(super) fn search_bounded(
+        &self,
+        query: &str,
+        account: &str,
+        provider: &str,
+        compiled: &crate::tools::registry::Snapshot,
+        stop: &crate::auth::Cancel,
+        mut budget: usize,
+    ) -> Result<super::search::Matches> {
+        use super::search::{self, Matches, Scope};
+        let query = search::normalize_query(query)?;
+        let scope = Scope {
+            account,
+            provider,
+            cwd: &self.cwd,
+        };
+        let mut matches = Matches::default();
+        for entry in self.entries_checked(|| stop.check())? {
+            if !matches!(entry.kind.as_str(), "main" | "fork") {
+                continue;
+            }
+            if budget == 0 || matches.hits.len() == search::HIT_LIMIT {
+                matches.limit_reached = true;
+                break;
+            }
+            let result = search::read(
+                &self.root.join(&entry.id),
+                &entry.id,
+                scope,
+                compiled,
+                &query,
+                &mut budget,
+                search::HIT_LIMIT - matches.hits.len(),
+                stop,
+            );
+            stop.check()?;
+            match result {
+                Ok(mut records) => {
+                    matches.hits.append(&mut records);
+                    matches.limit_reached |= matches.hits.len() == search::HIT_LIMIT;
+                }
+                Err("session_search_scope") => {}
+                Err("journal_summary_limit") => matches.limit_reached = true,
+                Err(_) => matches.unavailable = true,
+            }
+        }
+        Ok(matches)
+    }
+    pub(crate) fn search_source(
+        &self,
+        hit: &super::search::Hit,
+        account: &str,
+        provider: &str,
+        compiled: &crate::tools::registry::Snapshot,
+        stop: &crate::auth::Cancel,
+    ) -> Result<Vec<(String, String)>> {
+        let selected = self.explicit(&hit.session)?;
+        let metadata = self.metadata(&hit.session)?.ok_or("unknown_session")?;
+        need(
+            !metadata.has("kind") || matches!(metadata.text_field("kind")?, "main" | "fork"),
+            "session_search_scope",
+        )?;
+        super::search::open(
+            &selected.directory,
+            hit,
+            super::search::Scope {
+                account,
+                provider,
+                cwd: &self.cwd,
+            },
+            compiled,
+            &mut (64 * 1024 * 1024),
+            stop,
+        )
+    }
     fn metadata(&self, id: &str) -> Result<Option<Json>> {
         self.files
             .info(id)

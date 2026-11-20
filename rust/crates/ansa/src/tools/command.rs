@@ -85,6 +85,10 @@ pub struct ProcessRunner {
     worker: PathBuf,
 }
 impl ProcessRunner {
+    pub(crate) fn read_output(&self, args: &Json) -> Result<Json> {
+        crate::process::output_spool::read_page(&self.root, args)
+    }
+
     pub(crate) fn has_job(&self, invocation: &Invocation) -> Result<bool> {
         match self
             .root

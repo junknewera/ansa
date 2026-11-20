@@ -1,6 +1,7 @@
 use crate::{
     auth::Cancel,
     config::{AgentSettings, Result, agents::saved_instructions, n, path_text, s},
+    process::output_spool,
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::{
         replay::{Effects, Execution},
@@ -106,6 +107,7 @@ impl Host {
             || path.starts_with(self.settings.directory.join("auth"))
             || path.starts_with(self.settings.directory.join("openrouter"))
             || path.starts_with(self.settings.directory.join("sessions"))
+            || path.starts_with(self.settings.directory.join("harness-profiles"))
             || path.starts_with(self.settings.directory.join("terminal-workspaces"))
             || self.scope.is_some() && path.components().any(|part| part.as_os_str() == ".git")
     }
@@ -409,7 +411,10 @@ pub(crate) fn summary_catalog(settings: &AgentSettings) -> Result<Arc<Snapshot>>
         shared_writer: None,
         scope: None,
     };
-    Ok(register_local_tools(Arc::new(host), |_| Ok(()))?.read_only())
+    Ok(register_local_tools(Arc::new(host), |registry| {
+        super::skills::register(registry, None)
+    })?
+    .read_only())
 }
 
 pub fn local_task_tools(
@@ -539,6 +544,40 @@ fn register_local_tools(
     super::edit::register(&mut registry, host.clone())?;
     super::workspace::register(&mut registry, host.clone())?;
     super::analysis::register(&mut registry, host.clone())?;
+    let output = host.processes.clone();
+    let read = Arc::new(move |args: &Json| match output.read_output(args) {
+        Ok(page) => result(page),
+        Err(code) => error(code),
+    });
+    let executor = read.clone();
+    registry.register_with_policy(
+        Definition {
+            descriptor: Descriptor {
+                name: "read_output".into(),
+                description: "Read a retained run_command output_id in this session. Select stdout or stderr and a byte offset with limit 1..4096. Use next_offset to page through stored bytes. Text is a preview; bytes_base64 preserves the byte range exactly.".into(),
+                revision: "ansa_output_v1".into(),
+                schema: schema(&[
+                    ("id", "string"),
+                    ("stream", "string"),
+                    ("offset", "integer"),
+                    ("limit", "integer"),
+                ])?,
+            },
+            validator: Arc::new(|args| output_spool::valid_page(args).unwrap_or(false)),
+            executor,
+        },
+        Policy {
+            read_only: true,
+            invoke: Some(Arc::new(move |invocation, stop| {
+                if stop.cancelled() {
+                    Outcome::not_started()
+                } else {
+                    read(&invocation.arguments)
+                }
+            })),
+            ..Policy::default()
+        },
+    )?;
     let preview = host.clone();
     registry.register_with_policy(
         Definition {
@@ -590,7 +629,7 @@ fn register_local_tools(
     let maximum = host.settings.process_timeout_ms;
     let run = host.clone();
     let recovery = host.clone();
-    registry.register_with_policy(Definition {descriptor:Descriptor {name:"run_command".into(),description:"Run argv without a shell unless explicitly requested. Noninteractive, no sudo, no background services. timeout_ms must be positive and not exceed the configured limit. Exit codes and truncated stdout/stderr are returned as data.".into(),revision:"ansa_process_v1".into(),schema:schema(&[("argv","array"),("cwd","string"),("timeout_ms","integer")])?},validator:Arc::new(move |args|{
+    registry.register_with_policy(Definition {descriptor:Descriptor {name:"run_command".into(),description:"Run argv without a shell unless explicitly requested. Noninteractive, no sudo, no background services. timeout_ms must be positive and not exceed the configured limit. Read additional stdout or stderr via read_output if an output_id is returned.".into(),revision:output_spool::REVISION.into(),schema:schema(&[("argv","array"),("cwd","string"),("timeout_ms","integer")])?},validator:Arc::new(move |args|{
         (||->Result<bool>{if !path_argument(args,"cwd")?||args.usize_field("timeout_ms")?==0||args.usize_field("timeout_ms")?>maximum{return Ok(false);}
             let argv=args.field("argv")?.elements()?;if argv.is_empty()||argv.len()>64||argv[0].text()?.is_empty(){return Ok(false);}let mut bytes=0;for arg in argv {let arg=arg.text()?;if arg.contains('\0')||arg.len()>16384-bytes{return Ok(false);}bytes+=arg.len();}Ok(true)})().unwrap_or(false)
     }),executor:Arc::new(|_|Outcome::failed_unknown())},Policy {requires_journal:true,invoke:Some(Arc::new(move |invocation,stop|match run.run(invocation,stop) {
