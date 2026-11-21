@@ -1009,7 +1009,8 @@ def completion_and_help(screen, root, cwd):
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/theme", "/files", "/agents", "/sessions",
-                "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact", "/orchestrate+", "/terminals"}
+                "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
+                "/orchestrate", "/orchestrate+", "/terminals"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"
@@ -1565,9 +1566,10 @@ def openrouter_orchestration(screen, root, cwd):
     return "normal"
 
 
-def configure_plus_roles(screen):
-    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "SIWC adapter starts Carbon")
-    local(screen, "/orchestrate+")
+def configure_plus_roles(screen, pending=False):
+    if not pending:
+        until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "SIWC adapter starts Carbon")
+        local(screen, "/orchestrate+")
     until(screen, lambda frame: "Save role models" in frame, "all three role selectors")
     for role, model, model_offset, effort in [
         ("Strong", "gpt-6.2-sol", 0, "high"),
@@ -1583,7 +1585,8 @@ def configure_plus_roles(screen):
         until(screen, lambda frame: "Save role models" in frame and f"{model} · {effort}" in frame,
               f"{role} selection")
     screen.send(b"\r")
-    until(screen, lambda frame: "Orchestrate+ role models saved" in frame, "durable role profile")
+    if not pending:
+        until(screen, lambda frame: "Orchestrate+ role models saved" in frame, "durable role profile")
 
 
 def siwc_orchestrate_plus(screen, root, cwd):
@@ -1610,10 +1613,8 @@ def siwc_orchestrate_plus(screen, root, cwd):
     until(screen, lambda frame: completed(root, prior) and "PLUS_CONTEXT_READY" in frame
           and "Ctrl+C stop" not in screen.vt.line(-2),
           "previous Work turn from a different model settled")
-    screen.send(b"\t\t\t")
-    until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2), "ordinary Orchestrate+ mode")
     prompt = "Exercise quick, fresh, and final review decisions"
-    screen.send(prompt + "\r")
+    screen.send("/orchestrate+ " + prompt + "\r")
     until(screen, lambda frame: all(label in frame for label in ("PLUS_CARBON_PLAN", "Start", "Refine", "Cancel")),
           "approval shows plan and role models")
     frame = visible(screen)
@@ -1842,10 +1843,18 @@ def siwc_orchestrate_plus_implement(screen, root, cwd):
     check = cwd / "check.sh"
     check.write_text(f'#!/bin/sh\nset -eu\ngrep -q "^after fixture" report.txt\ntouch "{marker}"\n')
     check.chmod(0o700)
-    configure_plus_roles(screen)
-    screen.send(b"\t\t\t")
-    until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2), "orchestration mode")
-    screen.send(b"Change report.txt to after fixture and run the test\r")
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "SIWC adapter starts Carbon")
+    local(screen, "/plan")
+    until(screen, lambda _: "Plan" in screen.vt.line(-2), "start from read-only planning mode")
+    prompt = "Change report.txt to after fixture and run the test\nInspect /files"
+    screen.send("/orchestrate+ " + prompt + "\r")
+    until(screen, lambda frame: "Save role models" in frame, "first use asks for role models")
+    assert not any(row["kind"] == "accepted" for row in records(root))
+    screen.send(b"\r")
+    until(screen, lambda frame: "Strong · model" in frame, "open the model chooser")
+    escape(screen)
+    until(screen, lambda frame: "Save role models" in frame, "return to roles without losing the task")
+    configure_plus_roles(screen, pending=True)
     until(screen, lambda frame: all(label in frame for label in (
         "MISLABELED_INVESTIGATION", "Start read only", "Implement",
     )), "the model mislabeled the requested change as an investigation")
@@ -1860,6 +1869,7 @@ def siwc_orchestrate_plus_implement(screen, root, cwd):
     rows = records(root)
     drafts = [row for row in rows if row["kind"] == "accepted"]
     assert len(drafts) == 2 and all(row.get("draft") for row in drafts)
+    assert drafts[0]["text"] == prompt and drafts[0]["mode"] == "basic"
     assert not any(row["kind"] in ("intent", "outcome") for row in rows)
     assert report.read_text() == "before fixture\n" and not marker.exists()
     stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
@@ -1913,7 +1923,7 @@ def siwc_orchestration(screen, root, cwd):
     assert completed(root, "UNNAMED_READ_SCOPE"), "strict response is retained as an unapproved draft"
     screen.send(b"\x03")
     until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear the unnamed folder request")
-    screen.send(b"Inspect Workspace/pet\r")
+    screen.send(b"/orchestrate Inspect Workspace/pet\r")
     until(screen, lambda frame: "Read folder" in frame and "SIWC_CARBON_PLAN" in frame and "Start" in frame,
           "the read folder and plan are visible before approval")
     selected = str(root / "home/Workspace/pet")

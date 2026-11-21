@@ -586,7 +586,8 @@ fn editor_multiline_and_word_edits_preserve_utf8_boundaries() {
     assert_eq!(editor.text().unwrap(), "привет \nfirst second");
     editor.feed(11, true);
     assert_eq!(editor.text().unwrap(), "привет \nfirst ");
-    assert_eq!(feed(&mut editor, b"\x1b\r"), [Action::QueueSubmit]);
+    assert!(feed(&mut editor, b"\x1b\r").is_empty());
+    assert_eq!(editor.text().unwrap(), "привет \nfirst \n");
     assert_eq!(editor.feed(b'\n', true), None);
     assert!(editor.text().unwrap().ends_with('\n'));
     assert_eq!(editor.feed(b'\r', true), Some(Action::Submit));

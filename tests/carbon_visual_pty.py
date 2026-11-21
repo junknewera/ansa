@@ -298,12 +298,22 @@ def native_background(screen, *labels):
 def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     screen = start(binary, root, home, cwd, screens, 'lifecycle')
     answer = 'OMH_TOOL_OK:OMH_FIXED_VALUE_42'
-    screen.send('VISUAL_TASK\r')
-    until(screen, lambda text: completed(root, 'VISUAL_TASK') and answer in text, 'committed colored final text')
+    prompt = 'VISUAL_TASK\n\nPARAGRAPH'
+    before_submit = journals(root)
+    screen.send(b'VISUAL_TASKPARAGRAPH' + b'\x1b[D' * len('PARAGRAPH') + b'\x1b\r\x1b[13;2u')
+    until(screen, lambda text: '› VISUAL_TASK\n\n    PARAGRAPH' in text, 'both modified Enter keys insert in the draft')
+    assert journals(root) == before_submit
+    screen.send(b'\r')
+    until(screen, lambda text: completed(root, prompt) and answer in text, 'committed colored final text')
     assert 'get_test_value' not in visible(screen)
     answer_fg = screen.vt.attribute(answer)[0]
     user_bg = screen.vt.attribute('VISUAL_TASK', last=True)[1]
     assert user_bg is not None and screen.vt.attribute('VISUAL_TASK', last=True)[2], 'user text lost its visual emphasis'
+    row, col = screen.vt.location('VISUAL_TASK', last=True)
+    assert not screen.vt.line(row + 1) and 'PARAGRAPH' in screen.vt.line(row + 2)
+    assert all(attr[1] == user_bg for attr in screen.vt.attrs[row + 1][col - 2:col + len('VISUAL_TASK')])
+    assert screen.vt.attrs[row + 1][col + len('VISUAL_TASK')][1] is None
+    assert screen.vt.attrs[row + 3][col - 2][1] is None
     native_background(screen, answer)
     screen.send('VISUAL_DRAFT Ж')
     until(screen, lambda text: 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'pinned colored draft')

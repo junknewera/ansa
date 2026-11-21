@@ -20,6 +20,7 @@ pub struct MouseEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Submit,
+    /// Kept for consumers of the typed input API.
     QueueSubmit,
     Overflow,
     /// Kept for consumers of the old typed input API; no key emits it.
@@ -198,11 +199,9 @@ impl Editor {
             self.pasted_byte(ch);
         }
     }
-    fn submit(&self, queue: bool) -> Option<Action> {
+    fn submit(&self) -> Option<Action> {
         Some(if self.overflow {
             Action::Overflow
-        } else if queue {
-            Action::QueueSubmit
         } else {
             Action::Submit
         })
@@ -246,8 +245,8 @@ impl Editor {
             b"\x1b[5~" => Some(Action::PageUp),
             b"\x1b[6~" => Some(Action::PageDown),
             b"\x1b[Z" => Some(Action::FocusPrevious),
-            b"\x1b\r" | b"\x1b\n" | b"\x1b[13;3u" => self.submit(true),
-            b"\x1b[13;2u" | b"\x1b[27;2;13~" => {
+            b"\x1b\r" | b"\x1b\n" | b"\x1b[13;3u" | b"\x1b[13;2u" | b"\x1b[27;2;13~"
+            | b"\x1b[27;3;13~" => {
                 self.insert(b'\n');
                 None
             }
@@ -332,13 +331,13 @@ impl Editor {
                     self.cursor = begin;
                 }
                 127 | 8 => self.backspace(),
-                b'\r' => return self.submit(false),
+                b'\r' => return self.submit(),
                 b'\n' => self.insert(b'\n'),
                 0..=31 => {}
                 _ => self.insert(ch),
             }
         } else if ch == b'\n' {
-            return self.submit(false);
+            return self.submit();
         } else {
             self.insert(ch);
         }
