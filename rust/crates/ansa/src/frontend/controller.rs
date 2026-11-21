@@ -924,10 +924,15 @@ impl State {
         status.push_str(&diagnostics::status_notice(view, &detail));
         let visible = self.reading.as_deref().unwrap_or(&entries);
         let frame = if let Some(ui) = ui {
+            let (input, cursor) = if ui.drafting_plan {
+                (&[][..], 0)
+            } else {
+                (self.editor.bytes.as_slice(), self.editor.cursor)
+            };
             carbon::layout_workspace(
                 visible,
-                &self.editor.bytes,
-                self.editor.cursor,
+                input,
+                cursor,
                 &status,
                 self.scroll,
                 context,

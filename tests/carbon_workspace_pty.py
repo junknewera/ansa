@@ -1041,18 +1041,31 @@ def completion_and_help(screen, root, cwd):
 def new_resume_and_exit(screen, root, cwd):
     assert screen.vt.line(0) == "  ANSA" and screen.vt.line(1) == ""
     assert "ready" not in screen.vt.line(-2) and cwd.name in screen.vt.line(-2)
-    screen.send("PREVIOUS_SESSION\r")
-    until(screen, lambda frame: completed(root, "PREVIOUS_SESSION") and "OMH_TOOL_OK" in frame,
+    local(screen, "/sessions")
+    until(screen, lambda _: "No saved conversations" in popup_text(screen),
+          "a new empty session is absent from history")
+    escape(screen)
+    prompt = "PREVIOUS_SESSION\n\n\n\nSECOND_PARAGRAPH"
+    screen.send("\x1b[200~" + prompt + "\x1b[201~\r")
+    until(screen, lambda frame: completed(root, prompt) and "OMH_TOOL_OK" in frame,
           "previous session committed")
+    rows = [line.strip() for line in body(screen).splitlines()]
+    first = rows.index("> PREVIOUS_SESSION")
+    assert rows[first:first + 3] == ["> PREVIOUS_SESSION", "", "SECOND_PARAGRAPH"]
     previous, = [path for path in (root / "home/.ansa/sessions").iterdir() if path.is_dir()]
     local(screen, "/new")
     until(screen, lambda frame: ready(screen) and "PREVIOUS_SESSION" not in frame
           and sum(row["kind"] == "init" for row in records(root)) == 2, "new conversation with an empty transcript")
     assert sum(row["kind"] == "accepted" for row in records(root)) == 1
+    empty_journal = journals(root)
+    local(screen, "/new")
+    until(screen, lambda frame: ready(screen) and "PREVIOUS_SESSION" not in frame,
+          "repeated new stays on an empty conversation")
     local(screen, "/resume")
     until(screen, lambda frame: "Project sessions" in frame and "PREVIOUS_SESSION" in popup_text(screen),
           "resume opened saved sessions on an idle chat")
     assert "resume_not_available" not in visible(screen)
+    assert "New conversation" not in popup_text(screen) and journals(root) == empty_journal
     escape(screen)
     until(screen, lambda frame: "Project sessions" not in frame, "session picker closed")
     before_search = journals(root)
@@ -1138,6 +1151,9 @@ def model_effort_pair(screen, root, cwd):
     screen.additional_screens.append(("explicit-model", explicit))
     local(explicit, f"/sessions {initial.name}")
     until(explicit, lambda frame: ready(explicit), "resumed session uses its own saved model")
+    explicit.send("MODEL_INHERITANCE_FIXTURE\r")
+    until(explicit, lambda _: completed(root, "MODEL_INHERITANCE_FIXTURE"),
+          "create a turn before opening a distinct conversation")
     previous = set((home / ".ansa/sessions").iterdir())
     local(explicit, "/new")
     until(explicit, lambda frame: ready(explicit)
@@ -1858,13 +1874,12 @@ def siwc_orchestration(screen, root, cwd):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "GPT ready without a network call")
     screen.send(b"\t\t")
     until(screen, lambda _: "Orchestrate" in screen.vt.line(-2), "GPT orchestration mode")
-    for prompt in ("UNCONFIRMED_FORMAT", "UNCONSTRAINED_FORMAT"):
+    for attempt, prompt in enumerate(("UNCONFIRMED_FORMAT", "UNCONFIRMED_FORMAT", "UNCONSTRAINED_FORMAT"), start=1):
         def paused_draft():
             rows = records(root)
-            draft = next((row["turn"] for row in rows if row["kind"] == "accepted"
-                          and row["text"] == prompt), None)
-            return draft and any(
-                row["kind"] == "pause" and row["turn"] == draft
+            drafts = [row["turn"] for row in rows if row["kind"] == "accepted" and row.get("draft")]
+            return len(drafts) == attempt and any(
+                row["kind"] == "pause" and row["turn"] == drafts[-1]
                 and row["diagnostic"] == "siwc_structured_format_unconfirmed"
                 for row in rows
             )
@@ -1872,12 +1887,23 @@ def siwc_orchestration(screen, root, cwd):
         screen.send(prompt + "\r")
         until(screen, lambda frame: paused_draft()
               and "ChatGPT did not confirm the strict plan format" in frame
+              and "Drafting a plan" not in frame
               and screen.vt.line(-4) == "  › " + prompt, "unconfirmed response rejected and draft restored")
         assert not (root / "home/.ansa/orchestration").exists()
-        draft, = [row for row in records(root) if row["kind"] == "accepted" and row["text"] == prompt]
+        draft = [row for row in records(root) if row["kind"] == "accepted" and row["text"] == prompt][-1]
+        until(screen, lambda _: [line.strip() for line in body(screen).splitlines()].count("> " + prompt) == 1,
+              "one chat message even after a repeated planning attempt")
         assert not any(row["kind"] == "done" and row["turn"] == draft["turn"] for row in records(root))
         screen.send(b"\x03")
         until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear failed draft")
+        if attempt == 1:
+            local(screen, "/sessions")
+            until(screen, lambda _: "Resume current request" in popup_text(screen), "paused draft can be resumed")
+            screen.send(b"\r")
+            until(screen, lambda frame: sum(row["kind"] == "pause" and row["turn"] == draft["turn"]
+                                            for row in records(root)) == 2
+                  and "ChatGPT did not confirm the strict plan format" in frame
+                  and "Drafting a plan" not in frame, "resumed draft can pause again without hiding the error")
         local(screen, "/cancel")
         until(screen, lambda _: any(row["kind"] == "cancel" and row["turn"] == draft["turn"]
                                     for row in records(root)), "cancel paused unconfirmed draft")
@@ -1911,7 +1937,9 @@ def siwc_orchestration(screen, root, cwd):
     with (root / "home/.ansa/auth/lock").open("rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         screen.send(b"Cancel this draft\r")
-        until(screen, lambda frame: "Drafting a plan" in frame, "plan waits for the shared account lock")
+        until(screen, lambda _: "Drafting a plan" in screen.vt.line(-1),
+              "plan waits in the footer for the shared account lock")
+        assert "Drafting a plan" not in body(screen) and screen.vt.line(-4) == "  ›"
         screen.send(b"\x03")
         until(screen, lambda frame: "Drafting a plan" not in frame
               and screen.vt.line(-4) == "  › Cancel this draft", "cancel keeps the pending draft")

@@ -87,6 +87,7 @@ impl ToolDetail {
 pub struct Timeline {
     entries: Transcript,
     conversation: Transcript,
+    latest_draft: Option<(TurnId, ring::digest::Digest)>,
     turn: TurnId,
     request: RequestId,
     mode: AgentMode,
@@ -107,11 +108,20 @@ pub(crate) fn conversation_row(row: &Entry) -> bool {
         && !draft_material(row)
 }
 
+fn is_draft_question(role: &str, turn: &TurnId) -> bool {
+    role == "user" && turn.0.starts_with("draft-") && !turn.0.starts_with("draft-revise-")
+}
+
+fn draft_question(row: &Entry) -> bool {
+    is_draft_question(&row.role, &row.turn)
+}
+
 impl Default for Timeline {
     fn default() -> Self {
         Self {
             entries: Transcript::default(),
             conversation: Transcript::default(),
+            latest_draft: None,
             turn: "idle".into(),
             request: "idle".into(),
             mode: AgentMode::Basic,
@@ -204,6 +214,7 @@ impl Timeline {
         }
         let mut result = Self::default();
         let mut bytes = 0;
+        let mut decoded = Vec::new();
         for entry in entries {
             let turn = entry.text_field("turn")?;
             let request = entry.text_field("request")?;
@@ -243,7 +254,7 @@ impl Timeline {
             } else {
                 None
             };
-            result.append_entry(Entry {
+            decoded.push(Entry {
                 turn: turn.into(),
                 request: request.into(),
                 role: role.into(),
@@ -253,11 +264,45 @@ impl Timeline {
                 tool,
             });
         }
+        let mut entries = decoded.into_iter().peekable();
+        while let Some(entry) = entries.next() {
+            if draft_question(&entry) {
+                let turn = entry.turn.clone();
+                let mut chunks = vec![entry];
+                while entries
+                    .peek()
+                    .is_some_and(|next| next.turn == turn && draft_question(next))
+                {
+                    chunks.extend(entries.next());
+                }
+                let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+                for chunk in &chunks {
+                    hash.update(chunk.text.as_bytes());
+                }
+                let visible = result.record_draft(&turn, hash.finish());
+                for chunk in chunks {
+                    result.append_entry(chunk, visible);
+                }
+            } else {
+                result.append_entry(entry, true);
+            }
+        }
         Ok(result)
     }
-    fn append_entry(&mut self, entry: Entry) {
+    fn record_draft(&mut self, turn: &TurnId, digest: ring::digest::Digest) -> bool {
+        let fresh = self
+            .latest_draft
+            .as_ref()
+            .is_none_or(|(previous, hash)| previous == turn || hash.as_ref() != digest.as_ref());
+        self.latest_draft = Some((turn.clone(), digest));
+        fresh
+    }
+    fn append_entry(&mut self, entry: Entry, visible: bool) {
         let entry = std::sync::Arc::new(entry);
-        if conversation_row(&entry) {
+        if visible && conversation_row(&entry) {
+            if !draft_question(&entry) && matches!(entry.role.as_str(), "assistant" | "user") {
+                self.latest_draft = None;
+            }
             self.conversation.append_shared(entry.clone());
         }
         self.entries.append_shared(entry);
@@ -271,6 +316,15 @@ impl Timeline {
         let tool = tool.filter(ToolDetail::display_valid);
         let chunk_limit =
             (128 * 1024).min(256 * 1024 - tool.as_ref().map_or(0, ToolDetail::display_bytes));
+        let visible = if is_draft_question(role, &self.turn) {
+            let turn = self.turn.clone();
+            self.record_draft(
+                &turn,
+                ring::digest::digest(&ring::digest::SHA256, text.as_bytes()),
+            )
+        } else {
+            true
+        };
         // Arguments and summaries may exceed a page entry, and tool output
         // may fill its whole native limit before the display prefix is added.
         // Split the projection losslessly; provider-native history is untouched.
@@ -281,21 +335,24 @@ impl Timeline {
             while !remaining.is_char_boundary(end) {
                 end -= 1;
             }
-            self.append_entry(Entry {
-                turn: self.turn.clone(),
-                request: self.request.clone(),
-                role: role.into(),
-                text: remaining[..end].into(),
-                state: state.into(),
-                mode: self.mode,
-                tool: tool.as_ref().map(|tool| {
-                    let mut detail = tool.clone();
-                    detail.content_start = detail.content_start.saturating_sub(offset).min(end);
-                    detail.continued = offset > 0;
-                    detail.last_chunk = offset + end == text.len();
-                    std::sync::Arc::new(detail)
-                }),
-            });
+            self.append_entry(
+                Entry {
+                    turn: self.turn.clone(),
+                    request: self.request.clone(),
+                    role: role.into(),
+                    text: remaining[..end].into(),
+                    state: state.into(),
+                    mode: self.mode,
+                    tool: tool.as_ref().map(|tool| {
+                        let mut detail = tool.clone();
+                        detail.content_start = detail.content_start.saturating_sub(offset).min(end);
+                        detail.continued = offset > 0;
+                        detail.last_chunk = offset + end == text.len();
+                        std::sync::Arc::new(detail)
+                    }),
+                },
+                visible,
+            );
             remaining = &remaining[end..];
             offset += end;
             if remaining.is_empty() {
@@ -707,6 +764,20 @@ mod tests {
             offset = page.end;
         }
         assert_eq!(seen, text);
+
+        // Distinct requests can share the entire first chunk. Only an exact
+        // retry disappears from chat, both live and after restoring a fork.
+        let mut timeline = Timeline::default();
+        let prompt = "界".repeat(44_000);
+        for (turn, suffix) in [("draft-1", "A"), ("draft-2", "A"), ("draft-3", "B")] {
+            timeline.turn = turn.into();
+            timeline.append("user", format!("{prompt}{suffix}"), "accepted");
+        }
+        let restored = Timeline::load(&timeline.save().unwrap()).unwrap();
+        for timeline in [timeline, restored] {
+            assert_eq!(timeline.len(), 6);
+            assert_eq!(timeline.conversation_len(), 4);
+        }
     }
     #[test]
     fn conversation_pages_anchor_to_messages_across_tool_heavy_history() {
