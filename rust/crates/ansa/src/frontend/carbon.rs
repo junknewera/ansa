@@ -31,6 +31,9 @@ pub struct Frame {
     chat_inset: usize,
     chat_rows: ChatRows,
     agent_rows: Vec<String>,
+    pub(super) activity: Option<Box<Frame>>,
+    pub(super) activity_keys: Vec<String>,
+    pub(super) activity_scroll: usize,
     suggestion_bounds: Option<(usize, usize)>,
     pub(super) timeline_range: Option<(usize, usize)>,
     pub(super) timeline_total: usize,
@@ -83,6 +86,20 @@ impl Frame {
         (left..left + width).contains(&x).then_some(())?;
         self.agent_rows.get(y.checked_sub(top)?).map(String::as_str)
     }
+    pub(super) fn activity_at(&self, x: usize, y: usize) -> Option<(&Frame, &str)> {
+        let (left, top, width, height) = self.inspector_bounds?;
+        if !(left..left + width).contains(&x) || !(top..top + height).contains(&y) {
+            return None;
+        }
+        let activity = self.activity.as_deref()?;
+        let row = y - top + 1;
+        let (_, action) = activity
+            .tool_actions
+            .iter()
+            .find(|(index, _)| *index == row)?;
+        Some((activity, action))
+    }
+
     pub fn output_view(&self, key: &str) -> Option<std::sync::Arc<OutputView>> {
         self.output_views.get(key).cloned()
     }
@@ -493,14 +510,14 @@ pub fn layout(
     input: &[u8],
     cursor: usize,
     status: &str,
-    expanded: bool,
+    _expanded: bool,
     scroll: usize,
     context: &str,
     size: (usize, usize),
     color: bool,
 ) -> Option<Frame> {
     layout_impl(
-        history, input, cursor, status, expanded, scroll, context, size, color, false,
+        history, input, cursor, status, None, scroll, context, size, color, false,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -515,7 +532,7 @@ pub fn layout_full(
     color: bool,
 ) -> Option<Frame> {
     layout_impl(
-        history, input, cursor, status, true, scroll, context, size, color, true,
+        history, input, cursor, status, None, scroll, context, size, color, true,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -524,7 +541,7 @@ fn layout_impl(
     input: &[u8],
     cursor: usize,
     status: &str,
-    _expanded: bool,
+    activity: Option<&ActivityViewport>,
     scroll: usize,
     context: &str,
     size: (usize, usize),
@@ -762,7 +779,24 @@ fn layout_impl(
         }
     }
     let available = max_rows - if full { 5 } else { 3 };
-    let end = wrapped.len() - scroll.min(wrapped.len().saturating_sub(available));
+    let mut end = wrapped.len() - scroll.min(wrapped.len().saturating_sub(available));
+    if let Some(selected) = activity.and_then(|activity| activity.selected.as_ref())
+        && let Some((row, _)) = tool_actions
+            .iter()
+            .find(|(row, key)| *row < wrapped.len() && key == selected)
+    {
+        end = end.clamp(row + 1, row.saturating_add(available).max(row + 1));
+    }
+    let activity_keys = if activity.is_some() {
+        let mut keys = tool_actions
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        keys.dedup();
+        keys
+    } else {
+        Vec::new()
+    };
     let begin = end.saturating_sub(available);
     let mut header = format!("{mint}{}ansa{reset}", if color { "\x1b[1m" } else { "" });
     let mut used = 4;
@@ -866,6 +900,9 @@ fn layout_impl(
         chat_bounds: Some((1, available + 1, cols)),
         chat_inset: 0,
         agent_rows: Vec::new(),
+        activity: None,
+        activity_keys,
+        activity_scroll: wrapped.len().saturating_sub(end),
         chat_rows: ChatRows {
             wrapped: wrapped.into(),
             first: begin,
@@ -919,6 +956,7 @@ pub struct Inspector {
     pub footer: String,
     pub kind: InspectorKind,
     pub agents: Vec<AgentLine>,
+    pub activity: Option<ActivityViewport>,
     pub document: Option<super::markdown::Document>,
     pub markdown: Option<std::sync::Arc<Vec<super::markdown::Row>>>,
     pub diff: Option<std::sync::Arc<Vec<super::diff::Row>>>,
@@ -928,6 +966,13 @@ pub struct Inspector {
     /// Zero-based column/row relative to the parsed grid.
     pub cursor: Option<(usize, usize)>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityViewport {
+    pub entries: Vec<Entry>,
+    pub scroll: usize,
+    pub selected: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLine {
     pub id: String,
@@ -1378,6 +1423,7 @@ fn inspector_rows(
     height: usize,
     color: bool,
     focused: bool,
+    activity: Option<&Frame>,
 ) -> Vec<String> {
     let mut rows = vec![styled(
         &clipped(&panel.title, width),
@@ -1416,7 +1462,9 @@ fn inspector_rows(
     let footer = usize::from(!panel.footer.is_empty());
     let available = height.saturating_sub(rows.len() + footer);
     let document_rows = panel.document.as_ref().map(|doc| doc.viewport_rows(width));
-    if panel.kind == InspectorKind::Agents {
+    if let Some(activity) = activity {
+        rows.extend(activity.lines.iter().skip(1).take(available).cloned());
+    } else if panel.kind == InspectorKind::Agents {
         let (first, count, stride) = agent_window(panel, available);
         if panel.agents.is_empty() && available > 0 {
             rows.push(styled(
@@ -1538,6 +1586,33 @@ fn inspector_rows(
     rows.truncate(height);
     rows
 }
+fn animate_activity<'a>(history: &'a [Entry], ui: &Workspace) -> std::borrow::Cow<'a, [Entry]> {
+    if history.iter().any(|entry| entry.role == "activity") {
+        std::borrow::Cow::Owned(
+            history
+                .iter()
+                .cloned()
+                .map(|mut entry| {
+                    if entry.role == "activity" {
+                        let spinner = if ui.animate {
+                            ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
+                                [usize::from(ui.animation_frame) % 8]
+                        } else {
+                            "◷"
+                        };
+                        entry.text = format!("{spinner} {}", entry.text);
+                        if ui.animate {
+                            entry.role = format!("activity:{}", ui.animation_frame % 32);
+                        }
+                    }
+                    entry
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(history)
+    }
+}
 /// Main Carbon screen. Inspectors are temporary and never reduce the chat to
 /// an unreadable sliver: narrow terminals stack chat above the inspector.
 #[allow(clippy::too_many_arguments)]
@@ -1605,9 +1680,14 @@ pub fn layout_workspace(
         .inspector
         .as_ref()
         .is_some_and(|panel| panel.kind == InspectorKind::Plan);
+    let activity_panel = ui
+        .inspector
+        .as_ref()
+        .is_some_and(|panel| panel.activity.is_some());
     let has_panel = ui.inspector.is_some() || side.is_some();
     let side_by_side = has_panel
         && !plan
+        && !activity_panel
         && !ui.wide_diff
         && (width >= 100 || (picture || side.is_some()) && width >= 63);
     let panel_width = if side_by_side {
@@ -1645,7 +1725,7 @@ pub fn layout_workspace(
     );
     let body_height = height.saturating_sub(7 + editor.len()).max(1);
     let stacked = has_panel && !side_by_side;
-    let chat_height = if ui.wide_diff {
+    let chat_height = if ui.wide_diff || activity_panel {
         0
     } else if plan {
         1
@@ -1661,39 +1741,15 @@ pub fn layout_workspace(
     } else {
         body_height
     };
-    let animated;
-    let history: &[Entry] = if history.iter().any(|entry| entry.role == "activity") {
-        animated = history
-            .iter()
-            .cloned()
-            .map(|mut entry| {
-                if entry.role == "activity" {
-                    let spinner = if ui.animate {
-                        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
-                            [usize::from(ui.animation_frame) % 8]
-                    } else {
-                        "◷"
-                    };
-                    entry.text = format!("{spinner} {}", entry.text);
-                    if ui.animate {
-                        entry.role = format!("activity:{}", ui.animation_frame % 32);
-                    }
-                }
-                entry
-            })
-            .collect::<Vec<_>>();
-        &animated
-    } else {
-        history
-    };
+    let history = animate_activity(history, ui);
     let side_headings = side.is_some() && chat_height > 0;
     let chat_rows_count = chat_height - usize::from(side_headings);
     let chat = layout_impl(
-        side.map_or(history, |side| side.parent_history.as_slice()),
+        side.map_or(history.as_ref(), |side| side.parent_history.as_slice()),
         b"",
         0,
         "",
-        true,
+        None,
         side.map_or(scroll, |side| side.parent_scroll),
         "",
         (chat_width - inset.len() + 1, chat_rows_count + 5),
@@ -1725,16 +1781,17 @@ pub fn layout_workspace(
         line.insert_str(0, inset);
     }
     let mut inspector_bounds = None;
+    let mut activity_frame = None;
     let mut panes = vec![None; height];
     let mut side_scroll_limit = None;
     if let Some(side) = side {
         let side_history_height = panel_height.saturating_sub(1);
         let reply = layout_impl(
-            history,
+            &history,
             b"",
             0,
             "",
-            true,
+            None,
             scroll,
             "",
             (panel_width + 1, side_history_height + 5),
@@ -1768,16 +1825,53 @@ pub fn layout_workspace(
             rows.extend(panel_rows);
         }
     } else if let Some(panel) = &ui.inspector {
+        let chrome = 1
+            + usize::from(!panel.tabs.is_empty() && panel_height > 2)
+            + usize::from(panel_height > 3);
+        let content_height =
+            panel_height.saturating_sub(chrome + usize::from(!panel.footer.is_empty()));
+        activity_frame = panel
+            .activity
+            .as_ref()
+            .filter(|activity| !activity.entries.is_empty() && content_height > 0)
+            .and_then(|activity| {
+                let mut frame = layout_impl(
+                    &animate_activity(&activity.entries, ui),
+                    b"",
+                    0,
+                    "",
+                    Some(activity),
+                    activity.scroll,
+                    "",
+                    (panel_width + 1, content_height + 5),
+                    color,
+                    true,
+                )?;
+                if ui.focus == Focus::Inspector
+                    && ui.popup.is_none()
+                    && let Some(selected) = &activity.selected
+                {
+                    for (row, key) in &frame.tool_actions {
+                        if key == selected {
+                            let line = &mut frame.lines[*row];
+                            *line = if color {
+                                styled(&padded(&plain(line), panel_width), SELECTED, true)
+                            } else {
+                                clipped(&format!("› {}", plain(line)), panel_width)
+                            };
+                        }
+                    }
+                }
+                Some(Box::new(frame))
+            });
         let panel_rows = inspector_rows(
             panel,
             panel_width,
             panel_height,
             color,
             ui.focus == Focus::Inspector,
+            activity_frame.as_deref(),
         );
-        let chrome = 1
-            + usize::from(!panel.tabs.is_empty() && panel_height > 2)
-            + usize::from(panel_height > 3);
         inspector_bounds = Some((
             if side_by_side { chat_width + 3 } else { 0 },
             3 + if stacked { chat_height + 1 } else { 0 } + chrome,
@@ -2039,6 +2133,13 @@ pub fn layout_workspace(
             chat_width,
         )),
         chat_inset: inset.len(),
+        activity: if ui.popup.is_none() {
+            activity_frame
+        } else {
+            None
+        },
+        activity_keys: Vec::new(),
+        activity_scroll: 0,
         agent_rows: ui
             .inspector
             .as_ref()
@@ -2872,6 +2973,59 @@ fn source_line(text: &str, color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_model_row_has_the_same_action_as_the_agent_card() {
+        let entries = vec![Entry {
+            role: "agent_card".into(),
+            text: String::new(),
+            action: Some("agent:coordinator".into()),
+            status: None,
+            edit: None,
+            output: None,
+            agent: Some(std::sync::Arc::new(AgentLine {
+                id: "coordinator".into(),
+                title: "Coordinate the approved step".into(),
+                state: "Running".into(),
+                detail: String::new(),
+                role: AgentRole::Coordinator,
+                model: "gpt-6.1-sol".into(),
+                activity: "planning".into(),
+            })),
+        }];
+        let ui = Workspace {
+            inspector: Some(Inspector {
+                title: "Terminals".into(),
+                tabs: vec!["Activity".into(), "Shell".into()],
+                footer: "Esc".into(),
+                activity: Some(ActivityViewport {
+                    entries,
+                    scroll: 0,
+                    selected: None,
+                }),
+                ..Inspector::default()
+            }),
+            focus: Focus::Inspector,
+            ..Workspace::default()
+        };
+        let frame = layout_workspace(&[], b"", 0, "", 0, "", (110, 44), false, &ui).unwrap();
+        for label in [
+            "Coordinate the approved step",
+            "Coordinator · gpt-6.1-sol",
+            "Running",
+        ] {
+            let (row, column) = frame
+                .lines
+                .iter()
+                .enumerate()
+                .find_map(|(row, line)| line.find(label).map(|byte| (row, cells(&line[..byte]))))
+                .unwrap();
+            assert_eq!(
+                frame.activity_at(column, row).unwrap().1,
+                "agent:coordinator"
+            );
+        }
+    }
 
     #[test]
     fn wrapped_chat_selection_omits_the_workspace_gutter() {

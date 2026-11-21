@@ -48,14 +48,30 @@ def escape(screen):
         screen.drain(.01)
 
 
+def activity_open(screen):
+    return any(line.strip() == "Terminals" or line.strip().startswith("Terminals · Events ")
+               for line in visible(screen).splitlines())
+
+
+def open_activity(screen):
+    screen.send(b"\x14")
+    until(screen, lambda _: activity_open(screen), "Terminals Activity opened")
+
+
+def close_activity(screen):
+    escape(screen)
+    until(screen, lambda _: not activity_open(screen), "Terminals Activity closed")
+
+
 def select_result(screen, label):
+    until(screen, lambda _: activity_open(screen), "select a result in Terminals Activity")
+    screen.send("G")
     paint_quiet(screen)
-    screen.send(b"\x07")
-    for _ in range(screen.vt.rows):
+    for _ in range(screen.vt.rows * 2):
+        screen.send(b"\x1b[A")
         paint_quiet(screen)
-        if any(line.startswith(f"  › {label}") for line in visible(screen).splitlines()):
+        if any(line.lstrip().startswith("› ") and label in line for line in body(screen).splitlines()):
             return
-        screen.send(b"\x1b[B")
     raise AssertionError((label, visible(screen)))
 
 
@@ -170,9 +186,9 @@ def terminal(screen):
     until(screen, lambda frame: "Terminal ·" in frame and shell_ready(screen), "embedded shell ready")
 
 
-def seed_history(binary, root, cwd):
+def seed_history(binary, root, cwd, count=20):
     session = None
-    for index in range(20):
+    for index in range(count):
         argv = [str(binary), "--offline", "--cwd", str(cwd)]
         if session:
             argv += ["--session", session]
@@ -312,35 +328,39 @@ def markdown_source_preview(screen, root, cwd):
 
 def inline_tool_details(screen, root, cwd):
     screen.send("TOOLS_TASK\r")
-    until(screen, lambda frame: completed(root, "TOOLS_TASK") and ready(screen) and "get_test_value" in body(screen), "compact completed tool")
-    compact = body(screen)
-    headers = [line for line in compact.splitlines() if re.match(r"  [>v] get_test_value\b", line)]
-    assert len(headers) == 1 and "done" in headers[0], "tool lifecycle was split into duplicate rows"
-    assert "prepared" not in compact and "KnownResult" not in compact and "Arguments" not in compact
+    until(screen, lambda frame: completed(root, "TOOLS_TASK") and ready(screen)
+          and "OMH_TOOL_OK" in frame, "completed tool turn has an assistant reply")
+    assert "get_test_value" not in body(screen) and "Arguments" not in body(screen)
     screen.send("TOOLS_DRAFT Ж")
     until(screen, lambda frame: screen.vt.line(-4) == "  › TOOLS_DRAFT Ж", "tool draft")
-    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("  > get_test_value"))
-    click(screen, 2, row)
+    open_activity(screen)
+    until(screen, lambda _: "get_test_value" in body(screen), "compact completed tool in Activity")
+    compact = body(screen)
+    headers = [line for line in compact.splitlines() if re.match(r"[>v] get_test_value\b", line)]
+    assert len(headers) == 1 and "done" in headers[0], "tool lifecycle was split into duplicate rows"
+    assert "prepared" not in compact and "KnownResult" not in compact and "Arguments" not in compact
+    row = next(row for row in range(3, screen.vt.rows - 5) if "> get_test_value" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index("> get_test_value"), row)
     until(screen, lambda frame: "Arguments" in body(screen) and "Output" in body(screen), "tool row opened inline")
     expanded = body(screen)
     assert "value: OMH_FIXED_VALUE_42" in expanded and "ok: true" in expanded
     assert '{"ok"' not in expanded and "KnownResult" not in expanded, "details exposed the raw protocol instead of readable values"
     assert [row["invocation"]["arguments"] for row in records(root) if row["kind"] == "intent"] == [{}], "display projection changed the invocation arguments"
-    assert len([line for line in expanded.splitlines() if re.match(r"  [>v] get_test_value\b", line)]) == 1
+    assert len([line for line in expanded.splitlines() if re.match(r"(?:› )?[>v] get_test_value\b", line)]) == 1
     assert screen.vt.line(-4) == "  › TOOLS_DRAFT Ж"
-    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("  v get_test_value"))
-    click(screen, 2, row)
+    row = next(row for row in range(3, screen.vt.rows - 5) if "v get_test_value" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index("v get_test_value"), row)
     until(screen, lambda frame: "Arguments" not in body(screen) and "> get_test_value" in body(screen), "tool row collapsed")
 
     # Dragging a tool row selects text rather than activating its click target.
     paint_quiet(screen)
-    row = next(row for row in range(3, screen.vt.rows - 5) if screen.vt.line(row).startswith("  > get_test_value"))
+    row = next(row for row in range(3, screen.vt.rows - 5) if "> get_test_value" in screen.vt.line(row))
+    column = screen.vt.line(row).index("get_test_value")
     at = len(screen.raw)
-    mouse(screen, 0, 4, row)
-    mouse(screen, 32, 4 + len("get_test_value") - 1, row)
-    mouse(screen, 0, 4 + len("get_test_value") - 1, row, release=True)
+    mouse(screen, 0, column, row)
+    mouse(screen, 32, column + len("get_test_value") - 1, row)
+    mouse(screen, 0, column + len("get_test_value") - 1, row, release=True)
     assert copied(screen, at) == "get_test_value", "tool-row drag did not copy the displayed text"
-    escape(screen)
     screen.send(b"\x0f")
     until(screen, lambda frame: "Arguments" in body(screen) and "Output" in body(screen), "Ctrl+O opened tool details")
     assert screen.vt.line(-4) == "  › TOOLS_DRAFT Ж"
@@ -357,7 +377,9 @@ def inline_tool_details(screen, root, cwd):
     assert screen.vt.line(-4) == "  › TOOLS_DRAFT Ж", "read-only output accepted Unicode, paste or deletion into the draft"
     assert body(screen) == output_before and journals(root) == before, "read-only output input changed the view or canonical journal"
     escape(screen)
-    until(screen, lambda frame: "j/k lines" not in frame and "get_test_value" in frame, "output inspector returned to chat")
+    until(screen, lambda frame: activity_open(screen) and "get_test_value" in frame, "output inspector returned to Activity")
+    close_activity(screen)
+    assert "get_test_value" not in body(screen) and "value: OMH_FIXED_VALUE_42" not in body(screen)
     assert journals(root) == before and screen.vt.line(-4) == "  › TOOLS_DRAFT Ж"
 
 
@@ -429,9 +451,9 @@ def mouse_copy(screen, root, cwd):
 def selection_scroll(screen, root, cwd):
     (cwd / "panel").mkdir()
     (cwd / "panel" / "notes.txt").write_text("INSPECTOR_NEVER_COPY\n")
-    session = seed_history(screen.child.args[0], root, cwd)
+    session = seed_history(screen.child.args[0], root, cwd, count=34)
     local(screen, f"/sessions {session}")
-    until(screen, lambda frame: "HISTORY_SEED_19" in frame and ready(screen), "selectable canonical tail")
+    until(screen, lambda frame: "HISTORY_SEED_33" in frame and ready(screen), "selectable canonical tail")
     screen.resize(126, 32)
     screen.vt = Terminal(126, 32)
     local(screen, "/files")
@@ -445,12 +467,12 @@ def selection_scroll(screen, root, cwd):
     until(screen, lambda frame: "panel/" in frame, "h returned to the parent")
     escape(screen)
     local(screen, "/files panel/notes.txt")
-    until(screen, lambda frame: "INSPECTOR_NEVER_COPY" in frame and "HISTORY_SEED_19" in frame, "split pane for selection")
+    until(screen, lambda frame: "INSPECTOR_NEVER_COPY" in frame and "HISTORY_SEED_33" in frame, "split pane for selection")
     paint_quiet(screen)
-    row = next(row for row in range(3, 27) if "HISTORY_SEED_19" in screen.vt.line(row))
+    row = next(row for row in range(3, 27) if "HISTORY_SEED_33" in screen.vt.line(row))
     first = body(screen)
     at = len(screen.raw)
-    mouse(screen, 0, len("  > HISTORY_SEED_19") - 1, row)
+    mouse(screen, 0, len("  > HISTORY_SEED_33") - 1, row)
     mouse(screen, 32, 10, 3)
     until(screen, lambda frame: body(screen) != first and reading(screen), "drag at the top edge scrolls")
     for _ in range(240):
@@ -464,9 +486,26 @@ def selection_scroll(screen, root, cwd):
     paint_quiet(screen)
     mouse(screen, 0, 4, row, release=True)
     text = copied(screen, at)
-    assert "HISTORY_FIRST" in text and "HISTORY_SEED_19" in text, text[-500:]
+    assert "HISTORY_FIRST" in text and "HISTORY_SEED_33" in text, text[-500:]
     assert "INSPECTOR_NEVER_COPY" not in text and "Files" not in text and "\x1b" not in text
     assert screen.raw[at:].count(b"\x1b]52;c;") == 1
+    before = journals(root)
+    open_activity(screen)
+    until(screen, lambda _: "get_test_value" in body(screen), "operation history in Terminals")
+    assert "HISTORY_FIRST" not in body(screen) and "HISTORY_SEED_33" not in body(screen)
+    for _ in range(8):
+        screen.send(b"\x1b[5~")
+        paint_quiet(screen)
+        if "Terminals · Events " in body(screen):
+            break
+    else:
+        raise AssertionError("Activity did not cross a journal page")
+    assert "get_test_value" in body(screen), "canonical operations disappeared on the older page"
+    screen.send("G")
+    until(screen, lambda _: activity_open(screen) and "Terminals · Events " not in body(screen),
+          "return to latest operation history")
+    close_activity(screen)
+    assert reading(screen) and journals(root) == before, "Activity paging changed chat reading state or journal"
 
 
 def branches(screen, root, cwd):
@@ -501,8 +540,15 @@ def branches(screen, root, cwd):
     screen.send("side-followup")
     until(screen, lambda _: "› side-followup" in wide_panes()[1], "draft in the BTW composer")
     screen.send(b"\r")
-    until(screen, lambda _: completed(root, "side-followup") and wide_panes()[1].count(answer) == 2,
-          "second BTW answer")
+    def both_side_answers(_):
+        # A restored parent answer may precede the two side turns in this pane.
+        side = wide_panes()[1]
+        _, first, rest = side.partition("> side-marker")
+        first_reply, second, second_reply = rest.partition("> side-followup")
+        return (first and second and first_reply.count(answer) == 1
+                and second_reply.count(answer) == 1 and completed(root, "side-followup"))
+
+    until(screen, both_side_answers, "second BTW answer")
     assert "side-followup" not in wide_panes()[0]
     side_sessions = []
     for session in (root / "home/.ansa/sessions").iterdir():
@@ -810,11 +856,15 @@ def native_terminal_panel(screen, root, cwd):
     screen.send("/term")
     until(screen, lambda frame: "/terminals" in body(screen), "native terminal command completion")
     screen.send(b"\t\r")
+    until(screen, lambda _: activity_open(screen), "Activity works before the agent has opened a shell")
+    row = next(row for row in range(screen.vt.rows) if screen.vt.line(row).strip() == "Activity  Shell")
+    click(screen, screen.vt.line(row).index("Shell"), row)
     until(screen, lambda frame: "Agent terminal" in frame and "The agent has not opened a terminal yet" in frame,
           "managed terminal panel in the normal Carbon entry point")
     session, = catalog.glob("*/terminal-host-v1/terminal-v1.json")
     escape(screen)
-    until(screen, lambda frame: "Agent terminal" not in frame, "Esc returned to the chat")
+    until(screen, lambda frame: "No activity" in frame and activity_open(screen), "Esc returned to Activity")
+    close_activity(screen)
     screen.send("KEEP_FILES_DRAFT\x06")
     until(screen, lambda frame: "Files" in frame and "KEEP_FILES_DRAFT" in screen.vt.line(-4), "Ctrl+F opens files without submitting a draft")
     escape(screen)
@@ -822,11 +872,15 @@ def native_terminal_panel(screen, root, cwd):
     screen.send(b"\x15")
     screen.send("TERMINAL_DEMO\r")
     until(screen, lambda frame: completed(root, "TERMINAL_DEMO"), "offline terminal tool created a PTY")
-    screen.send(b"\x14")
+    assert "terminal_create" not in body(screen) and "ANSA_TERMINAL_READY" not in body(screen)
+    open_activity(screen)
+    screen.send("s")
     until(screen, lambda frame: "Demo terminal" in frame and "ANSA_TERMINAL_READY" in body(screen),
-          "Carbon renders live PTY output")
-    escape(screen)
-    until(screen, lambda frame: "ANSA_TERMINAL_READY" not in body(screen), "Esc returned to the chat")
+          "Carbon renders live PTY output on the Shell tab")
+    screen.send("a")
+    until(screen, lambda frame: activity_open(screen) and "terminal_create" in frame, "return to recorded terminal operations")
+    close_activity(screen)
+    assert "ANSA_TERMINAL_READY" not in body(screen)
     local(screen, "/exit")
     result = screen.finish()
     assert result["exit"] == 0 and result["termios_restored"]
@@ -845,9 +899,11 @@ def native_terminal_panel(screen, root, cwd):
     restarted_host = session.parents[1] / "terminal-host-v1-2"
     until(resumed, lambda frame: (restarted_host / "0001.json").is_file(),
           "reopened conversation can start a fresh shell")
-    local(resumed, "/terminals")
-    until(resumed, lambda frame: "ANSA_TERMINAL_READY" in body(resumed), "reopened shell is live")
+    local(resumed, "/terminals Demo terminal")
+    until(resumed, lambda frame: "ANSA_TERMINAL_READY" in body(resumed), "reopened named shell is live")
     escape(resumed)
+    until(resumed, lambda _: activity_open(resumed), "named shell returns to Activity")
+    close_activity(resumed)
     local(resumed, "/exit")
     resumed.result = resumed.finish()
     assert resumed.result["exit"] == 0 and resumed.result["termios_restored"]
@@ -1230,8 +1286,14 @@ def orchestration_candidate(screen, root, cwd):
     assert not (home := root / "home/.ansa/orchestration").exists()
     assert "./check.sh" in visible(screen) and not check_marker.exists()
     screen.send(b"\r")
+    until(screen, lambda frame: "ansa-result готова" in frame, "candidate synthesis in the chat", timeout=15)
+    assert all(label not in body(screen) for label in ("Verified changes", "Approved plan", "report.txt · +1 −1", "./check.sh · passed"))
+    open_activity(screen)
+    until(screen, lambda frame: "report.txt · +1 −1" in frame, "verified candidate in Activity")
+    select_result(screen, "report.txt · +1 −1")
+    screen.send(b"\r")
     until(screen, lambda frame: "Verified changes" in frame and "after fixture" in frame,
-          "reviewed isolated candidate and diff", timeout=15)
+          "reviewed isolated candidate and diff")
     checkout, = home.glob("*/*/checkout")
     release = json.loads((checkout.parent / "release.json").read_text())
     assert release["candidate"] == git("rev-parse", "ansa-result", path=checkout).strip()
@@ -1242,7 +1304,6 @@ def orchestration_candidate(screen, root, cwd):
     assert git("status", "--short") == before
     assert check_marker.read_text() == "x"
     assert "project snapshot → ansa-result" in visible(screen)
-    screen.send(b"\t")
     for cols, rows in [(80, 24), (120, 36)]:
         screen.resize(cols, rows)
         screen.vt = Terminal(cols, rows)
@@ -1265,17 +1326,19 @@ def orchestration_candidate(screen, root, cwd):
         return ("- before fixture" in rows[start + 1]
                 and "+ after fixture" in rows[start + 2])
 
-    until(screen, candidate_excerpt, "verified candidate shows the actual change once below its summary")
-    until(screen, lambda frame: "ansa-result готова" in frame, "candidate synthesis in the chat")
+    until(screen, candidate_excerpt, "Activity shows the actual change once below its summary")
+    close_activity(screen)
     screen.send("review draft")
-    until(screen, lambda frame: "./check.sh · passed" in frame, "confirmed command as chat result")
+    until(screen, lambda _: "review draft" in screen.vt.line(-4), "draft in the chat")
+    open_activity(screen)
+    until(screen, lambda frame: "./check.sh · passed" in frame, "confirmed command in Activity")
     select_result(screen, "./check.sh · passed")
     screen.send(b"\r")
     until(screen, lambda frame: "fixture-check-output" in frame, "show actual command output")
     escape(screen)
     until(screen, lambda frame: "› ./check.sh · passed" in frame and "review draft" in screen.vt.line(-4),
           "same keyboard result and draft after Esc")
-    escape(screen)
+    close_activity(screen)
     screen.send(b"\x03")
     results = [event for event in records(root) if event["kind"] == "outcome"]
     assert len(results) == 2, "edit and independent diff review should each use a native tool"
@@ -1295,23 +1358,30 @@ def orchestration_candidate(screen, root, cwd):
     pending.chmod(0o600)
     restarted = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--session", parent_id])
     screen.additional_screens = [("restart", restarted)]
+    assert "Approved plan" not in body(restarted)
+    open_activity(restarted)
     until(restarted, lambda frame: "Approved plan" in frame, "plan link after restart")
     select_result(restarted, "Approved plan")
     restarted.send(b"\r")
     until(restarted, lambda frame: "Original request" in frame, "original question from approved run ledger")
     escape(restarted)
-    escape(restarted)
-    until(restarted, lambda frame: "./check.sh · passed" in frame, "verified checks recovered from their receipts")
+    until(restarted, lambda frame: activity_open(restarted) and "./check.sh · passed" in frame, "verified checks recovered from their receipts")
     select_result(restarted, "./check.sh · passed")
     restarted.send(b"\r")
     until(restarted, lambda frame: "fixture-check-output" in frame, "verified command output after restarting")
     escape(restarted)
-    escape(restarted)
+    until(restarted, lambda _: activity_open(restarted), "restored output returns to Activity")
+    close_activity(restarted)
     local(restarted, "/sessions")
     until(restarted, lambda frame: "Resume orchestration" in frame, "explicit continuation from original ledgers")
     restarted.send(b"\r")
-    until(restarted, lambda frame: "Verified changes" in frame, "reconciled exact original candidate", timeout=15)
-    until(restarted, lambda frame: (run / "summary-admitted").is_file(), "restored durable handoff receipt")
+    until(restarted, lambda frame: (run / "summary-admitted").is_file(), "restored durable handoff receipt", timeout=15)
+    assert "Verified changes" not in body(restarted)
+    open_activity(restarted)
+    until(restarted, lambda frame: "report.txt · +1 −1" in frame, "reconciled exact original candidate")
+    select_result(restarted, "report.txt · +1 −1")
+    restarted.send(b"\r")
+    until(restarted, lambda frame: "Verified changes" in frame and "after fixture" in frame, "reconciled candidate diff")
     assert git("rev-parse", "ansa-result", path=checkout) == frozen
     assert check_marker.read_text() == "x", "recovery ran the completed command again"
     assert journals(root) == before_journals, "reconciliation executed a second tool or repeated the handoff"
@@ -1378,11 +1448,11 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     local(restarted, "/sessions")
     until(restarted, lambda frame: "Resume orchestration" in frame, "saved run can resume")
     restarted.send(b"\r")
-    expected = "Plan stopped (run_budget)" if exhausted else "Verified changes"
-    until(restarted, lambda frame: expected in frame or "run_step_unavailable" in frame,
-          "explicit reviewer resume", timeout=15)
-    assert expected in visible(restarted), visible(restarted)
     if exhausted:
+        expected = "Plan stopped (run_budget)"
+        until(restarted, lambda frame: expected in frame or "run_step_unavailable" in frame,
+              "explicit reviewer resume", timeout=15)
+        assert expected in visible(restarted), visible(restarted)
         assert not (run / "release.json").exists()
         assert not (run / "summary-admitted").exists()
         assert subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/ansa-result"],
@@ -1395,7 +1465,13 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
         escape(restarted)
         assert journals(root) == before, "Session picker continued an exhausted review"
     else:
-        until(restarted, lambda _: (run / "summary-admitted").is_file(), "durable candidate acceptance")
+        until(restarted, lambda _: (run / "summary-admitted").is_file(), "durable candidate acceptance", timeout=15)
+        assert "Verified changes" not in body(restarted)
+        open_activity(restarted)
+        until(restarted, lambda frame: "Independent review · passed" in frame, "resumed verification in Activity")
+        select_result(restarted, "report.txt · +1 −1")
+        restarted.send(b"\r")
+        until(restarted, lambda frame: "Verified changes" in frame and "after fixture review-resume" in frame, "resumed candidate diff")
         assert git("rev-parse", "ansa-result", path=checkout) == frozen
         assert json.loads((run / "release.json").read_text())["candidate"] == frozen
     assert git("rev-parse", "HEAD") == original and git("status", "--short") == previous_status
@@ -1438,7 +1514,10 @@ def openrouter_orchestration(screen, root, cwd):
     assert not (root / "home/.ansa/orchestration").exists()
     assert "Follow-up recommendation" in visible(screen)
     screen.send(b"\r")
-    until(screen, lambda frame: "0/1 agents" in frame, "read-only plan starts despite a post-report recommendation")
+    open_activity(screen)
+    until(screen, lambda frame: "0/1 steps done" in frame, "read-only plan starts despite a post-report recommendation")
+    close_activity(screen)
+    assert "Work plan" not in body(screen) and "0/1 steps done" not in body(screen)
     local(screen, "/effort low")
     until(screen, lambda frame: "Wait for orchestration to finish before switching models" in frame,
           "the orchestration generation remains fixed while a helper runs")
@@ -1446,39 +1525,31 @@ def openrouter_orchestration(screen, root, cwd):
     screen.send("keep draft")
     until(screen, lambda frame: "keep draft" in screen.vt.line(-4), "draft retained while helper runs")
     assert "Draft · send after the task finishes" not in visible(screen)
+    open_activity(screen)
     held_child.unlink()
     until(screen, lambda frame: "Coordinator is writing the summary" in frame
           and "Draft · send after the task finishes" in frame, "summary phase comes from coordinator state")
+    close_activity(screen)
+    assert "Coordinator is writing the summary" not in body(screen)
     held_summary.unlink()
     until(screen, lambda frame: "OPENROUTER_CARBON_DONE" in frame, "coordinator summary", timeout=15)
-    until(screen, lambda frame: "Coordinator is writing the summary" not in frame and "Approved plan" in frame,
-          "completed coordination leaves original request and plan in history")
+    assert "Approved plan" not in body(screen)
     assert "summarize fixture" in visible(screen) and "END_OF_USER_REQUEST" in visible(screen) and "keep draft" in screen.vt.line(-4)
     assert not any(row.get("text") == "keep draft" for row in records(root))
+    open_activity(screen)
+    until(screen, lambda frame: "Approved plan" in frame, "approved plan in Activity after completion")
     select_result(screen, "Approved plan")
     screen.send(b"\r")
     until(screen, lambda frame: "OPENROUTER_CARBON_PLAN" in frame, "read approved plan from its journal")
     escape(screen)
-    escape(screen)
+    until(screen, lambda _: activity_open(screen), "approved plan returns to Activity")
+    close_activity(screen)
     screen.send(b"\x03")
     local(screen, "/exit")
     return "normal"
 
 
-def siwc_orchestrate_plus(screen, root, cwd):
-    def git(*args, path=cwd):
-        return subprocess.check_output(["git", *args], cwd=path, text=True)
-
-    report = cwd / "report.txt"
-    report.write_text("before fixture\n")
-    check = cwd / "check.sh"
-    marker = root / "check-ran"
-    check.write_text(f'#!/bin/sh\nset -eu\ngrep -q "^after fixture" report.txt\ncat report.txt >> "{marker}"\nprintf "fixture-check-output\\n"\n')
-    check.chmod(0o700)
-    git("init", "-q")
-    git("add", "report.txt", "check.sh")
-    git("-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "fixture")
-    original = git("rev-parse", "HEAD")
+def configure_plus_roles(screen):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "SIWC adapter starts Carbon")
     local(screen, "/orchestrate+")
     until(screen, lambda frame: "Save role models" in frame, "all three role selectors")
@@ -1497,6 +1568,23 @@ def siwc_orchestrate_plus(screen, root, cwd):
               f"{role} selection")
     screen.send(b"\r")
     until(screen, lambda frame: "Orchestrate+ role models saved" in frame, "durable role profile")
+
+
+def siwc_orchestrate_plus(screen, root, cwd):
+    def git(*args, path=cwd):
+        return subprocess.check_output(["git", *args], cwd=path, text=True)
+
+    report = cwd / "report.txt"
+    report.write_text("before fixture\n")
+    check = cwd / "check.sh"
+    marker = root / "check-ran"
+    check.write_text(f'#!/bin/sh\nset -eu\ngrep -q "^after fixture" report.txt\ncat report.txt >> "{marker}"\nprintf "fixture-check-output\\n"\n')
+    check.chmod(0o700)
+    git("init", "-q")
+    git("add", "report.txt", "check.sh")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "fixture")
+    original = git("rev-parse", "HEAD")
+    configure_plus_roles(screen)
     local(screen, "/model gpt-6.1-sol")
     until(screen, lambda frame: "Default" in frame and "Enter apply" in frame, "default conversation effort")
     screen.send(b"\r")
@@ -1508,7 +1596,8 @@ def siwc_orchestrate_plus(screen, root, cwd):
           "previous Work turn from a different model settled")
     screen.send(b"\t\t\t")
     until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2), "ordinary Orchestrate+ mode")
-    screen.send(b"Exercise quick, fresh, and final review decisions\r")
+    prompt = "Exercise quick, fresh, and final review decisions"
+    screen.send(prompt + "\r")
     until(screen, lambda frame: all(label in frame for label in ("PLUS_CARBON_PLAN", "Start", "Refine", "Cancel")),
           "approval shows plan and role models")
     frame = visible(screen)
@@ -1517,6 +1606,10 @@ def siwc_orchestrate_plus(screen, root, cwd):
     assert "./check.sh" in frame and not marker.exists()
     ledgers = root / "home/.ansa/orchestration"
     assert not ledgers.exists()
+    assert report.read_text() == "before fixture\n" and not marker.exists()
+    assert len(journals(root)) == 1, "survey repair launched child sessions before approval"
+    before_approval = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
+    assert before_approval == ["prior-work", "survey-for-implementation", "strong-plan"], before_approval
     holds = {stage: root / f"hold-plus-{stage}"
              for stage in ("coordinate", "worker-rejected", "whole-review")}
     for hold in holds.values():
@@ -1532,40 +1625,42 @@ def siwc_orchestrate_plus(screen, root, cwd):
                    for index, row in enumerate(rows) if index)
 
     screen.send(b"\r")
-    until(screen, lambda frame: held("coordinate") and all(label in frame for label in (
-        "Work plan", "□ Set report to after fixture", "0/2 agents done",
+    until(screen, lambda _: held("coordinate") and body(screen).count(prompt) == 1,
+          "repaired proposal leaves one visible user request in the main conversation")
+    assert all(label not in body(screen) for label in ("Work plan", "0/2 steps done", "Coordinator · gpt-6.1-sol"))
+    open_activity(screen)
+    until(screen, lambda frame: all(label in frame for label in (
+        "Proposed plan", "Work plan", "□ Set report to after fixture", "0/2 steps done",
         "Coordinator · gpt-6.1-sol", "Running · planning",
     )),
-          "coordinator active before any approved step completes")
+          "coordinator active and historical plan links loaded before the first step")
+    assert body(screen).count("Proposed plan") == 1 and prompt not in body(screen)
+    paint_quiet(screen)
     row = next(index for index, line in enumerate(visible(screen).splitlines())
                if "Coordinator · gpt-6.1-sol" in line)
     click(screen, screen.vt.line(row).index("Coordinator · gpt-6.1-sol"), row)
     until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
-          "clicking the model row in the chat opens the coordinator's transcript")
+          "clicking the model row in Activity opens the coordinator's transcript")
     escape(screen)
-    until(screen, lambda frame: "Conversation agents" in frame, "Escape restores agent roster")
-    escape(screen)
-    until(screen, lambda frame: "Conversation agents" not in frame and "0/2 agents done" in frame,
-          "Escape restores the live chat")
-    select_result(screen, " ■   Set report to after fixture")
+    until(screen, lambda frame: activity_open(screen) and "0/2 steps done" in frame,
+          "Escape restores live Activity")
+    select_result(screen, "Set report to after fixture")
     screen.send(b"\r")
     until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
-          "Enter opens the selected card in the chat")
+          "Enter opens the selected card in Activity")
     escape(screen)
-    until(screen, lambda frame: "Conversation agents" in frame, "Escape returns to the roster")
-    escape(screen)
-    if reading(screen):
-        escape(screen)
-    until(screen, lambda frame: "Conversation agents" not in frame and "0/2 agents done" in frame,
-          "Return to the coordinator's live chat")
+    until(screen, lambda frame: activity_open(screen) and "0/2 steps done" in frame,
+          "Escape restores the coordinator's live activity")
     row = next(index for index, line in enumerate(visible(screen).splitlines())
-               if "0/2 agents done" in line)
-    click(screen, screen.vt.line(row).index("0/2 agents done"), row)
+               if "0/2 steps done" in line)
+    click(screen, screen.vt.line(row).index("0/2 steps done"), row)
     until(screen, lambda frame: "Conversation agents" in frame
           and running_role("Coordinator · planning · gpt-6.1-sol", "Set report to after fixture"),
           "clickable live activity opens the running coordinator")
     escape(screen)
-    until(screen, lambda frame: "Conversation agents" not in frame, "Escape returns to chat")
+    until(screen, lambda frame: activity_open(screen) and "Conversation agents" not in frame,
+          "Escape returns from the roster to Activity")
+    close_activity(screen)
     local(screen, "/agents")
     until(screen, lambda frame: "Conversation agents" in frame
           and running_role("Coordinator · planning · gpt-6.1-sol", "Set report to after fixture"),
@@ -1596,7 +1691,14 @@ def siwc_orchestrate_plus(screen, root, cwd):
     if reading(screen):
         escape(screen)
     holds["whole-review"].unlink()
-    until(screen, lambda frame: "PLUS_CARBON_DONE" in frame, "completed Plus synthesis", timeout=45)
+    def completed_plus_synthesis(frame):
+        rows = records(root)
+        turns = {event["turn"] for event in rows if event.get("handoff") is True}
+        return ("PLUS_CARBON_DONE" in frame and "(response preview)" not in frame
+                and "Ctrl+C stop" not in screen.vt.line(-2)
+                and any(event["kind"] == "done" and event["turn"] in turns for event in rows))
+
+    until(screen, completed_plus_synthesis, "durable Plus synthesis and idle composer", timeout=45)
 
     checkout, = ledgers.glob("*/*/checkout")
     assert git("show", "ansa-result:report.txt", path=checkout) == "after fixture reviewed\n"
@@ -1615,10 +1717,11 @@ def siwc_orchestrate_plus(screen, root, cwd):
     until(screen, lambda frame: completed(root, followup) and "PLUS_CONTINUITY_OK" in frame,
           "the strong model continues the original conversation")
     accepted = [row for row in records(root) if row["kind"] == "accepted"]
-    draft, = [row for row in accepted if row.get("draft")]
+    first_draft, repair_draft = [row for row in accepted if row.get("draft")]
+    assert first_draft["text"] == prompt
     summary_turn, = [row for row in accepted if row.get("handoff")]
     continued, = [row for row in accepted if row["text"] == followup]
-    for row in (draft, summary_turn, continued):
+    for row in (first_draft, repair_draft, summary_turn, continued):
         request = row["next"]
         assert request["binding"]["requested_model"] == "gpt-6.2-sol"
         assert request["effort"] == "high"
@@ -1627,7 +1730,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
                if item.get("role") == "assistant")
     trace = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert trace == [
-        "prior-work", "strong-plan", "coordinate", *["worker-rejected", "reject"] * 3,
+        "prior-work", "survey-for-implementation", "strong-plan", "coordinate", *["worker-rejected", "reject"] * 3,
         "escalate-quick", "quick-fix", "quick-verify", "coordinate",
         *["worker-rejected", "reject"] * 3, "escalate-fresh", "fresh-coordinate",
         "fresh-worker", "fresh-verify", "whole-review", "review-coordinate",
@@ -1642,6 +1745,111 @@ def siwc_orchestrate_plus(screen, root, cwd):
             if turns:
                 reviewers.append(turns)
     assert reviewers == [["plus-review-0", "plus-review-1"]], reviewers
+    local(screen, "/exit")
+    return "normal"
+
+
+def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
+    (root / "orchestration-plus-blocked").touch()
+    if reject:
+        (root / "orchestration-plus-reject-summary").touch()
+    configure_plus_roles(screen)
+    screen.send(b"\t\t\t")
+    until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2), "orchestration mode")
+    screen.send(b"Inspect Git status with the approved read scope\r")
+    until(screen, lambda frame: "PLUS_BLOCKED_PLAN" in frame and "Start" in frame,
+          "read-only plan approval")
+    screen.send(b"\r")
+
+    def handoff_event(kind):
+        rows = records(root)
+        turn = next((row["turn"] for row in rows if row.get("handoff") is True), None)
+        return turn is not None and any(row["kind"] == kind and row.get("turn") == turn for row in rows)
+
+    if reject:
+        until(screen, lambda _: handoff_event("pause"), "failed synthesis pauses durably")
+        screen.send(b"\x03")
+        until(screen, lambda _: handoff_event("cancel"), "explicit cancel after synthesis failure")
+    else:
+        until(screen, lambda frame: handoff_event("done") and "PLUS_STOPPED" in frame,
+              "parent answers why the approved run stopped")
+    until(screen, lambda _: "Tab mode" in screen.vt.line(-2), "parent idle after stopped handoff")
+    local(screen, "/basic")
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol")
+          and "Orchestrate+" not in screen.vt.line(-2), "return to Work")
+    followup = "PLUS_BLOCKED_FOLLOWUP"
+    screen.send(followup + "\r")
+    until(screen, lambda frame: completed(root, followup) and "PLUS_BLOCKED_CONTEXT_RETAINED" in frame,
+          "normal Work turn receives the authoritative stop evidence")
+    rows = records(root)
+    handoff, = [row for row in rows if row.get("handoff") is True]
+    evidence = json.loads(handoff["text"])
+    assert evidence["orchestration_outcome"] == "stopped" and evidence["reported_status"] == "blocked"
+    assert evidence["reason"] == "Approved read-only tools cannot run Git status"
+    assert handoff["next"]["binding"]["requested_model"] == "gpt-6.2-sol"
+    assert not any(row["kind"] == "outcome" for row in rows)
+    run, = (root / "home/.ansa/orchestration").glob("*/*")
+    assert not (run / "checkout").exists() and not (run / "release.json").exists()
+    events = [json.loads(path.read_text())["body"]["event"] for path in sorted((run / "ledger").glob("event-*.json"))]
+    stopped, = [event for event in events if event["event"] == "plus_stopped"]
+    assert stopped["step"] == evidence["task_id"] == "status"
+    assert stopped["phase"] == evidence["phase"] == "strong escalation"
+    assert stopped["report"]["status"] == evidence["reported_status"]
+    assert stopped["report"]["summary"] == evidence["reason"]
+    receipt = run / "summary-admitted"
+    assert receipt.read_text() == run.name
+    if reject:
+        # Simulate a lost delivery receipt. Resuming a stopped ledger must only
+        # reconcile the original handoff, even after the user cancelled synthesis.
+        before_journals = journals(root)
+        receipt.unlink()
+        local(screen, "/sessions")
+        until(screen, lambda frame: "Resume orchestration" in frame and "Stopped at status" in frame,
+              "stopped run is discoverable from its persisted ledger")
+        screen.send(b"\r")
+        until(screen, lambda _: receipt.exists(), "recover stopped handoff without restarting workers")
+        assert receipt.read_text() == run.name and journals(root) == before_journals
+    stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
+    assert stages == [
+        "strong-plan", "coordinate", *["worker-blocked", "verify-blocked"] * 3,
+        "escalate-blocked", "stopped-summary", "later-work",
+    ], stages
+    local(screen, "/exit")
+    return "normal"
+
+
+def siwc_orchestrate_plus_implement(screen, root, cwd):
+    (root / "orchestration-plus-implement").touch()
+    report = cwd / "report.txt"
+    report.write_text("before fixture\n")
+    marker = root / "implementation-check-ran"
+    check = cwd / "check.sh"
+    check.write_text(f'#!/bin/sh\nset -eu\ngrep -q "^after fixture" report.txt\ntouch "{marker}"\n')
+    check.chmod(0o700)
+    configure_plus_roles(screen)
+    screen.send(b"\t\t\t")
+    until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2), "orchestration mode")
+    screen.send(b"Change report.txt to after fixture and run the test\r")
+    until(screen, lambda frame: all(label in frame for label in (
+        "MISLABELED_INVESTIGATION", "Start read only", "Implement",
+    )), "the model mislabeled the requested change as an investigation")
+    assert not (root / "home/.ansa/orchestration").exists()
+    screen.send(b"\x1b[B\x1b[B")
+    until(screen, lambda frame: "[Implement]" in frame, "Implement is selected")
+    screen.send(b"\r")
+    until(screen, lambda frame: all(label in frame for label in (
+        "IMPLEMENT_SCOPED_CHANGE", "Change the fixture report", "report.txt", "./check.sh", "[Start]",
+    )), "a scoped implementation with executable verification requires fresh approval")
+    assert not (root / "home/.ansa/orchestration").exists()
+    rows = records(root)
+    drafts = [row for row in rows if row["kind"] == "accepted"]
+    assert len(drafts) == 2 and all(row.get("draft") for row in drafts)
+    assert not any(row["kind"] in ("intent", "outcome") for row in rows)
+    assert report.read_text() == "before fixture\n" and not marker.exists()
+    stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
+    assert stages == ["mislabeled-investigation", "implement-proposal"], stages
+    escape(screen)
+    until(screen, lambda frame: "[Start]" not in frame, "unapproved implementation is dismissed")
     local(screen, "/exit")
     return "normal"
 
@@ -1777,8 +1985,11 @@ def active_plan_clarification(screen, root, cwd):
     until(screen, lambda _: any(event.get("event") == "post" and event["step"] == "first" for event in events()), "first step running")
     clarification = "Focus the comparison on the first line"
     screen.send(clarification + "\r")
-    until(screen, lambda frame: "Coordinator receives the clarification" in frame, "durable clarification")
+    open_activity(screen)
+    until(screen, lambda frame: "Coordinator receives the clarification" in frame, "clarification status in Activity")
+    close_activity(screen)
     until(screen, lambda frame: "Оба помощника завершили проверку" in frame, "parent summary")
+    assert "Coordinator receives the clarification" not in body(screen) and "Work plan" not in body(screen)
     records = events()
     accepted, = [i for i, event in enumerate(records) if event.get("event") == "clarification" and event["text"] == clarification]
     finished, = [i for i, event in enumerate(records) if event.get("event") == "finished" and event["step"] == "first"]
@@ -1818,8 +2029,12 @@ def main():
              ("editor-missing", editor_missing), ("normal-exit", normal_exit),
              ("openrouter-orchestration", openrouter_orchestration),
              ("siwc-orchestration", siwc_orchestration),
-             ("siwc-orchestrate-plus", siwc_orchestrate_plus)]
-    transport_cases = {"openrouter-orchestration", "siwc-orchestration", "siwc-orchestrate-plus"}
+             ("siwc-orchestrate-plus", siwc_orchestrate_plus),
+             ("siwc-orchestrate-plus-implement", siwc_orchestrate_plus_implement),
+             ("siwc-orchestrate-plus-blocked", siwc_orchestrate_plus_blocked),
+             ("siwc-orchestrate-plus-blocked-rejected", lambda *args: siwc_orchestrate_plus_blocked(*args, reject=True))]
+    transport_cases = {"openrouter-orchestration", "siwc-orchestration",
+                       *(name for name, _ in cases if name.startswith("siwc-orchestrate-plus"))}
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -1854,10 +2069,10 @@ def main():
                     nested = home / "Workspace/pet/ansa"
                     nested.mkdir(parents=True)
                     (nested / "AGENTS.md").write_text("Follow the fixture instructions.\n" * 600 + "END_NESTED_INSTRUCTIONS\n")
-                if name == "siwc-orchestrate-plus":
+                if name.startswith("siwc-orchestrate-plus"):
                     (root / "orchestration-plus").touch()
                 adapter = "openrouter-carbon" if name.startswith("openrouter-") else "siwc-carbon"
-                size = (110, 44) if name == "siwc-orchestrate-plus" else (100, 32)
+                size = (110, 44) if name.startswith("siwc-orchestrate-plus") else (100, 32)
                 screen = Pty(str(args.binary.resolve()), root, home, cwd, "", True, size=size,
                              argv=["--frontend-fixture", str(root), adapter])
                 screen.vt = Terminal(*size)

@@ -29,6 +29,13 @@ pub struct Step {
     pub acceptance: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestedOutcome {
+    Implementation,
+    Investigation,
+}
+
 /// Visible label for typed helper assignments, including journals written before Carbon had a roster.
 pub(crate) fn assignment_title(text: &str) -> String {
     let first = text.lines().next().unwrap_or(text);
@@ -95,6 +102,8 @@ impl Step {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Proposal {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_outcome: Option<RequestedOutcome>,
     schema_version: u8,
     summary: String,
     steps: Vec<Step>,
@@ -273,7 +282,24 @@ impl Plan {
         &self.0.manual_checks
     }
 
+    pub(crate) fn require_implementation(&mut self) {
+        self.0.requested_outcome = Some(RequestedOutcome::Implementation);
+    }
+
     pub(crate) fn execution_ready(&self) -> Result<()> {
+        if let Some(outcome) = self.0.requested_outcome {
+            match outcome {
+                RequestedOutcome::Implementation
+                    if self.is_read_only() || self.command_checks().is_empty() =>
+                {
+                    return Err("orchestration_implementation_required");
+                }
+                RequestedOutcome::Investigation if !self.is_read_only() => {
+                    return Err("orchestration_investigation_only");
+                }
+                _ => {}
+            }
+        }
         if self.is_read_only() {
             return Ok(());
         }
@@ -495,6 +521,7 @@ mod tests {
     fn plan(steps: Vec<Step>) -> Result<Plan> {
         Plan::parse(
             &serde_json::to_string(&Proposal {
+                requested_outcome: None,
                 schema_version: 1,
                 summary: "Find out why the report sometimes comes back empty".into(),
                 steps,
@@ -505,6 +532,31 @@ mod tests {
             })
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn implementation_requires_an_approved_edit_and_executable_check() {
+        let mut proposed = plan(vec![step("inspect", Access::Read, "src", &[])]).unwrap();
+        assert!(proposed.execution_ready().is_ok());
+        proposed.require_implementation();
+        assert_eq!(
+            proposed.execution_ready(),
+            Err("orchestration_implementation_required")
+        );
+        proposed.0.steps[0].access = Access::Write;
+        assert_eq!(
+            proposed.execution_ready(),
+            Err("orchestration_implementation_required")
+        );
+        proposed.0.command_checks.push(CommandCheck {
+            argv: vec!["test".into(), "-s".into(), "src".into()],
+        });
+        assert!(proposed.execution_ready().is_ok());
+        proposed.0.requested_outcome = Some(RequestedOutcome::Investigation);
+        assert_eq!(
+            proposed.execution_ready(),
+            Err("orchestration_investigation_only")
+        );
     }
 
     fn ids<'a>(plan: &'a Plan, progress: &BTreeMap<String, Progress>) -> Vec<&'a str> {

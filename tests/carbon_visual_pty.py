@@ -216,6 +216,21 @@ def click(screen, column, row):
     mouse(screen, 0, column, row); mouse(screen, 0, column, row, True)
 
 
+def click_text(screen, text):
+    row, column = screen.vt.location(text)
+    click(screen, column, row)
+
+
+def open_activity(screen):
+    screen.send(b'\x14')
+    until(screen, lambda text: 'Activity' in text, 'Terminals Activity opened')
+
+
+def close_activity(screen):
+    escape(screen)
+    until(screen, lambda text: 'Activity' not in text, 'Terminals Activity closed')
+
+
 def records(root):
     result = []
     for directory in (root / 'home/.ansa/sessions').iterdir():
@@ -282,39 +297,40 @@ def native_background(screen, *labels):
 
 def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     screen = start(binary, root, home, cwd, screens, 'lifecycle')
+    answer = 'OMH_TOOL_OK:OMH_FIXED_VALUE_42'
     screen.send('VISUAL_TASK\r')
-    until(screen, lambda text: completed(root, 'VISUAL_TASK') and 'get_test_value' in text and 'OMH_TOOL_OK:OMH_FIXED_VALUE_42' in text, 'committed colored tool and final text')
-    headers = [screen.vt.line(row) for row in range(3, screen.vt.rows - 5) if 'get_test_value' in screen.vt.line(row)]
-    assert len(headers) == 1 and '▸' in headers[0] and 'done' in headers[0], headers
-    target_fg = screen.vt.attribute('get_test_value')[0]
-    answer_fg = screen.vt.attribute('OMH_TOOL_OK:OMH_FIXED_VALUE_42')[0]
-    status_fg = screen.vt.attribute('done')[0]
-    assert target_fg is not None and status_fg is not None and target_fg != answer_fg
+    until(screen, lambda text: completed(root, 'VISUAL_TASK') and answer in text, 'committed colored final text')
+    assert 'get_test_value' not in visible(screen)
+    answer_fg = screen.vt.attribute(answer)[0]
     user_bg = screen.vt.attribute('VISUAL_TASK', last=True)[1]
     assert user_bg is not None and screen.vt.attribute('VISUAL_TASK', last=True)[2], 'user text lost its visual emphasis'
-    native_background(screen, 'get_test_value', 'OMH_TOOL_OK:OMH_FIXED_VALUE_42')
+    native_background(screen, answer)
     screen.send('VISUAL_DRAFT Ж')
     until(screen, lambda text: 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'pinned colored draft')
     input_bg = screen.vt.attribute('VISUAL_DRAFT Ж')[1]
     native_background(screen, 'VISUAL_DRAFT Ж')
+    before = journals(root)
+    open_activity(screen)
+    until(screen, lambda text: 'get_test_value' in text and 'done' in text, 'committed tool in Activity')
+    headers = [screen.vt.line(row) for row in range(3, screen.vt.rows - 5) if 'get_test_value' in screen.vt.line(row)]
+    assert len(headers) == 1 and '▸' in headers[0] and 'done' in headers[0], headers
+    target_fg = screen.vt.attribute('get_test_value')[0]
+    status_fg = screen.vt.attribute('done')[0]
+    assert target_fg is not None and status_fg is not None and target_fg != answer_fg
     snapshot(screen, 'compact')
-    row, column = screen.vt.location('get_test_value')
-    click(screen, column, row)
-    until(screen, lambda text: 'Arguments' in text and 'Output' in text and '▾' in text, 'colored inline expand')
-    assert screen.vt.attribute('get_test_value')[0] == target_fg
-    assert screen.vt.attribute('VISUAL_TASK', last=True)[1] == user_bg
+    click_text(screen, 'get_test_value')
+    until(screen, lambda text: 'Arguments' in text and 'Output' in text and '▾' in text, 'colored Activity expansion')
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     snapshot(screen, 'expanded')
-    row, column = screen.vt.location('get_test_value')
-    click(screen, column, row)
+    click_text(screen, 'get_test_value')
     until(screen, lambda text: 'Arguments' not in text and '▸' in text, 'colored inline collapse')
-    before = journals(root)
-    row, column = screen.vt.location('get_test_value')
+    close_activity(screen)
+    assert 'get_test_value' not in visible(screen)
+    row, column = screen.vt.location(answer)
     mouse(screen, 0, column, row)
-    mouse(screen, 32, column + len('get_test_value') - 1, row)
-    until(screen, lambda text: attribute_is(screen, 'done', 0, status_fg), 'selection retained unselected status color')
-    until(screen, lambda text: screen.vt.attribute('get_test_value')[1] is not None, 'selection highlight painted')
-    selected_bg = screen.vt.attribute('get_test_value')[1]
+    mouse(screen, 32, column + len(answer) - 1, row)
+    until(screen, lambda text: screen.vt.attribute(answer)[1] is not None, 'selection highlight painted')
+    selected_bg = screen.vt.attribute(answer)[1]
     assert selected_bg is not None, 'local text selection has no visible background'
     assert screen.vt.attribute('VISUAL_TASK', last=True)[1] == user_bg
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
@@ -323,16 +339,15 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     screen.resize(72, 40)
     screen.wait(b'\x1b[H\x1b[2J', since=at)
     screen.vt = StyledTerminal(72, 40)
-    until(screen, lambda text: 'get_test_value' in text and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'colored frozen resize')
-    assert screen.vt.attribute('done')[0] == status_fg
+    until(screen, lambda text: answer in text and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'colored frozen resize')
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
-    assert screen.vt.attribute('get_test_value')[1] == selected_bg, 'resize lost local selection color'
+    assert screen.vt.attribute(answer)[1] == selected_bg, 'resize lost local selection color'
     snapshot(screen, 'resized-selection')
-    mouse(screen, 0, column + len('get_test_value') - 1, row, True)
-    assert copied(screen, at) == 'get_test_value'
-    until(screen, lambda text: attribute_is(screen, 'get_test_value', 1, None)
+    mouse(screen, 0, column + len(answer) - 1, row, True)
+    assert copied(screen, at) == answer
+    until(screen, lambda text: attribute_is(screen, answer, 1, None)
           and 'VISUAL_DRAFT Ж' in screen.vt.line(-4), 'release cleared selection and restored composer')
-    native_background(screen, 'get_test_value', 'VISUAL_DRAFT Ж')
+    native_background(screen, answer, 'VISUAL_DRAFT Ж')
     assert journals(root) == before, 'color interactions changed canonical journal'
     screen.send(b'\x15')
     local(screen, '/btw SIDE_VISUAL')
@@ -451,13 +466,17 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
     try:
         screen.send('EDIT_VISUAL_TASK\r')
         spinners = set('⠋⠙⠹⠸⠼⠴⠦⠧')
+        until(screen, lambda text: 'EDIT_VISUAL_TASK' in text, 'accepted user message under fixture hold', timeout=3)
+        assert 'waiting for model' not in visible(screen)
+        open_activity(screen)
 
         def activity():
-            return [(row, screen.vt.line(row)[2]) for row in range(3, screen.vt.rows - 5)
-                    if screen.vt.line(row)[2:3] in spinners and 'waiting for model' in screen.vt.line(row)]
+            return [(row, glyph) for row in range(3, screen.vt.rows - 5)
+                    if 'waiting for model' in screen.vt.line(row)
+                    for glyph in screen.vt.line(row) if glyph in spinners]
 
-        until(screen, lambda text: 'EDIT_VISUAL_TASK' in screen.vt.line(3) and bool(activity()),
-              'accepted user body and generating activity under fixture hold', timeout=3)
+        until(screen, lambda _: bool(activity()),
+              'generating activity under fixture hold', timeout=3)
         assert not (root / 'generated').exists(), 'fixture did not hold the first generation'
         since = len(screen.raw)
         began = time.monotonic()
@@ -480,41 +499,49 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         snapshot(screen, 'idle-animation')
     finally:
         hold.unlink(missing_ok=True)
-    until(screen, lambda text: completed(root, 'EDIT_VISUAL_TASK') and 'EDIT_DONE' in text and 'Edited' in text, 'acknowledged edit inline diff')
+    until(screen, lambda text: completed(root, 'EDIT_VISUAL_TASK') and 'Edited' in text, 'acknowledged edit in Activity')
     assert (cwd / 'edit-target.rs').read_text() == 'fn main() {\n    new();\n}\n'
     assert '(+1 -1)' in visible(screen)
     old_row, _ = screen.vt.location('old();')
     new_row, _ = screen.vt.location('new();')
-    assert re.match(r'^\s*2\s+-\s+old\(\);', screen.vt.line(old_row)), screen.vt.line(old_row)
-    assert re.match(r'^\s*2\s+\+\s+new\(\);', screen.vt.line(new_row)), screen.vt.line(new_row)
-    assert screen.vt.line(old_row).index('2') < screen.vt.line(new_row).index('2'), 'old/new gutters share a column'
-    assert screen.vt.line(old_row).index('-') == screen.vt.line(new_row).index('+'), 'diff markers misaligned'
+    old_gutter = re.search(r'(2)\s+(-)\s+old\(\);', screen.vt.line(old_row))
+    new_gutter = re.search(r'(2)\s+(\+)\s+new\(\);', screen.vt.line(new_row))
+    assert old_gutter and new_gutter, (screen.vt.line(old_row), screen.vt.line(new_row))
+    assert old_gutter.start(1) < new_gutter.start(1), 'old/new gutters share a column'
+    assert old_gutter.start(2) == new_gutter.start(2), 'diff markers misaligned'
     removed = screen.vt.attribute('old();')[1]
     added = screen.vt.attribute('new();')[1]
     context = screen.vt.attribute('fn main()')[1]
     assert removed is not None and added is not None and removed != added
     assert context is None and removed != context and added != context, 'diff colors must stay local against native context rows'
+    snapshot(screen, 'inline-diff')
+    close_activity(screen)
+    until(screen, lambda text: 'EDIT_DONE' in text, 'edit response in main chat')
     assert screen.vt.attribute('EDIT_VISUAL_TASK', last=True)[1] is not None
+    assert all(label not in visible(screen) for label in ('Edited', 'old();', 'new();'))
     screen.send('EDIT_DRAFT Ж')
     until(screen, lambda text: 'EDIT_DRAFT Ж' in screen.vt.line(-4), 'edit draft')
     native_background(screen, 'EDIT_DRAFT Ж')
     before = journals(root)
-    snapshot(screen, 'inline-diff')
+    open_activity(screen)
+    until(screen, lambda text: 'Edited' in text, 'edit visible with pinned draft')
     row, column = screen.vt.location('Edited')
     mouse(screen, 0, column, row)
     escape(screen)
     mouse(screen, 0, column, row, True)
     for _ in range(8): screen.drain(.01)
     assert 'Edit diff' not in visible(screen), 'Esc did not cancel the pending click'
-    row, column = screen.vt.location('Edited')
-    click(screen, column, row)
+    if 'Activity' not in visible(screen):
+        open_activity(screen)
+    until(screen, lambda text: 'Edited' in text, 'review Activity restored')
+    click_text(screen, 'Edited')
     until(screen, lambda text: 'Edit diff' in text and 'j/k lines' in text, 'complete per-edit Diff inspector')
     assert screen.vt.attribute('old();')[1] == removed and screen.vt.attribute('new();')[1] == added
     assert screen.vt.attribute('fn main()')[1] is None
     assert 'EDIT_DRAFT Ж' in screen.vt.line(-4)
     snapshot(screen, 'full-diff')
     escape(screen)
-    until(screen, lambda text: 'Edit diff' not in text and 'Edited' in text and 'EDIT_DONE' in text, 'Esc returned from edit diff')
+    until(screen, lambda text: 'Edit diff' not in text and 'Edited' in text, 'Esc returned from edit diff to Activity')
     assert 'EDIT_DRAFT Ж' in screen.vt.line(-4) and journals(root) == before
     rows = records(root)
     assert sum(row['kind'] == 'accepted' for row in rows) == 1
@@ -539,12 +566,16 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         eof_interrupted = False
         try:
             quiet.send('EDIT_REDUCED_MOTION_TASK\r')
+            until(quiet, lambda text: 'EDIT_REDUCED_MOTION_TASK' in text,
+                  'reduced-motion message under fixture hold', timeout=3)
+            assert 'waiting for model' not in visible(quiet)
+            open_activity(quiet)
 
             def quiet_activity():
                 return [row for row in range(3, quiet.vt.rows - 5)
-                        if quiet.vt.line(row).startswith('  ◷ ') and 'waiting for model' in quiet.vt.line(row)]
+                        if '◷ waiting for model' in quiet.vt.line(row)]
 
-            until(quiet, lambda text: 'EDIT_REDUCED_MOTION_TASK' in quiet.vt.line(3) and bool(quiet_activity()),
+            until(quiet, lambda _: bool(quiet_activity()),
                   'reduced-motion activity under fixture hold', timeout=3)
             quiet_row = quiet_activity()
             assert len(quiet_row) == 1 and not (quiet_root / 'generated').exists()
@@ -561,6 +592,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
             quiet_elapsed = time.monotonic() - quiet_began
             quiet_delta_bytes = len(quiet.raw) - quiet_since
             snapshot(quiet, 'reduced-motion-idle')
+            close_activity(quiet)
             quiet.send(b'\x04')
             quiet.drain(.04)
             quiet.child.send_signal(signal.SIGINT)
@@ -652,8 +684,14 @@ def native_chart(binary, adapter, root, home, cwd, screens):
                    extra_env={'TERM': 'xterm-kitty'})
     pending = len(screen.raw)
     screen.send('Покажи график\r')
-    until(screen, lambda text: 'Chart · chart.png' in text and 'PNG · 160 × 80' in text
-          and completed(root, 'Покажи график'), 'agent opened validated PNG')
+    until(screen, lambda text: 'png_requested' in text and completed(root, 'Покажи график'),
+          'assistant confirmed the PNG tool outcome')
+    assert 'Open chart' not in visible(screen) and image_bytes(screen, pending) is None
+    open_activity(screen)
+    until(screen, lambda text: 'Open chart · chart.png' in text, 'validated PNG link in Activity')
+    click_text(screen, 'Open chart · chart.png')
+    until(screen, lambda text: 'Chart · chart.png' in text and 'PNG · 160 × 80' in text,
+          'opened validated PNG from Activity')
     screen.wait(b'\x1b_Ga=T,f=100,t=d,', pending)
     assert screen.vt.location('Chart · chart.png')[1] > screen.vt.cols // 3
     until(screen, lambda _: image_bytes(screen, pending) is not None, 'complete image transfer')
@@ -661,7 +699,6 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     assert data == path.read_bytes()
     snapshot(screen, 'visible-chart')
     started = len(screen.raw)
-    screen.send(b'\t')
     until(screen, lambda text: 'Enter copy path' in text, 'graph focused')
     for _ in range(2):
         copied_at = len(screen.raw)
@@ -672,18 +709,22 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     escape(screen)
     delete = b'\x1b_Ga=d,d=I,i=' + image_id + b',q=2;'
     screen.wait(delete, started)
-    until(screen, lambda text: 'PNG · 160 × 80' not in text, 'Escape closed chart')
+    until(screen, lambda text: 'PNG · 160 × 80' not in text and 'Open chart · chart.png' in text,
+          'Escape returned to Activity')
     snapshot(screen, 'closed-chart')
-    row, col = screen.vt.location('Open chart')
     started = len(screen.raw)
-    click(screen, col, row)
-    until(screen, lambda text: 'Chart · chart.png' in text, 'chart reopened from chat')
+    click_text(screen, 'Open chart · chart.png')
+    until(screen, lambda text: 'Chart · chart.png' in text, 'chart reopened from Activity')
     until(screen, lambda _: image_bytes(screen, started) is not None, 'complete reopened chart')
     snapshot(screen, 'reopened-chart')
     escape(screen)
+    until(screen, lambda text: 'Open chart · chart.png' in text, 'Activity after chart reopen')
+    close_activity(screen)
     screen.send('chart draft')
     until(screen, lambda _: 'chart draft' in screen.vt.line(-4), 'draft before keyboard navigation')
     screen.send(b'\x07')
+    until(screen, lambda text: 'Activity' in text and 'Open chart · chart.png' in text,
+          'Ctrl+G opened Activity with the chart link')
     for _ in range(12):
         screen.drain(.03)
         visible(screen)
@@ -698,19 +739,27 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     until(screen, lambda text: 'PNG · 160 × 80' not in text and 'chart draft' in screen.vt.line(-4)
           and screen.vt.attribute('Open chart · chart.png')[1] is not None,
           'Esc restored result focus and draft')
-    escape(screen)
+    close_activity(screen)
     screen.send(b'\x03')
     other = cwd / 'other.png'
     Image.new('RGB', (240, 120), (40, 90, 190)).save(other)
     (root / 'preview-other').touch()
     screen.send('Покажи второй график\r')
+    until(screen, lambda text: completed(root, 'Покажи второй график') and 'png_requested' in text,
+          'second chart tool completed')
+    assert 'Open chart' not in visible(screen)
+    open_activity(screen)
+    until(screen, lambda text: 'Open chart · other.png' in text, 'second chart link in Activity')
+    click_text(screen, 'Open chart · other.png')
     until(screen, lambda text: 'Chart · other.png' in text
           and completed(root, 'Покажи второй график'), 'second chart opened')
     escape(screen)
-    row, col = screen.vt.location('Open chart · chart.png')
-    click(screen, col, row)
+    until(screen, lambda text: 'Open chart · chart.png' in text, 'older chart link still in Activity')
+    click_text(screen, 'Open chart · chart.png')
     until(screen, lambda text: 'Chart · chart.png' in text, 'first chart still opens')
     escape(screen)
+    until(screen, lambda text: 'Open chart · chart.png' in text, 'returned to the chart link')
+    close_activity(screen)
     import struct
     import zlib
     good = other.read_bytes()
@@ -722,20 +771,22 @@ def native_chart(binary, adapter, root, home, cwd, screens):
     screen.send('Проверь повреждённый PNG\r')
     # The durable Done can precede the frame with the assistant's verdict.
     # Wait for that frame before taking coordinates from the transcript.
-    until(screen, lambda text: 'preview_png_decode' in text and 'PNG_REJECTED' in text
-          and completed(root, 'Проверь повреждённый PNG'),
-          'invalid PNG rejected visibly')
+    until(screen, lambda text: 'PNG_REJECTED' in text and completed(root, 'Проверь повреждённый PNG'),
+          'assistant reported the invalid PNG rejection')
+    assert 'preview_png_decode' not in visible(screen)
+    open_activity(screen)
+    until(screen, lambda text: 'preview_png_decode' in text and 'Open chart · chart.png' in text,
+          'invalid PNG diagnostic and earlier validated chart in Activity')
     assert 'Chart · other.png' not in visible(screen)
-    row, col = screen.vt.location('Open chart · chart.png')
     reopening = len(screen.raw)
-    click(screen, col, row)
+    click_text(screen, 'Open chart · chart.png')
     until(screen, lambda text: 'Chart · chart.png' in text and image_bytes(screen, reopening) is not None,
           'active chart before shutdown')
     started = len(screen.raw)
     finish(screen)
     assert delete in screen.raw[started:]
     assert screen.raw.rfind(delete) > screen.raw.rfind(b'\x1b_Ga=T,')
-    return {'opened_by_agent': True, 'placement_id': int(image_id), 'bytes': path.stat().st_size,
+    return {'opened_from_activity': True, 'placement_id': int(image_id), 'bytes': path.stat().st_size,
             'copies_keep_picture': 2, 'first_chart_reopened': True, 'invalid_png_rejected': True}
 
 
@@ -746,8 +797,15 @@ def dataset_chart(binary, adapter, root, home, cwd, screens):
                    extra_env={'TERM': 'xterm-kitty'})
     pending = len(screen.raw)
     screen.send('Построй график продаж по месяцам\r')
-    until(screen, lambda text: 'Chart · chart.png' in text and image_bytes(screen, pending) is not None
-          and completed(root, 'Построй график продаж по месяцам'), 'CSV analysis opened its PNG', timeout=30)
+    until(screen, lambda _: completed(root, 'Построй график продаж по месяцам'),
+          'CSV analysis finished', timeout=30)
+    assert 'Open chart' not in visible(screen) and 'Source · sales.csv' not in visible(screen)
+    open_activity(screen)
+    until(screen, lambda text: 'Open chart · chart.png' in text and 'Source · sales.csv' in text,
+          'analysis chart and source links in Activity')
+    click_text(screen, 'Open chart · chart.png')
+    until(screen, lambda text: 'Chart · chart.png' in text and image_bytes(screen, pending) is not None,
+          'opened the CSV analysis PNG from Activity')
     path, = (home / '.ansa/sessions').glob('*/artifacts/*/chart.png')
     receipt = json.loads(path.with_name('receipt.json').read_text())
     descriptor, = [item for item in receipt['result']['artifacts'] if item['mime'] == 'image/png']
@@ -757,8 +815,8 @@ def dataset_chart(binary, adapter, root, home, cwd, screens):
     assert digest == descriptor['sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
     snapshot(screen, 'dataset-chart')
     escape(screen)
-    row, column = screen.vt.location('Source · sales.csv')
-    click(screen, column, row)
+    until(screen, lambda text: 'Source · sales.csv' in text, 'chart closed to the Activity source link')
+    click_text(screen, 'Source · sales.csv')
     until(screen, lambda text: 'sales.csv · read-only' in text and '2026-03-03,550' in text,
           'open the source CSV bound to the completed calculation')
     escape(screen)

@@ -47,6 +47,13 @@ pub(super) struct Proposal {
 }
 
 impl Proposal {
+    pub(super) fn can_request_implementation(&self) -> bool {
+        self.profile.is_some()
+            && !self.read_only
+            && self.plan.is_read_only()
+            && self.plan.execution_ready().is_ok()
+    }
+
     #[cfg(feature = "orchestration-pilot")]
     pub(super) fn generate(
         factory: &Factory,
@@ -69,6 +76,9 @@ impl Proposal {
         skill: Option<String>,
         profile: Option<RoleProfile>,
     ) -> Result<Self> {
+        if seed.source_turn().0.starts_with("draft-revise-") {
+            plan.require_implementation();
+        }
         if read_only && !plan.is_read_only() {
             return Err("plan_mode_read_only");
         }
@@ -209,9 +219,24 @@ pub(super) struct Completed {
     pub evidence: Option<String>,
     pub generation: Option<crate::runtime::GenerationSelection>,
     pub candidate: Option<Candidate>,
+    pub stopped: bool,
 }
 
 impl Completed {
+    fn stopped(run: &Run, source: &Request) -> Option<Self> {
+        let (step, phase, report) = run.stopped_report()?;
+        Some(Self {
+            id: run.identity().run.clone(),
+            evidence: Some(serde_json::json!({
+                "orchestration_outcome": "stopped", "task_id": step, "phase": phase,
+                "reported_status": report.status, "reason": report.summary, "detail": report.findings.first(),
+            }).to_string()),
+            generation: Self::conversation_generation(run, source),
+            candidate: None,
+            stopped: true,
+        })
+    }
+
     fn conversation_generation(
         run: &Run,
         source: &Request,
@@ -649,6 +674,7 @@ async fn schedule(
             evidence: evidence(&run, &prompt, release.as_ref(), None),
             generation: Completed::conversation_generation(&run, &source),
             candidate: release,
+            stopped: false,
         })
     }
     .await;
@@ -1272,12 +1298,16 @@ pub(super) fn recent_plan_links(factory: &Factory, parent: &str) -> Result<PlanL
             clarification = Some((modified, identity.clone()));
         }
         if (run.pending_clarifications().is_empty() || run.active_plus_task().is_some())
-            && continuable(&run, time)
+            && (run.stopped_report().is_some() || continuable(&run, time))
             && continuation
                 .as_ref()
                 .is_none_or(|(old, _, _)| *old < modified)
         {
-            continuation = Some((modified, identity, run.plan().summary().to_owned()));
+            let title = run.stopped_report().map_or_else(
+                || run.plan().summary().to_owned(),
+                |(step, _, report)| format!("Stopped at {step} · {}", report.summary),
+            );
+            continuation = Some((modified, identity, title));
         }
     }
     Ok(PlanLinks {
@@ -1447,6 +1477,12 @@ async fn resume_owned(
 ) -> Result<Completed> {
     let storage = run_root(factory, &identity.parent_session).join(&identity.run);
     let mut run = Run::open(&storage.join("ledger"), &identity)?;
+    if run.stopped_report().is_some() {
+        let context = run.context().ok_or("orchestration_context")?;
+        let source = Request::load(&Json::parse(&context.configuration)?)?;
+        factory.check_orchestration_context(&source)?;
+        return Completed::stopped(&run, &source).ok_or("run_plus_stop");
+    }
     if read_only && !run.plan().is_read_only() {
         return Err("plan_mode_read_only");
     }

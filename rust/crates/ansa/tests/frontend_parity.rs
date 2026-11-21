@@ -462,6 +462,7 @@ fn large_valid_snapshot_is_encoded_with_complete_tool_results() {
     let snapshot = Snapshot {
         autocompact_percent: 50,
         timeline_size: 0,
+        conversation_size: 0,
         generation: GenerationSelection {
             model: "fixture-model".into(),
             effort: None,

@@ -664,6 +664,8 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
     }
 }
 
+use crate::session::timeline::{conversation_row, draft_material};
+
 pub(super) fn project(
     entries: &[transcript::Entry],
     view: &Snapshot,
@@ -675,25 +677,38 @@ pub(super) fn project(
     let mut tools: Vec<Tool> = Vec::new();
     let mut indices = BTreeMap::new();
     let mut items = Vec::new();
+    let mut drafts = BTreeSet::new();
     for row in entries {
         let Some(detail) = &row.tool else {
             let is_tool = matches!(row.role.as_str(), "tool" | "tool_result");
-            // Old fork seeds have plain timeline rows. Their full text remains
-            // available through Ctrl+O without guessing identity from labels.
-            let text = if !all && (is_tool || row.role == "reasoning") {
-                row.text.lines().next().unwrap_or_default().into()
-            } else {
-                row.text.clone()
-            };
-            items.push(Item::Text(Entry {
-                role: row.role.clone(),
-                text,
-                action: None,
-                edit: None,
-                output: None,
-                agent: None,
-                status: None,
-            }));
+            if draft_material(row) {
+                if drafts.insert(row.turn.0.as_str()) {
+                    let proposal = entry(
+                        "Proposed plan".into(),
+                        Some(format!("plan:draft:{}", row.turn.0)),
+                        "tool_success",
+                    );
+                    if row.turn.0.starts_with("draft-revise-")
+                        && let Some(Item::Text(previous)) = items.last_mut()
+                        && previous
+                            .action
+                            .as_ref()
+                            .is_some_and(|key| key.starts_with("plan:draft:"))
+                    {
+                        *previous = proposal;
+                    } else {
+                        items.push(Item::Text(proposal));
+                    }
+                }
+            } else if row.role != "user" && !conversation_row(row) {
+                // Old fork seeds contain plain tool rows without operation IDs.
+                let text = if !all && is_tool {
+                    row.text.lines().next().unwrap_or_default().into()
+                } else {
+                    row.text.clone()
+                };
+                items.push(Item::Text(entry(text, None, &row.role)));
+            }
             if row.role == "assistant"
                 && let Some(run) = row.turn.0.strip_prefix("summary-")
                 && crate::provider::contracts::valid_id(run)
@@ -1025,6 +1040,7 @@ mod tests {
     fn view() -> Snapshot {
         Snapshot {
             timeline_size: 1,
+            conversation_size: 1,
             generation: GenerationSelection {
                 model: "fixture".into(),
                 effort: None,
@@ -1583,6 +1599,78 @@ mod tests {
             String::new()
         });
         assert!(super::tests::text(&first).contains("Arguments (excerpt)"));
+    }
+    #[test]
+    fn terminal_activity_keeps_plan_links_and_draft_material_without_parent_chat() {
+        let plain = |turn: &str, role: &str, state: &str, text: &str| transcript::Entry {
+            turn: turn.into(),
+            request: "request".into(),
+            role: role.into(),
+            text: text.into(),
+            state: state.into(),
+            mode: AgentMode::Basic,
+            tool: None,
+        };
+        let rows = [
+            plain("draft-legacy", "user", "accepted", "USER_INPUT"),
+            plain("draft-legacy", "assistant", "completed", "LEGACY_DRAFT"),
+            plain("planned", "assistant", "plan_draft", "PART_ONE"),
+            plain("planned", "assistant", "plan_draft", "PART_TWO"),
+            plain("planned", "reasoning", "confirmed", "PLAN_REASONING"),
+            plain("draft-revise-auto", "user", "accepted", "REPAIR_PROMPT"),
+            plain(
+                "draft-revise-auto",
+                "reasoning",
+                "confirmed",
+                "REPAIR_REASONING",
+            ),
+            plain(
+                "draft-revise-auto",
+                "assistant",
+                "plan_draft",
+                "CORRECTED_PLAN",
+            ),
+            plain("summary-test", "reasoning", "confirmed", "PARENT_REASONING"),
+            plain("summary-test", "assistant", "completed", "PARENT_MESSAGE"),
+        ];
+        let chat: Vec<_> = rows
+            .iter()
+            .filter(|row| conversation_row(row))
+            .map(|row| row.text.as_str())
+            .collect();
+        assert_eq!(
+            chat,
+            [
+                "USER_INPUT",
+                "PLAN_REASONING",
+                "REPAIR_REASONING",
+                "PARENT_REASONING",
+                "PARENT_MESSAGE"
+            ]
+        );
+
+        let activity = project(&rows, &view(), &BTreeSet::new(), false, false, |_| {
+            String::new()
+        });
+        let actions: Vec<_> = activity
+            .iter()
+            .filter_map(|entry| entry.action.as_deref())
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "plan:draft:draft-legacy",
+                "plan:draft:draft-revise-auto",
+                "plan:test"
+            ]
+        );
+        let shown = text(&activity);
+        assert!(!shown.contains("REPAIR_PROMPT"));
+        assert!(
+            !shown.contains("REASONING")
+                && !shown.contains("PARENT_")
+                && !shown.contains("USER_INPUT")
+        );
     }
     #[test]
     fn recovery_and_legacy_unknown_results_remain_visible_in_closed_groups() {

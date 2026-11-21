@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 
-from carbon_workspace_pty import completed, local, roots, start, until
+from carbon_workspace_pty import close_activity, completed, escape, local, open_activity, roots, select_result, start, until
 from parity import session_cases
 import native_eval as evaluation
 
@@ -126,11 +126,18 @@ def capture(binary, directory, arm, receipt):
             else:
                 until(screen, lambda frame: "./check.sh" in frame and "Refine" in frame, "plan confirmation")
                 screen.send(b"\r")
-                marker = "offline_eval_verified" if arm == "N1" else "Verified changes"
-                until(screen, lambda frame: marker in frame, "frozen candidate", timeout=15)
-                if arm == "N2":
+                if arm == "N1":
+                    until(screen, lambda frame: "offline_eval_verified" in frame, "frozen candidate", timeout=15)
+                else:
                     until(screen, lambda _: any((home / ".ansa/orchestration").glob(
-                        "*/*/summary-admitted")), "durable review handoff")
+                        "*/*/summary-admitted")), "durable review handoff", timeout=15)
+                    open_activity(screen)
+                    until(screen, lambda frame: "Independent review · passed" in frame, "review in Activity")
+                    select_result(screen, "report.txt · +1 −1")
+                    screen.send(b"\r")
+                    until(screen, lambda frame: "Verified changes" in frame, "frozen candidate")
+                    escape(screen)
+                    close_activity(screen)
             local(screen, "/exit")
             exit_result = screen.finish()
             require(exit_result["exit"] == 0 and exit_result["termios_restored"],

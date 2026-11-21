@@ -88,10 +88,14 @@ fn command(c: &RuntimeCommand) -> Result<Json> {
         CommandPayload::GetSnapshot(v) => {
             f.extend([("type", s("snapshot")), ("after_sequence", n(*v as usize))])
         }
-        CommandPayload::GetTranscript(v) | CommandPayload::GetTimeline(v) => f.extend([
+        CommandPayload::GetTranscript(v)
+        | CommandPayload::GetTimeline(v)
+        | CommandPayload::GetConversation(v) => f.extend([
             (
                 "type",
-                s(if matches!(c.payload, CommandPayload::GetTimeline(_)) {
+                s(if matches!(c.payload, CommandPayload::GetConversation(_)) {
+                    "conversation"
+                } else if matches!(c.payload, CommandPayload::GetTimeline(_)) {
                     "timeline"
                 } else {
                     "transcript"
@@ -322,6 +326,7 @@ fn events() -> Result<Json> {
     };
     let snapshot = Snapshot {
         timeline_size: 0,
+        conversation_size: 0,
         generation: GenerationSelection {
             model: "fixture-model".into(),
             effort: None,

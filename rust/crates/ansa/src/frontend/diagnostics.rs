@@ -17,6 +17,7 @@ mod tests {
     fn view() -> Snapshot {
         Snapshot {
             timeline_size: 0,
+            conversation_size: 0,
             generation: super::super::protocol_v1::GenerationSelection {
                 model: "fixture-model".into(),
                 effort: None,

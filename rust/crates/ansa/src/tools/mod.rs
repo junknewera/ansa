@@ -6,6 +6,7 @@ mod edit;
 pub mod editor_context;
 pub mod evidence;
 pub mod files;
+mod git_snapshot;
 pub mod invocation;
 pub mod registry;
 pub mod schema;

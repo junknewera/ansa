@@ -51,6 +51,7 @@ pub struct TranscriptPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub timeline_size: usize,
+    pub conversation_size: usize,
     pub generation: GenerationSelection,
     pub autocompact_percent: u8,
     pub followups: Vec<Followup>,

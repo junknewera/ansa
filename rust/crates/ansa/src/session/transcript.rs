@@ -84,6 +84,9 @@ impl Transcript {
         self.size == 0
     }
     pub(crate) fn append(&mut self, entry: Entry) {
+        self.append_shared(Arc::new(entry));
+    }
+    pub(super) fn append_shared(&mut self, entry: Arc<Entry>) {
         let mut block = match &self.tail {
             Some(b) if b.entries.len() < 64 => (**b).clone(),
             _ => Block {
@@ -91,7 +94,7 @@ impl Transcript {
                 entries: vec![],
             },
         };
-        block.entries.push(Arc::new(entry));
+        block.entries.push(entry);
         self.tail = Some(Arc::new(block));
         self.size += 1;
     }

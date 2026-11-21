@@ -104,7 +104,8 @@ pub(super) fn phase(request: &Request) -> &'static str {
         Some(
             FinalFormat::OrchestrationPlan
             | FinalFormat::OrchestrationPlanWithCommands
-            | FinalFormat::OrchestrationPlanWithReadFolder,
+            | FinalFormat::OrchestrationPlanWithReadFolder
+            | FinalFormat::OrchestrationPlanWithOutcome,
         ) => "plan",
         Some(FinalFormat::ChildResult) => {
             if request

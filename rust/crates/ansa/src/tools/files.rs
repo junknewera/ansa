@@ -412,6 +412,7 @@ pub(crate) fn summary_catalog(settings: &AgentSettings) -> Result<Arc<Snapshot>>
         scope: None,
     };
     Ok(register_local_tools(Arc::new(host), |registry| {
+        super::git_snapshot::register_inspection(registry)?;
         super::skills::register(registry, None)
     })?
     .read_only())
@@ -425,6 +426,23 @@ pub fn local_task_tools(
     worker: &Path,
     scope: TaskScope,
 ) -> Result<Arc<Snapshot>> {
+    let advertised = epoch.exact_state.has("orchestration_git_snapshot")
+        && epoch
+            .exact_state
+            .field("orchestration_git_snapshot")?
+            .boolean()?;
+    local_task_tools_with_git(settings, epoch, session, auth, worker, scope, advertised)
+}
+
+pub(crate) fn local_task_tools_with_git(
+    settings: AgentSettings,
+    epoch: Epoch,
+    session: &Path,
+    auth: &Path,
+    worker: &Path,
+    scope: TaskScope,
+    advertised_git: bool,
+) -> Result<Arc<Snapshot>> {
     if !settings.cwd.starts_with(&scope.root) {
         return Err("task_workspace");
     }
@@ -432,9 +450,19 @@ pub fn local_task_tools(
     if !scope.writes.is_empty() {
         names.push("edit_file");
     }
+    if scope.writes.is_empty() && scope.reads.is_empty() && advertised_git {
+        names.push("git_snapshot");
+    }
     let mut host = local_host(settings, epoch, session, auth, worker, None)?;
     host.scope = Some(scope);
-    Ok(register_local_tools(Arc::new(host), |_| Ok(()))?.named_tools(&names))
+    let host = Arc::new(host);
+    Ok(register_local_tools(host.clone(), |registry| {
+        if names.contains(&"git_snapshot") {
+            super::git_snapshot::register(registry, host)?;
+        }
+        Ok(())
+    })?
+    .named_tools(&names))
 }
 
 fn local_host(

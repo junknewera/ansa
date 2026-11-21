@@ -82,7 +82,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/terminals",
-        description: "View the agent terminal",
+        description: "View activity and the agent shell",
     },
 ];
 

@@ -184,6 +184,11 @@ enum Event {
         tool_evidence: Option<ChildToolEvidence>,
         acceptance: PlusAcceptance,
     },
+    PlusStopped {
+        step: String,
+        phase: String,
+        report: ChildResult,
+    },
     Cancelled,
     Continued,
 }
@@ -205,6 +210,7 @@ struct State {
     children: BTreeMap<String, Child>,
     plus: bool,
     plus_active: Option<String>,
+    plus_stop: Option<(String, ChildResult)>,
     plus_results: BTreeMap<String, (String, ChildResult, Option<ChildToolEvidence>)>,
     plus_replan: Option<ChildResult>,
 }
@@ -249,6 +255,7 @@ impl State {
             children: BTreeMap::new(),
             plus: profile.is_some(),
             plus_active: None,
+            plus_stop: None,
             plus_results: BTreeMap::new(),
             plus_replan: None,
         })
@@ -479,6 +486,22 @@ impl State {
                     (session.clone(), result.clone(), tool_evidence.clone()),
                 );
                 self.plus_active = None;
+            }
+            Event::PlusStopped {
+                step,
+                phase,
+                report,
+            } => {
+                self.can_dispatch()?;
+                report.validate()?;
+                if self.plus_active.as_ref() != Some(step)
+                    || report.status == ChildStatus::Completed
+                    || !matches!(phase.as_str(), "coordinator planning" | "strong escalation")
+                {
+                    return Err("run_plus_stop");
+                }
+                self.plus_stop = Some((phase.clone(), report.clone()));
+                self.cancelled = true;
             }
             Event::Cancelled if !self.cancelled => self.cancelled = true,
             Event::Continued => self.can_dispatch()?,
@@ -968,6 +991,24 @@ impl Run {
             })?;
         }
         Ok(())
+    }
+
+    pub(crate) fn stop_plus(
+        &mut self,
+        step: String,
+        phase: &str,
+        report: ChildResult,
+    ) -> Result<()> {
+        self.commit(Event::PlusStopped {
+            step,
+            phase: phase.into(),
+            report,
+        })
+    }
+
+    pub(crate) fn stopped_report(&self) -> Option<(&str, &str, &ChildResult)> {
+        let (phase, report) = self.state.plus_stop.as_ref()?;
+        Some((self.state.plus_active.as_deref()?, phase, report))
     }
 
     pub fn cancel(&mut self) -> Result<()> {

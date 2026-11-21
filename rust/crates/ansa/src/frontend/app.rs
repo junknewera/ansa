@@ -938,6 +938,10 @@ fn plus_fixture_response(
     let medium = ("gpt-6.1-sol", "medium");
     let weak = ("gpt-6.1-luna", "low");
     let model = request["model"].as_str().ok_or("fixture_request")?;
+    let blocked = trace.with_file_name("orchestration-plus-blocked").is_file();
+    let implement = trace
+        .with_file_name("orchestration-plus-implement")
+        .is_file();
     let checks_passed = task
         .contains(r#""passed_command_checks":[{"command":"./check.sh","status":"passed"}]"#)
         && task.contains(r#""failed_checks":[]"#)
@@ -949,11 +953,50 @@ fn plus_fixture_response(
     };
     let mut edit = None;
     let (stage, role, text) = match format {
-        Some("ansa_orchestration_plan_v3") => (
+        Some("ansa_orchestration_plan_v4") if implement => {
+            let repair = request["instructions"]
+                .as_str()
+                .is_some_and(|text| text.contains("Keep requested_outcome as implementation"));
+            if request["tools"] != json!([]) || repair != seen("MISLABELED_INVESTIGATION") {
+                return Err("fixture_implementation_context");
+            }
+            if repair {
+                ("implement-proposal", strong, json!({
+                    "schema_version":1,"requested_outcome":"implementation","summary":"IMPLEMENT_SCOPED_CHANGE","steps":[
+                        {"id":"edit","task":"Change the fixture report","access":"write","paths":["report.txt"],"depends_on":[],"acceptance":"Report starts with after fixture"}
+                    ],"checks":[{"path":"report.txt","contains":"after fixture"}],
+                    "manual_checks":[],"command_checks":[{"argv":["./check.sh"]}],"read_folder":null
+                }).to_string())
+            } else {
+                ("mislabeled-investigation", strong, json!({
+                    "schema_version":1,"requested_outcome":"investigation","summary":"MISLABELED_INVESTIGATION","steps":[
+                        {"id":"inspect","task":"Read the fixture report","access":"read","paths":["report.txt"],"depends_on":[],"acceptance":"Report inspected"}
+                    ],"checks":[],"manual_checks":[],"command_checks":[],"read_folder":null
+                }).to_string())
+            }
+        }
+        _ if implement => return Err("fixture_dispatch_without_implementation_approval"),
+        Some("ansa_orchestration_plan_v4") if blocked => (
+            "strong-plan", strong,
+            json!({
+                "schema_version":1,"requested_outcome":"investigation","summary":"PLUS_BLOCKED_PLAN","steps":[
+                    {"id":"status","task":"Inspect Git status","access":"read","paths":[],"depends_on":[],"acceptance":"Verified Git status"}
+                ],"checks":[],"manual_checks":[],"command_checks":[],"read_folder":null
+            }).to_string(),
+        ),
+        Some("ansa_orchestration_plan_v4") if !seen("SURVEY_FOR_IMPLEMENTATION") => (
+            "survey-for-implementation", strong,
+            json!({
+                "schema_version":1,"requested_outcome":"implementation","summary":"SURVEY_FOR_IMPLEMENTATION","steps":[
+                    {"id":"inspect","task":"Inspect report","access":"read","paths":["report.txt"],"depends_on":[],"acceptance":"Find the fixture"}
+                ],"checks":[],"manual_checks":[],"command_checks":[],"read_folder":null
+            }).to_string(),
+        ),
+        Some("ansa_orchestration_plan_v4") => (
             if model == strong.0 { "strong-plan" } else { "medium-plan" },
             if model == strong.0 { strong } else { medium },
             json!({
-                "schema_version":1,"summary":"PLUS_CARBON_PLAN","steps":[
+                "schema_version":1,"requested_outcome":"implementation","summary":"PLUS_CARBON_PLAN","steps":[
                     {"id":"quick","task":"Set report to after fixture","access":"write","paths":["report.txt"],"depends_on":[],"acceptance":"Report starts with after fixture"},
                     {"id":"fresh","task":"Confirm report preserves the fixture","access":"read","paths":["report.txt"],"depends_on":["quick"],"acceptance":"Report preserves the fixture"},
                 ],"checks":[{"path":"report.txt","contains":"after fixture"}],"manual_checks":[],
@@ -969,7 +1012,9 @@ fn plus_fixture_response(
             ("fresh-coordinate", medium, completed("FRESH_COORDINATOR"))
         }
         Some("ansa_child_result_v1") if task.starts_with("Assigned task") => {
-            if task.contains("QUICK_DECISION") {
+            if blocked {
+                ("worker-blocked", weak, desired("blocked", "Read-only Git status unavailable", &[]))
+            } else if task.contains("QUICK_DECISION") {
                 edit = Some(("before fixture", "after fixture"));
                 ("quick-fix", medium, completed("QUICK_FIX_APPLIED"))
             } else if task.contains("FRESH_COORDINATOR") {
@@ -979,7 +1024,9 @@ fn plus_fixture_response(
             }
         }
         Some("ansa_child_result_v1") if task.starts_with("Evaluate the worker") => {
-            if task.contains("QUICK_FIX_APPLIED") && seen("ORIGINAL_COORDINATOR") {
+            if blocked {
+                ("verify-blocked", medium, desired("blocked", "Git state could not be independently verified", &[]))
+            } else if task.contains("QUICK_FIX_APPLIED") && seen("ORIGINAL_COORDINATOR") {
                 ("quick-verify", medium, completed("QUICK_VERIFIED"))
             } else if task.contains("FRESH_EVIDENCE") && seen("FRESH_COORDINATOR") {
                 ("fresh-verify", medium, completed("FRESH_VERIFIED"))
@@ -990,10 +1037,11 @@ fn plus_fixture_response(
             }
         }
         Some("ansa_child_result_v1") if task.starts_with("Resolve a failed approved task") => {
-            if task.matches("WORKER_WITHOUT_EVIDENCE").count() != 3 {
+            if blocked && task.matches("Read-only Git status unavailable").count() == 3 {
+                ("escalate-blocked", strong, desired("blocked", "Approved read-only tools cannot run Git status", &["Repository status remains unverified"]))
+            } else if task.matches("WORKER_WITHOUT_EVIDENCE").count() != 3 {
                 return Err("fixture_escalation_context");
-            }
-            if task.contains("\nTask quick\n") {
+            } else if task.contains("\nTask quick\n") {
                 ("escalate-quick", strong, completed("QUICK_DECISION"))
             } else {
                 ("escalate-fresh", strong, desired("changes_requested", "FRESH_DECISION", &["Start independent context"]))
@@ -1027,6 +1075,26 @@ fn plus_fixture_response(
                 return Err("fixture_parent_context");
             }
             ("later-work", strong, "PLUS_CONTINUITY_OK".into())
+        }
+        None if blocked && task == "PLUS_BLOCKED_FOLLOWUP" => {
+            if !input.iter().filter_map(prompt).any(|message| {
+                message.contains("Approved read-only tools cannot run Git status")
+                    && message.contains(r#""orchestration_outcome":"stopped""#)
+            }) {
+                return Err("fixture_parent_context");
+            }
+            ("later-work", (model, ""), "PLUS_BLOCKED_CONTEXT_RETAINED".into())
+        }
+        None if blocked => {
+            if !task.contains("Approved read-only tools cannot run Git status")
+                || !task.contains(r#""orchestration_outcome":"stopped""#)
+                || !task.contains(r#""phase":"strong escalation""#)
+                || request["tools"].as_array().is_none_or(|tools| !tools.is_empty())
+                || task.contains("WORKER_WITHOUT_EVIDENCE")
+            {
+                return Err("fixture_parent_handoff");
+            }
+            ("stopped-summary", strong, "PLUS_STOPPED Git status is unavailable within approved read-only scope.".into())
         }
         None => ("summary", strong, "PLUS_CARBON_DONE".into()),
         _ => return Err("fixture_format"),
@@ -1065,6 +1133,13 @@ fn plus_fixture_response(
         .open(trace)
         .and_then(|mut file| writeln!(file, "{line}"))
         .map_err(|_| "fixture_trace")?;
+    if stage == "stopped-summary"
+        && trace
+            .with_file_name("orchestration-plus-reject-summary")
+            .is_file()
+    {
+        return Err("fixture_summary_rejected");
+    }
     let hold = trace.with_file_name(format!("hold-plus-{stage}"));
     let deadline = std::time::Instant::now() + Duration::from_secs(12);
     while hold.exists() {
