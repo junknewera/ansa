@@ -615,7 +615,14 @@ fn layout_impl(
         let user = entry.role == "user" || queued;
         let mut fence = false;
         let mut first = true;
-        for text in safe.split('\n') {
+        let mut blank = false;
+        let lines = if user { safe.trim_matches('\n') } else { &safe };
+        for text in lines.split('\n') {
+            let empty = text.trim().is_empty();
+            if user && empty && blank {
+                continue;
+            }
+            blank = empty;
             if assistant && text.starts_with("```") {
                 fence = !fence;
                 continue;
@@ -1075,6 +1082,7 @@ pub struct Workspace {
     pub suggestions: Option<Popup>,
     pub animation_frame: u8,
     pub animate: bool,
+    pub drafting_plan: bool,
     pub draft_notice: bool,
     pub interrupt_hint: &'static str,
     pub result_selected: Option<String>,
@@ -1104,6 +1112,7 @@ const DIFF_REMOVE: &str = "\x1b[48;2;68;31;36m";
 const USER_MESSAGE: &str = "\x1b[48;2;29;35;39m";
 const RESET: &str = "\x1b[0m";
 const EXIT_HINT: &str = "Press Ctrl+C again to exit";
+const DRAFTING_HINT: &str = "Drafting a plan · Esc or Ctrl+C cancel";
 const SELECTED: &str = "\x1b[48;2;46;63;88m\x1b[38;2;232;240;255m";
 
 fn tool_ink(role: &str) -> &'static str {
@@ -1631,6 +1640,8 @@ pub fn layout_workspace(
     if columns < 12 || height < 8 || (ui.side_chat.is_some() && height < 10) {
         let status = if ui.exit_confirmation {
             EXIT_HINT
+        } else if ui.drafting_plan {
+            DRAFTING_HINT
         } else if ui.side_chat.is_some() {
             "BTW · Esc return"
         } else {
@@ -1945,7 +1956,9 @@ pub fn layout_workspace(
         terminal_kind,
         Some(InspectorKind::Command | InspectorKind::Editor)
     );
-    let navigation = if ui.result_selected.is_some() {
+    let navigation = if ui.drafting_plan {
+        ""
+    } else if ui.result_selected.is_some() {
         if narrow {
             "↑/↓ · Enter · Esc"
         } else {
@@ -1990,7 +2003,7 @@ pub fn layout_workspace(
         } else {
             ""
         },
-        if ui.result_selected.is_some() || ui.popup.is_some() {
+        if ui.drafting_plan || ui.result_selected.is_some() || ui.popup.is_some() {
             ""
         } else {
             "? help"
@@ -2015,7 +2028,9 @@ pub fn layout_workspace(
     } else {
         notice
     };
-    let notice = if notice.is_empty() && ui.draft_notice {
+    let notice = if ui.drafting_plan {
+        DRAFTING_HINT
+    } else if notice.is_empty() && ui.draft_notice {
         "Draft · send after the task finishes"
     } else {
         notice

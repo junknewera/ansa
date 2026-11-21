@@ -1264,6 +1264,23 @@ impl Workbench {
         }
     }
     fn create(&mut self, kind: Kind, prompt: Option<String>, foreground: bool, io: &Io) -> bool {
+        if kind == Kind::Main {
+            let slot = &self.slots[self.current];
+            if slot.kind == Kind::Main
+                && !slot.closed
+                && !slot.closing
+                && slot.title.is_none()
+                && !slot.active()
+                && slot
+                    .state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|view| view.state == "idle" && view.timeline_size == 0)
+            {
+                self.switch(self.current);
+                return true;
+            }
+        }
         if self.slots.len() + self.jobs.len() + self.pending_context.len() >= MAX_SESSIONS {
             self.report(io, "Open session limit reached (16)");
             return false;
@@ -2761,6 +2778,21 @@ impl Workbench {
         if let Some(intent) = &mut self.planning_context
             && intent.owner == id
         {
+            if intent.resume.is_some()
+                && match &event.payload {
+                    EventPayload::CommandAccepted { command, .. } => {
+                        intent.resume.as_ref() == Some(command)
+                    }
+                    EventPayload::FrontendSnapshot(snapshot) => {
+                        snapshot.durable
+                            && snapshot.submit.as_ref() == Some(&intent.submit)
+                            && !matches!(snapshot.state.as_str(), "paused" | "cancelled")
+                    }
+                    _ => false,
+                }
+            {
+                intent.resume = None;
+            }
             let selected = intent.pending_draft.is_some()
                 && intent
                     .profile
@@ -2884,25 +2916,35 @@ impl Workbench {
         {
             self.pending_context.remove(&command.0);
             if self.planning_context.as_ref().is_some_and(|intent| {
-                &intent.command == command || intent.resume.as_ref() == Some(command)
+                intent.owner == id
+                    && (intent.resume.as_ref() == Some(command) || &intent.command == command)
             }) {
                 self.cancel_modal();
                 self.menu = None;
             }
         }
-        if matches!(&event.payload, EventPayload::FrontendSnapshot(snapshot)
-            if snapshot.state == "cancelled" && snapshot.submit.as_ref().is_some_and(|command|
-                self.planning_context.as_ref().is_some_and(|intent| &intent.submit == command)))
-        {
+        let checked_snapshot = match &event.payload {
+            EventPayload::FrontendSnapshot(snapshot) => {
+                if !self.slots[index].accepts_snapshot(snapshot) {
+                    return;
+                }
+                Some(snapshot)
+            }
+            _ => None,
+        };
+        if checked_snapshot.is_some_and(|snapshot| {
+            (snapshot.state == "cancelled"
+                || (snapshot.state == "paused" && snapshot.durable && !snapshot.worker_busy))
+                && self.planning_context.as_ref().is_some_and(|intent| {
+                    intent.owner == id
+                        && intent.resume.is_none()
+                        && snapshot.submit.as_ref() == Some(&intent.submit)
+                })
+        }) {
             self.cancel_modal();
             self.menu = None;
         }
         let slot = &mut self.slots[index];
-        if let EventPayload::FrontendSnapshot(snapshot) = &event.payload
-            && !slot.accepts_snapshot(snapshot)
-        {
-            return;
-        }
         if self
             .orchestration_summary
             .get(id)
@@ -3572,7 +3614,10 @@ impl Workbench {
                     self.menu = Some(Menu::Sessions {
                         entries: entries
                             .into_iter()
-                            .filter(|s| matches!(s.entry.kind.as_str(), "main" | "fork"))
+                            .filter(|s| {
+                                matches!(s.entry.kind.as_str(), "main" | "fork")
+                                    && s.status != crate::session::catalog::SummaryStatus::Empty
+                            })
                             .collect(),
                         selected: 0,
                         resume_target: self.resume_target(),
@@ -4766,11 +4811,7 @@ impl Workbench {
                 footer: "Esc cancel".into(),
                 ..Popup::default()
             },
-            Menu::DraftingPlan => Popup {
-                title: "Drafting a plan".into(),
-                footer: "Esc or Ctrl+C cancel".into(),
-                ..Popup::default()
-            },
+            Menu::DraftingPlan => return None,
             Menu::Sessions {
                 entries,
                 selected,
@@ -4779,7 +4820,15 @@ impl Workbench {
                 clarification,
             } => Popup {
                 title: "Project sessions".into(),
-                subtitle: "Choose a conversation".into(),
+                subtitle: if entries.is_empty()
+                    && resume_target.is_none()
+                    && continuation.is_none()
+                    && clarification.is_none()
+                {
+                    "No saved conversations".into()
+                } else {
+                    "Choose a conversation".into()
+                },
                 items: resume_target
                     .iter()
                     .map(|_| Choice {
@@ -5274,9 +5323,12 @@ impl Workbench {
                 .map(|completion| completion.popup(completion.exact_command(&slot.state.editor))),
             animate: self.animation_enabled(),
             animation_frame: Self::animation_frame(),
+            drafting_plan: matches!(self.menu, Some(Menu::DraftingPlan)),
             draft_notice: !slot.state.editor.bytes.is_empty()
                 && self.orchestration_summary.contains_key(&slot.id),
-            interrupt_hint: if !slot.state.editor.bytes.is_empty() {
+            interrupt_hint: if matches!(self.menu, Some(Menu::DraftingPlan)) {
+                ""
+            } else if !slot.state.editor.bytes.is_empty() {
                 "Ctrl+C clear draft"
             } else if self.collecting_orchestration() || slot.interruptible() {
                 "Ctrl+C stop"
