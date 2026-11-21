@@ -29,6 +29,7 @@ use std::{
     time::SystemTime,
 };
 use tokio::sync::mpsc;
+mod activity;
 mod roles;
 mod ux;
 
@@ -54,8 +55,10 @@ struct Slot {
     handle: Handle,
     state: State,
     replies: Replies,
-    timeline: Option<TranscriptPage>,
-    timeline_query: GetTranscript,
+    conversation_page: Option<TranscriptPage>,
+    conversation_query: GetTranscript,
+    activity_timeline: Option<TranscriptPage>,
+    activity_query: GetTranscript,
     refresh: Instant,
     refresh_transcript: bool,
     settled: Instant,
@@ -72,7 +75,6 @@ struct Slot {
     jump_top: bool,
     tool_expanded: std::collections::BTreeSet<String>,
     tool_anchor_limit: Option<usize>,
-    images_through: Option<usize>,
     candidate_reviews: std::collections::VecDeque<ux::CandidateView>,
 }
 impl Slot {
@@ -99,8 +101,10 @@ impl Slot {
             handle,
             state,
             replies: Replies::new(),
-            timeline: None,
-            timeline_query: GetTranscript {
+            conversation_page: None,
+            activity_timeline: None,
+            activity_query: activity::latest(),
+            conversation_query: GetTranscript {
                 before: 0,
                 limit: 64,
                 forward: false,
@@ -121,7 +125,6 @@ impl Slot {
             jump_top: false,
             tool_expanded: Default::default(),
             tool_anchor_limit: None,
-            images_through: None,
             candidate_reviews: std::collections::VecDeque::new(),
         }
     }
@@ -133,7 +136,7 @@ impl Slot {
             self.state.scroll = 0;
         }
         self.state.follow_tail = !top;
-        self.timeline_query = GetTranscript {
+        self.conversation_query = GetTranscript {
             before: 0,
             limit: 64,
             forward: top,
@@ -142,9 +145,9 @@ impl Slot {
     }
     fn cancel_history_jump(&mut self) {
         if std::mem::take(&mut self.jump_top)
-            && let Some(page) = &self.timeline
+            && let Some(page) = &self.conversation_page
         {
-            self.timeline_query = GetTranscript {
+            self.conversation_query = GetTranscript {
                 before: page.end,
                 limit: 64,
                 forward: false,
@@ -156,16 +159,16 @@ impl Slot {
         self.state.follow_tail = true;
         self.state.reading = None;
         self.state.scroll = 0;
-        self.timeline_query = GetTranscript {
+        self.conversation_query = GetTranscript {
             before: 0,
             limit: 64,
             forward: false,
         };
         self.refresh = Instant::now();
     }
-    fn received_timeline(&mut self, page: &TranscriptPage) {
+    fn received_conversation(&mut self, page: &TranscriptPage) {
         if self
-            .timeline
+            .conversation_page
             .as_ref()
             .is_none_or(|old| (old.begin, old.end) != (page.begin, page.end))
             || self.jump_top
@@ -174,26 +177,13 @@ impl Slot {
         }
         if self.jump_top
             && !self.state.follow_tail
-            && page.query == self.timeline_query
+            && page.query == self.conversation_query
             && page.query.forward
         {
             self.state.scroll = usize::MAX;
         }
         self.jump_top = false;
-        self.timeline = Some(page.clone());
-    }
-    fn new_image(&mut self, page: &TranscriptPage) -> Option<graphics::Source> {
-        if page.end != page.total {
-            return None;
-        }
-        let previous = self.images_through.replace(page.end)?;
-        page.entries
-            .iter()
-            .skip(previous.saturating_sub(page.begin))
-            .rev()
-            .find_map(|entry| {
-                graphics::Source::from_entry(entry, &self.id).map(|(_, source)| source)
-            })
+        self.conversation_page = Some(page.clone());
     }
     fn active(&self) -> bool {
         !self.ready
@@ -225,9 +215,9 @@ impl Slot {
                     && !(snapshot.state == "idle" && snapshot.worker_busy)
                     && self.state.page.2 >= snapshot.transcript_size
                     && self
-                        .timeline
+                        .conversation_page
                         .as_ref()
-                        .is_some_and(|page| page.total >= snapshot.timeline_size)
+                        .is_some_and(|page| page.total >= snapshot.conversation_size)
             })
     }
     fn became_ready(&mut self) {
@@ -359,12 +349,12 @@ impl Slot {
                 .snapshot
                 .as_ref()
                 .is_some_and(|snapshot| self.state.page.2 < snapshot.transcript_size);
-        let timeline_stale = self.state.snapshot.as_ref().is_some_and(|snapshot| {
-            self.timeline.as_ref().is_none_or(|page| {
-                page.total < snapshot.timeline_size || page.query != self.timeline_query
+        let conversation_stale = self.state.snapshot.as_ref().is_some_and(|snapshot| {
+            self.conversation_page.as_ref().is_none_or(|page| {
+                page.total < snapshot.conversation_size || page.query != self.conversation_query
             })
         });
-        if (now >= self.refresh || transcript_stale || timeline_stale)
+        if (now >= self.refresh || transcript_stale || conversation_stale)
             && self.state.snapshot.is_some()
         {
             // Both page kinds share one bounded actor mailbox. Issue one read
@@ -372,7 +362,7 @@ impl Slot {
             // post tasks; user recall/copy collisions remain retryable reads.
             let transcript = if !self.state.history_ready {
                 true
-            } else if transcript_stale != timeline_stale {
+            } else if transcript_stale != conversation_stale {
                 transcript_stale
             } else {
                 self.refresh_transcript
@@ -380,7 +370,7 @@ impl Slot {
             let payload = if transcript {
                 CommandPayload::GetTranscript(self.state.query.clone())
             } else {
-                CommandPayload::GetTimeline(self.timeline_query.clone())
+                CommandPayload::GetConversation(self.conversation_query.clone())
             };
             self.state
                 .post_read(&self.handle, payload, &mut self.replies);
@@ -451,19 +441,87 @@ impl Slot {
             self.state.report(io, "No active step");
         }
     }
+    fn conversation(&self) -> Option<Vec<Entry>> {
+        let page = self.conversation_page.as_ref()?;
+        let view = self.state.snapshot.as_ref()?;
+        let mut entries = page
+            .entries
+            .iter()
+            .map(|row| Entry {
+                role: row.role.clone(),
+                text: row.text.clone(),
+                action: None,
+                edit: None,
+                output: None,
+                agent: None,
+                status: None,
+            })
+            .collect::<Vec<_>>();
+        if page.end == page.total {
+            entries.extend(
+                view.followups
+                    .iter()
+                    .filter(|message| message.state == "queued")
+                    .map(|message| Entry {
+                        action: None,
+                        edit: None,
+                        output: None,
+                        agent: None,
+                        status: None,
+                        role: "queued_user".into(),
+                        text: message.text.clone(),
+                    }),
+            );
+            if let Some(preview) = &self.state.preview
+                && !preview.text.is_empty()
+                && preview.state != "committed"
+                && self.state.preview_request == view.request
+                && !view
+                    .submit
+                    .as_ref()
+                    .is_some_and(|id| id.0.starts_with("draft-"))
+            {
+                entries.push(Entry {
+                    action: None,
+                    edit: None,
+                    output: None,
+                    agent: None,
+                    status: None,
+                    role: "assistant".into(),
+                    text: format!(
+                        "{}\n({})",
+                        preview.text,
+                        if preview.state == "discarded" {
+                            "incomplete response"
+                        } else {
+                            "response preview"
+                        }
+                    ),
+                });
+            }
+        }
+        Some(entries)
+    }
+
+    fn activity_page(&self) -> Option<&TranscriptPage> {
+        self.activity_timeline.as_ref()
+    }
+
     fn projected(&self) -> Option<Vec<Entry>> {
-        let page = self.timeline.as_ref()?;
+        let page = self.activity_page();
+        let rows = page.map_or(&[][..], |page| page.entries.as_slice());
+        let at_tail = page.is_none_or(|page| page.end == page.total);
         let view = self.state.snapshot.as_ref()?;
         let now = Instant::now();
         let mut entries = super::super::tool_ui::project(
-            &page.entries,
+            rows,
             view,
             &self.tool_expanded,
             self.state.tools_expanded,
-            page.end == page.total,
+            at_tail,
             |operation| self.state.progress.tool_elapsed(operation, now),
         );
-        for row in page.entries.iter().rev() {
+        for row in rows.iter().rev() {
             let Some((operation, png)) = graphics::Source::from_entry(row, &self.id) else {
                 continue;
             };
@@ -487,47 +545,7 @@ impl Slot {
                 },
             );
         }
-        if page.end == page.total {
-            for message in view
-                .followups
-                .iter()
-                .filter(|message| message.state == "queued")
-            {
-                entries.push(Entry {
-                    action: None,
-                    edit: None,
-                    output: None,
-                    agent: None,
-                    status: None,
-                    role: "queued_user".into(),
-                    text: message.text.clone(),
-                });
-            }
-            if let Some(preview) = &self.state.preview
-                && !preview.text.is_empty()
-                && preview.state != "committed"
-                && self.state.preview_request == view.request
-            {
-                entries.push(Entry {
-                    action: None,
-                    edit: None,
-                    output: None,
-                    agent: None,
-                    status: None,
-                    role: "assistant".into(),
-                    text: format!(
-                        "{}\n({})",
-                        preview.text,
-                        if preview.state == "discarded" {
-                            "incomplete response"
-                        } else {
-                            "response preview"
-                        }
-                    ),
-                });
-            }
-        }
-        if page.end == page.total
+        if at_tail
             && view.worker_busy
             && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
         {
@@ -843,6 +861,7 @@ impl Files {
 }
 struct AgentReader {
     id: String,
+    from_list: bool,
     parent: String,
     title: String,
     pending: bool,
@@ -863,6 +882,7 @@ enum Panel {
         selected: Option<String>,
     },
     Terminal,
+    Activity(activity::Navigation),
     NativeTerminal {
         token: u64,
         name: String,
@@ -938,6 +958,7 @@ struct Workbench {
     summaries: Vec<SessionSummary>,
     panel: Option<Panel>,
     output_back: Option<Box<Panel>>,
+    activity_back: Option<activity::Navigation>,
     terminal_back: Option<Box<Files>>,
     terminal: Option<super::super::terminal_pane::TerminalPane>,
     terminal_decoder: super::super::terminal_input::TerminalInput,
@@ -1062,6 +1083,7 @@ impl Workbench {
             summaries: Vec::new(),
             panel: None,
             output_back: None,
+            activity_back: None,
             terminal_back: None,
             terminal: None,
             terminal_decoder: Default::default(),
@@ -1217,6 +1239,8 @@ impl Workbench {
         self.requested_model = None;
         self.terminal_decoder.take_pending();
         self.terminal_escape_at = None;
+        self.activity_back = None;
+        self.output_back = None;
         self.panel = None;
         self.focus = Focus::Chat;
         self.selection = None;
@@ -1425,6 +1449,7 @@ impl Workbench {
             .unwrap_or_else(|| self.conversation_root());
         self.panel = Some(Panel::AgentTranscript(AgentReader {
             id: id.into(),
+            from_list: matches!(self.panel, Some(Panel::Agents { .. })),
             parent,
             title: line.title.clone(),
             pending: false,
@@ -1487,20 +1512,24 @@ impl Workbench {
         });
     }
 
-    fn inspect_terminal(&mut self, name: &str, io: &Io) {
-        if self
-            .factory
-            .terminal_owner(&self.slots[self.current].id)
-            .is_none()
-        {
-            self.report(io, "Agent terminal unavailable in this conversation");
-            return;
-        }
+    fn inspect_terminal(&mut self, name: &str) {
+        self.completion = None;
+        self.selection = None;
+        self.tool_press = None;
+        self.result_selected = None;
+        self.wide_diff = false;
         self.file_token = self.file_token.wrapping_add(1);
         self.panel = Some(Panel::NativeTerminal {
             token: self.file_token,
             name: name.to_owned(),
-            view: None,
+            view: self
+                .factory
+                .terminal_owner(&self.slots[self.current].id)
+                .is_none()
+                .then(|| carbon::OutputView {
+                    title: "Agent terminal".into(),
+                    text: "The agent has no terminal in this conversation".into(),
+                }),
             pending: false,
             next: Instant::now(),
         });
@@ -1701,9 +1730,9 @@ impl Workbench {
             let history_current = slot.state.snapshot.as_ref().is_some_and(|snapshot| {
                 slot.state.page.2 >= snapshot.transcript_size
                     && slot
-                        .timeline
+                        .conversation_page
                         .as_ref()
-                        .is_some_and(|page| page.total >= snapshot.timeline_size)
+                        .is_some_and(|page| page.total >= snapshot.conversation_size)
             });
             if !slot.closing
                 && (slot.closed
@@ -2074,7 +2103,13 @@ impl Workbench {
         self.report(io, mode);
     }
 
-    fn start_orchestration_plan(&mut self, text: &str, skill: Option<String>, io: &Io) -> bool {
+    fn start_orchestration_plan(
+        &mut self,
+        text: &str,
+        skill: Option<String>,
+        repair: bool,
+        io: &Io,
+    ) -> bool {
         if !matches!(self.slots[self.current].kind, Kind::Main | Kind::Fork) {
             self.report(io, "Open the main conversation to delegate work");
             return false;
@@ -2137,7 +2172,12 @@ impl Workbench {
             },
             None => None,
         };
-        let mut draft = self.factory.plan_draft(read_only, instructions.as_deref());
+        let mut draft =
+            self.factory
+                .plan_draft(read_only, instructions.as_deref(), profile.is_some());
+        if repair {
+            draft.instructions.push_str("\nRevise the preceding implementation plan. Keep requested_outcome as implementation. Include the requested code changes as scoped write steps and at least one executable test in command_checks. The corrected proposal will be shown for approval before any work starts.");
+        }
         draft.previous_prompt = previous_prompt;
         draft.profile = match profile.as_ref().map(RoleProfile::encode).transpose() {
             Ok(profile) => profile.map(|value| value.dump()),
@@ -2167,7 +2207,8 @@ impl Workbench {
                 Box::new(draft),
             ),
         );
-        let id = CommandId(format!("draft-{}", command.command.0));
+        let prefix = if repair { "draft-revise" } else { "draft" };
+        let id = CommandId(format!("{prefix}-{}", command.command.0));
         command.command = id.clone();
         let turn = TurnId(id.0.clone());
         command.turn = turn.clone();
@@ -2419,7 +2460,10 @@ impl Workbench {
                 || commands::agent_task(text).is_some()
                 || delegation.is_some())
         {
-            return (self.start_orchestration_plan(text, delegation, io), false);
+            return (
+                self.start_orchestration_plan(text, delegation, false, io),
+                false,
+            );
         }
         let (command, argument) = text
             .trim()
@@ -2427,7 +2471,12 @@ impl Workbench {
             .map_or((text.trim(), ""), |(c, a)| (c, a.trim()));
         match commands::canonical(command) {
             "/terminals" => {
-                self.inspect_terminal(argument, io);
+                if argument.is_empty() {
+                    self.open_activity();
+                } else {
+                    self.activity_back = Some(activity::Navigation::default());
+                    self.inspect_terminal(argument);
+                }
                 (true, false)
             }
             "/new" if argument.is_empty() => (self.create(Kind::Main, None, true, io), false),
@@ -2900,7 +2949,6 @@ impl Workbench {
                 result: orchestration::mark_handoff(&factory, &owner, &run),
             });
         }
-        let mut image = None;
         match &event.payload {
             EventPayload::CommandAccepted { command, .. }
                 if slot.follow_accepted_submit.as_ref() == Some(command) =>
@@ -2933,17 +2981,20 @@ impl Workbench {
                 slot.resync = true;
                 slot.refresh = Instant::now();
             }
-            EventPayload::TimelinePage(page)
-                if page.query == slot.timeline_query
+            EventPayload::ConversationPage(page) => {
+                if page.query == slot.conversation_query
                     && page.total
                         >= slot
                             .state
                             .snapshot
                             .as_ref()
-                            .map_or(0, |snapshot| snapshot.timeline_size) =>
-            {
-                image = slot.new_image(page);
-                slot.received_timeline(page);
+                            .map_or(0, |snapshot| snapshot.conversation_size)
+                {
+                    slot.received_conversation(page);
+                }
+            }
+            EventPayload::TimelinePage(page) if page.query == slot.activity_query => {
+                slot.activity_timeline = Some(page.clone());
             }
             _ => {}
         }
@@ -2962,18 +3013,6 @@ impl Workbench {
         }
         if reading.is_some() {
             slot.state.reading = reading;
-        }
-        if let Some(image) = image
-            && index == self.current
-            && slot.state.follow_tail
-            && self.menu.is_none()
-            && self.selection.is_none()
-            && self.editor.is_none()
-            && self.pending_editor.is_none()
-            && !self.editor_preparing
-            && !matches!(self.panel, Some(Panel::Terminal))
-        {
-            self.show_image(image, io);
         }
     }
     fn job(&mut self, job: Job, io: &Io) {
@@ -3093,6 +3132,7 @@ impl Workbench {
                                 &archive.plan,
                                 Some(&archive.prompt),
                                 None,
+                                false,
                             );
                             match archive.candidate {
                                 Ok(Some(candidate)) => {
@@ -3106,8 +3146,12 @@ impl Workbench {
                             }
                         }
                         Err(code) => {
-                            self.panel = None;
-                            self.focus = Focus::Chat;
+                            if self.activity_back.is_some() {
+                                self.return_to_activity();
+                            } else {
+                                self.panel = None;
+                                self.focus = Focus::Chat;
+                            }
                             self.report(io, &format!("Could not open plan ({code})"));
                         }
                     }
@@ -3128,15 +3172,31 @@ impl Workbench {
                 self.menu = None;
                 match result {
                     Ok(proposal) => {
+                        let blocked = proposal.plan.execution_ready().err();
+                        if blocked == Some("orchestration_implementation_required")
+                            && !proposal.read_only
+                            && self.orchestration_mode == Some(OrchestrationMode::Plus)
+                            && !proposal.seed.source_turn().0.starts_with("draft-revise-")
+                        {
+                            self.refinement = None;
+                            if self.start_orchestration_plan(
+                                &proposal.prompt,
+                                proposal.skill.clone(),
+                                true,
+                                io,
+                            ) {
+                                return;
+                            }
+                        }
                         let slot = &mut self.slots[self.current];
                         slot.state.editor.clear();
                         slot.state.input_history.reset();
                         self.refinement = None;
-                        let blocked = proposal.plan.execution_ready().err();
                         self.show_orchestration_plan(
                             &proposal.plan,
                             None,
                             proposal.profile.as_ref(),
+                            proposal.can_request_implementation(),
                         );
                         self.frames.clear();
                         self.displayed = None;
@@ -3219,6 +3279,10 @@ impl Workbench {
                 self.update_orchestration_progress();
                 self.orchestration_progress = None;
                 self.orchestration_inbox = None;
+                let result = match &self.orchestration_stop {
+                    Some((_, stop)) => stop.check().and(result),
+                    None => result,
+                };
                 if !generation_checked
                     && !self.input_closed
                     && let Ok(completed) = &result
@@ -3264,7 +3328,6 @@ impl Workbench {
                         result: factory.summaries(&stop),
                     });
                 }
-                let foreground = self.slots[self.current].id == owner;
                 let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner) else {
                     return;
                 };
@@ -3272,9 +3335,6 @@ impl Workbench {
                     Ok(completed) if !self.input_closed && !parent.active() => {
                         if let Some(candidate) = completed.candidate {
                             let review = ux::CandidateView::new(completed.id.clone(), candidate);
-                            if foreground && self.panel.is_none() {
-                                self.panel = Some(review.panel());
-                            }
                             parent.remember_candidate(review);
                         }
                         let Some(evidence) = completed.evidence else {
@@ -3299,17 +3359,24 @@ impl Workbench {
                         ) {
                             parent.state.status.clear();
                             self.orchestration_summary.insert(owner.clone(), summary);
-                            self.orchestration_handoffs
-                                .insert(owner.clone(), completed.id);
+                            self.orchestration_handoffs.insert(owner.clone(), completed.id);
                             if parent.state.follow_tail {
                                 parent.show_latest();
                             }
                         } else {
-                            parent
-                                .state
-                                .report(io, "Results are in the agents' transcripts");
+                            parent.state.report(
+                                io,
+                                if completed.stopped {
+                                    "Plan stopped · see the agents' transcripts"
+                                } else {
+                                    "Results are in the agents' transcripts"
+                                },
+                            );
                         }
                     }
+                    Ok(completed) if completed.stopped => parent
+                        .state
+                        .report(io, "Plan stopped · see the agents' transcripts"),
                     Ok(_) => parent
                         .state
                         .report(io, "Results are in the agents' transcripts"),
@@ -3714,7 +3781,9 @@ impl Workbench {
             return;
         }
         if self.selection.take().is_some() {
-            self.slots[self.current].show_latest();
+            if !matches!(self.panel, Some(Panel::Activity(_))) {
+                self.slots[self.current].show_latest();
+            }
             return;
         }
         if matches!(self.panel, Some(Panel::Terminal)) {
@@ -3737,11 +3806,17 @@ impl Workbench {
             return;
         }
         self.pending_editor = None;
-        if let Some(Panel::AgentTranscript(reader)) = &self.panel {
+        if let Some(Panel::AgentTranscript(reader)) = &self.panel
+            && (reader.from_list || self.activity_back.is_none())
+        {
             self.panel = Some(Panel::Agents {
                 selected: Some(reader.id.clone()),
             });
             self.focus = Focus::Inspector;
+            return;
+        }
+        if self.panel.is_some() && self.activity_back.is_some() {
+            self.return_to_activity();
             return;
         }
         if self.panel.take().is_some() {
@@ -3773,6 +3848,15 @@ impl Workbench {
         }
     }
     fn page(&mut self, older: bool) {
+        if self.focus == Focus::Inspector && matches!(self.panel, Some(Panel::Activity(_))) {
+            self.scroll_activity(
+                older,
+                self.displayed.as_ref().map_or(8, |frame| {
+                    frame.inspector_content_rows.saturating_sub(1).max(1)
+                }),
+            );
+            return;
+        }
         let output_limit = match &self.panel {
             Some(Panel::Output { view, .. }) => {
                 self.output_lines(&view.text).len().saturating_sub(1)
@@ -3861,10 +3945,10 @@ impl Workbench {
                 state.reading_total = state.snapshot.as_ref().map_or(0, |s| s.transcript_size);
             }
             state.follow_tail = false;
-            if slot.timeline_query.before == 0
-                && let Some(page) = &slot.timeline
+            if slot.conversation_query.before == 0
+                && let Some(page) = &slot.conversation_page
             {
-                slot.timeline_query = GetTranscript {
+                slot.conversation_query = GetTranscript {
                     before: page.end,
                     limit: 64,
                     forward: false,
@@ -3872,10 +3956,10 @@ impl Workbench {
             }
             if state.scroll >= state.scroll_limit
                 && can_page
-                && let Some(page) = &slot.timeline
+                && let Some(page) = &slot.conversation_page
                 && page.begin > 0
             {
-                slot.timeline_query = GetTranscript {
+                slot.conversation_query = GetTranscript {
                     before: page.begin,
                     limit: neighbor.map_or(64, |(begin, end)| end - begin),
                     forward: false,
@@ -3889,11 +3973,11 @@ impl Workbench {
             }
         } else if state.scroll == 0
             && can_page
-            && let Some(page) = &slot.timeline
+            && let Some(page) = &slot.conversation_page
             && page.end < page.total
             && tail.is_none_or(|limit| page.end < limit)
         {
-            slot.timeline_query = GetTranscript {
+            slot.conversation_query = GetTranscript {
                 before: page.end,
                 limit: neighbor.map_or_else(
                     || tail.map_or(64, |end| (end - page.end).min(64)),
@@ -3910,13 +3994,13 @@ impl Workbench {
             if state.scroll == 0
                 && !dragging
                 && slot
-                    .timeline
+                    .conversation_page
                     .as_ref()
                     .is_some_and(|page| page.end == page.total)
             {
                 state.follow_tail = true;
                 state.reading = None;
-                slot.timeline_query = GetTranscript {
+                slot.conversation_query = GetTranscript {
                     before: 0,
                     limit: 64,
                     forward: false,
@@ -3936,7 +4020,7 @@ impl Workbench {
     }
     fn drag_scroll(&mut self, older: bool, lines: usize, io: &Io) -> bool {
         let range = self.slots[self.current]
-            .timeline
+            .conversation_page
             .as_ref()
             .map(|page| (page.begin, page.end));
         self.selection.as_ref().is_some_and(|selection| {
@@ -3972,6 +4056,13 @@ impl Workbench {
             completion.navigate(older);
             return;
         }
+        if self.menu.is_none()
+            && self.focus == Focus::Inspector
+            && matches!(self.panel, Some(Panel::Activity(_)))
+        {
+            self.select_activity(older);
+            return;
+        }
         let agent_rows = if matches!(self.panel, Some(Panel::Agents { .. })) {
             self.agent_rows()
         } else {
@@ -3995,7 +4086,14 @@ impl Workbench {
         };
         match &mut self.menu {
             Some(Menu::Roles(picker)) => picker.navigate(delta),
-            Some(Menu::Orchestration { selected, .. }) => delta(selected, 3),
+            Some(Menu::Orchestration { selected, proposal }) => delta(
+                selected,
+                if proposal.can_request_implementation() {
+                    4
+                } else {
+                    3
+                },
+            ),
             Some(Menu::Themes(preview)) => {
                 preview.navigate(older);
                 let theme = preview.current();
@@ -4053,7 +4151,12 @@ impl Workbench {
                     *selected = agent_rows.get(index).map(|(id, _)| id.clone());
                 }
                 Some(Panel::Output { offset, .. }) => delta(offset, output_count),
-                Some(Panel::Terminal | Panel::Image { .. } | Panel::NativeTerminal { .. }) => {}
+                Some(
+                    Panel::Activity(_)
+                    | Panel::Terminal
+                    | Panel::Image { .. }
+                    | Panel::NativeTerminal { .. },
+                ) => {}
                 Some(Panel::AgentTranscript(reader)) => {
                     if let Some(page) = &reader.page {
                         let width = self
@@ -4131,6 +4234,15 @@ impl Workbench {
                             self.refinement =
                                 Some((proposal.prompt, proposal.read_only, proposal.skill));
                             self.report(io, "Enter a clarification for the plan");
+                        }
+                        2 if proposal.can_request_implementation() => {
+                            self.refinement = None;
+                            self.start_orchestration_plan(
+                                &proposal.prompt,
+                                proposal.skill,
+                                true,
+                                io,
+                            );
                         }
                         _ => self.report(io, "Plan cancelled"),
                     }
@@ -4262,6 +4374,7 @@ impl Workbench {
                         self.open_file(entry.path.clone(), io);
                     }
                 }
+                Some(Panel::Activity(_)) => self.enter_activity(io),
                 Some(Panel::Agents { selected }) => {
                     if let Some(id) = selected.clone() {
                         self.open_agent(&id);
@@ -4379,9 +4492,15 @@ impl Workbench {
                 self.selection_frame = None;
                 self.next_drag_scroll = None;
                 self.tool_press = None;
-                // A partially painted frame has no single truthful text
-                // snapshot. Selection starts only on a completed paint.
-                if !self.frames.is_empty() || io.writer.failed() {
+                if io.writer.failed() {
+                    return;
+                }
+                if matches!(self.panel, Some(Panel::Activity(_))) {
+                    self.tool_press = self.activity_press(mouse.column, mouse.row);
+                }
+                // Text selection needs one complete paint. Activity actions
+                // can use the same hit target across an in-flight redraw.
+                if !self.frames.is_empty() {
                     return;
                 }
                 if matches!(self.panel, Some(Panel::Agents { .. }))
@@ -4414,6 +4533,14 @@ impl Workbench {
                         None
                     });
                 if let Some(tab) = tab {
+                    if tab == 1 && matches!(self.panel, Some(Panel::Activity(_))) {
+                        self.activity_shell();
+                        return;
+                    }
+                    if tab == 0 && matches!(self.panel, Some(Panel::NativeTerminal { .. })) {
+                        self.return_to_activity();
+                        return;
+                    }
                     if tab == 1 && matches!(self.panel, Some(Panel::Files(_))) {
                         self.open_terminal(io);
                         return;
@@ -4435,6 +4562,13 @@ impl Workbench {
                     let in_chat = frame.chat_bounds.is_some_and(|(begin, end, right)| {
                         mouse.row >= begin && mouse.row < end && mouse.column < right
                     });
+                    let in_activity = matches!(self.panel, Some(Panel::Activity(_)))
+                        && frame
+                            .inspector_bounds()
+                            .is_some_and(|(left, top, width, height)| {
+                                (left..left + width).contains(&mouse.column)
+                                    && (top..top + height).contains(&mouse.row)
+                            });
                     if in_chat
                         && let Some((_, key)) =
                             frame.tool_actions.iter().find(|(row, _)| *row == mouse.row)
@@ -4453,13 +4587,13 @@ impl Workbench {
                     let slot = &mut self.slots[self.current];
                     self.selection = if in_chat {
                         Selection::chat(frame.clone(), mouse.column, mouse.row)
-                    } else if matches!(self.panel, Some(Panel::Terminal)) {
+                    } else if in_activity || matches!(self.panel, Some(Panel::Terminal)) {
                         Some(Selection::new(frame.clone(), mouse.column, mouse.row))
                     } else {
                         None
                     };
                     if in_chat && self.selection.is_some() {
-                        let reading = slot.projected();
+                        let reading = slot.conversation();
                         slot.state.follow_tail = false;
                         slot.state.reading_total = slot
                             .state
@@ -4467,7 +4601,7 @@ impl Workbench {
                             .as_ref()
                             .map_or(0, |s| s.transcript_size);
                         if let Some((begin, end)) = frame.timeline_range {
-                            slot.timeline_query = GetTranscript {
+                            slot.conversation_query = GetTranscript {
                                 before: end,
                                 limit: end.saturating_sub(begin).max(1),
                                 forward: false,
@@ -4499,7 +4633,11 @@ impl Workbench {
                 if let Some((column, row, key, edit, output)) = self.tool_press.take()
                     && (column, row) == (mouse.column, mouse.row)
                 {
-                    self.activate_result(key, edit, output, io);
+                    if matches!(self.panel, Some(Panel::Activity(_))) {
+                        self.activate_activity(key, edit, output, io);
+                    } else {
+                        self.activate_result(key, edit, output, io);
+                    }
                     return;
                 }
                 if let Some(mut selection) = self.selection.take()
@@ -4786,29 +4924,33 @@ impl Workbench {
             Panel::Orchestration { document, offset } => {
                 let footer = if let Some(Menu::Orchestration { selected, proposal }) = &self.menu {
                     let blocked = proposal.plan.execution_ready().err();
-                    let actions = [
-                        if blocked.is_none() {
-                            "Start"
-                        } else {
-                            "Start unavailable"
-                        },
-                        "Refine",
-                        "Cancel",
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, label)| {
-                        if index == *selected {
-                            format!("[{label}]")
-                        } else {
-                            label.into()
-                        }
-                    })
-                    .collect::<Vec<String>>()
-                    .join("   ");
+                    let start = if blocked.is_some() {
+                        "Start unavailable"
+                    } else if proposal.profile.is_some() && proposal.plan.is_read_only() {
+                        "Start read only"
+                    } else {
+                        "Start"
+                    };
+                    let mut actions = vec![start, "Refine"];
+                    if proposal.can_request_implementation() {
+                        actions.push("Implement");
+                    }
+                    actions.push("Cancel");
+                    let actions = actions
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, label)| {
+                            if index == *selected {
+                                format!("[{label}]")
+                            } else {
+                                label.into()
+                            }
+                        })
+                        .collect::<Vec<String>>()
+                        .join("   ");
                     format!("{actions}   ·   ↑/↓ · Enter")
                 } else {
-                    "PgUp/PgDn or scroll · Esc chat".into()
+                    "PgUp/PgDn or scroll · Esc back".into()
                 };
                 Some(Inspector {
                     title: "Plan · PgUp/PgDn or scroll".into(),
@@ -4857,14 +4999,17 @@ impl Workbench {
                 footer: "j/k lines · PgUp/PgDn pages · g/G start/end · Esc back".into(),
                 ..Inspector::default()
             }),
+            Panel::Activity(navigation) => Some(self.activity_inspector(navigation)),
             Panel::NativeTerminal { view, .. } => Some(Inspector {
+                tabs: activity::tabs(),
+                selected_tab: 1,
                 title: view
                     .as_ref()
                     .map_or_else(|| "Agent terminal".into(), |view| view.title.clone()),
                 lines: view.as_ref().map_or_else(Vec::new, |view| {
                     view.text.lines().map(str::to_owned).collect()
                 }),
-                footer: "Esc chat".into(),
+                footer: "a activity · Esc back".into(),
                 ..Inspector::default()
             }),
             Panel::EditDiff {
@@ -4878,7 +5023,7 @@ impl Workbench {
                 kind: InspectorKind::Diff,
                 diff: Some(rows.clone()),
                 diff_column: *column,
-                footer: "j/k lines · h/l horizontal · f expand · Esc chat".into(),
+                footer: "j/k lines · h/l horizontal · f expand · Esc back".into(),
                 ..Inspector::default()
             }),
             Panel::AgentTranscript(reader) => Some(Inspector {
@@ -4892,9 +5037,9 @@ impl Workbench {
                         .as_ref()
                         .filter(|page| page.begin > 0 || page.end < page.total)
                         .map_or("", |_| " · [/] pages");
-                    format!("PgUp/PgDn scroll{pages} · r refresh · Esc agents")
+                    format!("PgUp/PgDn scroll{pages} · r refresh · Esc back")
                 } else {
-                    format!("{} · Esc agents", reader.notice)
+                    format!("{} · Esc back", reader.notice)
                 },
                 ..Inspector::default()
             }),
@@ -5164,8 +5309,11 @@ impl Workbench {
     }
     fn animation_enabled(&self) -> bool {
         let slot = &self.slots[self.current];
-        self.selection.is_none()
-            && slot.state.follow_tail
+        matches!(self.panel, Some(Panel::Activity(_)))
+            && self.selection.is_none()
+            && slot
+                .activity_page()
+                .is_none_or(|page| page.end == page.total)
             && self.menu.is_none()
             && self.completion.is_none()
             && (self.collecting_orchestration()
@@ -5288,8 +5436,11 @@ impl Workbench {
                 .state
                 .render_workspace(io, context, &ui, projected.as_deref());
             if let Some(live) = &mut live {
-                live.timeline_range = slot.timeline.as_ref().map(|page| (page.begin, page.end));
-                live.timeline_total = slot.timeline.as_ref().map_or(0, |page| page.total);
+                live.timeline_range = slot
+                    .conversation_page
+                    .as_ref()
+                    .map(|page| (page.begin, page.end));
+                live.timeline_total = slot.conversation_page.as_ref().map_or(0, |page| page.total);
                 if selection.scroll_pending && self.selection_frame.is_none() {
                     let mut next = selection.clone();
                     next.update(
@@ -5422,7 +5573,7 @@ impl Workbench {
         }
         if self.selection.is_none()
             && let Some(frame) = &mut frame
-            && let Some(page) = &self.slots[self.current].timeline
+            && let Some(page) = &self.slots[self.current].conversation_page
         {
             frame.timeline_range = Some((page.begin, page.end));
             frame.timeline_total = page.total;
@@ -5686,10 +5837,15 @@ pub async fn run_attached(
             dirty |= next_animation != animated_frame;
             animated_frame = next_animation;
             let mut admissions = Vec::new();
-            for slot in &mut work.slots {
+            let activity_open = matches!(work.panel, Some(Panel::Activity(_)));
+            let current = work.current;
+            for (index, slot) in work.slots.iter_mut().enumerate() {
                 dirty |= slot.poll_replies(io)?;
                 admissions.append(&mut slot.admissions);
-                if !finished { slot.refresh(io, now); }
+                if !finished {
+                    if activity_open && current == index { slot.refresh_activity(); }
+                    slot.refresh(io, now);
+                }
                 dirty |= slot.state.progress.tick(now);
                 if slot.state.explicit_status { dirty |= slot.state.wait_clock.tick(now); }
             }
@@ -5749,9 +5905,10 @@ pub async fn run_attached(
                             if byte.is_ascii() && !work.input_editor().escape_pending() && !work.input_editor().pasting() {
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());
                                 if byte == 7 && work.focus == Focus::Chat && work.menu.is_none() && work.completion.is_none() {
-                                    work.navigate_results(None);
+                                    work.open_activity();
                                     continue;
                                 }
+                                if work.menu.is_none() && work.focus == Focus::Inspector && work.activity_key(byte) { continue; }
                                 if byte == b'f' && work.focus == Focus::Inspector
                                     && (matches!(&work.panel, Some(Panel::EditDiff { .. }))
                                         || matches!(&work.panel, Some(Panel::Files(files)) if files.tab == 1 && files.document.is_some())) {
@@ -5867,7 +6024,7 @@ pub async fn run_attached(
                                     Action::HistoryOlder | Action::HistoryNewer => work.navigate(action == Action::HistoryOlder),
                                     Action::PageUp => work.page(true), Action::PageDown => work.page(false),
                                     Action::OpenFiles => { work.open_file(work.factory.settings.cwd.clone(), io); }
-                                    Action::OpenTerminals => { work.inspect_terminal("", io); }
+                                    Action::OpenTerminals => { work.open_activity(); }
                                     Action::ToggleTools => { let slot = &mut work.slots[work.current]; slot.state.tools_expanded = !slot.state.tools_expanded; slot.state.reading = None; }
                                     Action::CopyHistory => work.slots[work.current].state.start_copy(io),
                                     Action::Overflow => { work.report(io, "ansa: submit_size"); work.slots[work.current].state.exit = 1; work.slots[work.current].state.editor.clear(); work.slots[work.current].state.input_history.reset(); }
@@ -6127,9 +6284,9 @@ mod tests {
             end: 1,
             total: 80,
             entries: vec![],
-            query: slot.timeline_query.clone(),
+            query: slot.conversation_query.clone(),
         };
-        slot.received_timeline(&page);
+        slot.received_conversation(&page);
         let frame = carbon::layout_full(
             &[Entry {
                 status: None,
@@ -6170,16 +6327,16 @@ mod tests {
             end: 80,
             total: 80,
             entries: vec![],
-            query: slot.timeline_query.clone(),
+            query: slot.conversation_query.clone(),
         };
-        slot.received_timeline(&tail);
+        slot.received_conversation(&tail);
         assert_eq!(slot.state.scroll, 0);
         assert!(slot.state.follow_tail && !slot.jump_top);
         for _ in 0..2 {
             slot.jump_history(true);
             slot.cancel_history_jump();
-            assert!(!slot.timeline_query.forward);
-            assert_eq!(slot.timeline_query.before, tail.end);
+            assert!(!slot.conversation_query.forward);
+            assert_eq!(slot.conversation_query.before, tail.end);
             assert!(!slot.jump_top);
         }
         slot.runtime.shutdown().await.unwrap();
@@ -6424,22 +6581,22 @@ mod tests {
         })
         .await
         .unwrap();
-        let query = slot.timeline_query.clone();
+        let query = slot.conversation_query.clone();
         handle
             .post(
                 slot.state
-                    .command(&handle, CommandPayload::GetTimeline(query)),
+                    .command(&handle, CommandPayload::GetConversation(query)),
             )
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let SessionEvent::Runtime(RuntimeEvent {
-                    payload: EventPayload::TimelinePage(page),
+                    payload: EventPayload::ConversationPage(page),
                     ..
                 }) = events.recv().await.unwrap().1
                 {
-                    slot.timeline = Some(page);
+                    slot.conversation_page = Some(page);
                     break;
                 }
             }
@@ -6562,11 +6719,11 @@ mod tests {
                 .entries(slot.state.snapshot.as_ref().unwrap(), true, Instant::now())
                 .is_empty()
         );
-        slot.timeline = Some(TranscriptPage {
+        slot.activity_timeline = Some(TranscriptPage {
             begin: 0,
             end: 1,
             total: 1,
-            query: slot.timeline_query.clone(),
+            query: slot.activity_query.clone(),
             entries: vec![transcript::Entry {
                 tool: None,
                 turn: "turn".into(),

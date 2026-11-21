@@ -572,7 +572,7 @@ impl Factory {
         stop: &Cancel,
     ) -> Result<crate::orchestration::plan::Plan> {
         self.check_orchestration_context(&source)?;
-        let draft = self.plan_draft(read_only, skill);
+        let draft = self.plan_draft(read_only, skill, false);
         let mut epoch = source.epoch;
         epoch.instructions.push_str(&draft.instructions);
         let format = draft.format;
@@ -604,6 +604,7 @@ impl Factory {
         &self,
         read_only: bool,
         skill: Option<&str>,
+        plus: bool,
     ) -> crate::provider::contracts::PlanDraft {
         use crate::provider::structured::FinalFormat;
         #[cfg(feature = "orchestration-pilot")]
@@ -614,6 +615,11 @@ impl Factory {
         };
         #[cfg(not(feature = "orchestration-pilot"))]
         let format = FinalFormat::OrchestrationPlanWithReadFolder;
+        let format = if plus && format.has_read_folder() {
+            FinalFormat::OrchestrationPlanWithOutcome
+        } else {
+            format
+        };
         let mut instructions = String::new();
         instructions.push_str(&format!(
             "\nThe current working directory is {}.",
@@ -636,8 +642,19 @@ impl Factory {
         } else {
             instructions.push_str("Put required command-based or other unsupported checks in manual_checks. Those must be resolved before execution.");
         }
-        if format == FinalFormat::OrchestrationPlanWithReadFolder {
+        if format.has_read_folder() {
             instructions.push_str("\nFor a read-only investigation targeting a directory explicitly named in the request, set read_folder to the exact path spelling from the user message. Its resolved path will be shown before approval. Interpret all step paths relative to that folder and keep the steps about that folder. Use null for the current workspace or any plan involving writes. Do not infer or broaden the folder from other instructions. When revising a proposed plan, retain the user’s previously named folder if the latest clarification does not change it.");
+        }
+        if format == FinalFormat::OrchestrationPlanWithOutcome {
+            instructions.push_str(concat!(
+                "\nSet requested_outcome from the user's requested deliverable. For feature lists, fixes, ",
+                "and changes to behavior use implementation: include scoped write steps and executable ",
+                "command_checks exercising the changed behavior. A preliminary survey can be a dependency, ",
+                "but the approved plan must reach the requested working change and its test. For an explicit ",
+                "question, audit or planning-only request use investigation with read-only steps. ",
+                "An unrestricted workspace read helper can use git_snapshot for branch, HEAD, status and recent commits. ",
+                "Scoped readers only have file tools. Put executable tests in command_checks, not in read steps."
+            ));
         }
         if read_only {
             instructions
@@ -840,6 +857,14 @@ impl Factory {
             .with("orchestration_parent", Json::string(parent)?)?
             .with("orchestration_writes", paths(writes)?)?
             .with("orchestration_reads", paths(&assignment.paths)?)?;
+        if assignment.access == crate::orchestration::plan::Access::Read
+            && assignment.paths.is_empty()
+            && workspace == self.settings.cwd
+        {
+            epoch.exact_state = epoch
+                .exact_state
+                .with("orchestration_git_snapshot", Json::parse("true")?)?;
+        }
         if conversation
             && assignment.access == crate::orchestration::plan::Access::Read
             && matches!(
@@ -965,13 +990,19 @@ impl Factory {
                 .collect::<Result<Vec<_>>>()?;
             scope = scope.restrict_reads(&reads)?;
         }
-        let tools = local_task_tools(
+        let advertised_git = configuration
+            .tools
+            .descriptors
+            .iter()
+            .any(|tool| tool.name == "git_snapshot");
+        let tools = crate::tools::files::local_task_tools_with_git(
             settings,
             configuration.epoch.clone(),
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
             scope,
+            advertised_git,
         )?;
         let (generate, options) = if inspect_only {
             let generate: Generate = Arc::new(|_, _, _| Err("session_read_only"));

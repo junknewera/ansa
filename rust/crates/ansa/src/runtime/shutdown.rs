@@ -115,6 +115,7 @@ impl Handle {
             CommandPayload::Resume(_) => &self.resume,
             CommandPayload::GetTranscript(_)
             | CommandPayload::GetTimeline(_)
+            | CommandPayload::GetConversation(_)
             | CommandPayload::GetMessageReceipt(_)
             | CommandPayload::GetContext => &self.transcript,
             CommandPayload::Submit(_)

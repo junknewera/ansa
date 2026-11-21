@@ -32,7 +32,7 @@ fn child_tool_receipt(saved: &SavedResult, detail: Option<&ToolDetail>) -> Child
     let tool = detail.map_or("unknown", |detail| detail.name.as_str());
     let local_evidence = matches!(
         tool,
-        "read_file" | "list_directory" | "search_files" | "edit_file"
+        "read_file" | "list_directory" | "search_files" | "edit_file" | "git_snapshot"
     );
     let output_excerpt = if local_evidence {
         result.output().chars().take(200).collect()
@@ -290,6 +290,7 @@ impl Owner {
             .or_else(|| self.state.turn.as_ref().map(|t| &t.receipt));
         self.emit(EventPayload::FrontendSnapshot(Box::new(Snapshot {
             timeline_size: self.state.timeline.len(),
+            conversation_size: self.state.timeline.conversation_len(),
             generation: self.state.generation.clone(),
             autocompact_percent: self.state.autocompact_percent,
             followups: self
@@ -896,6 +897,7 @@ impl Owner {
                 CommandPayload::GetSnapshot(_)
                     | CommandPayload::GetTranscript(_)
                     | CommandPayload::GetTimeline(_)
+                    | CommandPayload::GetConversation(_)
                     | CommandPayload::GetMessageReceipt(_)
             )
         {
@@ -1078,15 +1080,25 @@ impl Owner {
                     seed: self.state.fork_seed()?,
                 });
             }
-            CommandPayload::GetTimeline(query) => {
-                let page = self.state.timeline.page(query.clone());
-                self.emit(EventPayload::TimelinePage(TranscriptPage {
+            CommandPayload::GetTimeline(query) | CommandPayload::GetConversation(query) => {
+                let conversation = matches!(command.payload, CommandPayload::GetConversation(_));
+                let page = if conversation {
+                    self.state.timeline.conversation_page(query.clone())
+                } else {
+                    self.state.timeline.page(query.clone())
+                };
+                let page = TranscriptPage {
                     begin: page.begin,
                     end: page.end,
                     total: page.total,
                     entries: page.entries,
                     query: page.query,
-                }));
+                };
+                self.emit(if conversation {
+                    EventPayload::ConversationPage(page)
+                } else {
+                    EventPayload::TimelinePage(page)
+                });
             }
             CommandPayload::Submit(submitted)
             | CommandPayload::Handoff(submitted)

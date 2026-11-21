@@ -86,22 +86,36 @@ impl ToolDetail {
 #[derive(Clone, Debug)]
 pub struct Timeline {
     entries: Transcript,
+    conversation: Transcript,
     turn: TurnId,
     request: RequestId,
     mode: AgentMode,
+    draft: bool,
     final_text: String,
     names: BTreeMap<String, ToolDetail>,
     purposes: BTreeMap<String, std::sync::Arc<str>>,
     pending: BTreeMap<String, String>,
 }
 
+pub(crate) fn draft_material(row: &Entry) -> bool {
+    row.role == "assistant" && (row.state == "plan_draft" || row.turn.0.starts_with("draft-"))
+}
+
+pub(crate) fn conversation_row(row: &Entry) -> bool {
+    matches!(row.role.as_str(), "user" | "assistant" | "reasoning")
+        && !(row.role == "user" && row.turn.0.starts_with("draft-revise-"))
+        && !draft_material(row)
+}
+
 impl Default for Timeline {
     fn default() -> Self {
         Self {
             entries: Transcript::default(),
+            conversation: Transcript::default(),
             turn: "idle".into(),
             request: "idle".into(),
             mode: AgentMode::Basic,
+            draft: false,
             final_text: String::new(),
             names: BTreeMap::new(),
             purposes: BTreeMap::new(),
@@ -129,6 +143,12 @@ impl Timeline {
     }
     pub fn page(&self, query: GetTranscript) -> Page {
         self.entries.page(query)
+    }
+    pub(crate) fn conversation_len(&self) -> usize {
+        self.conversation.len()
+    }
+    pub(crate) fn conversation_page(&self, query: GetTranscript) -> Page {
+        self.conversation.page(query)
     }
     pub fn save(&self) -> Result<Json> {
         let mut entries = Vec::new();
@@ -223,7 +243,7 @@ impl Timeline {
             } else {
                 None
             };
-            result.entries.append(Entry {
+            result.append_entry(Entry {
                 turn: turn.into(),
                 request: request.into(),
                 role: role.into(),
@@ -234,6 +254,13 @@ impl Timeline {
             });
         }
         Ok(result)
+    }
+    fn append_entry(&mut self, entry: Entry) {
+        let entry = std::sync::Arc::new(entry);
+        if conversation_row(&entry) {
+            self.conversation.append_shared(entry.clone());
+        }
+        self.entries.append_shared(entry);
     }
     fn append(&mut self, role: &str, text: String, state: &str) {
         self.append_tool(role, text, state, None);
@@ -254,7 +281,7 @@ impl Timeline {
             while !remaining.is_char_boundary(end) {
                 end -= 1;
             }
-            self.entries.append(Entry {
+            self.append_entry(Entry {
                 turn: self.turn.clone(),
                 request: self.request.clone(),
                 role: role.into(),
@@ -306,6 +333,7 @@ impl Timeline {
             "accepted" => {
                 self.turn = event.text_field("turn")?.into();
                 self.request = event.text_field("request")?.into();
+                self.draft = event.has("draft");
                 self.mode = if event.has("mode") && event.text_field("mode")? == "plan" {
                     AgentMode::Plan
                 } else {
@@ -316,6 +344,13 @@ impl Timeline {
                 self.purposes.clear();
                 let text = event.text_field("text")?;
                 let displayed = if event.has("handoff") {
+                    if let Ok(report) = Json::parse(text)
+                        && report.text_field("orchestration_outcome") == Ok("stopped")
+                        && let (Ok(step), Ok(reason)) =
+                            (report.text_field("task_id"), report.text_field("reason"))
+                    {
+                        self.append("notice", format!("Stopped at {step} · {reason}"), "blocked");
+                    }
                     super::state::displayed_handoff_question(text)
                 } else {
                     Some(text.to_owned())
@@ -453,7 +488,12 @@ impl Timeline {
             }
             "done" => {
                 let text = std::mem::take(&mut self.final_text);
-                self.append("assistant", text, "completed");
+                let state = if self.draft {
+                    "plan_draft"
+                } else {
+                    "completed"
+                };
+                self.append("assistant", text, state);
             }
             "cancel" => self.append("notice", "Current step stopped".into(), "cancelled"),
             _ => {}
@@ -667,6 +707,51 @@ mod tests {
             offset = page.end;
         }
         assert_eq!(seen, text);
+    }
+    #[test]
+    fn conversation_pages_anchor_to_messages_across_tool_heavy_history() {
+        let mut timeline = Timeline::default();
+        timeline.append("user", "First question".into(), "accepted");
+        timeline.append("assistant", "First answer".into(), "completed");
+        timeline.append("user", "Current question".into(), "accepted");
+        timeline.append("reasoning", "Public reasoning".into(), "confirmed");
+        timeline.turn = "draft-revise-fixture".into();
+        timeline.append("user", "Synthetic repair request".into(), "accepted");
+        timeline.append("assistant", "Structured plan".into(), "plan_draft");
+        for index in 0..96 {
+            timeline.append("tool_result", format!("Tool {index}"), "finished");
+        }
+        let query = GetTranscript {
+            before: 0,
+            limit: 2,
+            forward: false,
+        };
+        let restored = Timeline::load(&timeline.save().unwrap()).unwrap();
+        for timeline in [timeline, restored] {
+            let raw = timeline.page(GetTranscript {
+                limit: 64,
+                ..query.clone()
+            });
+            assert_eq!(raw.entries.len(), 64);
+            assert!(raw.entries.iter().all(|entry| entry.role == "tool_result"));
+            let latest = timeline.conversation_page(query.clone());
+            assert_eq!((latest.begin, latest.end, latest.total), (2, 4, 4));
+            assert_eq!(latest.entries[0].text, "Current question");
+            assert_eq!(latest.entries[1].text, "Public reasoning");
+            let older = timeline.conversation_page(GetTranscript {
+                before: latest.begin,
+                ..query.clone()
+            });
+            assert_eq!((older.begin, older.end, older.total), (0, 2, 4));
+            assert_eq!(older.entries[0].text, "First question");
+            assert_eq!(older.entries[1].text, "First answer");
+            let forward = timeline.conversation_page(GetTranscript {
+                before: older.end,
+                forward: true,
+                ..query.clone()
+            });
+            assert_eq!(forward.entries, latest.entries);
+        }
     }
     #[test]
     fn projection_keeps_public_summary_and_never_serializes_opaque_reasoning() {

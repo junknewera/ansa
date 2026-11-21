@@ -141,6 +141,7 @@ pub enum CommandPayload {
     SetGeneration(GenerationSelection),
     GetContext,
     GetTimeline(GetTranscript),
+    GetConversation(GetTranscript),
     Cancel(RequestId),
     GetSnapshot(u64),
     Resume(RequestId),
@@ -185,6 +186,7 @@ pub enum EventPayload {
         seed: crate::session::state::ForkSeed,
     },
     TimelinePage(crate::frontend::protocol_v1::TranscriptPage),
+    ConversationPage(crate::frontend::protocol_v1::TranscriptPage),
     CommandAccepted {
         command: CommandId,
         request: Option<RequestId>,
@@ -291,7 +293,9 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
             }
             Ok(())
         }
-        CommandPayload::GetTranscript(query) | CommandPayload::GetTimeline(query)
+        CommandPayload::GetTranscript(query)
+        | CommandPayload::GetTimeline(query)
+        | CommandPayload::GetConversation(query)
             if query.limit == 0 || query.limit > 64 =>
         {
             Err("transcript_page_limit")

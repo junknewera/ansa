@@ -386,11 +386,13 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                 ("state", s(&v.state)),
             ],
         ),
-        EventPayload::TranscriptPage(v) | EventPayload::TimelinePage(v) => (
-            if matches!(event.payload, EventPayload::TimelinePage(_)) {
-                "timeline"
-            } else {
-                "transcript"
+        EventPayload::TranscriptPage(v)
+        | EventPayload::TimelinePage(v)
+        | EventPayload::ConversationPage(v) => (
+            match event.payload {
+                EventPayload::TimelinePage(_) => "timeline",
+                EventPayload::ConversationPage(_) => "conversation",
+                _ => "transcript",
             },
             vec![
                 ("begin", n(v.begin as u64)),

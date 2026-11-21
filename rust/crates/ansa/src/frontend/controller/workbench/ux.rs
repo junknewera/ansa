@@ -59,13 +59,29 @@ impl Workbench {
     }
 
     pub(super) fn projected_slot(&self, slot: &Slot) -> Option<Vec<Entry>> {
-        let mut entries = slot.projected()?;
+        slot.conversation()
+    }
+
+    pub(super) fn terminal_activity(&self) -> Vec<Entry> {
+        let slot = &self.slots[self.current];
+        let mut entries = slot.projected().unwrap_or_default();
+        let at_tail = slot
+            .activity_page()
+            .is_none_or(|page| page.end == page.total);
         for review in &slot.candidate_reviews {
             let plan_key = format!("plan:{}", review.run);
-            if let Some(index) = entries
+            let index = entries
                 .iter()
-                .position(|entry| entry.action.as_ref() == Some(&plan_key))
-            {
+                .position(|entry| entry.action.as_ref() == Some(&plan_key));
+            let index = match index {
+                Some(index) => Some(index + 1),
+                None if at_tail => {
+                    entries.push(result_entry("Approved plan".into(), Some(plan_key), None));
+                    Some(entries.len())
+                }
+                None => None,
+            };
+            if let Some(index) = index {
                 let diff = Some(format!("candidate:{}", review.run));
                 let mut review_entries = vec![result_entry(review.heading.clone(), diff, None)];
                 let changed = |row: &crate::frontend::diff::Row| {
@@ -96,23 +112,19 @@ impl Workbench {
                         Some(view.clone()),
                     )
                 }));
-                entries.splice(index + 1..index + 1, review_entries);
+                entries.splice(index..index, review_entries);
             }
         }
-        if slot
-            .timeline
-            .as_ref()
-            .is_some_and(|page| page.end < page.total)
-        {
-            return Some(entries);
+        if !at_tail {
+            return entries;
         }
-        if self.orchestration_progress.is_some()
+        let collecting = self.orchestration_progress.is_some()
             && self
                 .orchestration_stop
                 .as_ref()
-                .is_some_and(|(owner, _)| owner == &slot.id)
-        {
-            let view = self.orchestration_views.get(&slot.id);
+                .is_some_and(|(owner, _)| owner == &slot.id);
+        let view = self.orchestration_views.get(&slot.id);
+        if collecting || view.is_some() {
             if let Some(view) = view {
                 let mut plan = format!("## Work plan\n{}", view.plan.summary());
                 for step in view.plan.steps() {
@@ -138,7 +150,7 @@ impl Workbench {
                 text: view.map_or_else(
                     || "Starting agents".into(),
                     |view| {
-                        let label = if view.reviewing {
+                        let label = if collecting && view.reviewing {
                             "Verifying agent changes"
                         } else if view.clarification_pending {
                             "Coordinator receives the clarification after the current step"
@@ -146,7 +158,7 @@ impl Workbench {
                             "Agents"
                         };
                         format!(
-                            "{label} · {}/{} agents done",
+                            "{label} · {}/{} steps done",
                             view.completed_steps.len(),
                             view.plan.steps().len()
                         )
@@ -186,8 +198,12 @@ impl Workbench {
                         }),
                 );
             }
-        } else if slot.state.follow_tail && self.orchestration_summary.contains_key(&slot.id) {
-            if entries.last().is_some_and(|entry| entry.role == "activity") {
+        }
+        if self.orchestration_summary.contains_key(&slot.id) {
+            if entries
+                .last()
+                .is_some_and(|entry| entry.role == "activity" && entry.action.is_none())
+            {
                 entries.pop();
             }
             entries.push(Entry {
@@ -199,10 +215,7 @@ impl Workbench {
                 output: None,
                 agent: None,
             });
-        } else if slot.state.follow_tail
-            && let Some(view) = self.orchestration_views.get(&slot.id)
-            && view.clarification_pending
-        {
+        } else if !collecting && let Some(view) = view.filter(|view| view.clarification_pending) {
             entries.push(Entry {
                 text: "Plan and saved clarification".into(),
                 role: "activity".into(),
@@ -213,7 +226,7 @@ impl Workbench {
                 agent: None,
             });
         }
-        Some(entries)
+        entries
     }
     pub(super) fn navigating(&self) -> bool {
         self.menu.is_some()
@@ -234,17 +247,22 @@ impl Workbench {
         plan: &crate::orchestration::plan::Plan,
         prompt: Option<&str>,
         profile: Option<&RoleProfile>,
+        can_request_implementation: bool,
     ) {
         let mut sections = Vec::new();
+        if can_request_implementation {
+            sections.push("**Read-only investigation**  \nThis run produces a report. Select Implement to request changes and tests.".into());
+        }
         if let Some(profile) = profile {
             sections.push(roles::profile_lines(profile).join("  \n"));
         }
         if let Err(code) = plan.execution_ready() {
-            sections.push(if code == "orchestration_manual_checks_required" {
-                "**A manual check is required before starting. Select Refine.**".into()
-            } else {
-                "**Select Refine to add a check for the changes.**".into()
-            });
+            sections.push(match code {
+                "orchestration_manual_checks_required" => "**A manual check is required before starting. Select Refine.**",
+                "orchestration_implementation_required" => "**Implementation requires a write step and an executable test. Select Refine.**",
+                "orchestration_investigation_only" => "**An investigation plan must contain only read steps. Select Refine.**",
+                _ => "**Select Refine to add a check for the changes.**",
+            }.into());
         }
         if let Some(prompt) = prompt {
             sections.push(format!("## Original request\n\n{prompt}"));
@@ -294,9 +312,9 @@ impl Workbench {
                     .snapshot
                     .as_ref()
                     .map_or(0, |s| s.transcript_size);
-                if let Some(page) = &slot.timeline {
-                    slot.timeline_query.before = page.end;
-                    slot.timeline_query.forward = false;
+                if let Some(page) = &slot.conversation_page {
+                    slot.conversation_query.before = page.end;
+                    slot.conversation_query.forward = false;
                 }
             }
         }
@@ -316,19 +334,11 @@ impl Workbench {
             self.result_scroll = Some(slot.state.scroll);
         }
         if key == "agents:active" {
-            // A mouse press freezes text for dragging. A click on live progress
-            // should keep the parent following the ongoing run in the other pane.
-            if self.result_selected.is_none() {
-                self.slots[self.current].show_latest();
-            }
             self.open_agents(io);
         } else if let Some(id) = key.strip_prefix("agent:") {
-            if self.result_selected.is_none() {
-                self.slots[self.current].show_latest();
-            }
             self.open_agent(id);
         } else if let Some(operation) = key.strip_prefix("image:") {
-            let source = slot.timeline.as_ref().and_then(|page| {
+            let source = slot.activity_page().and_then(|page| {
                 page.entries.iter().find_map(|entry| {
                     graphics::Source::from_entry(entry, &slot.id)
                         .filter(|(id, _)| *id == operation)
@@ -341,10 +351,27 @@ impl Workbench {
                     self.focus = Focus::Inspector;
                 }
             }
+        } else if let Some(turn) = key.strip_prefix("plan:draft:") {
+            let Some(page) = slot.activity_page() else {
+                return;
+            };
+            let plan: String = page
+                .entries
+                .iter()
+                .filter(|row| row.turn.0 == turn && crate::session::timeline::draft_material(row))
+                .map(|row| row.text.as_str())
+                .collect();
+            if !plan.is_empty() {
+                self.panel = Some(Panel::Orchestration {
+                    document: crate::frontend::markdown::Document::parse(&plan),
+                    offset: 0,
+                });
+                self.focus = Focus::Inspector;
+            }
         } else if let Some(run) = key.strip_prefix("plan:") {
             if run == "active" {
                 if let Some(view) = self.orchestration_views.get(&slot.id) {
-                    self.show_orchestration_plan(&view.plan.clone(), None, None);
+                    self.show_orchestration_plan(&view.plan.clone(), None, None, false);
                 }
             } else if self.can_job(io) {
                 let parent = self.slots[self.current].id.clone();
@@ -409,8 +436,10 @@ impl Workbench {
             if !slot.tool_expanded.remove(&key) && slot.tool_expanded.len() < 4096 {
                 slot.tool_expanded.insert(key);
             }
-            slot.tool_anchor_limit = self.displayed.as_ref().map(|frame| frame.scroll_limit);
-            slot.state.reading = None;
+            if !matches!(self.panel, Some(Panel::Activity(_))) {
+                slot.tool_anchor_limit = self.displayed.as_ref().map(|frame| frame.scroll_limit);
+                slot.state.reading = None;
+            }
         }
     }
 
@@ -445,11 +474,7 @@ impl Workbench {
         }
     }
     pub(super) fn available_commands(&self) -> &'static [commands::Command] {
-        commands::available(
-            self.factory
-                .terminal_owner(&self.slots[self.current].id)
-                .is_some(),
-        )
+        commands::available(true)
     }
     pub(super) fn refresh_completion(&mut self) {
         if self.menu.is_some()

@@ -152,7 +152,9 @@ impl State {
         }
         if matches!(
             payload,
-            CommandPayload::GetTranscript(_) | CommandPayload::GetTimeline(_)
+            CommandPayload::GetTranscript(_)
+                | CommandPayload::GetTimeline(_)
+                | CommandPayload::GetConversation(_)
         ) && self.page_read.is_some()
         {
             return false;
@@ -162,6 +164,7 @@ impl State {
             CommandPayload::GetSnapshot(_)
                 | CommandPayload::GetTranscript(_)
                 | CommandPayload::GetTimeline(_)
+                | CommandPayload::GetConversation(_)
         ));
         self.post_with_origin(handle, payload, replies, true)
     }
@@ -199,7 +202,9 @@ impl State {
         if internal_read
             && matches!(
                 command.payload,
-                CommandPayload::GetTranscript(_) | CommandPayload::GetTimeline(_)
+                CommandPayload::GetTranscript(_)
+                    | CommandPayload::GetTimeline(_)
+                    | CommandPayload::GetConversation(_)
             )
             && self.page_read.is_some()
         {
@@ -211,7 +216,9 @@ impl State {
         if internal_read
             && matches!(
                 command.payload,
-                CommandPayload::GetTranscript(_) | CommandPayload::GetTimeline(_)
+                CommandPayload::GetTranscript(_)
+                    | CommandPayload::GetTimeline(_)
+                    | CommandPayload::GetConversation(_)
             )
         {
             self.page_read = Some(command.command.clone());
@@ -220,6 +227,7 @@ impl State {
             command.payload,
             CommandPayload::GetTranscript(_)
                 | CommandPayload::GetTimeline(_)
+                | CommandPayload::GetConversation(_)
                 | CommandPayload::GetContext
         )
         .then(|| self.read_lane.clone());
@@ -776,6 +784,7 @@ impl State {
         }
         let mut entries: Vec<_> = self.entries[begin..]
             .iter()
+            .filter(|row| ui.is_none() || crate::session::timeline::conversation_row(row))
             .map(|e| Entry {
                 action: None,
                 edit: None,
@@ -786,9 +795,10 @@ impl State {
                 text: e.text.clone(),
             })
             .collect();
-        if let Some(index) = self.entries[begin..]
-            .iter()
-            .position(|e| e.role == "user" && Some(&e.request) == view.request.as_ref())
+        if ui.is_none()
+            && let Some(index) = self.entries[begin..]
+                .iter()
+                .position(|e| e.role == "user" && Some(&e.request) == view.request.as_ref())
         {
             entries.splice(
                 index + 1..index + 1,
@@ -796,14 +806,16 @@ impl State {
                     .entries(view, self.tools_expanded, Instant::now()),
             );
         }
-        if preview_visible(
-            &self.entries,
-            self.page.1,
-            self.page.2,
-            self.preview_request.as_ref(),
-            self.preview.as_ref(),
-            view.state == "completed" && view.durable,
-        ) {
+        if ui.is_none()
+            && preview_visible(
+                &self.entries,
+                self.page.1,
+                self.page.2,
+                self.preview_request.as_ref(),
+                self.preview.as_ref(),
+                view.state == "completed" && view.durable,
+            )
+        {
             let preview = self.preview.as_ref().expect("checked");
             entries.push(Entry {
                 action: None,

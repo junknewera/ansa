@@ -435,12 +435,39 @@ fn evaluation(task: &Step, worker: &PhaseResult) -> String {
     )
 }
 
+enum TaskFailure {
+    Runtime(&'static str),
+    Blocked(&'static str, ChildResult),
+}
+
+impl From<&'static str> for TaskFailure {
+    fn from(code: &'static str) -> Self {
+        Self::Runtime(code)
+    }
+}
+
+fn blocked_task(phase: &'static str, outcome: &ChildResult) -> TaskFailure {
+    TaskFailure::Blocked(
+        phase,
+        ChildResult {
+            status: outcome.status,
+            summary: crate::context::token_prefix(&outcome.summary, 160).into(),
+            findings: outcome
+                .findings
+                .first()
+                .map(|detail| crate::context::token_prefix(detail, 120).to_owned())
+                .into_iter()
+                .collect(),
+        },
+    )
+}
+
 async fn task_work(
     phase: &Phase<'_>,
     task: &Step,
     profile: &RoleProfile,
     context: &serde_json::Value,
-) -> Result<(PhaseResult, PhaseResult, Option<ChildResult>)> {
+) -> std::result::Result<(PhaseResult, PhaseResult, Option<ChildResult>), TaskFailure> {
     let mut prior = None;
     let mut cycle = 0_u32;
     loop {
@@ -465,7 +492,7 @@ async fn task_work(
             )
             .await?;
         if medium.result.status != ChildStatus::Completed {
-            return Err("orchestration_plus_plan_blocked");
+            return Err(blocked_task("coordinator planning", &medium.result));
         }
         let mut instructions = medium.result.clone();
         let mut history = Vec::new();
@@ -527,7 +554,9 @@ async fn task_work(
             )
             .await?;
         let quick_fix = match strong.result.status {
-            ChildStatus::Blocked => return Err("orchestration_plus_escalation_blocked"),
+            ChildStatus::Blocked => {
+                return Err(blocked_task("strong escalation", &strong.result));
+            }
             ChildStatus::ChangesRequested => None,
             ChildStatus::Completed => {
                 let fix = assignment(
@@ -685,17 +714,26 @@ pub(super) async fn schedule(
                     .map(|step| (step.id.as_str(), crate::context::token_prefix(&step.task, 100)))
                     .collect::<BTreeMap<_, _>>(),
             });
-            let (PhaseResult { result, session, tool_evidence }, verifier, replan) = {
+            let work = {
                 let work = task_work(&phase, &task, profile, &input);
                 tokio::pin!(work);
                 loop {
                     tokio::select! {
-                        result = &mut work => break result?,
+                        result = &mut work => break result,
                         Some(message) = inbox.recv() => {
                             let _ = message.acknowledgement.send(run.clarify(message.text));
                             publish_progress(&progress, &run, &source, &details, false);
                         }
                     }
+                }
+            };
+            let (PhaseResult { result, session, tool_evidence }, verifier, replan) = match work {
+                Ok(work) => work,
+                Err(TaskFailure::Runtime(code)) => return Err(code),
+                Err(TaskFailure::Blocked(phase, report)) => {
+                    stop.check()?;
+                    run.stop_plus(task.id, phase, report)?;
+                    return Completed::stopped(&run, &source).ok_or("run_plus_stop");
                 }
             };
             stop.check()?;
@@ -730,6 +768,7 @@ pub(super) async fn schedule(
             evidence: evidence(&run, &prompt, release.as_ref(), report_review.as_ref()),
             generation: Completed::conversation_generation(&run, &source),
             candidate: release,
+            stopped: false,
         })
     }.await;
     if result
