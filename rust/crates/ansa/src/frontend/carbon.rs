@@ -59,6 +59,7 @@ struct ChatRows {
 struct ChatRow {
     text: String,
     join: Option<&'static str>,
+    background_width: usize,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRow {
@@ -577,7 +578,10 @@ fn layout_impl(
                 if let Some(action) = &entry.action {
                     tool_actions.push((wrapped.len(), action.clone()));
                 }
-                wrapped.push(ChatRow { text, join: None });
+                wrapped.push(ChatRow {
+                    text,
+                    ..ChatRow::default()
+                });
             }
             continue;
         }
@@ -605,7 +609,7 @@ fn layout_impl(
             for text in safe.lines() {
                 wrapped.push(ChatRow {
                     text: diff_line(&clipped(text, cols), kind, cols, color),
-                    join: None,
+                    ..ChatRow::default()
                 });
             }
             continue;
@@ -613,6 +617,8 @@ fn layout_impl(
         let assistant = entry.role == "assistant";
         let queued = entry.role == "queued_user";
         let user = entry.role == "user" || queued;
+        let mut blank_rows = Vec::new();
+        let mut message_width = 0;
         let mut fence = false;
         let mut first = true;
         let mut blank = false;
@@ -769,20 +775,33 @@ fn layout_impl(
                 if color {
                     line.push_str(reset);
                 }
+                let row_start = pos;
                 pos = end;
                 let space = pos < chars.len() && chars[pos].glyph.text == " ";
                 if space {
                     pos += 1;
                 }
+                if color && user && !queued {
+                    if empty {
+                        blank_rows.push(wrapped.len());
+                    } else {
+                        let width = chars[row_start..end].iter().map(|ch| ch.glyph.width).sum();
+                        message_width = message_width.max(width);
+                    }
+                }
                 wrapped.push(ChatRow {
                     text: line,
                     join: (pos < chars.len()).then_some(if space { " " } else { "" }),
+                    ..ChatRow::default()
                 });
                 if pos >= chars.len() {
                     break;
                 }
             }
             first = false;
+        }
+        for row in blank_rows {
+            wrapped[row].background_width = message_width;
         }
     }
     let available = max_rows - if full { 5 } else { 3 };
@@ -819,7 +838,13 @@ fn layout_impl(
         used += glyph.width;
     }
     let mut lines = vec![header];
-    lines.extend(wrapped[begin..end].iter().map(|line| line.text.clone()));
+    lines.extend(wrapped[begin..end].iter().map(|line| {
+        if line.background_width > 0 {
+            styled(&" ".repeat(line.background_width), USER_MESSAGE, color)
+        } else {
+            line.text.clone()
+        }
+    }));
     let mut status_lines = status.splitn(3, '\n');
     let status = if full {
         status_lines.next().unwrap_or("")

@@ -77,8 +77,12 @@ const COMMANDS: &[Command] = &[
         description: "Show or set the context compaction percentage",
     },
     Command {
+        name: "/orchestrate",
+        description: "Open Orchestrate or draft a plan for a task",
+    },
+    Command {
         name: "/orchestrate+",
-        description: "Configure Orchestrate+ role models and reasoning effort",
+        description: "Configure role models or draft a plan for a task",
     },
     Command {
         name: "/terminals",
@@ -164,6 +168,12 @@ impl Completion {
         // A slash inside a path/URL is ordinary text. A command token may
         // occur at any word boundary, including in the middle of a message.
         if begin > 0 && !text[..begin].chars().next_back()?.is_whitespace() {
+            return None;
+        }
+        if matches!(
+            text[..begin].split_whitespace().next(),
+            Some("/orchestrate" | "/orchestrate+")
+        ) {
             return None;
         }
         let query = prefix.get(begin..)?;

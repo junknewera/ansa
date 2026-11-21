@@ -947,6 +947,7 @@ struct Workbench {
     orchestration_summary: BTreeMap<String, CommandId>,
     orchestration_mode: Option<OrchestrationMode>,
     refinement: Option<(String, bool, Option<String>)>,
+    plan_after_roles: Option<(String, Option<String>, bool)>,
     menu: Option<Menu>,
     completion: Option<Completion>,
     navigation_editor: super::super::input::Editor,
@@ -1072,6 +1073,7 @@ impl Workbench {
             orchestration_summary: BTreeMap::new(),
             orchestration_mode: None,
             refinement: None,
+            plan_after_roles: None,
             menu: None,
             completion: None,
             navigation_editor: Default::default(),
@@ -1772,6 +1774,7 @@ impl Workbench {
     }
     fn cancel_modal(&mut self) {
         self.planning_context = None;
+        self.plan_after_roles = None;
         match &self.menu {
             Some(Menu::Themes(preview)) => self.set_theme(preview.original()),
             Some(Menu::Palette { original, .. }) => {
@@ -2149,7 +2152,9 @@ impl Workbench {
             match self.factory.role_profile() {
                 Ok(Some(profile)) => Some(profile),
                 Ok(None) => {
-                    self.open_role_picker(io);
+                    if self.open_role_picker(io) {
+                        self.plan_after_roles = Some((text.into(), skill, repair));
+                    }
                     return false;
                 }
                 Err(code) => {
@@ -2482,10 +2487,11 @@ impl Workbench {
                 false,
             );
         }
-        let (command, argument) = text
-            .trim()
+        let (command, raw_argument) = text
+            .trim_start()
             .split_once(char::is_whitespace)
-            .map_or((text.trim(), ""), |(c, a)| (c, a.trim()));
+            .unwrap_or((text.trim_start(), ""));
+        let argument = raw_argument.trim();
         match commands::canonical(command) {
             "/terminals" => {
                 if argument.is_empty() {
@@ -2584,6 +2590,36 @@ impl Workbench {
                 }
             }
             "/orchestrate+" if argument.is_empty() => (self.open_role_picker(io), false),
+            "/orchestrate" | "/orchestrate+" => {
+                if self.factory.orchestration_route().is_err()
+                    || !matches!(self.slots[self.current].kind, Kind::Main | Kind::Fork)
+                {
+                    self.report(io, "Open an orchestration-capable main conversation");
+                    return (false, false);
+                }
+                if self.orchestration_stop.is_some() || self.slots[self.current].active() {
+                    self.report(io, "Wait for the current task to finish");
+                    return (false, false);
+                }
+                self.orchestration_mode = Some(if command == "/orchestrate+" {
+                    OrchestrationMode::Plus
+                } else {
+                    OrchestrationMode::Standard
+                });
+                self.refinement = None;
+                self.slots[self.current].state.mode = AgentMode::Basic;
+                self.slots[self.current].state.mode_ready = true;
+                self.factory.set_editor_mode(AgentMode::Plan);
+                if argument.is_empty() {
+                    self.report(io, "Enter the task for Orchestrate");
+                    (true, false)
+                } else {
+                    (
+                        self.start_orchestration_plan(raw_argument.trim_start(), None, false, io),
+                        false,
+                    )
+                }
+            }
             "/model" => {
                 self.requested_model = (!argument.is_empty()).then(|| argument.to_string());
                 self.open_models(false, io);
@@ -3677,6 +3713,7 @@ impl Workbench {
                     Ok(picker) => self.menu = Some(Menu::Roles(picker)),
                     Err(code) => {
                         self.menu = None;
+                        self.plan_after_roles = None;
                         self.report(
                             io,
                             &format!("Could not load Orchestrate+ role models: {code}"),
@@ -3687,7 +3724,12 @@ impl Workbench {
             Job::RoleModelsSaved { result, .. } => match result {
                 Ok(()) => {
                     self.menu = None;
-                    self.report(io, "Orchestrate+ role models saved");
+                    let pending = self.plan_after_roles.take();
+                    if let Some((prompt, skill, repair)) = pending {
+                        self.start_orchestration_plan(&prompt, skill, repair, io);
+                    } else {
+                        self.report(io, "Orchestrate+ role models saved");
+                    }
                 }
                 Err(code) => {
                     if let Some(Menu::Roles(picker)) = &mut self.menu {
@@ -3795,6 +3837,11 @@ impl Workbench {
         }
         self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
+        if let Some(Menu::Roles(picker)) = &mut self.menu
+            && picker.back()
+        {
+            return;
+        }
         if matches!(self.menu, Some(Menu::DraftingPlan)) {
             self.cancel_drafting_plan();
         }
@@ -3804,11 +3851,6 @@ impl Workbench {
         if self.completion.take().is_some() {
             let editor = &self.slots[self.current].state.editor;
             self.completion_closed = Some((editor.bytes.clone(), editor.cursor));
-            return;
-        }
-        if let Some(Menu::Roles(picker)) = &mut self.menu
-            && picker.back()
-        {
             return;
         }
         if let Some(menu) = self.menu.take() {
