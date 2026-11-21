@@ -540,8 +540,15 @@ def branches(screen, root, cwd):
     screen.send("side-followup")
     until(screen, lambda _: "› side-followup" in wide_panes()[1], "draft in the BTW composer")
     screen.send(b"\r")
-    until(screen, lambda _: completed(root, "side-followup") and wide_panes()[1].count(answer) == 2,
-          "second BTW answer")
+    def both_side_answers(_):
+        # A restored parent answer may precede the two side turns in this pane.
+        side = wide_panes()[1]
+        _, first, rest = side.partition("> side-marker")
+        first_reply, second, second_reply = rest.partition("> side-followup")
+        return (first and second and first_reply.count(answer) == 1
+                and second_reply.count(answer) == 1 and completed(root, "side-followup"))
+
+    until(screen, both_side_answers, "second BTW answer")
     assert "side-followup" not in wide_panes()[0]
     side_sessions = []
     for session in (root / "home/.ansa/sessions").iterdir():
