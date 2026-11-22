@@ -180,7 +180,7 @@ impl OpenRouter {
                 body: Secret::new(body),
                 bearer: (url == API).then(|| self.key.clone()),
                 body_limit: 512 * 1024,
-                timeout_ms,
+                timeout_ms: Some(timeout_ms),
             },
             stop,
         )?;
@@ -728,7 +728,7 @@ mod tests {
                 let call = calls.fetch_add(1, Ordering::AcqRel);
                 if call == 0 {
                     assert_eq!(request.url, CATALOG);
-                    assert_eq!(request.timeout_ms, REQUEST_TIMEOUT_MS);
+                    assert_eq!(request.timeout_ms, Some(REQUEST_TIMEOUT_MS));
                     assert!(request.bearer.is_none());
                     return Ok(reply(
                         json!({"data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"context_length":1000000,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}}),

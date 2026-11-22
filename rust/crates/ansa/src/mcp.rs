@@ -224,7 +224,7 @@ impl Http {
                 body: Secret::new(message.dump()),
                 bearer: self.bearer.clone(),
                 body_limit: FRAME,
-                timeout_ms: timeout.as_millis().max(1) as u64,
+                timeout_ms: Some(timeout.as_millis().max(1) as u64),
             },
             stop,
             &mut fields,
@@ -269,7 +269,7 @@ impl Drop for Http {
             body: Secret::new(String::new()),
             bearer: self.bearer.clone(),
             body_limit: 4096,
-            timeout_ms: 500,
+            timeout_ms: Some(500),
         };
         let _ = mcp_exchange(&request, &Cancel::default(), &mut fields);
     }
