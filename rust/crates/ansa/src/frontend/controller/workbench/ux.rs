@@ -12,6 +12,14 @@ pub(super) struct CandidateView {
     manual: Option<Arc<carbon::OutputView>>,
 }
 
+fn step_progress(label: &str, view: &orchestration::RunView) -> String {
+    format!(
+        "{label} · {}/{} steps done",
+        view.completed_steps.len(),
+        view.plan.steps().len()
+    )
+}
+
 impl CandidateView {
     pub(super) fn new(run: String, candidate: orchestration::Candidate) -> Self {
         use crate::frontend::diff::{Kind, patch_rows};
@@ -85,6 +93,34 @@ impl Workbench {
         slot.conversation()
     }
 
+    pub(super) fn orchestration_notice(&self) -> Option<String> {
+        let owner = &self.slots[self.current].id;
+        if self.orchestration_summary.contains_key(owner) {
+            return Some("Writing the summary".into());
+        }
+        if !self.collecting_orchestration() {
+            return None;
+        }
+        Some(self.orchestration_views.get(owner).map_or_else(
+            || "Starting agents".into(),
+            |view| {
+                let label = if view.reviewing {
+                    "Reviewing changes"
+                } else {
+                    "Agents"
+                };
+                step_progress(label, view)
+            },
+        ))
+    }
+
+    pub(super) fn paused_orchestration_notice(&self) -> Option<String> {
+        let owner = &self.slots[self.current].id;
+        let reason = self.orchestration_views.get(owner)?.pause_reason.as_ref()?;
+        (!self.collecting_orchestration())
+            .then(|| format!("Orchestration paused · {reason} · /sessions for options"))
+    }
+
     pub(super) fn terminal_activity(&self) -> Vec<Entry> {
         let slot = &self.slots[self.current];
         let mut entries = slot.projected().unwrap_or_default();
@@ -148,104 +184,70 @@ impl Workbench {
         if !at_tail {
             return entries;
         }
-        let collecting = self.orchestration_progress.is_some()
-            && self
-                .orchestration_stop
-                .as_ref()
-                .is_some_and(|(owner, _)| owner == &slot.id);
+        let collecting = self.collecting_orchestration();
         let view = self.orchestration_views.get(&slot.id);
-        if collecting || view.is_some() {
-            if let Some(view) = view {
-                let mut plan = format!("## Work plan\n{}", view.plan.summary());
-                for step in view.plan.steps() {
-                    let mark = if view.completed_steps.contains(&step.id) {
-                        '✓'
-                    } else {
-                        '□'
-                    };
-                    let title = step.task.lines().next().unwrap_or(&step.id);
-                    plan.push_str(&format!("\n{mark} {title}"));
-                }
-                entries.push(Entry {
-                    role: "assistant".into(),
-                    text: plan,
-                    action: Some("plan:active".into()),
-                    status: None,
-                    edit: None,
-                    output: None,
-                    agent: None,
-                });
-            }
-            entries.push(Entry {
-                text: view.map_or_else(
-                    || "Starting agents".into(),
-                    |view| {
-                        let label = if collecting && view.reviewing {
-                            "Verifying agent changes"
-                        } else if view.clarification_pending {
-                            "Coordinator receives the clarification after the current step"
-                        } else {
-                            "Agents"
-                        };
-                        format!(
-                            "{label} · {}/{} steps done",
-                            view.completed_steps.len(),
-                            view.plan.steps().len()
-                        )
-                    },
-                ),
-                role: "activity".into(),
-                action: Some("agents:active".into()),
-                status: None,
-                edit: None,
-                output: None,
-                agent: None,
-            });
-            if let Some(view) = view {
-                let active = |agent: &carbon::AgentLine| {
-                    matches!(agent.state.as_str(), "Running" | "Paused")
-                };
-                let recent = view
-                    .agents
-                    .iter()
-                    .filter(|(_, agent)| !active(agent))
-                    .take(2)
-                    .collect::<Vec<_>>();
-                let running = view.agents.iter().filter(|(_, agent)| active(agent));
-                entries.extend(
-                    recent
-                        .into_iter()
-                        .rev()
-                        .chain(running)
-                        .map(|(id, agent)| Entry {
-                            role: "agent_card".into(),
-                            text: String::new(),
-                            action: Some(format!("agent:{id}")),
-                            status: None,
-                            edit: None,
-                            output: None,
-                            agent: Some(Arc::new(agent.clone())),
-                        }),
-                );
+        if let Some(view) = view {
+            let saved_plan = format!("plan:{}", view.id);
+            if !entries
+                .iter()
+                .any(|entry| entry.action.as_ref() == Some(&saved_plan))
+            {
+                entries.push(result_entry(
+                    "Approved plan".into(),
+                    Some("plan:active".into()),
+                    None,
+                ));
             }
         }
-        if self.orchestration_summary.contains_key(&slot.id) {
-            if entries
-                .last()
-                .is_some_and(|entry| entry.role == "activity" && entry.action.is_none())
-            {
-                entries.pop();
-            }
+        let notice = self
+            .orchestration_notice()
+            .or_else(|| view.map(|view| step_progress("Agents", view)));
+        if let Some(notice) = notice {
             entries.push(Entry {
-                text: "Coordinator is writing the summary".into(),
-                role: "activity".into(),
+                text: if view.is_some_and(|view| view.clarification_pending) && collecting {
+                    "Coordinator receives the clarification after the current step".into()
+                } else {
+                    notice
+                },
+                role: if collecting || self.orchestration_summary.contains_key(&slot.id) {
+                    "activity"
+                } else {
+                    "tool_detail"
+                }
+                .into(),
                 action: None,
                 status: None,
                 edit: None,
                 output: None,
                 agent: None,
             });
-        } else if !collecting && let Some(view) = view.filter(|view| view.clarification_pending) {
+        }
+        entries.extend(
+            self.agent_rows()
+                .into_iter()
+                .rev()
+                .map(|(id, agent)| Entry {
+                    role: "agent_card".into(),
+                    text: String::new(),
+                    action: Some(format!("agent:{id}")),
+                    status: None,
+                    edit: None,
+                    output: None,
+                    agent: Some(Arc::new(agent)),
+                }),
+        );
+        if let Some(text) = self.paused_orchestration_notice() {
+            entries.push(Entry {
+                role: "tool_warning".into(),
+                text,
+                action: None,
+                status: None,
+                edit: None,
+                output: None,
+                agent: None,
+            });
+        }
+        if !collecting && let Some(view) = view.filter(|view| view.clarification_pending) {
             entries.push(Entry {
                 text: "Plan and saved clarification".into(),
                 role: "activity".into(),
@@ -367,9 +369,7 @@ impl Workbench {
         if self.result_selected.is_some() && self.result_scroll.is_none() {
             self.result_scroll = Some(slot.state.scroll);
         }
-        if key == "agents:active" {
-            self.open_agents(io);
-        } else if let Some(id) = key.strip_prefix("agent:") {
+        if let Some(id) = key.strip_prefix("agent:") {
             self.open_agent(id);
         } else if let Some(operation) = key.strip_prefix("image:") {
             let source = slot.activity_page().and_then(|page| {
@@ -660,13 +660,16 @@ impl Workbench {
                 .map(|(_, agent)| agent.clone())
             {
                 agent.title = format!("{tree}{branch}{}", agent.title);
-                agent.detail = format!("{indent}{}", agent.detail);
                 result.push((id.clone(), agent));
                 continue;
             }
             let live = self.slots.iter().find(|slot| slot.id == *id);
-            let state = live
-                .and_then(|slot| slot.state.snapshot.as_ref())
+            let snapshot = live.and_then(|slot| slot.state.snapshot.as_ref());
+            let archived = self
+                .summaries
+                .iter()
+                .find(|summary| summary.entry.id == *id);
+            let state = snapshot
                 .map(|view| {
                     if view.worker_busy {
                         "Running"
@@ -679,14 +682,8 @@ impl Workbench {
                         }
                     }
                 })
-                .unwrap_or_else(|| {
-                    self.summaries
-                        .iter()
-                        .find(|s| s.entry.id == *id)
-                        .map_or("Unavailable", |s| s.status.label())
-                });
-            let generation = live
-                .and_then(|slot| slot.state.snapshot.as_ref())
+                .unwrap_or_else(|| archived.map_or("Unavailable", |s| s.status.label()));
+            let generation = snapshot
                 .map(|view| {
                     format!(
                         "{}{}",
@@ -699,18 +696,22 @@ impl Workbench {
                 })
                 .unwrap_or_default();
             let elapsed = live.and_then(|slot| slot.state.progress.elapsed());
-            let detail = if let Some(preview) = self
-                .summaries
-                .iter()
-                .find(|summary| summary.entry.id == *id)
-                .and_then(|summary| summary.preview.as_ref())
-            {
-                format!("{indent}{preview}")
+            let pause_diagnostic = match snapshot {
+                Some(view) if state == "Paused" && !view.diagnostic.is_empty() => {
+                    Some(view.diagnostic.as_str())
+                }
+                Some(_) => None,
+                None => archived.and_then(|summary| summary.pause_diagnostic.as_deref()),
+            };
+            let activity = if let Some(code) = pause_diagnostic {
+                crate::frontend::diagnostics::error(code)
+            } else if let Some(preview) = archived.and_then(|summary| summary.preview.as_ref()) {
+                preview.clone()
             } else {
                 match (generation.is_empty(), elapsed) {
-                    (false, Some(elapsed)) => format!("{indent}{generation} · {elapsed}"),
-                    (false, None) => format!("{indent}{generation}"),
-                    (true, Some(elapsed)) => format!("{indent}{elapsed}"),
+                    (false, Some(elapsed)) => format!("{generation} · {elapsed}"),
+                    (false, None) => generation,
+                    (true, Some(elapsed)) => elapsed,
                     (true, None) => String::new(),
                 }
             };
@@ -720,10 +721,9 @@ impl Workbench {
                     id: id.clone(),
                     title: format!("{tree}{branch}{}", self.title(id)),
                     state: state.into(),
-                    detail,
                     role: carbon::AgentRole::Research,
                     model: String::new(),
-                    activity: String::new(),
+                    activity,
                 },
             ));
         }

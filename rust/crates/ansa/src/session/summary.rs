@@ -49,6 +49,7 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub preview: Option<String>,
     pub status: SummaryStatus,
+    pub pause_diagnostic: Option<String>,
 }
 impl SessionSummary {
     fn unavailable(entry: CatalogEntry) -> Self {
@@ -57,6 +58,7 @@ impl SessionSummary {
             title: None,
             preview: None,
             status: SummaryStatus::Unavailable,
+            pause_diagnostic: None,
         }
     }
 }
@@ -91,6 +93,7 @@ pub(crate) fn read(
         title: None,
         preview: None,
         status: SummaryStatus::Empty,
+        pause_diagnostic: None,
     };
     let mut initialized = false;
     let mut turn: Option<String> = None;
@@ -507,6 +510,13 @@ pub(crate) fn read(
     }
     if outstanding.is_some() || unknown_effect {
         summary.status = SummaryStatus::Unknown;
+    }
+    if summary.status == SummaryStatus::Paused {
+        summary.pause_diagnostic = canonical
+            .as_ref()
+            .and_then(|state| state.turn.as_ref())
+            .filter(|turn| !turn.diagnostic.is_empty())
+            .map(|turn| turn.diagnostic.clone());
     }
     Ok(summary)
 }

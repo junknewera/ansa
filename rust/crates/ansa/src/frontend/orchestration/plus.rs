@@ -72,7 +72,6 @@ impl Phase<'_> {
             id: id.into(),
             title: user_task.lines().next().unwrap_or_default().into(),
             state: "Running".into(),
-            detail: format!("{label} · {}", role.model),
             role: agent_role,
             model: role.model.clone(),
             activity: stage.into(),
@@ -289,6 +288,9 @@ impl Phase<'_> {
                         ..
                     }
                 ) {
+                    let reason = pause_reason(&proof);
+                    agent.activity = reason.clone();
+                    publish_pause(self.progress.sender, reason);
                     return Err("orchestration_paused");
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
@@ -326,10 +328,7 @@ impl Phase<'_> {
         };
         agent.state = status.into();
         if let Some(error) = error {
-            agent.detail.push_str(&format!(" · {error}"));
-            if !acted {
-                agent.activity = error.into();
-            }
+            agent.activity = error.into();
         } else if !acted && let Ok(done) = &result {
             agent.activity = done
                 .result
