@@ -132,8 +132,15 @@ impl CompactedContext {
                         "compaction_item",
                     )?;
                 } else {
+                    let content = item.field("content")?;
                     need(
-                        item.text_field("role")? == "user" && item.field("content")?.is_string(),
+                        item.text_field("role")? == "user"
+                            && (content.is_string()
+                                || crate::provider::contracts::image::has_images(content)
+                                    && request.input.iter().any(|original| {
+                                        original.text_field("role") == Ok("user")
+                                            && original.field("content") == Ok(content)
+                                    })),
                         "compaction_retained_item",
                     )?;
                 }

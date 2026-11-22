@@ -688,6 +688,16 @@ fn text_with_providers(
     result
 }
 
+/// Record the provider's wire-level message history only in an opted-in synthetic fixture.
+#[cfg(feature = "frontend-test-adapter")]
+fn record_fixture_messages(path: &Path, messages: &serde_json::Value) -> Result<()> {
+    match std::fs::OpenOptions::new().append(true).open(path) {
+        Ok(mut file) => writeln!(file, "{messages}").map_err(|_| "fixture_record"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("fixture_record"),
+    }
+}
+
 #[cfg(feature = "frontend-test-adapter")]
 pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
     use serde_json::{Value, json};
@@ -704,15 +714,24 @@ pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
         openrouter::{CATALOG, ENDPOINT, PROVIDER},
         transport::http::Head,
     };
+    let inputs = if root.join("fixture-image-model").is_file() {
+        vec!["text", "image"]
+    } else {
+        vec!["text"]
+    };
+    let wire_capture = root.join("outbound-messages.jsonl");
     let hold_child = root.join("hold-orchestration-child");
     let hold_summary = root.join("hold-orchestration-summary");
     let exchange: Exchange = Arc::new(move |request, stop| {
         let content = if request.url == CATALOG {
-            json!({"data":{"id":OPENROUTER_MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}})
+            json!({"data":{"id":OPENROUTER_MODEL,"architecture":{"input_modalities":inputs},"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}})
         } else {
             let request: Value =
                 serde_json::from_str(request.body.expose()).map_err(|_| "fixture_body")?;
             let format = &request["response_format"]["json_schema"];
+            if format["name"] != "ansa_native_schema_probe" {
+                record_fixture_messages(&wire_capture, &request["messages"])?;
+            }
             let hold = match format["name"].as_str() {
                 Some("ansa_child_result_v1") => Some(&hold_child),
                 None if request.get("tools").is_none() => Some(&hold_summary),
@@ -770,6 +789,12 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
     let cwd = fixture_home.join("workspace");
     ansa_linux::fs::private_directory(&cwd).map_err(|_| "fixture_workspace")?;
     let plus = root.join("orchestration-plus").is_file();
+    let inputs = if root.join("fixture-image-model").is_file() {
+        vec!["text", "image"]
+    } else {
+        vec!["text"]
+    };
+    let wire_capture = root.join("outbound-messages.jsonl");
     let trace = root.join("plus-requests.jsonl");
     let sequence = std::sync::atomic::AtomicUsize::new(0);
     let auth_path = fixture_home.join(".ansa/auth");
@@ -805,7 +830,7 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                                 {"slug":"gpt-6.1-luna","visibility":"list","supported_reasoning_levels":["low"]},
                             ]})
                         } else {
-                            json!({"models":[{"slug":MODEL,"visibility":"list"}]})
+                            json!({"models":[{"slug":MODEL,"visibility":"list","input_modalities":inputs}]})
                         }.to_string(),
                     })
                 }),
@@ -823,6 +848,7 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                     {
                         return Err("fixture_request");
                     }
+                    record_fixture_messages(&wire_capture, &request["input"])?;
                     let input = request["input"].as_array().ok_or("fixture_input")?;
                     let last = input.last().ok_or("fixture_input")?;
                     let text = request.get("text");

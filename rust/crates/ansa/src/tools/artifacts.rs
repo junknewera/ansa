@@ -379,7 +379,7 @@ pub(crate) fn read_preview_png(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn check_blob(mime: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn check_blob(mime: &str, bytes: &[u8]) -> Result<()> {
     if mime == "image/png" {
         if bytes.len() < 33 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
             return Err("artifact_png");

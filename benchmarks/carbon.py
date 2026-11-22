@@ -1,7 +1,10 @@
 """Drive a fresh benchmark session through the normal Carbon frontend."""
 
+import base64
 import hashlib
 import json
+from pathlib import Path
+import os
 import re
 import stat
 import subprocess
@@ -12,6 +15,8 @@ from parity import session_cases
 
 MODES = {"work": "Work", "plan": "Plan", "planner": "Orchestrate",
          "orchestrate": "Orchestrate", "orchestrate+": "Orchestrate+"}
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_JOURNAL = 64 * 1024 * 1024
 
 
@@ -42,6 +47,66 @@ def journals(home, only=None):
     return traces
 
 
+def prepare_turn_images(root, attachments, turns):
+    """Stage the exact frozen bytes under generated PTY-safe names, outside the workspace."""
+    queued = [[] for _ in turns]
+    if not attachments:
+        return queued
+    directory = root / "images"
+    directory.mkdir(mode=0o700)
+    for index, attachment in enumerate(attachments):
+        images = queued[attachment["turn"]]
+        remaining = MAX_IMAGE_BYTES - sum(item["bytes"] for item in images)
+        if len(images) >= MAX_IMAGES:
+            raise ValueError("at most four images per turn")
+        file = Path(attachment["path"])
+        with os.fdopen(os.open(file, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), "rb") as stream:
+            st = os.fstat(stream.fileno())
+            if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= remaining:
+                raise ValueError("invalid or oversized image input")
+            data = stream.read(remaining + 1)
+        sha = hashlib.sha256(data).hexdigest()
+        if len(data) > remaining or sha != attachment["sha256"]:
+            raise ValueError("image input changed")
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime, suffix = "image/png", "png"
+        elif data.startswith(b"\xff\xd8\xff"):
+            mime, suffix = "image/jpeg", "jpg"
+        else:
+            raise ValueError("image input must be PNG or JPEG")
+        path = directory / f"{index}.{suffix}"
+        path.write_bytes(data)
+        images.append({"path": path, "sha256": sha, "bytes": len(data), "media_type": mime})
+    return queued
+
+
+def verify_turn_images(images, message, accepted, response):
+    if accepted.get("image_sha256", []) != [image["sha256"] for image in images]:
+        raise ValueError("accepted image hashes differ from the manifest")
+    # Check the actual user input in the admitted provider request, even after a
+    # tool loop. Historical images must never migrate to a later plain-text turn.
+    request = response["response"]["request"]
+    user = next((item for item in reversed(request["input"]) if item.get("role") == "user"), None)
+    if not user:
+        raise ValueError("provider request is missing the current user turn")
+    content = user["content"]
+    if not images:
+        if content != message:
+            raise ValueError("unexpected image or text in a later turn")
+        return
+    if not isinstance(content, list) or len(content) != 1 + len(images) or content[0] != {
+            "type": "input_text", "text": message}:
+        raise ValueError("incorrect text or image count in provider request")
+    for part, image in zip(content[1:], images):
+        prefix = f"data:{image['media_type']};base64,"
+        url = part.get("image_url", "")
+        if part.get("type") != "input_image" or not isinstance(url, str) or not url.startswith(prefix):
+            raise ValueError("expected an inline original image in provider request")
+        actual = base64.b64decode(url[len(prefix):], validate=True)
+        if len(actual) != image["bytes"] or hashlib.sha256(actual).hexdigest() != image["sha256"]:
+            raise ValueError("provider image bytes differ from the frozen input")
+
+
 def response_text(event):
     return "".join(part["text"] for item in event["response"]["items"]
                    if item["type"] == "message" and item.get("role") == "assistant"
@@ -61,7 +126,14 @@ def completed_turn(events, match):
         elif active and kind == "done":
             return active, responses[-1]
         elif active and kind in ("pause", "cancel"):
-            raise TrialStopped("failed", event.get("diagnostic", kind))
+            reason = event.get("diagnostic", kind)
+            if reason in ("siwc_image_unsupported", "openrouter_image_unsupported"):
+                raise TrialStopped("unsupported", reason)
+            if reason.startswith(("http_", "auth_", "provider_", "openrouter_catalog")) or reason in (
+                    "openrouter_auth", "openrouter_http", "openrouter_key_invalid", "openrouter_model",
+                    "openrouter_provider", "openrouter_route_state", "siwc_structured_format_unconfirmed"):
+                raise TrialStopped("infra_error", reason)
+            raise TrialStopped("failed", reason)
     return None
 
 
@@ -105,7 +177,8 @@ def install_roles(home, route, account, roles):
 
 
 def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input_commit,
-            fixture_args=None):
+            fixture_args=None, attachments=()):
+    turn_images = prepare_turn_images(root, attachments, turns)
     argv = ["--cwd", str(workspace), "--model", arm["model"]]
     if arm["route"] == "offline":
         argv.append("--offline")
@@ -173,11 +246,25 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
             wait(lambda frame: ready() and selected(frame, label), "mode selection")
 
         answers = []
+        image_inputs = []
         plan = None
         candidate = None
         result_workspace = workspace
         if mode in ("work", "plan"):
-            for message in turns:
+            for index, (message, images) in enumerate(zip(turns, turn_images)):
+                for count, image in enumerate(images, 1):
+                    submit("/attach " + str(image["path"]))
+
+                    def acknowledged(_):
+                        footer = screen.vt.line(-1).strip()
+                        if footer.startswith("Could not attach image"):
+                            raise ValueError(footer)
+                        return ready() and footer.startswith(f"Image attached ({count})")
+
+                    try:
+                        wait(acknowledged, "confirming image attachment")
+                    except TrialStopped as error:
+                        raise TrialStopped("infra_error", "Carbon did not acknowledge the image") from error
                 before = len(parent_events())
                 submit(message)
                 turn, response = wait(lambda _: completed_turn(
@@ -185,6 +272,11 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
                     "completing turn")
                 if turn["mode"] != ("basic" if mode == "work" else "plan") or turn.get("draft"):
                     raise ValueError("unexpected native turn mode")
+                if attachments:
+                    verify_turn_images(images, message, turn, response)
+                    image_inputs.extend({"turn": index, "session": parent, "bytes": image["bytes"],
+                                         "media_type": image["media_type"], "sha256": image["sha256"]}
+                                        for image in images)
                 answers.append(response_text(response))
                 wait(lambda _: ready() and "Ctrl+C stop" not in screen.vt.line(-2), "chat ready")
                 # Require the submitted draft to have left the editor.
@@ -248,7 +340,10 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
         exit_result = screen.finish()
         if exit_result["exit"] != 0 or not exit_result["termios_restored"]:
             raise ValueError("Carbon did not exit cleanly")
-        return result_workspace, {"answers": answers, "plan": plan, "candidate": candidate}
+        answer = {"answers": answers, "plan": plan, "candidate": candidate}
+        if attachments:
+            answer["image_inputs"] = image_inputs
+        return result_workspace, answer
     finally:
         if screen.child.poll() is None:
             screen.child.terminate()

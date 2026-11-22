@@ -152,6 +152,10 @@ fn explanation(code: &str) -> &'static str {
         "auth_required" => "Sign in again",
         "provider_policy_denied" => "Provider denied the request",
         "provider_usage_limit" => "Provider usage limit reached",
+        "siwc_image_unsupported" => "The selected ChatGPT model does not accept image inputs",
+        "openrouter_image_unsupported" => {
+            "The selected OpenRouter route does not advertise image inputs"
+        }
         "tool_turn_limit" => "Tool limit for the entire turn reached",
         "tool_batch_limit" => "Tool batch exceeds the configured per-segment allowance",
         "tool_round_limit" => "Tool budget reached",

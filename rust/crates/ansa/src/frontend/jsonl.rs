@@ -224,7 +224,7 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                 (
                     "receipt",
                     receipt.as_ref().map_or_else(null, |receipt| {
-                        object(vec![
+                        let mut fields = vec![
                             (
                                 "kind",
                                 s(match receipt.kind {
@@ -242,7 +242,9 @@ pub fn encode(event: &RuntimeEvent) -> Json {
                             ("admission_durable", b(receipt.admission_durable)),
                             ("text_sha256", s(&receipt.text_sha256)),
                             ("state_durable", b(receipt.state_durable)),
-                        ])
+                        ];
+                        receipt.add_image_hashes(&mut fields);
+                        object(fields)
                     }),
                 ),
             ],

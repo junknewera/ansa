@@ -23,6 +23,7 @@ def main(argv=None):
     parser.add_argument("--model")
     parser.add_argument("--route", choices=("siwc", "openrouter", "offline"), default="offline")
     parser.add_argument("--auth-dir", type=Path, help="dedicated existing profile for live arms")
+    parser.add_argument("--image-input", action="store_true", help="declare native image input for this binary, route and model")
     parser.add_argument("--candidate-guidance", type=Path, help="prepare a strict paired guidance comparison")
     args = parser.parse_args(argv)
     if args.list:
@@ -38,6 +39,8 @@ def main(argv=None):
     output = args.output.resolve()
     arm = {"id": "baseline", "binary": str(args.binary.resolve(strict=True)), "model": args.model,
            "route": args.route, "mode": "work"}
+    if args.image_input:
+        arm["image_input"] = True
     if args.auth_dir:
         arm["auth_dir"] = str(args.auth_dir.resolve(strict=True))
     output.mkdir(mode=0o700)

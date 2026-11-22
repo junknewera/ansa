@@ -1022,7 +1022,7 @@ def completion_and_help(screen, root, cwd):
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
                 "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
-                "/orchestrate", "/orchestrate+", "/terminals", "/accept", "/clarify"}
+                "/orchestrate", "/orchestrate+", "/terminals", "/accept", "/clarify", "/attach"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"

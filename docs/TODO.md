@@ -174,7 +174,7 @@
   функций и состояние виртуальной среды на каждом ходе, включая уточнение
   числа строк. Оставить родственные варианты одного сюжета в одной выборке.
   [Данные BFCL](https://github.com/ShishirPatil/gorilla/blob/6ea57973c7a6097fd7c5915698c54c17c5b1b6c8/berkeley-function-call-leaderboard/bfcl_eval/data/BFCL_v4_multi_turn_miss_param.json)
-- [ ] Вложения в чате. Подготовлены исходные данные и оценщики. Открыты транспорт изображений в Carbon, проверка на моделях и прогон Docker-оценщика. Подключить CharXiv Reasoning `val/figure_id=0` для
+- [x] Вложения в чате. Подключены CharXiv Reasoning `val/figure_id=0` для
   объяснения графика и SWE-bench Multimodal `chartjs__Chart.js-8567` для
   правки проекта по скриншоту. Передавать оригинальное изображение в
   пользовательском сообщении. Проверять ответ по эталону CharXiv и патч

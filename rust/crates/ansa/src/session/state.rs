@@ -249,6 +249,7 @@ pub struct Receipt {
     pub turn: TurnId,
     pub request: RequestId,
     pub text: Arc<String>,
+    pub image_sha256: Vec<String>,
     pub state: String,
     pub mode: AgentMode,
     pub internal: bool,
@@ -602,7 +603,7 @@ impl State {
         }
     }
     pub fn request_for(&self, text: &str, mode: AgentMode) -> Result<Request> {
-        self.request_for_input(text, mode, false, None)
+        self.request_for_input(text, mode, false, None, None)
     }
 
     pub(crate) fn request_for_input(
@@ -611,6 +612,7 @@ impl State {
         mode: AgentMode,
         internal: bool,
         draft: Option<&PlanDraft>,
+        image_content: Option<&Json>,
     ) -> Result<Request> {
         let policy = PromptPolicy::resolve(&self.epoch.exact_state)?;
         let (epoch, tools) = if let Some(draft) = draft {
@@ -709,13 +711,15 @@ impl State {
             self.history.clone()
         };
         let content = if internal {
-            handoff_content(text)
+            Json::string(&handoff_content(text))?
+        } else if let Some(parts) = image_content {
+            parts.clone()
         } else {
-            text.to_owned()
+            Json::string(text)?
         };
         input.push(Json::object(vec![
             ("role", Json::string("user")?),
-            ("content", Json::string(&content)?),
+            ("content", content),
         ])?);
         let mut binding = self.configuration.binding.clone();
         binding.requested_model = self.generation.model.clone();
@@ -853,6 +857,14 @@ impl State {
                 )?;
                 self.context_usage = Some(ContextUsage::new(&context, budget));
             }
+            for item in &context.input {
+                if item.text_field("role") == Ok("user")
+                    && let Ok(content) = item.field("content")
+                    && crate::provider::contracts::image::has_images(content)
+                {
+                    crate::provider::contracts::image::validate_content(content)?;
+                }
+            }
             self.history = context.input;
             self.history_bytes = Json::array(self.history.clone())?.dump().len();
             if event.has("completed_starts") {
@@ -868,7 +880,12 @@ impl State {
                         starts.last().is_none_or(|last| index > *last)
                             && self.history.get(index).is_some_and(|item| {
                                 item.text_field("role") == Ok("user")
-                                    && item.field("content").is_ok_and(Json::is_string)
+                                    && item.field("content").is_ok_and(|content| {
+                                        content.is_string()
+                                            || crate::provider::contracts::image::has_images(
+                                                content,
+                                            )
+                                    })
                             }),
                         "fork_completed_starts",
                     )?;
@@ -1146,10 +1163,22 @@ impl State {
                 None
             };
             let next = Request::load(event.field("next")?)?;
+            let (image_sha256, image_content) = if event.has("image_sha256") {
+                let content = next
+                    .input
+                    .last()
+                    .ok_or("session_request_conflict")?
+                    .field("content")?;
+                let hashes =
+                    crate::provider::contracts::image::verify_content(event, text, content)?;
+                (hashes, Some(content))
+            } else {
+                (Vec::new(), None)
+            };
             need(
                 next.save()?
                     == self
-                        .request_for_input(text, mode, internal, draft.as_ref())?
+                        .request_for_input(text, mode, internal, draft.as_ref(), image_content)?
                         .save()?,
                 "session_request_conflict",
             )?;
@@ -1163,6 +1192,7 @@ impl State {
                 turn: TurnId(turn.into()),
                 request: RequestId(request.into()),
                 text: Arc::new(text.into()),
+                image_sha256,
                 state: stage.into(),
                 mode,
                 internal,
@@ -1288,6 +1318,18 @@ impl State {
                 current.receipt.mode,
                 current.receipt.internal,
                 current.receipt.draft.as_ref(),
+                if current.receipt.image_sha256.is_empty() {
+                    None
+                } else {
+                    Some(
+                        current
+                            .next
+                            .input
+                            .get(current.start_item)
+                            .ok_or("session_request_conflict")?
+                            .field("content")?,
+                    )
+                },
             )?;
             // A settings change applies to future turns, never to Resume or
             // to an already accepted compacting turn.

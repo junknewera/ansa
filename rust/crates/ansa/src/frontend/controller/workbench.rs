@@ -30,6 +30,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 mod activity;
+mod attachments;
 mod roles;
 mod ux;
 
@@ -313,6 +314,9 @@ impl Slot {
                 }
             }
             if let Some(code) = code {
+                if self.state.image_submission.as_ref() == Some(&id) {
+                    self.state.image_submission = None;
+                }
                 self.chat_priority.take_if(|(pending, _)| *pending == id);
                 if self.follow_accepted_submit.as_ref() == Some(&id) {
                     self.follow_accepted_submit = None;
@@ -636,6 +640,10 @@ enum SummaryDispatch {
 }
 
 enum Job {
+    Attachment {
+        owner: String,
+        result: Result<ImageInput>,
+    },
     ManualAccepted {
         owner: String,
         token: u64,
@@ -2186,6 +2194,16 @@ impl Workbench {
             self.report(io, "Mode can change after the current request finishes");
             return;
         }
+        if slot.state.mode == AgentMode::Plan
+            && (slot.state.image_loading || !slot.state.images.is_empty())
+            && self.factory.orchestration_route().is_ok()
+        {
+            self.report(
+                io,
+                "Send or clear attached images before switching to Orchestrate",
+            );
+            return;
+        }
         self.refinement = None;
         (self.orchestration_mode, slot.state.mode) =
             match (self.orchestration_mode, slot.state.mode) {
@@ -2251,6 +2269,12 @@ impl Workbench {
         repair: bool,
         io: &Io,
     ) -> bool {
+        if self.slots[self.current].state.image_loading
+            || !self.slots[self.current].state.images.is_empty()
+        {
+            self.report(io, "Send or clear attached images before delegating a task");
+            return false;
+        }
         if self.slots[self.current]
             .state
             .snapshot
@@ -2750,6 +2774,17 @@ impl Workbench {
             .unwrap_or((text.trim_start(), ""));
         let argument = raw_argument.trim();
         match commands::canonical(command) {
+            "/attach" => (self.attach(argument, io), false),
+            "/orchestrate" | "/orchestrate+"
+                if self.slots[self.current].state.image_loading
+                    || !self.slots[self.current].state.images.is_empty() =>
+            {
+                self.report(
+                    io,
+                    "Send or clear attached images before switching to Orchestrate",
+                );
+                (false, false)
+            }
             "/clarify" => {
                 self.clarify_orchestration(text, argument, io);
                 (false, false)
@@ -3523,6 +3558,21 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
+            Job::Attachment { owner, result } => {
+                if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
+                    slot.state.image_loading = false;
+                    match result {
+                        Ok(image) => {
+                            slot.state.images.push(image);
+                            let count = slot.state.images.len();
+                            slot.state.report(io, &format!("Image attached ({count})"));
+                        }
+                        Err(code) => slot
+                            .state
+                            .report(io, &format!("Could not attach image ({code})")),
+                    }
+                }
+            }
             Job::ManualAccepted { run, result, .. } => {
                 self.menu = None;
                 self.modal_stop = None;

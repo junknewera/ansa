@@ -54,6 +54,7 @@ function M.new(api)
   local function matching(message, receipt)
     local expected_turn = message.target == vim.NIL and ('n_' .. vim.fn.sha256(api.client()):sub(1,16) .. '_' .. message.id) or message.turn
     return receipt.text_sha256 == vim.fn.sha256(message.text)
+      and receipt.image_sha256 == nil
       and receipt.turn == expected_turn
       and receipt.kind == (message.target == vim.NIL and 'submit' or 'steer')
       and (message.target == vim.NIL or receipt.request == message.target)

@@ -111,6 +111,14 @@ impl Request {
             context_estimate: None,
         })
     }
+    pub(crate) fn has_image_input(&self) -> bool {
+        self.input.iter().any(|item| {
+            item.text_field("role") == Ok("user")
+                && item
+                    .field("content")
+                    .is_ok_and(super::contracts::image::has_images)
+        })
+    }
     pub fn with_effort(mut self, effort: Option<String>) -> Result<Self, &'static str> {
         if effort
             .as_ref()

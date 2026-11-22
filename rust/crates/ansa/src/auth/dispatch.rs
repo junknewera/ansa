@@ -14,6 +14,7 @@ pub struct ModelCapability {
     pub display_name: String,
     pub efforts: Vec<String>,
     pub context_window: Option<usize>,
+    input_images: Option<bool>,
 }
 /// Only explicit catalog metadata authorizes effort values. Slugs and the
 /// illustrative UI levels are never a capability oracle.
@@ -66,6 +67,11 @@ fn catalog_models(catalog: &Json, selected: Option<&str>) -> Result<Vec<ModelCap
                 slug.into()
             },
             efforts,
+            input_images: model.field("input_modalities").ok().map(|field| {
+                field
+                    .elements()
+                    .is_ok_and(|modes| modes.iter().any(|m| m.text() == Ok("image")))
+            }),
             context_window: ["context_window", "max_context_window"]
                 .into_iter()
                 .find_map(|field| model.usize_field(field).ok().filter(|window| *window >= 2)),
@@ -200,6 +206,13 @@ impl Authorization {
                 effort: request.effort.clone(),
             },
         )?;
+        if request.has_image_input()
+            && self.models.iter().any(|model| {
+                model.model == request.binding.requested_model && model.input_images == Some(false)
+            })
+        {
+            return Err("siwc_image_unsupported");
+        }
         let verified = self.auth.access(cancel, false)?;
         if verified.account != self.account {
             return Err("auth_account_mismatch");

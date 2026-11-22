@@ -681,3 +681,55 @@ fn transcript_block_boundaries_and_byte_cap() {
     });
     assert_eq!((page.begin, page.end, page.entries.len()), (4, 20, 16));
 }
+
+#[test]
+fn fork_and_native_compaction_preserve_original_image_parts() {
+    let original = Request::load(data().field("configuration").unwrap()).unwrap();
+    let valid = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC";
+    let item = |url| {
+        Json::parse(
+            &serde_json::json!({"role":"user","content":[
+        {"type":"input_text","text":"describe"},{"type":"input_image","image_url":url}]})
+            .to_string(),
+        )
+        .unwrap()
+    };
+    let retained = item(valid);
+    let altered = item("data:image/png;base64,bm90IHBuZw==");
+    let history = original.clone().with_input(vec![retained.clone()]).unwrap();
+    let capsule = |inputs: Request| {
+        Json::parse(r#"{"kind":"fork","source_session":"parent","source_turn":"one","transcript":[],"completed_starts":[0]}"#)
+            .unwrap().with("context", inputs.save().unwrap()).unwrap()
+            .with("timeline", ansa::session::timeline::Timeline::default().save().unwrap()).unwrap()
+    };
+    let mut child = state();
+    child.apply(&child.initialization().unwrap()).unwrap();
+    assert!(
+        child
+            .apply(&capsule(
+                original.with_input(vec![altered.clone()]).unwrap()
+            ))
+            .is_err()
+    );
+    assert!(child.history.is_empty());
+    child.apply(&capsule(history.clone())).unwrap();
+    assert_eq!(child.history.as_slice(), std::slice::from_ref(&retained));
+    let compact = |user| {
+        Json::parse(r#"{"object":"response.compaction","id":"cp"}"#)
+            .unwrap()
+            .with(
+                "output",
+                Json::array(vec![
+                    Json::parse(
+                        r#"{"type":"compaction","id":"opaque","encrypted_content":"cipher"}"#,
+                    )
+                    .unwrap(),
+                    user,
+                ])
+                .unwrap(),
+            )
+            .unwrap()
+    };
+    assert!(CompactedContext::admit(history.clone(), compact(retained)).is_ok());
+    assert!(CompactedContext::admit(history, compact(altered)).is_err());
+}

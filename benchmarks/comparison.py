@@ -32,6 +32,10 @@ def validate(comparison, arms, tasks, rows):
                    if identity(arms[left], key) != identity(arms[right], key)}
     require(differences == {factor}, f"expected {factor} alone to differ; got {sorted(differences)}")
 
+    if factor not in ("binary", "model"):
+        require(arms[left].get("image_input", False) == arms[right].get("image_input", False),
+                "identical builds and models must declare identical image capability")
+
     families = {}
     paired_splits = set()
     supported = defaultdict(set)

@@ -98,10 +98,11 @@ def load_experiment(path):
     require(isinstance(spec["arms"], list) and spec["arms"], "expected arms")
     for arm in spec["arms"]:
         check_fields(arm, ("id", "binary", "mode", "route", "model"),
-                     ("effort", "roles", "guidance", "auth_dir", "mcp_config"))
+                     ("effort", "roles", "guidance", "auth_dir", "mcp_config", "image_input"))
         key = arm["id"]
         require(label(key) and key not in arms, "invalid or duplicate arm")
         require(arm["mode"] in MODES and arm["route"] in ("offline", *LIVE_ROUTES), "invalid mode or route")
+        require(type(arm.get("image_input", False)) is bool, "image_input must be a boolean")
         validate_selection(arm["model"], arm.get("effort"))
         require("auth_dir" in arm if arm["route"] in LIVE_ROUTES else "auth_dir" not in arm,
                 "live arms require a dedicated auth_dir")
@@ -174,14 +175,22 @@ def load_experiment(path):
 
     rows = [{"id": f"{task}.{repeat}.{arm}", "task": task, "repeat": repeat, "arm": arm}
             for task, repeat, arm in itertools.product(tasks, range(1, spec["repetitions"] + 1), arms)
-            if arms[arm]["mode"] in tasks[task]["modes"]]
+            if arms[arm]["mode"] in tasks[task]["modes"] or tasks[task].get("attachments")]
     for row in rows:
         arm = arms[row["arm"]]
         task = tasks[row["task"]]
         require("mcp_config" not in arm or "mcp_config" not in task,
                 "choose either task or arm MCP configuration")
         if task.get("attachments"):
-            row["unsupported"] = "Carbon cannot submit image attachments in a user turn"
+            row.update(mode=arm["mode"], model=arm["model"], route=arm["route"])
+            if arm["mode"] not in task["modes"]:
+                row["unsupported"] = "this task does not support the selected mode"
+            elif arm["mode"] not in ("work", "plan"):
+                row["unsupported"] = "Carbon accepts images in Work and Plan"
+            elif arm["route"] not in LIVE_ROUTES:
+                row["unsupported"] = "the offline model has no image transport"
+            elif not arm.get("image_input"):
+                row["unsupported"] = "image input was not declared for this binary, route and model"
     require(0 < len(rows) <= MAX_TRIALS
             and {row["arm"] for row in rows} == arms.keys()
             and {row["task"] for row in rows} == tasks.keys(), "empty or oversized matrix")
@@ -302,14 +311,16 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
                     "benchmark account needs a qualifying ChatGPT sign-in")
         fixture_args = fixture_launch(root, home, arm) if fixture_launch else None
         if fixture_args is not None:
-            result["transport"] = "synthetic-siwc"
+            result["transport"] = "synthetic-openrouter" if arm["route"] == "openrouter" else "synthetic-siwc"
         deadline = min(end, time.monotonic() + budget["trial_seconds"])
         if deadline <= time.monotonic():
             raise TrialStopped("not_run", "experiment time budget")
         agent_started = time.monotonic()
         grading_workspace, answer = capture(arm["binary"], root, home, workspace, env, arm,
                                              task["turns"], deadline, git, result["input_commit"],
-                                             fixture_args)
+                                             fixture_args, attachments=task.get("attachments", ()))
+        if "image_inputs" in answer:
+            result["image_inputs"] = answer["image_inputs"]
         result["agent_wall_seconds"] = round(time.monotonic() - agent_started, 3)
         result["candidate"] = answer["candidate"]
         write(root / "answer.json", answer)
