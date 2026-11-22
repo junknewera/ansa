@@ -303,9 +303,6 @@ impl Plan {
         if self.is_read_only() {
             return Ok(());
         }
-        if !self.manual_checks().is_empty() {
-            return Err("orchestration_manual_checks_required");
-        }
         if self.checks().is_empty() && self.command_checks().is_empty() {
             return Err("orchestration_missing_checks");
         }

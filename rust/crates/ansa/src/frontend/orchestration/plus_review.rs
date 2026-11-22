@@ -8,7 +8,6 @@ use super::{
 use crate::{
     context::token_prefix, frontend::carbon::OutputView, protocol::legacy_json_v1::sha256,
 };
-use std::collections::BTreeSet;
 
 pub(crate) const PLUS_REVIEW_SKILL: &str = include_str!("strong-review/SKILL.md");
 const LAST_ATTEMPT: u8 = 2;
@@ -83,15 +82,7 @@ pub(super) async fn review_candidate_plus(
     stop: &Cancel,
     progress: &PhaseProgress<'_>,
 ) -> Result<Candidate> {
-    let scope: Vec<_> = run
-        .plan()
-        .steps()
-        .iter()
-        .filter(|step| step.access == Access::Write)
-        .flat_map(|step| step.paths.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let scope = super::write_scope(run.plan());
     let storage = worktree.path().parent().ok_or("worktree_storage")?;
     let ledgers = storage.join("plus");
     let views = storage.join("plus-review-views");
@@ -175,17 +166,9 @@ pub(super) async fn review_candidate_plus(
         if failed.is_empty() && decision.result.status == ChildStatus::Completed {
             stop.check()?;
             let verdict = archived_review(storage, run, attempt, &candidate, &checks)?;
-            worktree.frozen_view_in(&candidate, &views, &view, &plan, true, stop)?;
-            worktree.local_branch(&candidate, stop)?;
-            super::super::publish::record_release(storage, worktree, &candidate)?;
+            let view = worktree.frozen_view_in(&candidate, &views, &view, &plan, true, stop)?;
             append_review_checks(&mut checks, run.plan(), &verdict);
-            return Ok(Candidate {
-                commit: candidate.commit().into(),
-                workspace: worktree.path().into(),
-                diff: candidate.diff().into(),
-                paths: candidate.paths().to_vec(),
-                checks,
-            });
+            return super::reviewed_candidate(run, worktree, &candidate, &view, checks, stop);
         }
         if decision.result.status == ChildStatus::Blocked || attempt == LAST_ATTEMPT {
             return Err("orchestration_review_unresolved");
