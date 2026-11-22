@@ -189,7 +189,7 @@ fn perform_route(
         .build()
         .map_err(|_| "http_runtime")?;
     reactor.block_on(async {
-        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+        let deadline = request.timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         let mut driver:Option<tokio::task::JoinHandle<()>>=None;
         let transfer=async {
             use tower_service::Service;
@@ -265,7 +265,8 @@ fn perform_route(
                             }
                             if message.has("method") && message.has("id") {
                                 mcp_server_reply(
-                                    request, mcp.as_deref().ok_or("mcp_server_request")?, &message, stop, deadline,
+                                    request, mcp.as_deref().ok_or("mcp_server_request")?, &message, stop,
+                                    deadline.ok_or("mcp_timeout_required")?,
                                 )?;
                             }
                             if message.text_field("method").ok() == Some("notifications/tools/list_changed") {
@@ -280,7 +281,19 @@ fn perform_route(
             if mcp_sse.is_some() { return Err("mcp_missing_response"); }
             Ok(HttpReply {head,body:String::from_utf8(bytes).map_err(|_|"http_body_utf8")?})
         };
-        let result=tokio::select! {biased; _=cancelled(stop)=>Err("auth_cancelled"), result=tokio::time::timeout(Duration::from_millis(request.timeout_ms),transfer)=>result.unwrap_or(Err("http_timeout"))};
+        let transfer = async {
+            match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline.into(), transfer)
+                    .await
+                    .unwrap_or(Err("http_timeout")),
+                None => transfer.await,
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancelled(stop) => Err("auth_cancelled"),
+            result = transfer => result,
+        };
         if let Some(driver)=driver.take(){driver.abort();let _=driver.await;}result
     })
 }
@@ -321,7 +334,7 @@ pub fn fixture_stream(
             body: Secret::new(value.dump()),
             bearer: Some(Secret::new("synthetic-bridge-bearer".into())),
             body_limit: 16 * 1024 * 1024,
-            timeout_ms: 3000,
+            timeout_ms: Some(3000),
         },
         stop,
         Some(sink),
@@ -461,7 +474,7 @@ fn mcp_server_reply(
         body: Secret::new(response.dump()),
         bearer: current.bearer.clone(),
         body_limit: 4096,
-        timeout_ms: remaining.min(1000) as u64,
+        timeout_ms: Some(remaining.min(1000) as u64),
     };
     // The request that yielded this SSE event still owns its reactor.
     let reply = std::thread::scope(|scope| {
@@ -475,6 +488,20 @@ fn mcp_server_reply(
     }
     Ok(())
 }
+fn responses_request(value: &Json, bearer: &Secret) -> HttpRequest<'static> {
+    HttpRequest {
+        method: "POST",
+        url: super::http::RESPONSES_ENDPOINT,
+        content_type: "application/json",
+        body: Secret::new(value.dump()),
+        bearer: Some(bearer.clone()),
+        body_limit: 16 * 1024 * 1024,
+        // Long reasoning requests may take longer than a fixed transfer
+        // deadline. Cancellation still covers connection and body reads.
+        timeout_ms: None,
+    }
+}
+
 pub fn stream(
     value: &Json,
     bearer: &Secret,
@@ -482,15 +509,7 @@ pub fn stream(
     stop: &Cancel,
 ) -> Result<()> {
     perform(
-        &HttpRequest {
-            method: "POST",
-            url: super::http::RESPONSES_ENDPOINT,
-            content_type: "application/json",
-            body: Secret::new(value.dump()),
-            bearer: Some(bearer.clone()),
-            body_limit: 16 * 1024 * 1024,
-            timeout_ms: super::http::RESPONSES_TIMEOUT_MS,
-        },
+        &responses_request(value, bearer),
         stop,
         Some(sink),
         StreamAdmission::SiwcResponses(value),

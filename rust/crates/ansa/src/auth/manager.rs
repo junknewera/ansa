@@ -28,7 +28,7 @@ pub struct HttpRequest<'a> {
     pub body: Secret,
     pub bearer: Option<Secret>,
     pub body_limit: usize,
-    pub timeout_ms: u64,
+    pub timeout_ms: Option<u64>,
 }
 pub struct HttpReply {
     pub head: Head,
@@ -269,7 +269,7 @@ impl AuthManager {
                 },
                 bearer: None,
                 body_limit: 2 * 1024 * 1024,
-                timeout_ms: 20000,
+                timeout_ms: Some(20_000),
             },
             cancel,
         )
@@ -797,7 +797,7 @@ impl AuthManager {
                 content_type: "",
                 bearer: None,
                 body_limit: 2 * 1024 * 1024,
-                timeout_ms: 20000,
+                timeout_ms: Some(20_000),
             },
             &lease,
             cancel,
@@ -870,7 +870,7 @@ impl AuthManager {
                 content_type: "application/json",
                 bearer: None,
                 body_limit: 16 * 1024 * 1024,
-                timeout_ms: 75000,
+                timeout_ms: None,
             },
             &lease,
             cancel,

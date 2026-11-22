@@ -103,6 +103,9 @@ fn h1_peer(listener: TcpListener, case: &str, body: &[u8]) {
         thread::sleep(Duration::from_millis(600));
         return;
     }
+    if case.starts_with("delayed-complete") {
+        thread::sleep(Duration::from_millis(300));
+    }
     let wire = if case == "trailer" {
         let mut v = format!(
             "HTTP/1.1 200 OK\r\n{mime}Transfer-Encoding: chunked\r\n\r\n{:x}\r\n",
@@ -115,19 +118,30 @@ fn h1_peer(listener: TcpListener, case: &str, body: &[u8]) {
     } else {
         let mut v = format!(
             "HTTP/1.1 {status} OK\r\n{mime}Content-Length: {}\r\n\r\n",
-            body.len() + if case == "truncated" { 20 } else { 0 }
+            body.len()
+                + if matches!(case, "truncated" | "unbounded-cancel") {
+                    20
+                } else {
+                    0
+                }
         )
         .into_bytes();
         v.extend_from_slice(body);
         v
     };
     let _ = socket.write_all(&wire);
+    if case == "unbounded-cancel" {
+        // Withhold HTTP EOF after the complete SSE response. Only cancellation
+        // should close the exchange without dispatching its tool call.
+        assert_eq!(socket.read(&mut [0]).unwrap(), 0);
+    }
     let _ = socket.shutdown(Shutdown::Both);
 }
 fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let body = std::fs::read(protocol_fixture("round1.sse")).unwrap();
+    let body_length = body.len();
     let server = if h2 {
         listener.set_nonblocking(true).unwrap();
         let fixture = transport_fixtures();
@@ -176,19 +190,14 @@ fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
     )
     .unwrap();
     let value = model.json().unwrap();
-    let request = HttpRequest {
-        method: "POST",
-        url: super::super::http::RESPONSES_ENDPOINT,
-        content_type: "application/json",
-        body: Secret::new(value.dump()),
-        bearer: Some(Secret::new("synthetic-only".into())),
-        body_limit: 16 * 1024 * 1024,
-        timeout_ms: if matches!(case, "missing-stall" | "h2-missing-timeout") {
-            200
-        } else {
-            2000
-        },
-    };
+    let mut request = responses_request(&value, &Secret::new("synthetic-only".into()));
+    match case {
+        "delayed-complete" | "unbounded-cancel" => assert!(request.timeout_ms.is_none()),
+        "delayed-complete-bounded" | "missing-stall" | "h2-missing-timeout" => {
+            request.timeout_ms = Some(200);
+        }
+        _ => request.timeout_ms = Some(2000),
+    }
     let mut decoder = ResponseStream::new_with_callbacks(
         model,
         crate::protocol::sse::Limits::default(),
@@ -196,12 +205,17 @@ fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
         None,
     );
     let mut received = 0;
+    let stop = Cancel::default();
     let result = perform_route(
         &request,
-        &Cancel::default(),
+        &stop,
         Some(&mut |bytes| {
             received += bytes.len();
-            decoder.feed(bytes)
+            decoder.feed(bytes)?;
+            if case == "unbounded-cancel" && received == body_length {
+                stop.cancel();
+            }
+            Ok(())
         }),
         format!("{}://localhost:{port}/", if h2 { "https" } else { "http" })
             .parse()
@@ -246,6 +260,22 @@ fn siwc_missing_mime_admits_complete_http2_response() {
     assert_eq!(executors, 1);
 }
 #[test]
+fn unbounded_siwc_waits_for_eof_and_still_cancels() {
+    let (result, _, executors) = exercise("delayed-complete-bounded", false, true);
+    assert_eq!(result, Err("http_timeout"));
+    assert_eq!(executors, 0);
+
+    let (result, received, executors) = exercise("delayed-complete", false, true);
+    assert_eq!(result, Ok(()));
+    assert!(received > 0);
+    assert_eq!(executors, 1);
+
+    let (result, received, executors) = exercise("unbounded-cancel", false, true);
+    assert_eq!(result, Err("auth_cancelled"));
+    assert!(received > 0);
+    assert_eq!(executors, 0);
+}
+#[test]
 fn strict_headers_and_failed_eof_never_dispatch() {
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -288,7 +318,7 @@ fn strict_headers_and_failed_eof_never_dispatch() {
             body: Secret::new(value.dump()),
             bearer: None,
             body_limit: 1024,
-            timeout_ms: 1,
+            timeout_ms: Some(1),
         };
         let mut called = false;
         let result = perform_route(

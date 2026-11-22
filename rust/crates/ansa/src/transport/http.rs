@@ -9,7 +9,6 @@ pub struct Head {
     pub content_types: Vec<String>,
 }
 pub const RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
-pub const RESPONSES_TIMEOUT_MS: u64 = 75_000;
 pub(crate) fn validate_request_profile(
     url: &str,
     method: &str,

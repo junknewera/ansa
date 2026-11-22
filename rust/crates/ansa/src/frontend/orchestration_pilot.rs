@@ -237,7 +237,7 @@ impl Pilot {
                 body: Secret::new(body),
                 bearer: (url != CATALOG).then(|| self.key.clone()),
                 body_limit: 512 * 1024,
-                timeout_ms: (timeout.as_millis() as u64).clamp(1, 75_000),
+                timeout_ms: Some((timeout.as_millis() as u64).clamp(1, 75_000)),
             },
             stop,
         );
