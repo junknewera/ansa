@@ -1,0 +1,54 @@
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ANSA_ANALYSIS_PYTHON: /usr/bin/python3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install analysis and shell test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3-matplotlib python3-pil zsh
+      - name: Install the repository toolchain
+        working-directory: rust
+        run: rustup show active-toolchain
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --all -- --check
+      - name: Check Rust targets
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test the Rust workspace
+        # Ubuntu's system zshrc can prompt about runner-owned completion directories.
+        # The terminal tests supply their own interactive shell configuration.
+        env:
+          skip_global_compinit: '1'
+        working-directory: rust
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
+      - name: Build Carbon test adapter
+        working-directory: rust
+        run: cargo build --locked --features frontend-test-adapter --example frontend_adapter
+      - name: Exercise Orchestrate+ through Carbon
+        run: |
+          python3 -B tests/carbon_workspace_pty.py \
+            --binary rust/target/debug/examples/frontend_adapter \
+            --case siwc-orchestrate-plus \
+            --case siwc-orchestrate-plus-budget \
+            --case siwc-orchestrate-plus-blocked \
+            --case siwc-orchestrate-plus-implement \
+            --case siwc-orchestrate-plus-blocked-rejected \
+            --output "${RUNNER_TEMP}/carbon-plus"

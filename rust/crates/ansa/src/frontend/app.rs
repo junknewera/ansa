@@ -814,25 +814,31 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                     }
                     if plus {
                         let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let item = plus_fixture_response(&request, input, &trace, index, stop)?;
-                        let mut added = item.clone();
-                        added["status"] = json!("in_progress");
-                        if item["type"] == "function_call" {
-                            added["arguments"] = json!("");
-                        }
+                        let items = if trace.with_file_name("orchestration-plus-budget").is_file() {
+                            plus_budget_fixture::items(&request, input, index)?
+                        } else {
+                            vec![plus_fixture_response(&request, input, &trace, index, stop)?]
+                        };
                         let model = &request["model"];
                         let id = format!("plus-response-{index}");
+                        let mut events = vec![
+                            json!({"type":"response.created","sequence_number":0,"response":{"id":id,"model":model,"status":"in_progress","output":[]}}),
+                        ];
+                        for (output_index, item) in items.iter().enumerate() {
+                            let mut added = item.clone();
+                            added["status"] = json!("in_progress");
+                            if item["type"] == "function_call" {
+                                added["arguments"] = json!("");
+                            }
+                            events.push(json!({"type":"response.output_item.added","sequence_number":events.len(),"output_index":output_index,"item":added}));
+                            events.push(json!({"type":"response.output_item.done","sequence_number":events.len(),"output_index":output_index,"item":item}));
+                        }
                         let mut completed =
-                            json!({"id":id,"model":model,"status":"completed","output":[item]});
+                            json!({"id":id,"model":model,"status":"completed","output":items});
                         if let Some(text) = text {
                             completed["text"] = text.clone();
                         }
-                        let events = [
-                            json!({"type":"response.created","sequence_number":0,"response":{"id":id,"model":model,"status":"in_progress","output":[]}}),
-                            json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":added}),
-                            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":item}),
-                            json!({"type":"response.completed","sequence_number":3,"response":completed}),
-                        ];
+                        events.push(json!({"type":"response.completed","sequence_number":events.len(),"response":completed}));
                         for event in events {
                             stop.check()?;
                             feed(format!("data: {event}\n\n").as_bytes())?;
@@ -924,6 +930,9 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
         },
     )
 }
+
+#[cfg(feature = "frontend-test-adapter")]
+mod plus_budget_fixture;
 
 #[cfg(feature = "frontend-test-adapter")]
 fn plus_fixture_response(
@@ -1039,11 +1048,11 @@ fn plus_fixture_response(
         Some("ansa_child_result_v1") if task.starts_with("Evaluate the worker") => {
             if blocked {
                 ("verify-blocked", medium, desired("blocked", "Git state could not be independently verified", &[]))
-            } else if task.contains("QUICK_FIX_APPLIED") && seen("ORIGINAL_COORDINATOR") {
+            } else if task.contains("QUICK_FIX_APPLIED") && seen("Use another method") {
                 ("quick-verify", medium, completed("QUICK_VERIFIED"))
             } else if task.contains("FRESH_EVIDENCE") && seen("FRESH_COORDINATOR") {
                 ("fresh-verify", medium, completed("FRESH_VERIFIED"))
-            } else if task.contains("WORKER_WITHOUT_EVIDENCE") && seen("ORIGINAL_COORDINATOR") {
+            } else if task.contains("WORKER_WITHOUT_EVIDENCE") && (task.contains("\nApproved task\n") || seen("Use another method")) {
                 ("reject", medium, desired("changes_requested", "Use another method", &["Missing evidence"]))
             } else {
                 return Err("fixture_coordinator_context");

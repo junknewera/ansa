@@ -161,7 +161,7 @@ fn string(value: &str) -> Json {
 pub fn saved_response(request: &Request, text: Option<&str>, calls: usize) -> Json {
     response_with_offset(request, text, calls, 0)
 }
-fn response_with_offset(
+pub(crate) fn response_with_offset(
     request: &Request,
     text: Option<&str>,
     calls: usize,

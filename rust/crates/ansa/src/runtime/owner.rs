@@ -413,7 +413,7 @@ impl Owner {
         }
         let journal = self.journal_identity.ok_or("child_requires_journal")?;
         let mut tool_evidence = None;
-        let mut pause_diagnostic = None;
+        let mut pause = None;
         let state = match self.state.submits.get(&lookup.command.0) {
             Some(receipt) => {
                 Self::match_child_submit(receipt, lookup)?;
@@ -427,7 +427,7 @@ impl Owner {
                     })
                     .ok_or("child_attempt_not_current")?;
                 if turn.paused && !turn.diagnostic.is_empty() {
-                    pause_diagnostic = Some(turn.diagnostic.clone());
+                    pause = Some((turn.diagnostic.clone(), turn.resumes.len()));
                 }
                 let quiescent = !self.busy()
                     && self.pending_outcome.is_none()
@@ -526,7 +526,7 @@ impl Owner {
                     Activity::Finished(_) => None,
                 }),
             tool_evidence,
-            pause_diagnostic,
+            pause,
             state,
         })
     }
@@ -1997,17 +1997,8 @@ impl Owner {
                             self.pause("plan_mode_read_only");
                             return Ok(());
                         }
-                        let completed = current.operation_offset + current.results.len();
-                        if !response.calls().is_empty()
-                            && (current.rounds >= 64
-                                || current.rounds - current.resume_round >= current.round_limit
-                                || completed > 256
-                                || response.calls().len() > 256 - completed
-                                || completed - current.resume_operation > current.call_limit
-                                || response.calls().len()
-                                    > current.call_limit - (completed - current.resume_operation))
-                        {
-                            self.pause("tool_round_limit");
+                        if let Some(reason) = current.tool_budget_pause(response.calls().len()) {
+                            self.pause(reason);
                             return Ok(());
                         }
                         let turn = self.turn();

@@ -59,6 +59,42 @@ fn parts(root: &f::Root) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn nonrenewable_tool_budgets_have_distinct_diagnostics() {
+    for (batch, call_limit, expected, executed) in [
+        (2, 1, "tool_batch_limit", 0),
+        (1, 256, "tool_turn_limit", 64),
+        (16, 256, "tool_turn_limit", 256),
+    ] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let offset = count.clone();
+        let mut runtime = f::setup(
+            count.clone(),
+            None,
+            Arc::new(move |request, _, _| {
+                native::load(&f::response_with_offset(
+                    request,
+                    None,
+                    batch,
+                    offset.load(Ordering::SeqCst),
+                ))
+            }),
+            Limits {
+                tool_rounds: 64,
+                tool_calls: call_limit,
+                ..Limits::default()
+            },
+            Options::default(),
+        )
+        .await;
+        let handle = runtime.handle();
+        f::submit(&handle, "assignment", "Read fixture", "task").await;
+        f::until(&handle, |payload| matches!(payload, EventPayload::RuntimeError {diagnostic, ..} if diagnostic == expected)).await;
+        assert_eq!(count.load(Ordering::SeqCst), executed);
+        f::finish(&mut runtime).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn parked_plan_resumes_the_same_request_after_a_tool_budget_pause() {
     struct Lease(Arc<AtomicUsize>);
     impl Drop for Lease {
@@ -71,9 +107,13 @@ async fn parked_plan_resumes_the_same_request_after_a_tool_budget_pause() {
     let executions = Arc::new(AtomicUsize::new(0));
     let leases = Arc::new(AtomicUsize::new(0));
     let active_leases = leases.clone();
+    let admissions = AtomicUsize::new(0);
     let options = Options {
         directory: Some(root.journal()),
         plan_guard: Some(Arc::new(move || {
+            if admissions.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err("terminal_workspace_busy");
+            }
             assert_eq!(active_leases.fetch_add(1, Ordering::SeqCst), 0);
             Ok(Box::new(Lease(active_leases.clone())))
         })),
@@ -162,6 +202,24 @@ async fn parked_plan_resumes_the_same_request_after_a_tool_budget_pause() {
     f::post(
         &handle,
         "resume-assignment-2",
+        CommandPayload::Resume(request.clone()),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    f::until(&handle, |payload| {
+        matches!(payload, EventPayload::RuntimeError { diagnostic, .. } if diagnostic == "terminal_workspace_busy")
+    })
+    .await;
+    assert_eq!(
+        parts(&root),
+        before,
+        "busy workspace advanced the paused turn"
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    f::post(
+        &handle,
+        "resume-assignment-3",
         CommandPayload::Resume(request.clone()),
         "task",
         PostStatus::Accepted,

@@ -124,7 +124,7 @@ pub struct ChildAttempt {
     state: ChildAttemptState,
     latest_tool: Option<(String, Option<String>)>,
     tool_evidence: Option<ChildToolEvidence>,
-    pause_diagnostic: Option<String>,
+    pause: Option<(String, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -184,7 +184,14 @@ impl ChildAttempt {
         self.tool_evidence.as_ref()
     }
     pub(crate) fn pause_diagnostic(&self) -> Option<&str> {
-        self.pause_diagnostic.as_deref()
+        self.pause
+            .as_ref()
+            .map(|(diagnostic, _)| diagnostic.as_str())
+    }
+    pub(crate) fn budget_pause_generation(&self) -> Option<usize> {
+        self.pause.as_ref().and_then(|(diagnostic, generation)| {
+            (diagnostic == "tool_round_limit").then_some(*generation)
+        })
     }
     pub fn into_state(self) -> ChildAttemptState {
         self.state

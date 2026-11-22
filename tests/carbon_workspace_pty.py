@@ -1700,7 +1700,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     before_approval = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert before_approval == ["prior-work", "survey-for-implementation", "strong-plan"], before_approval
     holds = {stage: root / f"hold-plus-{stage}"
-             for stage in ("coordinate", "worker-rejected", "whole-review")}
+             for stage in ("worker-rejected", "whole-review")}
     for hold in holds.values():
         hold.touch()
 
@@ -1714,26 +1714,26 @@ def siwc_orchestrate_plus(screen, root, cwd):
                    for index, row in enumerate(rows[1:-1], start=1))
 
     screen.send(b"\r")
-    until(screen, lambda _: held("coordinate") and body(screen).count(prompt) == 1
+    until(screen, lambda _: held("worker-rejected") and body(screen).count(prompt) == 1
           and "Agents · 0/2 steps done · Ctrl+T details" in body(screen),
           "the main conversation shows one request and compact progress")
     assert all(label not in body(screen) for label in (
-        "PLUS_CARBON_PLAN", "Coordinator · gpt-6.1-sol", "Conversation agents",
+        "PLUS_CARBON_PLAN", "Implementation · gpt-6.1-luna", "Conversation agents",
     ))
     open_activity(screen)
     until(screen, lambda frame: all(label in frame for label in (
         "Proposed plan", "Approved plan", "0/2 steps done",
-        "Coordinator · gpt-6.1-sol", "Running · planning",
+        "Implementation · gpt-6.1-luna", "Running",
     )),
-          "coordinator active and historical plan links loaded before the first step")
+          "worker active and historical plan links loaded before the first step")
     assert body(screen).count("Proposed plan") == 1 and prompt not in body(screen)
     assert "PLUS_CARBON_PLAN" not in body(screen)
     paint_quiet(screen)
     row = next(index for index, line in enumerate(visible(screen).splitlines())
-               if "Coordinator · gpt-6.1-sol" in line)
-    click(screen, screen.vt.line(row).index("Coordinator · gpt-6.1-sol"), row)
+               if "Implementation · gpt-6.1-luna" in line)
+    click(screen, screen.vt.line(row).index("Implementation · gpt-6.1-luna"), row)
     until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
-          "clicking the model row in Activity opens the coordinator's transcript")
+          "clicking the model row in Activity opens the worker's transcript")
     escape(screen)
     until(screen, lambda frame: activity_open(screen) and "0/2 steps done" in frame,
           "Escape restores live Activity")
@@ -1743,7 +1743,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
           "Enter opens the selected card in Activity")
     escape(screen)
     until(screen, lambda frame: activity_open(screen) and "0/2 steps done" in frame,
-          "Escape restores the coordinator's live activity")
+          "Escape restores the worker's live activity")
     select_result(screen, "Approved plan")
     screen.send(b"\r")
     until(screen, lambda frame: "PLUS_CARBON_PLAN" in frame, "approved plan opens on demand")
@@ -1756,20 +1756,10 @@ def siwc_orchestrate_plus(screen, root, cwd):
     screen.wait(b"\x1b[H\x1b[2J", since=at)
     local(screen, "/agents")
     until(screen, lambda frame: activity_open(screen) and "Conversation agents" not in frame
-          and running_card("Coordinator · gpt-6.1-sol", "Set report to after fixture"),
-          "/agents opens the same Activity with the running coordinator")
-    holds["coordinate"].unlink()
-
-    worker = "Implementation · gpt-6.1-luna"
-    until(screen, lambda _: held("worker-rejected")
-          and running_card(worker, "Set report to after fixture"),
-          "already-open Activity receives the newly created worker")
-    row = next(index - 1 for index, line in enumerate(visible(screen).splitlines()) if worker in line)
-    click(screen, screen.vt.line(row).index("Set report to after fixture"), row)
-    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
-          "mouse opens the running worker's transcript")
-    escape(screen)
-    until(screen, lambda _: activity_open(screen), "Escape restores live Activity")
+          and running_card("Implementation · gpt-6.1-luna", "Set report to after fixture"),
+          "/agents opens the same Activity with the running worker")
+    stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
+    assert stages == [*before_approval, "worker-rejected"], stages
     holds["worker-rejected"].unlink()
 
     until(screen, lambda _: held("whole-review") and activity_open(screen)
@@ -1825,8 +1815,8 @@ def siwc_orchestrate_plus(screen, root, cwd):
                if item.get("role") == "assistant")
     trace = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert trace == [
-        "prior-work", "survey-for-implementation", "strong-plan", "coordinate", *["worker-rejected", "reject"] * 3,
-        "escalate-quick", "quick-fix", "quick-verify", "coordinate",
+        "prior-work", "survey-for-implementation", "strong-plan", *["worker-rejected", "reject"] * 3,
+        "escalate-quick", "quick-fix", "quick-verify",
         *["worker-rejected", "reject"] * 3, "escalate-fresh", "fresh-coordinate",
         "fresh-worker", "fresh-verify", "whole-review", "review-coordinate",
         "review-fix", "targeted-review", "summary", "later-work",
@@ -1840,6 +1830,35 @@ def siwc_orchestrate_plus(screen, root, cwd):
             if turns:
                 reviewers.append(turns)
     assert reviewers == [["plus-review-0", "plus-review-1"]], reviewers
+    local(screen, "/exit")
+    return "normal"
+
+
+def siwc_orchestrate_plus_budget(screen, root, cwd):
+    (root / "orchestration-plus-budget").touch()
+    report = cwd / "report.txt"
+    original = "ORIGINAL\n" + "abcdefghijklmnopqrstuvwxyz" * 3 + "\n"
+    report.write_text(original)
+    subprocess.run(["git", "init", "-q"], cwd=cwd, check=True)
+    subprocess.run(["git", "add", "report.txt"], cwd=cwd, check=True)
+    subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost",
+                    "commit", "-qm", "fixture"], cwd=cwd, check=True)
+    configure_plus_roles(screen)
+    screen.send("/orchestrate+ Read and update report.txt\r")
+    until(screen, lambda frame: "Budget regression" in frame and "Start" in frame, "approved budget test plan")
+    screen.send(b"\r")
+    until(screen, lambda frame: "BUDGET_WORK_COMPLETE" in frame, "automatic worker continuation", timeout=35)
+    rows = records(root)
+    intents = [row["invocation"] for row in rows if row["kind"] == "intent"]
+    assert [v["name"] for v in intents] == ["read_file"] * 65 + ["edit_file"]
+    assert [int(v["arguments"]["offset"].lexeme) for v in intents[:-1]] == list(range(65))
+    contents = [json.loads(row["result"]["output"]) for row in rows if row["kind"] == "outcome"]
+    assert [v["content"] for v in contents[:-1]] == list(original[:65]) and contents[-1]["applied"]
+    assert sum(row["kind"] == "pause" and row["diagnostic"] == "tool_round_limit" for row in rows) == 1
+    assert sum(row["kind"] == "resume" for row in rows) == 1
+    checkout, = (root / "home/.ansa/orchestration").glob("*/*/checkout")
+    actual = subprocess.check_output(["git", "show", "ansa-result:report.txt"], cwd=checkout, text=True)
+    assert actual == original.replace("ORIGINAL", "UPDATED") and report.read_text() == original
     local(screen, "/exit")
     return "normal"
 
@@ -1909,7 +1928,7 @@ def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
         assert receipt.read_text() == run.name and journals(root) == before_journals
     stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert stages == [
-        "strong-plan", "coordinate", *["worker-blocked", "verify-blocked"] * 3,
+        "strong-plan", *["worker-blocked", "verify-blocked"] * 3,
         "escalate-blocked", "stopped-summary", "later-work",
     ], stages
     local(screen, "/exit")
@@ -2207,6 +2226,7 @@ def main():
              ("openrouter-orchestration", openrouter_orchestration),
              ("siwc-orchestration", siwc_orchestration),
              ("siwc-orchestrate-plus", siwc_orchestrate_plus),
+             ("siwc-orchestrate-plus-budget", siwc_orchestrate_plus_budget),
              ("siwc-orchestrate-plus-implement", siwc_orchestrate_plus_implement),
              ("siwc-orchestrate-plus-blocked", siwc_orchestrate_plus_blocked),
              ("siwc-orchestrate-plus-blocked-rejected", lambda *args: siwc_orchestrate_plus_blocked(*args, reject=True))]
