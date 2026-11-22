@@ -94,9 +94,12 @@ impl Phase<'_> {
             local::entry_exists(&directory, &identity.run).map_err(|_| "orchestration_storage")?;
         let mut phase = if existing {
             directory.sync_all().map_err(|_| "orchestration_storage")?;
-            let phase = Run::open(&ledger, &identity)?;
-            if phase.plan() != &plan || phase.deadline() != self.deadline {
+            let mut phase = Run::open(&ledger, &identity)?;
+            if phase.plan() != &plan || phase.deadline() > self.deadline {
                 return Err("orchestration_plus_phase_identity");
+            }
+            if phase.deadline() < self.deadline && phase.may_resume() {
+                phase.renew_deadline(self.deadline)?;
             }
             phase
         } else {
@@ -135,7 +138,7 @@ impl Phase<'_> {
                 .clone();
             let mut agent = card(&session.id);
             agent.state = child_status(result).into();
-            agent.activity = result.findings.first().unwrap_or(&result.summary).clone();
+            agent.activity.clone_from(&result.summary);
             self.publish(&agent);
             return Ok(PhaseResult {
                 result: result.clone(),
@@ -178,7 +181,6 @@ impl Phase<'_> {
         let session_id = opened.selected.id;
         let mut agent = card(&session_id);
         self.publish(&agent);
-        let mut acted = false;
         let mut child = Child {
             task,
             runtime: opened.runtime,
@@ -250,13 +252,13 @@ impl Phase<'_> {
             }
             loop {
                 self.stop.check()?;
-                if now()? >= self.deadline {
-                    return Err("orchestration_deadline");
-                }
                 let proof = child.receipt().await?;
                 if let Some(action) = latest_action(&proof) {
-                    agent.activity = action;
-                    acted = true;
+                    agent.activity = if stage.is_empty() {
+                        action
+                    } else {
+                        format!("{stage} · {action}")
+                    };
                     self.publish(&agent);
                 }
                 phase.observe(&id, &proof)?;
@@ -315,15 +317,18 @@ impl Phase<'_> {
         }
         .await;
         let result = async {
-            if result
-                .as_ref()
-                .is_err_and(|code| *code == "orchestration_paused")
-            {
+            if result.as_ref().is_err_and(|code| {
+                matches!(*code, "orchestration_paused" | "orchestration_deadline")
+            }) {
                 child.park().await?;
                 if self.stop.cancelled() {
                     return phase.cancel().and(Err("run_cancelled"));
                 }
-                if phase.submissions_exhausted() {
+                if phase.submissions_exhausted()
+                    && result
+                        .as_ref()
+                        .is_err_and(|code| *code == "orchestration_paused")
+                {
                     return Err("run_budget");
                 }
             } else if result.is_ok() {
@@ -339,20 +344,16 @@ impl Phase<'_> {
         .await;
         let (status, error) = match &result {
             Ok(done) => (child_status(&done.result), None),
-            Err(code) if *code == "orchestration_paused" => ("Paused", None),
+            Err("orchestration_deadline") => ("Paused", Some("Run window ended")),
+            Err("orchestration_paused") => ("Paused", None),
             Err(code) if self.stop.cancelled() => ("Stopped", Some(*code)),
             Err(code) => ("Failed", Some(*code)),
         };
         agent.state = status.into();
         if let Some(error) = error {
             agent.activity = error.into();
-        } else if !acted && let Ok(done) = &result {
-            agent.activity = done
-                .result
-                .findings
-                .first()
-                .unwrap_or(&done.result.summary)
-                .clone();
+        } else if let Ok(done) = &result {
+            agent.activity.clone_from(&done.result.summary);
         }
         self.publish(&agent);
         result
@@ -382,6 +383,26 @@ fn compact(result: &ChildResult) -> serde_json::Value {
         "summary": clip(&result.summary),
         "findings": result.findings.iter().take(4).map(|finding| clip(finding)).collect::<Vec<_>>(),
     })
+}
+
+pub(super) fn findings_excerpts(result: &ChildResult, per_finding: usize) -> Vec<&str> {
+    use crate::context::{estimate_text_tokens, token_prefix};
+
+    // Preserve historical excerpts while bounding the combined prompt size.
+    const FINDINGS_TOKENS: usize = 1400;
+    let mut remaining = FINDINGS_TOKENS;
+    let mut excerpts = Vec::new();
+    for finding in &result.findings {
+        let excerpt = token_prefix(finding, per_finding);
+        let cost = estimate_text_tokens(excerpt) + 1;
+        if cost > remaining {
+            excerpts.push("Additional findings omitted.");
+            break;
+        }
+        remaining -= cost;
+        excerpts.push(excerpt);
+    }
+    excerpts
 }
 
 pub(super) fn compact_tool_evidence(value: &ChildToolEvidence, limit: usize) -> serde_json::Value {
@@ -432,12 +453,7 @@ fn worker_instruction(task: &Step, coordinator: &ChildResult) -> String {
         task.id,
         task.task,
         crate::context::token_prefix(&coordinator.summary, 1000),
-        coordinator
-            .findings
-            .iter()
-            .map(|finding| crate::context::token_prefix(finding, 140))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        findings_excerpts(coordinator, 140).join("\n"),
     )
 }
 
@@ -839,6 +855,7 @@ pub(super) async fn schedule(
             stopped: false,
         })
     }.await;
+    let result = park_expired(result, &progress);
     if result
         .as_ref()
         .is_err_and(|code| *code == "orchestration_paused")

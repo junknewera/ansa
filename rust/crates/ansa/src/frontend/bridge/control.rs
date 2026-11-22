@@ -79,14 +79,7 @@ fn info_json(receipt: &MessageReceiptInfo) -> Json {
             "mode",
             receipt.mode.map_or_else(
                 || Json::parse("null").unwrap(),
-                |m| {
-                    s(if m == AgentMode::Plan {
-                        "plan"
-                    } else {
-                        "basic"
-                    })
-                    .unwrap()
-                },
+                |m| s(if m.read_only() { "plan" } else { "basic" }).unwrap(),
             ),
         ),
         ("admission_durable", flag(receipt.admission_durable)),

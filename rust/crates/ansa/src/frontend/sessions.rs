@@ -24,6 +24,8 @@ use std::{
 mod agent_transcript;
 pub(super) use agent_transcript::AgentTranscript;
 mod role_preferences;
+mod siwc_lane;
+pub(super) use siwc_lane::{Priority, SiwcLane};
 const CONSOLE_ACCOUNT: &str = "ansa-local-console";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +61,7 @@ pub struct Factory {
     pub(super) harness_trial: Option<String>,
     stop: Cancel,
     auth: Option<Arc<AuthManager>>,
+    siwc_lane: SiwcLane,
     editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
     carbon_terminal: bool,
     terminal_owners: Arc<Mutex<BTreeMap<String, terminals::Owner>>>,
@@ -90,6 +93,7 @@ impl Factory {
             harness_trial: None,
             stop: Cancel::default(),
             auth,
+            siwc_lane: SiwcLane::default(),
             editor: None,
             carbon_terminal: false,
             terminal_owners: Arc::default(),
@@ -107,6 +111,13 @@ impl Factory {
     pub(super) fn with_stop(mut self, stop: Cancel) -> Self {
         self.stop = stop;
         self
+    }
+    pub(super) fn with_siwc_lane(mut self, lane: SiwcLane) -> Self {
+        self.siwc_lane = lane;
+        self
+    }
+    pub(super) fn prioritize_chat(&self) -> Option<Priority> {
+        self.auth.as_ref().map(|_| self.siwc_lane.prioritize())
     }
 
     pub(crate) fn new_main_uses_terminal(&self) -> bool {
@@ -523,10 +534,12 @@ impl Factory {
         stop: &Cancel,
     ) -> Result<(Generate, Options)> {
         if let Some(auth) = &self.auth {
-            let (account, generate, mut options) = app::authorized_with_cancel(
+            let (account, generate, mut options) = app::authorized_in_workspace(
                 auth.clone(),
                 request.binding.requested_model.clone(),
                 stop,
+                self.siwc_lane.clone(),
+                false,
             )?;
             if account != request.binding.account || account != self.account {
                 return Err("auth_account_mismatch");
@@ -1297,9 +1310,12 @@ impl Factory {
                 },
             )
         } else {
-            let (account, generate, options) = app::authorized(
+            let (account, generate, options) = app::authorized_in_workspace(
                 self.auth.clone().ok_or("auth_required")?,
                 bound.requested_model.clone(),
+                &self.stop,
+                self.siwc_lane.clone(),
+                true,
             )?;
             if account != self.account {
                 return Err("auth_account_mismatch");

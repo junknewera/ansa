@@ -328,7 +328,7 @@ impl Owner {
                 && !self.storage_failed
                 && self.state.turn.is_some(),
             mode: current
-                .filter(|receipt| !receipt.internal)
+                .filter(|receipt| !receipt.internal && receipt.mode != AgentMode::OrchestrationChat)
                 .map_or(self.state.user_mode, |receipt| receipt.mode),
             transcript_size: self.state.transcript().len(),
             preview: self.preview.clone(),
@@ -1345,7 +1345,7 @@ impl Owner {
                     ("text", Json::string(&receipt.text)?),
                     (
                         "mode",
-                        Json::string(if receipt.mode == AgentMode::Plan {
+                        Json::string(if receipt.mode.read_only() {
                             "plan"
                         } else {
                             "basic"
@@ -1362,6 +1362,9 @@ impl Owner {
                 ];
                 if internal {
                     fields.push(("handoff", Json::parse("true")?));
+                }
+                if submitted.mode == AgentMode::OrchestrationChat {
+                    fields.push(("orchestration_chat", Json::parse("true")?));
                 }
                 if let Some(draft) = receipt.draft {
                     fields.push(("draft", draft.save()?));

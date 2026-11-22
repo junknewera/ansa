@@ -76,6 +76,21 @@ pub fn names(directory: &File, limit: usize) -> io::Result<(Vec<std::ffi::OsStri
     Ok((names, false))
 }
 
+pub fn visit_names(
+    directory: &File,
+    mut visit: impl FnMut(&std::ffi::OsStr) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    for entry in rustix::fs::Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if !matches!(name, b"." | b"..") {
+            visit(std::ffi::OsStr::from_bytes(name))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn count_names(directory: &File, excluded: &[&str], limit: usize) -> io::Result<usize> {
     let mut count = 0;
     for entry in rustix::fs::Dir::read_from(directory)? {

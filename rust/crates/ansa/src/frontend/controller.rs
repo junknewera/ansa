@@ -553,12 +553,25 @@ impl State {
             self.exit = 1;
             return (false, false);
         }
+        (
+            self.submit_text(text, self.mode, handle, io, replies),
+            false,
+        )
+    }
+    fn submit_text(
+        &mut self,
+        text: &str,
+        mode: AgentMode,
+        handle: &Handle,
+        io: &Io,
+        replies: &mut Replies,
+    ) -> bool {
         self.turn = TurnId(format!("t_{}_{}", self.prefix, self.sequence + 1));
         let posted = self.post(
             handle,
             CommandPayload::Submit(Submit {
                 text: text.into(),
-                mode: self.mode,
+                mode,
             }),
             replies,
         );
@@ -578,7 +591,7 @@ impl State {
             self.report(io, "ansa: submit_rejected\n");
             self.exit = 1;
         }
-        (posted, false)
+        posted
     }
     pub fn apply(&mut self, event: &RuntimeEvent, io: &Io) {
         match &event.payload {

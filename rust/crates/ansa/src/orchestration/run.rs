@@ -157,6 +157,10 @@ enum Event {
     Expired {
         at: u64,
     },
+    RenewDeadline {
+        previous: u64,
+        deadline: u64,
+    },
     Admitted {
         step: String,
         request: String,
@@ -266,6 +270,13 @@ impl State {
     }
 
     fn can_dispatch(&self) -> Result<()> {
+        if self.expired {
+            return Err("run_dispatch_unavailable");
+        }
+        self.can_resume()
+    }
+
+    fn can_resume(&self) -> Result<()> {
         if self
             .decisions
             .last()
@@ -273,7 +284,7 @@ impl State {
         {
             return Err("run_scope_confirmation");
         }
-        if !self.approved || self.cancelled || self.expired || self.unresolved {
+        if !self.approved || self.cancelled || self.unresolved {
             return Err("run_dispatch_unavailable");
         }
         Ok(())
@@ -413,6 +424,14 @@ impl State {
             }
             Event::Expired { at } if !self.expired && *at >= self.budget.deadline => {
                 self.expired = true
+            }
+            Event::RenewDeadline { previous, deadline } => {
+                self.can_resume()?;
+                if *previous != self.budget.deadline || *deadline <= *previous {
+                    return Err("run_deadline_identity");
+                }
+                self.budget.deadline = *deadline;
+                self.expired = false;
             }
             Event::Clarification { text } => {
                 self.can_dispatch()?;
@@ -689,6 +708,18 @@ impl Run {
         self.state.can_dispatch().is_ok() && now < self.state.budget.deadline
     }
 
+    pub(crate) fn may_resume(&self) -> bool {
+        self.state.can_resume().is_ok()
+    }
+
+    pub(crate) fn renew_deadline(&mut self, deadline: u64) -> Result<()> {
+        let previous = self.deadline();
+        if deadline > previous {
+            self.commit(Event::RenewDeadline { previous, deadline })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_continuation(&self, now: u64) -> Result<()> {
         if now >= self.deadline() {
             return Err("orchestration_deadline");
@@ -779,7 +810,7 @@ impl Run {
         stop.check()?;
         if now >= self.state.budget.deadline {
             self.commit(Event::Expired { at: now })?;
-            return Err("run_budget");
+            return Err("orchestration_deadline");
         }
         if !matches!(child.state(), ChildAttemptState::Missing) {
             return Err("run_child_already_admitted");
@@ -869,6 +900,10 @@ impl Run {
             return Err("run_child_not_resumable");
         };
         stop.check()?;
+        if now >= self.deadline() {
+            self.commit(Event::Expired { at: now })?;
+            return Err("orchestration_deadline");
+        }
         self.commit(Event::ResumePost {
             step: step.to_owned(),
             request: request.0.clone(),
@@ -1153,6 +1188,13 @@ fn plus_reopen_preserves_completed_effects_active_task_and_saved_clarification()
 
     let mut run = Run::open(&path, &identity).unwrap();
     assert!(run.ready().is_err());
+    assert_eq!(run.check_continuation(201), Err("orchestration_deadline"));
+    assert!(run.may_resume());
+    run.renew_deadline(400).unwrap();
+    drop(run);
+    let mut run = Run::open(&path, &identity).unwrap();
+    assert_eq!(run.deadline(), 400);
+    assert!(run.check_continuation(201).is_ok());
     run.continue_run(&[]).unwrap();
     assert_eq!(run.active_plus_task(), Some("two"));
     assert_eq!(

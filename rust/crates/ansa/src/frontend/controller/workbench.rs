@@ -65,6 +65,8 @@ struct Slot {
     resync: bool,
     pending_prompt: Option<String>,
     follow_accepted_submit: Option<CommandId>,
+    chat_priority: Option<(CommandId, crate::frontend::sessions::Priority)>,
+    pending_summary: Option<PendingSummary>,
     admissions: Vec<(String, bool)>,
     closed: bool,
     closing: bool,
@@ -115,6 +117,8 @@ impl Slot {
             resync: true,
             pending_prompt: prompt,
             follow_accepted_submit: None,
+            chat_priority: None,
+            pending_summary: None,
             admissions: Vec::new(),
             closed: false,
             closing: false,
@@ -247,6 +251,21 @@ impl Slot {
             dirty = true;
             let (id, submit, internal, result) = reply.map_err(|_| "cli_post_task")?;
             self.state.read_replied(&id);
+            if let Some(pending) = self.pending_summary.as_mut()
+                && matches!(pending.dispatch, SummaryDispatch::Sending)
+                && id.0.strip_prefix("summary-") == Some(pending.run.as_str())
+            {
+                if result == Ok(PostStatus::QueueFull) {
+                    pending.dispatch =
+                        SummaryDispatch::Ready(Instant::now() + Duration::from_millis(40));
+                    if self.state.pending.as_ref() == Some(&id) {
+                        self.state.pending = None;
+                    }
+                    self.admissions.push((id.0, false));
+                    continue;
+                }
+                self.pending_summary = None;
+            }
             let retry = internal && matches!(&result, Ok(PostStatus::QueueFull));
             if retry {
                 if self.ready_snapshot.as_ref() == Some(&id) {
@@ -294,6 +313,7 @@ impl Slot {
                 }
             }
             if let Some(code) = code {
+                self.chat_priority.take_if(|(pending, _)| *pending == id);
                 if self.follow_accepted_submit.as_ref() == Some(&id) {
                     self.follow_accepted_submit = None;
                 }
@@ -602,6 +622,19 @@ enum FileValue {
     Document(FileDocument),
     Image(graphics::Image),
 }
+struct PendingSummary {
+    run: String,
+    evidence: String,
+    generation: Option<GenerationSelection>,
+    dispatch: SummaryDispatch,
+}
+
+enum SummaryDispatch {
+    Ready(Instant),
+    SelectingGeneration,
+    Sending,
+}
+
 enum Job {
     ManualAccepted {
         owner: String,
@@ -616,7 +649,9 @@ enum Job {
     },
     AgentTranscript {
         token: u64,
-        result: Result<crate::frontend::sessions::AgentTranscript>,
+        live: bool,
+        reload: bool,
+        result: Result<Option<crate::frontend::sessions::AgentTranscript>>,
     },
     OrchestrationPlan {
         owner: String,
@@ -625,8 +660,12 @@ enum Job {
     },
     OrchestrationDone {
         owner: String,
-        generation_checked: bool,
         result: Result<orchestration::Completed>,
+    },
+    OrchestrationGeneration {
+        owner: String,
+        run: String,
+        result: Result<PostStatus>,
     },
     DraftCancel {
         owner: String,
@@ -635,7 +674,7 @@ enum Job {
     },
     ClarificationSaved {
         owner: String,
-        text: String,
+        draft: String,
         result: Result<()>,
     },
     OrchestrationReceipt {
@@ -876,6 +915,10 @@ struct AgentReader {
     title: String,
     pending: bool,
     requested: Option<u8>,
+    next_refresh: Instant,
+    was_live: bool,
+    tool_details: bool,
+    follow_agent: bool,
     offset: usize,
     page: Option<crate::frontend::sessions::AgentTranscript>,
     notice: String,
@@ -1181,15 +1224,15 @@ impl Workbench {
         } else if self.menu.is_some() {
             self.disarm_exit();
             self.escape(io);
+        } else if slot.interruptible() {
+            self.disarm_exit();
+            self.cancel_current(io);
         } else if let Some((owner, stop)) = &self.orchestration_stop
             && owner == &slot.id
         {
             stop.cancel();
             self.disarm_exit();
             self.report(io, "Stopping the current task");
-        } else if slot.interruptible() {
-            self.disarm_exit();
-            self.cancel_current(io);
         } else if self.exit_deadline.is_some_and(|deadline| now < deadline) {
             self.disarm_exit();
             return true;
@@ -1480,6 +1523,10 @@ impl Workbench {
             title: line.title.clone(),
             pending: false,
             requested: Some(b'r'),
+            next_refresh: Instant::now(),
+            was_live: true,
+            tool_details: false,
+            follow_agent: true,
             offset: 0,
             page: None,
             notice: "Opening transcript…".into(),
@@ -1495,15 +1542,41 @@ impl Workbench {
         {
             return;
         }
+        let Some(Panel::AgentTranscript(reader)) = &self.panel else {
+            return;
+        };
+        let live = self
+            .orchestration_views
+            .get(&reader.parent)
+            .is_some_and(|view| {
+                view.agents
+                    .iter()
+                    .any(|(id, agent)| id == &reader.id && agent.state == "Running")
+            })
+            || self
+                .slots
+                .iter()
+                .any(|slot| slot.id == reader.id && slot.active());
         let Some(Panel::AgentTranscript(reader)) = &mut self.panel else {
             return;
         };
         if reader.pending {
             return;
         }
-        let Some(key) = reader.requested.take() else {
+        let now = Instant::now();
+        let Some(key) = reader.requested.take().or_else(|| {
+            (now >= reader.next_refresh
+                && reader.follow_agent
+                && (live || reader.was_live)
+                && reader
+                    .page
+                    .as_ref()
+                    .is_none_or(|page| page.end == page.total))
+            .then_some(b'r')
+        }) else {
             return;
         };
+        reader.next_refresh = now + Duration::from_secs(1);
         let (before, forward) = match (key, &reader.page) {
             (b'[', Some(page)) if page.begin > 0 => (page.begin, false),
             (b']', Some(page)) if page.end < page.total => (page.end, true),
@@ -1513,10 +1586,11 @@ impl Workbench {
         self.file_token = self.file_token.wrapping_add(1);
         let token = self.file_token;
         reader.pending = true;
-        let cached = reader
+        reader.follow_agent = key == b'r';
+        let archive = reader
             .page
             .as_ref()
-            .filter(|_| key != b'r')
+            .filter(|page| key != b'r' || page.end == page.total)
             .map(|page| page.archive.clone());
         let id = reader.id.clone();
         let parent = reader.parent.clone();
@@ -1524,15 +1598,20 @@ impl Workbench {
         let stop = Cancel::linked(&self.stop);
         self.jobs.spawn_blocking(move || Job::AgentTranscript {
             token,
+            live,
+            reload: key == b'r',
             result: {
                 let query = GetTranscript {
                     before,
                     forward,
                     limit: 64,
                 };
-                match cached {
-                    Some(archive) => Ok(archive.page(query)),
-                    None => factory.agent_transcript(&id, &parent, query, &stop),
+                if key != b'r'
+                    && let Some(archive) = &archive
+                {
+                    Ok(Some(archive.page(query)))
+                } else {
+                    factory.agent_transcript(&id, &parent, query, archive.as_ref(), &stop)
                 }
             },
         });
@@ -1969,11 +2048,13 @@ impl Workbench {
         let token = self.modal_token;
         let owner = self.slots[self.current].id.clone();
         self.menu = Some(Menu::Loading("Project sessions".into()));
+        let stop = Cancel::linked(&self.stop);
+        self.modal_stop = Some(stop.clone());
         self.jobs.spawn_blocking(move || Job::Sessions {
-            plans: orchestration::recent_plan_links(&factory, &owner).unwrap_or_default(),
+            plans: orchestration::recent_plan_links(&factory, &owner, &stop).unwrap_or_default(),
             owner,
             token,
-            result: factory.summaries(&Cancel::default()),
+            result: factory.summaries(&stop),
         });
     }
     fn search_sessions(&mut self, query: &str, io: &Io) {
@@ -2116,7 +2197,7 @@ impl Workbench {
                     (Some(OrchestrationMode::Standard), AgentMode::Basic)
                 }
                 (None, AgentMode::Plan) => (None, AgentMode::Basic),
-                (None, AgentMode::Basic) => (None, AgentMode::Plan),
+                (None, AgentMode::Basic | AgentMode::OrchestrationChat) => (None, AgentMode::Plan),
             };
         slot.state.mode_ready = true;
         self.factory
@@ -2193,7 +2274,10 @@ impl Workbench {
             );
             return false;
         }
-        if self.orchestration_stop.is_some() || self.slots[self.current].active() {
+        if self.orchestration_stop.is_some()
+            || self.slots[self.current].active()
+            || self.slots[self.current].pending_summary.is_some()
+        {
             self.report(io, "Wait for the current task to finish");
             return false;
         }
@@ -2393,6 +2477,7 @@ impl Workbench {
         }
         if self.orchestration_stop.is_some()
             || slot.active()
+            || slot.pending_summary.is_some()
             || slot.id != proposal.seed.source_session().0
             || !self.can_job(io)
         {
@@ -2414,7 +2499,6 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            generation_checked: false,
             result: orchestration::execute(&factory, proposal, &stop, progress, commands),
         });
     }
@@ -2424,6 +2508,7 @@ impl Workbench {
         let read_only = slot.state.mode == AgentMode::Plan;
         if self.orchestration_stop.is_some()
             || slot.active()
+            || slot.pending_summary.is_some()
             || slot.id != identity.parent_session
             || !self.can_job(io)
         {
@@ -2442,7 +2527,6 @@ impl Workbench {
         let factory = self.factory.clone();
         self.jobs.spawn_blocking(move || Job::OrchestrationDone {
             owner,
-            generation_checked: false,
             result: orchestration::resume(&factory, identity, read_only, &stop, progress, commands),
         });
     }
@@ -2473,7 +2557,128 @@ impl Workbench {
                 .is_some_and(|(owner, _)| owner == &self.slots[self.current].id)
     }
 
-    fn clarify_orchestration(&mut self, text: &str, io: &Io) {
+    fn chat_during_orchestration(&mut self, text: &str, io: &Io) -> bool {
+        let slot = &mut self.slots[self.current];
+        if !slot.state.available() {
+            if slot
+                .state
+                .snapshot
+                .as_ref()
+                .is_some_and(|view| view.state == "paused")
+            {
+                slot.state.report(
+                    io,
+                    "Main chat paused · /sessions to resume or Ctrl+C to cancel",
+                );
+            } else {
+                slot.state.report(
+                    io,
+                    "The main agent is responding · your draft is still here",
+                );
+            }
+            return false;
+        }
+        let priority = self.factory.prioritize_chat();
+        slot.state.explicit_status = false;
+        let posted = slot.state.submit_text(
+            text,
+            AgentMode::OrchestrationChat,
+            &slot.handle,
+            io,
+            &mut slot.replies,
+        );
+        if posted {
+            slot.state.status.clear();
+            slot.chat_priority = priority
+                .zip(slot.state.pending.clone())
+                .map(|(guard, id)| (id, guard));
+        }
+        posted
+    }
+
+    fn dispatch_orchestration_summaries(&mut self, now: Instant) -> bool {
+        if self.input_closed {
+            return false;
+        }
+        let mut changed = false;
+        for parent in &mut self.slots {
+            if parent.closed
+                || parent.closing
+                || parent.active()
+                || !parent.state.available()
+                || !parent
+                    .state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|view| view.durable && !view.storage_failed)
+            {
+                continue;
+            }
+            let Some(pending) = parent.pending_summary.as_mut().filter(
+                |pending| matches!(pending.dispatch, SummaryDispatch::Ready(at) if now >= at),
+            ) else {
+                continue;
+            };
+            if let Some(generation) = &pending.generation
+                && parent
+                    .state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|view| &view.generation != generation)
+            {
+                if self.jobs.len() >= MAX_JOBS {
+                    continue;
+                }
+                pending.dispatch = SummaryDispatch::SelectingGeneration;
+                let owner = parent.id.clone();
+                let run = pending.run.clone();
+                let handle = parent.handle.clone();
+                let command = parent
+                    .state
+                    .command(&handle, CommandPayload::SetGeneration(generation.clone()));
+                self.jobs.spawn(async move {
+                    Job::OrchestrationGeneration {
+                        owner,
+                        run,
+                        result: handle.post(command).await,
+                    }
+                });
+                continue;
+            }
+            let mut command = parent.state.command(
+                &parent.handle,
+                CommandPayload::Handoff(Submit {
+                    text: pending.evidence.clone(),
+                    mode: AgentMode::Plan,
+                }),
+            );
+            command.command = CommandId(format!("summary-{}", pending.run));
+            command.turn = TurnId(command.command.0.clone());
+            let summary = command.command.clone();
+            if parent
+                .state
+                .post_command(&parent.handle, command, &mut parent.replies, false)
+            {
+                pending.dispatch = SummaryDispatch::Sending;
+                parent.state.status.clear();
+                self.orchestration_summary
+                    .insert(parent.id.clone(), summary);
+                self.orchestration_handoffs
+                    .insert(parent.id.clone(), pending.run.clone());
+                if parent.state.follow_tail {
+                    parent.show_latest();
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn clarify_orchestration(&mut self, draft: &str, text: &str, io: &Io) {
+        if text.is_empty() || !self.collecting_orchestration() {
+            self.report(io, "Use /clarify TEXT during an approved plan");
+            return;
+        }
         if self.clarification_pending || !self.can_job(io) {
             return;
         }
@@ -2495,11 +2700,11 @@ impl Workbench {
         }
         self.clarification_pending = true;
         let owner = self.slots[self.current].id.clone();
-        let text = text.to_owned();
+        let draft = draft.to_owned();
         self.jobs.spawn(async move {
             Job::ClarificationSaved {
                 owner,
-                text,
+                draft,
                 result: reply
                     .await
                     .unwrap_or(Err("orchestration_clarification_closed")),
@@ -2512,13 +2717,13 @@ impl Workbench {
             && !text.trim().is_empty()
             && self.collecting_orchestration()
         {
-            self.clarify_orchestration(text, io);
-            return (false, false);
+            return (self.chat_during_orchestration(text, io), false);
         }
         if !text.trim_start().starts_with('/')
-            && self
-                .orchestration_summary
-                .contains_key(&self.slots[self.current].id)
+            && (self.slots[self.current].pending_summary.is_some()
+                || self
+                    .orchestration_summary
+                    .contains_key(&self.slots[self.current].id))
         {
             self.report(
                 io,
@@ -2545,6 +2750,19 @@ impl Workbench {
             .unwrap_or((text.trim_start(), ""));
         let argument = raw_argument.trim();
         match commands::canonical(command) {
+            "/clarify" => {
+                self.clarify_orchestration(text, argument, io);
+                (false, false)
+            }
+            "/cancel"
+                if self.collecting_orchestration() && !self.slots[self.current].interruptible() =>
+            {
+                if let Some((_, stop)) = &self.orchestration_stop {
+                    stop.cancel();
+                }
+                self.report(io, "Stopping the current task");
+                (true, false)
+            }
             "/accept" => {
                 let mut words = argument.split_whitespace();
                 let (Some(run), Some(commit), None) = (words.next(), words.next(), words.next())
@@ -2634,7 +2852,7 @@ impl Workbench {
                 (true, false)
             }
             "/agents" => {
-                self.open_activity();
+                self.open_agents();
                 (true, false)
             }
             "/sessions" if argument == "search" => {
@@ -2884,8 +3102,12 @@ impl Workbench {
         };
         let Some(event) = event else {
             self.draft_cancellations.remove(id);
+            self.orchestration_summary.remove(id);
+            self.orchestration_handoffs.remove(id);
             let lost = self.discard_contexts(id);
             self.slots[index].closed = true;
+            self.slots[index].chat_priority = None;
+            self.slots[index].pending_summary = None;
             if lost || self.slots[index].pending_prompt.take().is_some() {
                 self.slots[index].state.exit = 1;
                 self.slots[index]
@@ -3086,6 +3308,23 @@ impl Workbench {
             self.menu = None;
         }
         let slot = &mut self.slots[index];
+        slot.chat_priority
+            .take_if(|(command, _)| match &event.payload {
+                EventPayload::Done => event.turn == slot.state.turn,
+                EventPayload::RuntimeError {
+                    command: Some(rejected),
+                    ..
+                } => command == rejected,
+                EventPayload::FrontendSnapshot(snapshot) => {
+                    snapshot.submit.as_ref() == Some(command)
+                        && !snapshot.worker_busy
+                        && matches!(
+                            snapshot.state.as_str(),
+                            "completed" | "cancelled" | "paused"
+                        )
+                }
+                _ => false,
+            });
         if self
             .orchestration_summary
             .get(id)
@@ -3316,20 +3555,30 @@ impl Workbench {
                     Err(code) => self.report(io, &format!("ChatGPT sign-in failed ({code})")),
                 }
             }
-            Job::AgentTranscript { token, result } => {
+            Job::AgentTranscript {
+                token,
+                live,
+                reload,
+                result,
+            } => {
                 if token == self.file_token
                     && let Some(Panel::AgentTranscript(reader)) = &mut self.panel
                 {
                     reader.pending = false;
                     match result {
-                        Ok(page) => {
+                        Ok(Some(page)) => {
                             reader.page = Some(page);
-                            reader.offset = 0;
+                            if !reload {
+                                reader.offset = 0;
+                            }
+                            reader.was_live = live;
                             reader.notice.clear();
                         }
-                        Err(code) => {
-                            reader.notice = format!("Transcript unavailable ({code}) · r retry")
+                        Ok(None) => reader.was_live = live,
+                        Err(code) if reader.page.is_none() => {
+                            reader.notice = format!("Transcript unavailable ({code}) · r retry");
                         }
+                        Err(_) => {}
                     }
                 }
             }
@@ -3467,14 +3716,14 @@ impl Workbench {
             }
             Job::ClarificationSaved {
                 owner,
-                text,
+                draft,
                 result,
             } => {
                 self.clarification_pending = false;
                 if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
                     match result {
                         Ok(()) => {
-                            if slot.state.editor.bytes == text.as_bytes() {
+                            if slot.state.editor.bytes == draft.as_bytes() {
                                 slot.state.editor.clear();
                                 slot.state.input_history.reset();
                             }
@@ -3488,53 +3737,15 @@ impl Workbench {
                     }
                 }
             }
-            Job::OrchestrationDone {
-                owner,
-                generation_checked,
-                result,
-            } => {
+            Job::OrchestrationDone { owner, result } => {
                 self.update_orchestration_progress();
                 self.orchestration_progress = None;
                 self.orchestration_inbox = None;
-                let result = match &self.orchestration_stop {
-                    Some((_, stop)) => stop.check().and(result),
-                    None => result,
-                };
-                if !generation_checked
-                    && !self.input_closed
-                    && let Ok(completed) = &result
-                    && completed.evidence.is_some()
-                    && let Some(generation) = &completed.generation
-                    && let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner)
-                    && !parent.active()
-                    && parent
-                        .state
-                        .snapshot
-                        .as_ref()
-                        .is_none_or(|view| &view.generation != generation)
-                    && let Some((_, stop)) = &self.orchestration_stop
-                {
-                    let stop = stop.clone();
-                    let handle = parent.handle.clone();
-                    let command = parent
-                        .state
-                        .command(&handle, CommandPayload::SetGeneration(generation.clone()));
-                    self.jobs.spawn(async move {
-                        let selection = handle.post(command).await;
-                        let result = stop.check().and(match selection {
-                            Ok(PostStatus::Accepted | PostStatus::Duplicate) => result,
-                            Err(code) => Err(code),
-                            _ => Err("orchestration_generation_unavailable"),
-                        });
-                        Job::OrchestrationDone {
-                            owner,
-                            generation_checked: true,
-                            result,
-                        }
-                    });
-                    return;
-                }
-                self.orchestration_stop = None;
+                let cancelled = self
+                    .orchestration_stop
+                    .take()
+                    .is_some_and(|(_, stop)| stop.cancelled());
+                let result = result.map_err(|code| if cancelled { "run_cancelled" } else { code });
                 if let Some(view) = self.orchestration_views.get_mut(&owner) {
                     if matches!(result, Err("orchestration_paused")) {
                         view.pause_reason
@@ -3550,54 +3761,30 @@ impl Workbench {
                     return;
                 };
                 match result {
-                    Ok(completed) if !self.input_closed && !parent.active() => {
+                    Ok(completed) => {
                         if let Some(candidate) = completed.candidate {
                             let review = ux::CandidateView::new(completed.id.clone(), candidate);
                             parent.remember_candidate(review);
+                        }
+                        if self.input_closed || cancelled || parent.closed || parent.closing {
+                            parent.state.report(io, if completed.stopped {
+                                "Plan stopped · see the agents' transcripts"
+                            } else {
+                                "Results are in the agents' transcripts"
+                            });
+                            return;
                         }
                         let Some(evidence) = completed.evidence else {
                             parent.state.report(io, "The model context is full · reports are in /agents");
                             return;
                         };
-                        let mut command = parent.state.command(
-                            &parent.handle,
-                            CommandPayload::Handoff(Submit {
-                                text: evidence,
-                                mode: AgentMode::Plan,
-                            }),
-                        );
-                        command.command = CommandId(format!("summary-{}", completed.id));
-                        command.turn = TurnId(format!("summary-{}", completed.id));
-                        let summary = command.command.clone();
-                        if parent.state.post_command(
-                            &parent.handle,
-                            command,
-                            &mut parent.replies,
-                            false,
-                        ) {
-                            parent.state.status.clear();
-                            self.orchestration_summary.insert(owner.clone(), summary);
-                            self.orchestration_handoffs.insert(owner.clone(), completed.id);
-                            if parent.state.follow_tail {
-                                parent.show_latest();
-                            }
-                        } else {
-                            parent.state.report(
-                                io,
-                                if completed.stopped {
-                                    "Plan stopped · see the agents' transcripts"
-                                } else {
-                                    "Results are in the agents' transcripts"
-                                },
-                            );
-                        }
+                        parent.pending_summary = Some(PendingSummary {
+                            run: completed.id,
+                            evidence,
+                            generation: completed.generation,
+                            dispatch: SummaryDispatch::Ready(Instant::now()),
+                        });
                     }
-                    Ok(completed) if completed.stopped => parent
-                        .state
-                        .report(io, "Plan stopped · see the agents' transcripts"),
-                    Ok(_) => parent
-                        .state
-                        .report(io, "Results are in the agents' transcripts"),
                     Err("auth_cancelled" | "run_cancelled") => {
                         parent.state.report(io, "Plan stopped")
                     }
@@ -3610,6 +3797,39 @@ impl Workbench {
                     Err("orchestration_scope_confirmation") => parent.state.report(io,
                         "Plan stopped at the approved scope · submit the revised request to review a new plan"),
                     Err(code) => parent.state.report(io, &format!("Plan stopped ({code})")),
+                }
+            }
+            Job::OrchestrationGeneration { owner, run, result } => {
+                if let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner)
+                    && let Some(pending) = parent
+                        .pending_summary
+                        .as_mut()
+                        .filter(|pending| pending.run == run)
+                {
+                    match result {
+                        Ok(PostStatus::Accepted | PostStatus::Duplicate) => {
+                            // SetGeneration is acknowledged only after its
+                            // selection is durable. The snapshot may arrive later.
+                            pending.generation = None;
+                            pending.dispatch = SummaryDispatch::Ready(Instant::now());
+                        }
+                        Ok(PostStatus::QueueFull) => {
+                            pending.dispatch =
+                                SummaryDispatch::Ready(Instant::now() + Duration::from_millis(40));
+                        }
+                        result => {
+                            parent.pending_summary = None;
+                            let code = result
+                                .err()
+                                .unwrap_or("orchestration_generation_unavailable");
+                            parent.state.report(
+                                io,
+                                &format!(
+                                    "Could not write the summary ({code}) · reports are in /agents"
+                                ),
+                            );
+                        }
+                    }
                 }
             }
             Job::TerminalScreen { token, result } => {
@@ -4088,12 +4308,41 @@ impl Workbench {
         self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
         if self.focus == Focus::Inspector {
+            if let Some(Panel::AgentTranscript(reader)) = &mut self.panel {
+                if reader.follow_agent {
+                    let (width, height) = self
+                        .displayed
+                        .as_ref()
+                        .and_then(|frame| frame.inspector_bounds())
+                        .map_or((80, 6), |(_, _, w, h)| (w, h));
+                    let document = reader.page.as_ref().map(|page| {
+                        if reader.tool_details {
+                            &page.details
+                        } else {
+                            &page.document
+                        }
+                    });
+                    reader.offset = document.map_or(0, |document| {
+                        document
+                            .viewport_rows(width.max(1))
+                            .len()
+                            .saturating_sub(height.max(1))
+                    });
+                    reader.follow_agent = false;
+                }
+            }
             let reading = match &mut self.panel {
                 Some(Panel::Orchestration { document, offset }) => Some((&*document, offset)),
-                Some(Panel::AgentTranscript(reader)) => reader
-                    .page
-                    .as_ref()
-                    .map(|page| (&page.document, &mut reader.offset)),
+                Some(Panel::AgentTranscript(reader)) => reader.page.as_ref().map(|page| {
+                    (
+                        if reader.tool_details {
+                            &page.details
+                        } else {
+                            &page.document
+                        },
+                        &mut reader.offset,
+                    )
+                }),
                 _ => None,
             };
             if let Some((document, offset)) = reading {
@@ -4372,7 +4621,24 @@ impl Workbench {
                             .as_ref()
                             .and_then(|frame| frame.inspector_bounds())
                             .map_or(72, |bounds| bounds.2);
-                        delta(&mut reader.offset, page.document.viewport_rows(width).len());
+                        let document = if reader.tool_details {
+                            &page.details
+                        } else {
+                            &page.document
+                        };
+                        if reader.follow_agent && older {
+                            let height = self
+                                .displayed
+                                .as_ref()
+                                .and_then(|frame| frame.inspector_bounds())
+                                .map_or(6, |bounds| bounds.3);
+                            reader.offset = document
+                                .viewport_rows(width)
+                                .len()
+                                .saturating_sub(height.max(1));
+                            reader.follow_agent = false;
+                        }
+                        delta(&mut reader.offset, document.viewport_rows(width).len());
                     }
                 }
                 Some(Panel::Orchestration { .. }) => {}
@@ -4692,7 +4958,14 @@ impl Workbench {
                     hovered = Focus::Chat;
                 }
             }
-            if mouse.kind == MouseKind::Press {
+            if mouse.kind == MouseKind::Press
+                && !(hovered == Focus::Inspector
+                    && self
+                        .activity_back
+                        .as_ref()
+                        .is_some_and(|pane| pane.agents_only)
+                    && matches!(&self.panel, Some(Panel::AgentTranscript(_))))
+            {
                 self.focus = hovered;
             }
         }
@@ -5260,16 +5533,24 @@ impl Workbench {
             }),
             Panel::AgentTranscript(reader) => Some(Inspector {
                 title: format!("Agent transcript · {}", reader.title),
-                document: reader.page.as_ref().map(|page| page.document.clone()),
+                kind: InspectorKind::Agents,
+                document: reader.page.as_ref().map(|page| {
+                    if reader.tool_details {
+                        page.details.clone()
+                    } else {
+                        page.document.clone()
+                    }
+                }),
                 lines: vec![reader.notice.clone()],
                 offset: reader.offset,
+                follow_tail: reader.follow_agent,
                 footer: if reader.notice.is_empty() {
                     let pages = reader
                         .page
                         .as_ref()
                         .filter(|page| page.begin > 0 || page.end < page.total)
                         .map_or("", |_| " · [/] pages");
-                    format!("PgUp/PgDn scroll{pages} · r refresh · Esc back")
+                    format!("Tab focus · t tool details{pages} · Esc back")
                 } else {
                     format!("{} · Esc back", reader.notice)
                 },
@@ -5525,7 +5806,8 @@ impl Workbench {
                 .orchestration_notice()
                 .map(|notice| format!("{notice} · Ctrl+T details")),
             draft_notice: !slot.state.editor.bytes.is_empty()
-                && self.orchestration_summary.contains_key(&slot.id),
+                && (slot.pending_summary.is_some()
+                    || self.orchestration_summary.contains_key(&slot.id)),
             interrupt_hint: if matches!(self.menu, Some(Menu::DraftingPlan)) {
                 ""
             } else if !slot.state.editor.bytes.is_empty() {
@@ -6098,7 +6380,13 @@ pub async fn run_attached(
             for (id, accepted) in admissions {
                 if !accepted {
                     work.pending_context.remove(&id);
-                    work.orchestration_summary.retain(|_, pending| pending.0 != id);
+                    work.orchestration_summary.retain(|owner, pending| {
+                        if pending.0 != id {
+                            return true;
+                        }
+                        work.orchestration_handoffs.remove(owner);
+                        false
+                    });
                     work.draft_cancellations.retain(|_, pending| pending.submit.0 != id);
                     if work.planning_context.as_ref().is_some_and(|intent|
                         intent.command.0 == id || intent.resume.as_ref().is_some_and(|resume| resume.0 == id)) {
@@ -6106,6 +6394,9 @@ pub async fn run_attached(
                         work.menu = None;
                     }
                 }
+            }
+            if !finished {
+                dirty |= work.dispatch_orchestration_summaries(now);
             }
             if !work.draft_cancellations.is_empty() {
                 for index in 0..work.slots.len() {
@@ -6172,8 +6463,10 @@ pub async fn run_attached(
                                     }
                                     if byte >= 32 && byte != 127 { continue; }
                                 }
-                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::AgentTranscript(_))) && matches!(byte, b'r' | b'[' | b']') {
-                                    if let Some(Panel::AgentTranscript(reader)) = &mut work.panel { reader.requested = Some(byte); }
+                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::AgentTranscript(_))) && matches!(byte, b'r' | b'[' | b']' | b't') {
+                                    if let Some(Panel::AgentTranscript(reader)) = &mut work.panel {
+                                        if byte == b't' { reader.tool_details = !reader.tool_details; reader.offset = 0; } else { reader.requested = Some(byte); }
+                                    }
                                     continue;
                                 }
                                 if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::AgentTranscript(_))) && byte >= 32 && byte != 127 { continue; }

@@ -814,6 +814,7 @@ impl Workbench {
             .as_ref()
             .is_some_and(|(id, _)| id == owner)
             || self.orchestration_summary.contains_key(owner)
+            || self.slots[self.current].pending_summary.is_some()
         {
             self.report(
                 io,

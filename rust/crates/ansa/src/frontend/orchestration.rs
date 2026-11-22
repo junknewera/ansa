@@ -491,6 +491,17 @@ pub(super) fn execute(
     reactor.block_on(execute_owned(factory, proposal, stop, progress, inbox))
 }
 
+const RUN_WINDOW_SECS: u64 = 2 * 60 * 60;
+
+fn park_expired<T>(result: Result<T>, progress: &watch::Sender<Option<RunView>>) -> Result<T> {
+    if matches!(result, Err("orchestration_deadline")) {
+        publish_pause(progress, "Run window ended · resume to continue".into());
+        Err("orchestration_paused")
+    } else {
+        result
+    }
+}
+
 async fn execute_owned(
     factory: &Factory,
     proposal: Proposal,
@@ -499,7 +510,7 @@ async fn execute_owned(
     inbox: Clarifications,
 ) -> Result<Completed> {
     let started = now()?;
-    let deadline = started + 2 * 60 * 60;
+    let deadline = started + RUN_WINDOW_SECS;
     let parent = &proposal.seed.source_session().0;
     let source = proposal.seed.request()?;
     let model_window = proposal.seed.model_window();
@@ -513,7 +524,7 @@ async fn execute_owned(
             .saturating_sub(crate::context::estimate_request_tokens(&parent))
     });
     let (storage, identity) = run_directory(factory, parent)?;
-    let submissions = (proposal.plan.steps().len() * 2).max(1) as u8;
+    let submissions = 64;
     let mut run = Run::create_with_context(
         &storage.join("ledger"),
         identity,
@@ -628,9 +639,6 @@ async fn schedule(
     let result = async {
         loop {
             stop.check()?;
-            if now()? >= deadline {
-                return Err("orchestration_deadline");
-            }
             let mut paused = 0;
             let mut paused_reason = None;
             let previously_active = active.len();
@@ -669,6 +677,13 @@ async fn schedule(
                 if paused == active.len() {
                     publish_pause(&progress, reason);
                     return Err("orchestration_paused");
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                continue;
+            }
+            if now()? >= deadline {
+                if active.is_empty() {
+                    return Err("orchestration_deadline");
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
                 continue;
@@ -747,6 +762,7 @@ async fn schedule(
         })
     }
     .await;
+    let result = park_expired(result, &progress);
     if result
         .as_ref()
         .is_err_and(|code| *code == "orchestration_paused")
@@ -924,16 +940,12 @@ fn run_command_checks(
                 return Err("orchestration_deadline");
             }
             worktree.frozen_view_named(candidate, name, &plan, false, stop)?;
-            let remaining = run.deadline().saturating_sub(now()?);
-            if remaining == 0 {
-                return Err("orchestration_deadline");
-            }
             runner.run(
                 &invocation,
                 &ProcessOptions {
                     cwd: path.join("checkout"),
                     argv: check.argv.clone(),
-                    timeout_ms: (remaining.min(600) as usize * 1000).min(timeout_ms),
+                    timeout_ms,
                     output_bytes: 8192,
                 },
                 stop,
@@ -1075,8 +1087,11 @@ async fn run_candidate_phase(
     let plan = Plan::parse(&encoded)?;
     let (mut phase, mut original) = if ledger.exists() {
         let mut phase = Run::open(&ledger, &identity)?;
-        if phase.plan() != &plan || phase.deadline() != deadline {
+        if phase.plan() != &plan || phase.deadline() > deadline {
             return Err("candidate_review_identity");
+        }
+        if phase.deadline() < deadline {
+            phase.renew_deadline(deadline)?;
         }
         let original = restore_active(factory, &mut phase, stop).await?;
         (phase, original)
@@ -1088,7 +1103,7 @@ async fn run_candidate_phase(
             DispatchBudget {
                 started_at,
                 deadline,
-                submissions: 2,
+                submissions: 64,
             },
         )?;
         let digest = phase.plan_digest().to_owned();
@@ -1108,12 +1123,8 @@ async fn run_candidate_phase(
     let result = async {
         loop {
             stop.check()?;
-            if now()? >= deadline {
-                return Err("orchestration_deadline");
-            }
             let proof = child.receipt().await?;
             phase.observe(&child.task.id, &proof)?;
-            phase.check_continuation(now()?)?;
             if !phase.active().any(|id| id == child.task.id) {
                 return phase
                     .result(&child.task.id)
@@ -1190,6 +1201,10 @@ async fn start_child(
             stop,
         )
         .await;
+    if result == Err("orchestration_deadline") {
+        child.park().await?;
+        return Err("orchestration_deadline");
+    }
     if !matches!(result, Ok(PostStatus::Accepted)) {
         stop_children(run, std::slice::from_mut(&mut child)).await?;
         return Err(result.err().unwrap_or("orchestration_admission"));
@@ -1334,28 +1349,37 @@ pub(super) struct PlanLinks {
     pub clarification: Option<RunId>,
 }
 
-pub(super) fn recent_plan_links(factory: &Factory, parent: &str) -> Result<PlanLinks> {
+pub(super) fn recent_plan_links(
+    factory: &Factory,
+    parent: &str,
+    stop: &Cancel,
+) -> Result<PlanLinks> {
     if factory.orchestration_route().is_err() {
         return Ok(PlanLinks::default());
     }
-    let root = run_root(factory, parent);
-    if !root.exists() {
-        return Ok(PlanLinks::default());
-    }
-    let directory = fs::private_directory(&root).map_err(|_| "orchestration_storage")?;
-    let (names, more) = local::names(&directory, 128).map_err(|_| "orchestration_inventory")?;
-    if more {
-        return Err("orchestration_inventory_limit");
-    }
-    let time = now()?;
+    recent_plan_links_in(&run_root(factory, parent), parent, stop)
+}
+
+fn recent_plan_links_in(root: &Path, parent: &str, stop: &Cancel) -> Result<PlanLinks> {
+    stop.check()?;
+    let directory = match fs::private_directory(root) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PlanLinks::default());
+        }
+        Err(_) => return Err("orchestration_storage"),
+    };
     let mut continuation = None;
     let mut clarification = None;
-    for name in names {
+    let visited = local::visit_names(&directory, |name| {
+        if stop.cancelled() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
         let Some(id) = name
             .to_str()
             .filter(|id| crate::provider::contracts::valid_id(id))
         else {
-            continue;
+            return Ok(());
         };
         let identity = RunId {
             parent_session: parent.into(),
@@ -1363,21 +1387,26 @@ pub(super) fn recent_plan_links(factory: &Factory, parent: &str) -> Result<PlanL
         };
         let storage = root.join(id);
         let Ok(directory) = fs::private_directory(&storage) else {
-            continue;
+            return Ok(());
         };
-        if local::read(&directory, "summary-admitted", 64)
-            .ok()
-            .flatten()
-            .is_some_and(|value| value == id.as_bytes())
-        {
-            continue;
+        if !matches!(local::read(&directory, "summary-admitted", 64), Ok(None)) {
+            return Ok(());
         }
-        let Ok(run) = Run::open(&storage.join("ledger"), &identity) else {
-            continue;
+        let ledger = storage.join("ledger");
+        let Ok(run) = Run::open(&ledger, &identity) else {
+            return Ok(());
         };
-        let modified = std::fs::metadata(storage.join("ledger"))
-            .and_then(|metadata| metadata.modified())
-            .map_err(|_| "orchestration_storage")?;
+        let Ok(modified) =
+            fs::private_directory(&ledger).and_then(|ledger| ledger.metadata()?.modified())
+        else {
+            return Ok(());
+        };
+        let (Ok(manual), Ok(release)) = (
+            local::read(&directory, "manual-candidate.json", 4096),
+            local::read(&directory, "release.json", 4096),
+        ) else {
+            return Ok(());
+        };
         if !run.clarifications().is_empty()
             && clarification
                 .as_ref()
@@ -1385,10 +1414,9 @@ pub(super) fn recent_plan_links(factory: &Factory, parent: &str) -> Result<PlanL
         {
             clarification = Some((modified, identity.clone()));
         }
-        let pending_manual = storage.join("manual-candidate.json").is_file()
-            && !storage.join("release.json").exists();
+        let pending_manual = manual.is_some() && release.is_none();
         if (run.pending_clarifications().is_empty() || run.active_plus_task().is_some())
-            && (pending_manual || run.stopped_report().is_some() || continuable(&run, time))
+            && (pending_manual || run.stopped_report().is_some() || continuable(&run))
             && continuation
                 .as_ref()
                 .is_none_or(|(old, _, _)| *old < modified)
@@ -1405,15 +1433,106 @@ pub(super) fn recent_plan_links(factory: &Factory, parent: &str) -> Result<PlanL
             );
             continuation = Some((modified, identity, title));
         }
-    }
+        Ok(())
+    });
+    stop.check()?;
+    visited.map_err(|_| "orchestration_inventory")?;
     Ok(PlanLinks {
         continuation: continuation.map(|(_, id, title)| (id, title)),
         clarification: clarification.map(|(_, id)| id),
     })
 }
 
-fn continuable(run: &Run, time: u64) -> bool {
-    run.may_continue(time) && run.context().is_some() && run.plan().execution_ready().is_ok()
+fn continuable(run: &Run) -> bool {
+    run.may_resume() && run.context().is_some() && run.plan().execution_ready().is_ok()
+}
+
+#[cfg(test)]
+#[test]
+fn recent_plan_links_scans_the_entire_inventory() {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    struct Temporary(PathBuf);
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let mut nonce = [0; 16];
+    SystemRandom::new().fill(&mut nonce).unwrap();
+    let name = crate::protocol::legacy_json_v1::sha256(&nonce);
+    let path = std::env::temp_dir().join(name);
+    fs::create_private_leaf(&path).unwrap();
+    let root = Temporary(path);
+
+    for index in 0..140 {
+        std::fs::File::create(root.0.join(format!("unrelated-{index}"))).unwrap();
+    }
+    let create = |id: &str, modified, clarify| {
+        let storage = root.0.join(id);
+        let directory = fs::create_private_leaf(&storage).unwrap();
+        let path = storage.join("ledger");
+        let identity = RunId {
+            parent_session: "parent".into(),
+            run: id.into(),
+        };
+        let plan = Plan::parse(
+            r#"{"schema_version":1,"summary":"Inspect the workspace","steps":[{"id":"inspect","task":"Inspect sources","access":"read","paths":[],"depends_on":[],"acceptance":"Describe sources"}]}"#,
+        )
+        .unwrap();
+        let context = RunContext {
+            prompt: "Inspect the workspace".into(),
+            configuration: "{}".into(),
+            model_window: None,
+            handoff_tokens: None,
+            conversation_plan: false,
+            plus_profile: None,
+            check_timeout_ms: None,
+        };
+        let mut run = Run::create_with_context(
+            &path,
+            identity.clone(),
+            plan,
+            DispatchBudget {
+                started_at: 1,
+                deadline: 100,
+                submissions: 1,
+            },
+            Some(context),
+        )
+        .unwrap();
+        let digest = run.plan_digest().to_owned();
+        run.approve(&digest).unwrap();
+        if clarify {
+            run.clarify("Focus on source files".into()).unwrap();
+        }
+        drop(run);
+        fs::private_directory(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(modified))
+            .unwrap();
+        (identity, directory)
+    };
+    let (latest, _) = create("latest", 10, false);
+    create("older", 5, false);
+    let (clarification, _) = create("clarification", 12, true);
+    let (_, admitted) = create("admitted", 14, false);
+    local::create(&admitted, "summary-admitted", b"admitted").unwrap();
+    let (_, corrupt) = create("corrupt", 15, false);
+    local::create(&corrupt, "summary-admitted", b"wrong").unwrap();
+
+    let stop = Cancel::default();
+    let links = recent_plan_links_in(&root.0, "parent", &stop).unwrap();
+    assert_eq!(
+        links.continuation,
+        Some((latest, "Inspect the workspace".into()))
+    );
+    assert_eq!(links.clarification, Some(clarification));
+    stop.cancel();
+    assert!(matches!(
+        recent_plan_links_in(&root.0, "parent", &stop),
+        Err("auth_cancelled")
+    ));
 }
 
 pub(super) struct ArchivedPlan {
@@ -1670,8 +1789,7 @@ async fn resume_owned(
     if !run.pending_clarifications().is_empty() && run.active_plus_task().is_none() {
         return Err("orchestration_clarification_needs_review");
     }
-    run.check_continuation(now()?)?;
-    if !continuable(&run, now()?) {
+    if !continuable(&run) {
         return Err("orchestration_continuation_unavailable");
     }
     let context = run.context().ok_or("orchestration_context")?;
@@ -1680,6 +1798,9 @@ async fn resume_owned(
     if let Some(profile) = &context.plus_profile {
         let profile = RoleProfile::decode(&Json::parse(profile)?)?;
         let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
+        if now()? >= run.deadline() {
+            run.renew_deadline(now()?.saturating_add(RUN_WINDOW_SECS))?;
+        }
         run.continue_run(&[])?;
         return plus::schedule(
             factory, run, &storage, candidate, &profile, stop, progress, inbox,
@@ -1688,7 +1809,10 @@ async fn resume_owned(
     }
     factory.require_orchestration_route(&source, stop)?;
     let candidate = writer_workspace(factory, &run, &storage, true, stop)?;
-    let active = restore_active(factory, &mut run, stop).await?;
+    if now()? >= run.deadline() {
+        run.renew_deadline(now()?.saturating_add(RUN_WINDOW_SECS))?;
+    }
+    let active = park_expired(restore_active(factory, &mut run, stop).await, &progress)?;
     schedule(factory, run, candidate, active, stop, progress, inbox).await
 }
 
@@ -1730,10 +1854,11 @@ async fn restore_active(factory: &Factory, run: &mut Run, stop: &Cancel) -> Resu
             .map(|(step, receipt)| (step.as_str(), receipt))
             .collect::<Vec<_>>(),
     )?;
-    run.check_continuation(now()?)?;
     let mut active = Vec::new();
+    let mut pending = children.into_iter().zip(receipts);
     let startup = async {
-        for (mut child, (_, proof)) in children.into_iter().zip(receipts) {
+        run.check_continuation(now()?)?;
+        for (mut child, (_, proof)) in pending.by_ref() {
             if run.active().any(|id| id == child.task.id) {
                 active.push(child);
                 let child = active.last().ok_or("run_child_missing")?;
@@ -1775,7 +1900,16 @@ async fn restore_active(factory: &Factory, run: &mut Run, stop: &Cancel) -> Resu
     }
     .await;
     if let Err(code) = startup {
-        stop_children(run, &mut active).await?;
+        if code == "orchestration_deadline" {
+            for (child, _) in pending {
+                active.push(child);
+            }
+            for child in &mut active {
+                child.park().await?;
+            }
+        } else {
+            stop_children(run, &mut active).await?;
+        }
         return Err(code);
     }
     Ok(active)
