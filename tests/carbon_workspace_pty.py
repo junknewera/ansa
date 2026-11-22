@@ -1736,7 +1736,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     open_activity(screen)
     until(screen, lambda frame: all(label in frame for label in (
         "Proposed plan", "Approved plan", "0/2 steps done",
-        "Implementation · gpt-6.1-luna", "Running",
+        "Implementation · gpt-6.1-luna", "< / >", "Running",
     )),
           "worker active and historical plan links loaded before the first step")
     assert activity_body(screen).count("Proposed plan") == 1 and prompt not in activity_body(screen)
@@ -1792,7 +1792,8 @@ def siwc_orchestrate_plus(screen, root, cwd):
     assert '"findings":' not in visible(screen)
     escape(screen)
     until(screen, lambda _: held("whole-review") and agents_open(screen)
-          and running_card("Review · gpt-6.2-sol", "PLUS_CARBON_PLAN"),
+          and running_card("Review · gpt-6.2-sol", "PLUS_CARBON_PLAN")
+          and "|+ -|" in visible(screen),
           "already-open Activity receives the running strong reviewer", timeout=35)
     escape(screen)
     if reading(screen):
@@ -2238,10 +2239,13 @@ def active_plan_clarification(screen, root, cwd):
         return [json.loads(path.read_text())["body"]["event"] for path in sorted(ledgers.glob("*/*/ledger/event-*.json"))]
 
     until(screen, lambda _: any(event.get("event") == "post" and event["step"] == "first" for event in events()), "first step running")
+    open_activity(screen)
+    screen.send(b"\t")
+    until(screen, lambda _: "Tab → panel" in screen.vt.line(-2), "composer focus beside Activity")
     clarification = "Focus the comparison on the first line"
     screen.send("/clarify " + clarification + "\r")
-    open_activity(screen)
-    until(screen, lambda frame: "Coordinator receives the clarification" in frame, "clarification status in Activity")
+    until(screen, lambda _: "Coordinator receives the clarification" in " ".join(activity_body(screen).split()),
+          "clarification status in Activity")
     close_activity(screen)
     until(screen, lambda frame: "Оба помощника завершили проверку" in frame, "parent summary")
     assert "Coordinator receives the clarification" not in body(screen) and "Work plan" not in body(screen)

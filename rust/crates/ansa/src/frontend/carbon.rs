@@ -1014,14 +1014,19 @@ impl AgentRole {
 }
 
 fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
-    let (role, ink, avatar) = match agent.role {
-        AgentRole::Research => ("Research", MINT, ["■■■", "■ ■", "■■■"]),
-        AgentRole::Implementation => ("Implementation", VIOLET, ["■ ■", "■■■", "■ ■"]),
-        AgentRole::Coordinator => ("Coordinator", SKY, [" ■ ", "■■■", " ■ "]),
-        AgentRole::Review => ("Review", AMBER, ["  ■", "■ ■", " ■ "]),
+    let (role, ink, avatar, badge) = match agent.role {
+        AgentRole::Research => ("Research", MINT, [" .-. ", "(   )", " `-'\\"], "(o)\\"),
+        AgentRole::Implementation => (
+            "Implementation",
+            VIOLET,
+            [" / \\ ", "< / >", " \\ / "],
+            "</>",
+        ),
+        AgentRole::Coordinator => ("Coordinator", SKY, ["  o  ", " /|\\ ", "o o o"], "-+-"),
+        AgentRole::Review => ("Review", AMBER, ["+---+", "|+ -|", "+---+"], "[+-]"),
     };
     let compact = width < 25;
-    let content = width - if compact { 0 } else { 5 };
+    let content = width - if compact { 0 } else { 7 };
     let title = styled(&clipped(&agent.title, content), "\x1b[1m", color);
     let meta = if agent.model.is_empty() {
         role.to_owned()
@@ -1030,7 +1035,15 @@ fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
     } else {
         format!("{role} · {}", agent.model)
     };
-    let meta = styled(&clipped(&meta, content), ink, color);
+    let meta = if compact && content >= cells(badge) + 2 {
+        format!(
+            "{} {}",
+            styled(badge, ink, color),
+            styled(&clipped(&meta, content - cells(badge) - 1), ink, color)
+        )
+    } else {
+        styled(&clipped(&meta, content), ink, color)
+    };
     let (symbol, status_ink) = match agent.state.as_str() {
         "Completed" => ("✓", MINT),
         "Running" => ("●", VIOLET),
