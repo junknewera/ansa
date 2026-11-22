@@ -49,12 +49,13 @@ def escape(screen):
 
 
 def activity_open(screen):
-    return any(line.strip() == "Terminals" or line.strip().startswith("Terminals · Events ")
+    return any(line.rsplit("│", 1)[-1].strip() == "Terminals"
+               or line.rsplit("│", 1)[-1].strip().startswith("Terminals · Events ")
                for line in visible(screen).splitlines())
 
 
 def open_activity(screen):
-    screen.send(b"\x14")
+    screen.send(b"\x07")
     until(screen, lambda _: activity_open(screen), "Terminals Activity opened")
 
 
@@ -70,7 +71,7 @@ def select_result(screen, label):
     for _ in range(screen.vt.rows * 2):
         screen.send(b"\x1b[A")
         paint_quiet(screen)
-        if any(line.lstrip().startswith("› ") and label in line for line in body(screen).splitlines()):
+        if any(line.lstrip().startswith("› ") and label in line for line in activity_body(screen).splitlines()):
             return
     raise AssertionError((label, visible(screen)))
 
@@ -78,6 +79,10 @@ def select_result(screen, label):
 def body(screen):
     visible(screen)
     return "\n".join(screen.vt.line(row) for row in range(3, screen.vt.rows - 5))
+
+
+def activity_body(screen):
+    return "\n".join(line.partition("│")[2].lstrip() for line in body(screen).splitlines())
 
 
 def popup_text(screen):
@@ -342,14 +347,14 @@ def inline_tool_details(screen, root, cwd):
     until(screen, lambda frame: screen.vt.line(-4) == "  › TOOLS_DRAFT Ж", "tool draft")
     open_activity(screen)
     until(screen, lambda _: "get_test_value" in body(screen), "compact completed tool in Activity")
-    compact = body(screen)
+    compact = activity_body(screen)
     headers = [line for line in compact.splitlines() if re.match(r"[>v] get_test_value\b", line)]
     assert len(headers) == 1 and "done" in headers[0], "tool lifecycle was split into duplicate rows"
     assert "prepared" not in compact and "KnownResult" not in compact and "Arguments" not in compact
     row = next(row for row in range(3, screen.vt.rows - 5) if "> get_test_value" in screen.vt.line(row))
     click(screen, screen.vt.line(row).index("> get_test_value"), row)
     until(screen, lambda frame: "Arguments" in body(screen) and "Output" in body(screen), "tool row opened inline")
-    expanded = body(screen)
+    expanded = activity_body(screen)
     assert "value: OMH_FIXED_VALUE_42" in expanded and "ok: true" in expanded
     assert '{"ok"' not in expanded and "KnownResult" not in expanded, "details exposed the raw protocol instead of readable values"
     assert [row["invocation"]["arguments"] for row in records(root) if row["kind"] == "intent"] == [{}], "display projection changed the invocation arguments"
@@ -391,7 +396,7 @@ def inline_tool_details(screen, root, cwd):
 
 
 def input_and_copy(screen, root, cwd):
-    until(screen, lambda frame: "Ctrl+F Files" in frame and "Ctrl+T Terminals" in frame,
+    until(screen, lambda frame: "Ctrl+F Files" in frame and "Ctrl+T Agents" in frame,
           "available shortcuts on the idle workspace")
     before = journals(root)
     text = "Привет Ж界😀\n/exit is pasted text"
@@ -499,7 +504,7 @@ def selection_scroll(screen, root, cwd):
     before = journals(root)
     open_activity(screen)
     until(screen, lambda _: "get_test_value" in body(screen), "operation history in Terminals")
-    assert "HISTORY_FIRST" not in body(screen) and "HISTORY_SEED_33" not in body(screen)
+    assert "HISTORY_FIRST" not in activity_body(screen) and "HISTORY_SEED_33" not in activity_body(screen)
     for _ in range(8):
         screen.send(b"\x1b[5~")
         paint_quiet(screen)
@@ -864,7 +869,7 @@ def native_terminal_panel(screen, root, cwd):
     until(screen, lambda frame: "/terminals" in body(screen), "native terminal command completion")
     screen.send(b"\t\r")
     until(screen, lambda _: activity_open(screen), "Activity works before the agent has opened a shell")
-    row = next(row for row in range(screen.vt.rows) if screen.vt.line(row).strip() == "Activity  Shell")
+    row = next(row for row in range(screen.vt.rows) if "Agents  Activity  Shell" in screen.vt.line(row))
     click(screen, screen.vt.line(row).index("Shell"), row)
     until(screen, lambda frame: "Agent terminal" in frame and "The agent has not opened a terminal yet" in frame,
           "managed terminal panel in the normal Carbon entry point")
@@ -1509,7 +1514,7 @@ def orchestration_review_resume(screen, root, cwd, more_segments=False):
                   for _, rows in reviewer_records() for row in rows),
           "chat shows why the read-only reviewer stopped and how to resume", timeout=15)
     open_activity(screen)
-    until(screen, lambda frame: pause in frame, "Activity also shows the paused run")
+    until(screen, lambda _: pause in " ".join(activity_body(screen).split()), "Activity also shows the paused run")
     close_activity(screen)
     checkout, = store.glob("*/*/checkout")
     run = checkout.parent
@@ -1530,7 +1535,7 @@ def orchestration_review_resume(screen, root, cwd, more_segments=False):
                       argv_extra=["--session", run.parent.name])
     screen.additional_screens = [("restart", restarted)]
     open_activity(restarted)
-    until(restarted, lambda frame: "Paused · Tool budget reached (tool_round_limit)" in frame,
+    until(restarted, lambda _: "Paused · Tool budget reached" in activity_body(restarted),
           "archived agent card shows the original cause after restart")
     close_activity(restarted)
     local(restarted, "/sessions")
@@ -1596,7 +1601,7 @@ def openrouter_orchestration(screen, root, cwd):
     open_activity(screen)
     until(screen, lambda frame: "0/1 steps done" in frame, "read-only plan starts despite a post-report recommendation")
     close_activity(screen)
-    until(screen, lambda _: "Agents · 0/1 steps done · Ctrl+T details" in body(screen),
+    until(screen, lambda _: "Agents · 0/1 steps done · Ctrl+T Agents" in body(screen),
           "chat shows compact progress")
     assert "OPENROUTER_CARBON_PLAN" not in body(screen)
     local(screen, "/effort low")
@@ -1611,11 +1616,11 @@ def openrouter_orchestration(screen, root, cwd):
     until(screen, lambda frame: "Writing the summary" in frame
           and "Draft · send after the task finishes" in frame, "summary phase comes from coordinator state")
     close_activity(screen)
-    until(screen, lambda _: "Writing the summary · Ctrl+T details" in body(screen),
+    until(screen, lambda _: "Writing the summary · Ctrl+T Agents" in body(screen),
           "chat shows the main agent's summary phase")
     held_summary.unlink()
     until(screen, lambda frame: "OPENROUTER_CARBON_DONE" in frame
-          and "Ctrl+T details" not in frame and "(response preview)" not in frame,
+          and "Ctrl+T Agents" not in body(screen) and "(response preview)" not in frame,
           "main agent's committed summary", timeout=15)
     assert "Approved plan" not in body(screen)
     assert "summarize fixture" in visible(screen) and "END_OF_USER_REQUEST" in visible(screen) and "keep draft" in screen.vt.line(-4)
@@ -1711,7 +1716,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
 
     screen.send(b"\r")
     until(screen, lambda _: held("worker-rejected") and body(screen).count(prompt) == 1
-          and "Agents · 0/2 steps done · Ctrl+T details" in body(screen),
+          and "Agents · 0/2 steps done · Ctrl+T Agents" in body(screen),
           "the main conversation shows one request and compact progress")
     def active_question(text):
         return next((row for row in records(root)
@@ -1734,8 +1739,8 @@ def siwc_orchestrate_plus(screen, root, cwd):
         "Implementation · gpt-6.1-luna", "Running",
     )),
           "worker active and historical plan links loaded before the first step")
-    assert body(screen).count("Proposed plan") == 1 and prompt not in body(screen)
-    assert "PLUS_CARBON_PLAN" not in body(screen)
+    assert activity_body(screen).count("Proposed plan") == 1 and prompt not in activity_body(screen)
+    assert prompt in body(screen) and "PLUS_CARBON_PLAN" not in body(screen)
     paint_quiet(screen)
     row = next(index for index, line in enumerate(visible(screen).splitlines())
                if "Implementation · gpt-6.1-luna" in line)
@@ -1802,7 +1807,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
 
     until(screen, completed_plus_synthesis, "durable Plus synthesis and idle composer", timeout=45)
     assert all(label not in body(screen) for label in (
-        "Ctrl+T details", "Conversation agents", "Coordinator · gpt-6.1-sol",
+        "Ctrl+T Agents", "Conversation agents", "Coordinator · gpt-6.1-sol",
     ))
 
     checkout, = ledgers.glob("*/*/checkout")
@@ -1895,6 +1900,29 @@ def siwc_orchestrate_plus_budget(screen, root, cwd):
     return "normal"
 
 
+def siwc_orchestrate_plus_plan_only(screen, root, cwd):
+    configure_plus_roles(screen)
+    screen.send("/orchestrate+ PLUS_PLAN_ONLY\r")
+    until(screen, lambda frame: "Put a sock on the table" in body(screen)
+          and "Ctrl+C stop" not in screen.vt.line(-2), "plan-only goes straight to the conversation")
+    assert "[Start]" not in visible(screen) and "Refine" not in visible(screen)
+    assert not (root / "home/.ansa/orchestration").exists()
+    stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
+    assert stages == ["plan-only"], stages
+    screen.send(b"\x14")
+    until(screen, lambda frame: agents_open(screen) and "Agents  Activity  Shell" in frame
+          and "A tiny museum" in frame, "Ctrl+T opens Agents beside the plan")
+    paint_quiet(screen)
+    row = next(row for row in range(screen.vt.rows) if "Agents  Activity  Shell" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index("Shell"), row)
+    until(screen, lambda frame: "Agent terminal" in frame and "A tiny museum" in frame,
+          "Shell opens in the same right panel")
+    escape(screen)
+    until(screen, lambda _: agents_open(screen), "Esc returns to Agents")
+    local(screen, "/exit")
+    return "normal"
+
+
 def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
     (root / "orchestration-plus-blocked").touch()
     if reject:
@@ -1934,7 +1962,7 @@ def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
     handoff, = [row for row in rows if row.get("handoff") is True]
     evidence = json.loads(handoff["text"])
     assert evidence["orchestration_outcome"] == "stopped" and evidence["reported_status"] == "blocked"
-    assert evidence["reason"] == "Approved read-only tools cannot run Git status"
+    assert evidence["reason"] == "Git state could not be independently verified"
     assert handoff["next"]["binding"]["requested_model"] == "gpt-6.2-sol"
     assert not any(row["kind"] == "outcome" for row in rows)
     run, = (root / "home/.ansa/orchestration").glob("*/*")
@@ -1942,7 +1970,7 @@ def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
     events = [json.loads(path.read_text())["body"]["event"] for path in sorted((run / "ledger").glob("event-*.json"))]
     stopped, = [event for event in events if event["event"] == "plus_stopped"]
     assert stopped["step"] == evidence["task_id"] == "status"
-    assert stopped["phase"] == evidence["phase"] == "strong escalation"
+    assert stopped["phase"] == evidence["phase"] == "coordinator verification"
     assert stopped["report"]["status"] == evidence["reported_status"]
     assert stopped["report"]["summary"] == evidence["reason"]
     receipt = run / "summary-admitted"
@@ -1960,8 +1988,7 @@ def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
         assert receipt.read_text() == run.name and journals(root) == before_journals
     stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert stages == [
-        "strong-plan", *["worker-blocked", "verify-blocked"] * 3,
-        "escalate-blocked", "stopped-summary", "later-work",
+        "strong-plan", "worker-blocked", "verify-blocked", "stopped-summary", "later-work",
     ], stages
     local(screen, "/exit")
     return "normal"
@@ -2260,6 +2287,7 @@ def main():
              ("siwc-orchestrate-plus", siwc_orchestrate_plus),
              ("siwc-orchestrate-plus-budget", siwc_orchestrate_plus_budget),
              ("siwc-orchestrate-plus-implement", siwc_orchestrate_plus_implement),
+             ("siwc-orchestrate-plus-plan-only", siwc_orchestrate_plus_plan_only),
              ("siwc-orchestrate-plus-blocked", siwc_orchestrate_plus_blocked),
              ("siwc-orchestrate-plus-blocked-rejected", lambda *args: siwc_orchestrate_plus_blocked(*args, reject=True))]
     transport_cases = {"openrouter-orchestration", "siwc-orchestration",

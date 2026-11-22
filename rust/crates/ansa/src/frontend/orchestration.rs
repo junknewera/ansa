@@ -76,7 +76,7 @@ impl Proposal {
         skill: Option<String>,
         profile: Option<RoleProfile>,
     ) -> Result<Self> {
-        if seed.source_turn().0.starts_with("draft-revise-") {
+        if !plan.is_plan_only() && seed.source_turn().0.starts_with("draft-revise-") {
             plan.require_implementation();
         }
         if read_only && !plan.is_read_only() {

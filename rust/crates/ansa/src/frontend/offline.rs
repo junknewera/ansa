@@ -173,29 +173,29 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         }
     }
     let text = match request.final_format() {
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome) if user == "ORCHESTRATION_CLARIFICATION_FIXTURE" => serde_json::json!({
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome | FinalFormat::OrchestrationPlanWithPresentation) if user == "ORCHESTRATION_CLARIFICATION_FIXTURE" => serde_json::json!({
             "schema_version": 1, "summary": "Read and compare two files", "checks":[], "manual_checks":[], "steps": [
                 {"id":"first", "task":"Review first fixture file", "access":"read", "paths":["first.txt"], "depends_on":[], "acceptance":"Keep the first file intact"},
                 {"id":"second", "task":"Review second fixture file", "access":"read", "paths":["second.txt"], "depends_on":["first"], "acceptance":"Compare the findings"}
             ]
         }).to_string(),
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome) if user == "ORCHESTRATION_LONG_PLAN_FIXTURE" => serde_json::json!({
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome | FinalFormat::OrchestrationPlanWithPresentation) if user == "ORCHESTRATION_LONG_PLAN_FIXTURE" => serde_json::json!({
             "schema_version": 1, "summary": "Проверить перенос длинного плана", "checks":[], "manual_checks":[], "steps": [
                 {"id":"long", "task":format!("{}VISIBLE_END_OF_STEP", "длинная строка ".repeat(130)), "access":"read", "paths":[], "depends_on":[], "acceptance":"Прочитать строку целиком"}
             ]
         }).to_string(),
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome) if user == "ORCHESTRATION_REVIEW_RESUME_FIXTURE" => serde_json::json!({
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome | FinalFormat::OrchestrationPlanWithPresentation) if user == "ORCHESTRATION_REVIEW_RESUME_FIXTURE" => serde_json::json!({
             "schema_version":1, "summary":"Verify review-resume fixture", "checks":[{"path":"report.txt","contains":"after fixture review-resume"}], "manual_checks":[], "steps":[
                 {"id":"read","task":"Read the review-resume fixture","access":"read","paths":["report.txt"],"depends_on":[],"acceptance":"Report contains before fixture"},
                 {"id":"edit","task":"Синтетическая правка отчёта","access":"write","paths":["report.txt"],"depends_on":["read"],"acceptance":"Report contains after fixture"}
             ]
         }).to_string(),
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_MANUAL_CHECKS_FIXTURE") => serde_json::json!({
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome | FinalFormat::OrchestrationPlanWithPresentation) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_MANUAL_CHECKS_FIXTURE") => serde_json::json!({
             "schema_version": 1, "summary": "Обновить тестовый отчёт", "checks":[{"path":"report.txt","contains":"after fixture"}], "manual_checks": if user == "ORCHESTRATION_MANUAL_CHECKS_FIXTURE" { vec!["Подтвердить итоговый отчёт"] } else { vec![] }, "steps": [
                 {"id":"edit", "task":"Синтетическая правка отчёта", "access":"write", "paths":["report.txt"], "depends_on":[], "acceptance":"Тестовый отчёт содержит after fixture"}
             ]
         }).to_string(),
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome) => serde_json::json!({
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome | FinalFormat::OrchestrationPlanWithPresentation) => serde_json::json!({
             "schema_version": 1,
             "summary": "Разобрать запрос и собрать подтверждения",
             "checks": [],
@@ -265,7 +265,7 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         {
             plan = plan.with("read_folder", Json::parse("null")?)?;
         }
-        if request.final_format() == Some(FinalFormat::OrchestrationPlanWithOutcome) {
+        if request.final_format().is_some_and(FinalFormat::has_outcome) {
             let write = plan
                 .field("steps")?
                 .elements()?

@@ -92,6 +92,7 @@ pub struct Timeline {
     request: RequestId,
     mode: AgentMode,
     draft: bool,
+    plan_only: bool,
     final_text: String,
     names: BTreeMap<String, ToolDetail>,
     purposes: BTreeMap<String, std::sync::Arc<str>>,
@@ -99,7 +100,9 @@ pub struct Timeline {
 }
 
 pub(crate) fn draft_material(row: &Entry) -> bool {
-    row.role == "assistant" && (row.state == "plan_draft" || row.turn.0.starts_with("draft-"))
+    row.role == "assistant"
+        && row.state != "plan_only"
+        && (row.state == "plan_draft" || row.turn.0.starts_with("draft-"))
 }
 
 pub(crate) fn conversation_row(row: &Entry) -> bool {
@@ -126,6 +129,7 @@ impl Default for Timeline {
             request: "idle".into(),
             mode: AgentMode::Basic,
             draft: false,
+            plan_only: false,
             final_text: String::new(),
             names: BTreeMap::new(),
             purposes: BTreeMap::new(),
@@ -391,6 +395,7 @@ impl Timeline {
                 self.turn = event.text_field("turn")?.into();
                 self.request = event.text_field("request")?.into();
                 self.draft = event.has("draft");
+                self.plan_only = false;
                 self.mode = if event.has("mode") && event.text_field("mode")? == "plan" {
                     AgentMode::Plan
                 } else {
@@ -418,6 +423,10 @@ impl Timeline {
             }
             "response" => {
                 let response = codec_v1::load_response(event.field("response")?)?;
+                self.plan_only = self.draft
+                    && response
+                        .orchestration_plan()
+                        .is_ok_and(|plan| plan.is_plan_only());
                 self.purposes = response
                     .request()
                     .tools
@@ -558,7 +567,9 @@ impl Timeline {
             }
             "done" => {
                 let text = std::mem::take(&mut self.final_text);
-                let state = if self.draft {
+                let state = if self.plan_only {
+                    "plan_only"
+                } else if self.draft {
                     "plan_draft"
                 } else {
                     "completed"

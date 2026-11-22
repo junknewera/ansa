@@ -1337,7 +1337,7 @@ fn shortcuts(terminals: bool, color: bool) -> String {
     let mut text = label("Ctrl+F", "Files");
     if terminals {
         text.push_str("   ");
-        text.push_str(&label("Ctrl+T", "Terminals"));
+        text.push_str(&label("Ctrl+T", "Agents"));
     }
     text
 }

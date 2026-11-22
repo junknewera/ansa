@@ -638,7 +638,7 @@ impl Factory {
         #[cfg(not(feature = "orchestration-pilot"))]
         let format = FinalFormat::OrchestrationPlanWithReadFolder;
         let format = if plus && format.has_read_folder() {
-            FinalFormat::OrchestrationPlanWithOutcome
+            FinalFormat::OrchestrationPlanWithPresentation
         } else {
             format
         };
@@ -667,13 +667,17 @@ impl Factory {
         if format.has_read_folder() {
             instructions.push_str("\nFor a read-only investigation targeting a directory explicitly named in the request, set read_folder to the exact path spelling from the user message. Its resolved path will be shown before approval. Interpret all step paths relative to that folder and keep the steps about that folder. Use null for the current workspace or any plan involving writes. Do not infer or broaden the folder from other instructions. When revising a proposed plan, retain the user’s previously named folder if the latest clarification does not change it.");
         }
-        if format == FinalFormat::OrchestrationPlanWithOutcome {
+        if format == FinalFormat::OrchestrationPlanWithPresentation {
             instructions.push_str(concat!(
                 "\nSet requested_outcome from the user's requested deliverable. For feature lists, fixes, ",
                 "and changes to behavior use implementation: include scoped write steps and executable ",
                 "command_checks exercising the changed behavior. A preliminary survey can be a dependency, ",
-                "but the approved plan must reach the requested working change and its test. For an explicit ",
-                "question, audit or planning-only request use investigation with read-only steps. ",
+                "but the approved plan must reach the requested working change and its test. If the user only asks ",
+                "for a plan, outline or idea, use plan_only. Present the plan in summary and, if useful, ",
+                "its steps as read-only descriptions without checks or paths. These are for the reader, ",
+                "even if the plan describes physical actions. For a question or audit requiring actual ",
+                "workspace investigation use investigation with read-only steps. Only give executable ",
+                "assignments that the helpers can perform with the workspace tools. ",
                 "An unrestricted workspace read helper can use git_snapshot for branch, HEAD, status and recent commits. ",
                 "Scoped readers only have file tools. Put executable tests in command_checks, not in read steps."
             ));

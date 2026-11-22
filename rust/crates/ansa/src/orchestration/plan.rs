@@ -34,6 +34,7 @@ pub struct Step {
 enum RequestedOutcome {
     Implementation,
     Investigation,
+    PlanOnly,
 }
 
 /// Visible label for typed helper assignments, including journals written before Carbon had a roster.
@@ -153,6 +154,18 @@ impl Plan {
             || !valid_text(&proposal.summary)
         {
             return Err("plan_limits");
+        }
+        if proposal.requested_outcome == Some(RequestedOutcome::PlanOnly)
+            && (proposal.read_folder.is_some()
+                || !proposal.checks.is_empty()
+                || !proposal.manual_checks.is_empty()
+                || !proposal.command_checks.is_empty()
+                || proposal
+                    .steps
+                    .iter()
+                    .any(|step| step.access == Access::Write || !step.paths.is_empty()))
+        {
+            return Err("plan_only_execution_scope");
         }
         if proposal
             .checks
@@ -286,7 +299,14 @@ impl Plan {
         self.0.requested_outcome = Some(RequestedOutcome::Implementation);
     }
 
+    pub(crate) fn is_plan_only(&self) -> bool {
+        self.0.requested_outcome == Some(RequestedOutcome::PlanOnly)
+    }
+
     pub(crate) fn execution_ready(&self) -> Result<()> {
+        if self.is_plan_only() {
+            return Err("orchestration_plan_only");
+        }
         if let Some(outcome) = self.0.requested_outcome {
             match outcome {
                 RequestedOutcome::Implementation
@@ -339,6 +359,10 @@ impl Plan {
     /// change how a subsequent permission, path or command appears.
     pub(crate) fn markdown_sections(&self) -> Vec<String> {
         let mut sections = vec![self.summary().to_owned()];
+        if self.is_plan_only() {
+            sections.extend(self.steps().iter().map(|step| step.task.clone()));
+            return sections;
+        }
         if let Some(folder) = self.read_folder() {
             sections.push(format!(
                 "**Read folder**\n\n{}",
