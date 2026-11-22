@@ -148,10 +148,12 @@ impl RawMode {
         let mut raw = self.saved.clone();
         // Keep CR (Enter) distinct from LF (Ctrl+J / multiline input). The
         // caller's original mappings are retained in `saved` for handoff/exit.
+        // Disable software flow control so Ctrl+S cannot freeze the editor UI.
         raw.input_modes.remove(
             rustix::termios::InputModes::ICRNL
                 | rustix::termios::InputModes::INLCR
-                | rustix::termios::InputModes::IGNCR,
+                | rustix::termios::InputModes::IGNCR
+                | rustix::termios::InputModes::IXON,
         );
         raw.local_modes
             .remove(rustix::termios::LocalModes::ICANON | rustix::termios::LocalModes::ECHO);

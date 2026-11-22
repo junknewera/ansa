@@ -29,6 +29,10 @@ const COMMANDS: &[Command] = &[
         description: "Change reasoning effort",
     },
     Command {
+        name: "/login",
+        description: "Sign in with ChatGPT in your browser",
+    },
+    Command {
         name: "/theme",
         description: "Choose a theme",
     },

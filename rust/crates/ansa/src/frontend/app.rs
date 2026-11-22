@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use std::{
-    io::{IsTerminal, Write},
+    io::{BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -470,7 +470,15 @@ fn text_with_providers(
         )
     } else {
         let auth = load_siwc(&parsed.auth)?;
-        let (account, generate, options) = authorized(auth.clone(), settings.model.clone())?;
+        let (account, generate, options) = match authorized(auth.clone(), settings.model.clone()) {
+            Err("auth_required") if interactive => {
+                if !login_at_startup(&auth)? {
+                    return Ok(0);
+                }
+                authorized(auth.clone(), settings.model.clone())?
+            }
+            result => result?,
+        };
         workspace_auth = Some(auth);
         bound.account = account;
         (generate, options)
@@ -794,6 +802,11 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
                     let text = request.get("text");
                     let format = &request["text"]["format"];
                     let name = format["name"].as_str();
+                    if name == Some("ansa_orchestration_plan_v3")
+                        && last["content"] == "SYNTHETIC_PLAN_TIMEOUT"
+                    {
+                        return Err("http_timeout");
+                    }
                     if text.is_some()
                         && (format["strict"] != true || format["type"] != "json_schema")
                     {
@@ -1154,44 +1167,91 @@ fn plus_fixture_response(
     )
 }
 
+#[derive(Default)]
+struct BrowserLauncher(Option<std::process::Child>);
+
+impl BrowserLauncher {
+    fn open(&mut self, url: &str, show_url: bool) -> Result<()> {
+        if url.contains("id_token_hint") {
+            return Err("auth_browser_hint");
+        }
+        if show_url {
+            eprintln!("{url}");
+        }
+        self.0 = std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+        if self.0.is_none() && !show_url {
+            return Err("auth_browser_unavailable");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BrowserLauncher {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+fn login_in_browser(manager: &AuthManager, cancel: &Cancel, consent: bool) -> Result<()> {
+    let mut launcher = BrowserLauncher::default();
+    eprintln!("Continue with ChatGPT in your browser.");
+    manager.login(|url| launcher.open(url, true), cancel, consent)
+}
+
+pub(super) fn renew_in_browser(
+    manager: &AuthManager,
+    account: &str,
+    cancel: &Cancel,
+) -> Result<()> {
+    let mut launcher = BrowserLauncher::default();
+    manager.renew_login(account, |url| launcher.open(url, false), cancel)
+}
+
+fn login_at_startup(manager: &AuthManager) -> Result<bool> {
+    eprintln!("ANSA · ChatGPT sign-in");
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    loop {
+        eprintln!("Enter /login to open your browser, or /exit to quit.");
+        let mut line = String::new();
+        let read = (&mut input)
+            .take(128)
+            .read_line(&mut line)
+            .map_err(|_| "cli_input_read")?;
+        if read == 0 {
+            return Ok(false);
+        }
+        if !line.ends_with('\n') {
+            return Err("live_cli_options");
+        }
+        match line.trim() {
+            "/exit" => return Ok(false),
+            "/login" => match login_in_browser(manager, &Cancel::default(), false) {
+                Ok(()) => return Ok(true),
+                Err(code) => eprintln!("ChatGPT sign-in failed ({code})"),
+            },
+            _ => {}
+        }
+    }
+}
+
 fn auth_cli(command: &str, path: &Path) -> Result<i32> {
     let manager = auth_manager(path)?;
     let cancel = Cancel::default();
     let value = match command {
         "--login" | "--login-consent" => {
-            // Retain the launcher child until login finishes; never detach a
-            // reaper or let xdg-open's lifetime block callback acceptance.
-            struct Launcher(Option<std::process::Child>);
-            impl Drop for Launcher {
-                fn drop(&mut self) {
-                    if let Some(child) = &mut self.0 {
-                        if child.try_wait().ok().flatten().is_none() {
-                            let _ = child.kill();
-                        }
-                        let _ = child.wait();
-                    }
-                }
-            }
-            let mut launcher = Launcher(None);
-            eprintln!("Continue with ChatGPT in your browser.");
-            manager.login(
-                |url| {
-                    if url.contains("id_token_hint") {
-                        return Err("auth_browser_hint");
-                    }
-                    eprintln!("{url}");
-                    launcher.0 = std::process::Command::new("xdg-open")
-                        .arg(url)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .ok();
-                    Ok(())
-                },
-                &cancel,
-                command == "--login-consent",
-            )?;
+            login_in_browser(&manager, &cancel, command == "--login-consent")?;
             object(vec![
                 ("status", s("signed_in")),
                 ("plan_enabled", b(manager.status()?.plan_enabled)),

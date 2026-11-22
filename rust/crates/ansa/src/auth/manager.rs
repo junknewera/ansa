@@ -76,6 +76,7 @@ pub struct AuthManager {
     streaming: Option<StreamExchange>,
     clock: Clock,
     models: Mutex<Option<LiveModels>>,
+    renewed_session: Mutex<Option<String>>,
 }
 /// Only a successful live exchange populates this cache. The display cache on
 /// disk never enters this authorization path and no bearer is retained here.
@@ -245,6 +246,7 @@ impl AuthManager {
             clock,
             streaming,
             models: Mutex::new(None),
+            renewed_session: Mutex::new(None),
         })
     }
     fn request(
@@ -379,9 +381,46 @@ impl AuthManager {
         cancel: &Cancel,
         consent: bool,
     ) -> Result<()> {
+        self.login_bound(browser, cancel, consent, None)
+    }
+
+    /// Renew a signed-in caller's account. Other accounts are rejected before
+    /// their credentials can replace the existing local session.
+    pub fn renew_login(
+        &self,
+        account: &str,
+        browser: impl FnOnce(&str) -> Result<()>,
+        cancel: &Cancel,
+    ) -> Result<()> {
+        self.login_bound(browser, cancel, false, Some(account))
+    }
+
+    pub(crate) fn explicitly_renewed(&self, session: &str) -> bool {
+        self.renewed_session
+            .lock()
+            .is_ok_and(|current| current.as_deref() == Some(session))
+    }
+
+    fn login_bound(
+        &self,
+        browser: impl FnOnce(&str) -> Result<()>,
+        cancel: &Cancel,
+        consent: bool,
+        account: Option<&str>,
+    ) -> Result<()> {
         let _lock = self.store.lock(cancel)?;
         self.store.clean()?;
         let previous = self.store.read("credentials.json")?;
+        if let Some(expected) = account {
+            if self.store.signed_out()? {
+                return Err("auth_required");
+            }
+            if let Some(record) = &previous
+                && account_id(record)? != expected
+            {
+                return Err("auth_account_mismatch");
+            }
+        }
         if self.store.read("registration.json")?.is_none() {
             self.store.save(
                 "registration.json",
@@ -391,11 +430,13 @@ impl AuthManager {
                 ])?,
             )?;
         }
-        if self.store.signed_out()? && self.store.read("credentials.json")?.is_some() {
-            self.revocation_status(false)?;
-            self.store.remove("credentials.json")?;
+        if account.is_none() {
+            if self.store.signed_out()? && self.store.read("credentials.json")?.is_some() {
+                self.revocation_status(false)?;
+                self.store.remove("credentials.json")?;
+            }
+            self.store.remove("signed-out")?;
         }
-        self.store.remove("signed-out")?;
         let watch = Watch::new(self.store.clone(), cancel)?;
         let cancel = &watch.operation;
         let saved = self.registration()?;
@@ -488,6 +529,19 @@ impl AuthManager {
             },
             cancel,
         )?;
+        if let Some(expected) = account {
+            if account_id(&record)? != expected {
+                return Err("auth_account_mismatch");
+            }
+            if !plan_enabled(record.text_field("scope")?) {
+                return Err("auth_plan_permission");
+            }
+        }
+        cancel.check()?;
+        if self.store.signed_out()? {
+            return Err("auth_required");
+        }
+        // Complete the local commit if cancellation arrives after admission.
         if !saved.has("subject") {
             registration = registration.with("subject", record.field("subject")?.clone())?;
         }
@@ -503,7 +557,12 @@ impl AuthManager {
                 ("revocation_uncertain", boolean(uncertain)),
                 ("exchange_pending", boolean(false)),
             ])?,
-        )
+        )?;
+        if account.is_some() {
+            *self.renewed_session.lock().map_err(|_| "auth_state")? =
+                Some(record.text_field("session")?.to_owned());
+        }
+        Ok(())
     }
     pub fn access(&self, cancel: &Cancel, force_refresh: bool) -> Result<Lease> {
         let _lock = self.store.lock(cancel)?;
