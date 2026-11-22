@@ -65,6 +65,14 @@ def completed_turn(events, match):
     return None
 
 
+def check_run_status(footer):
+    status = footer.strip()
+    if status.startswith(("Plan stopped", "Orchestration paused")):
+        # A check whose effect is unknown cannot establish a model outcome.
+        kind = "infra_error" if status == "Plan stopped (orchestration_check_effect_unknown)" else "failed"
+        raise TrialStopped(kind, status)
+
+
 def candidate_for(run, source, input_commit, git):
     release = run / "release.json"
     if not release.is_file():
@@ -205,7 +213,8 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
                 screen.send(b"\r")
 
                 def finished(frame):
-                    if "Plan paused" in frame or "Agent paused" in frame or "Plan stopped ·" in frame:
+                    check_run_status(screen.vt.line(-1))
+                    if "Plan paused" in frame or "Agent paused" in frame:
                         raise TrialStopped("failed", "orchestration stopped")
                     turn = completed_turn(parent_events(), lambda event: event["turn"].startswith("summary-"))
                     if not turn or not ready() or "Ctrl+C stop" in screen.vt.line(-2):

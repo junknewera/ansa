@@ -1,0 +1,51 @@
+
+function.o:     file format elf64-x86-64
+
+Contents of section .text:
+ 0000 41564c8d 35000000 00415541 54555385  AVL.5....AUATUS.
+ 0010 f67e2a48 63f64889 fb31ed4c 8d2cf790  .~*Hc.H..1.L.,..
+ 0020 4c8b234c 89e7e800 00000039 e80f4fe8  L.#L.......9..O.
+ 0030 4d0f4ff4 4883c308 4c39eb75 e35b4c89  M.O.H...L9.u.[L.
+ 0040 f05d415c 415d415e c3                 .]A\A]A^.
+Contents of section .rodata.str1.1:
+ 0000 00                                   .
+
+Disassembly of section .text:
+
+0000000000000000 <func0>:
+   0:	41 56                	push   %r14
+   2:	4c 8d 35 00 00 00 00 	lea    0x0(%rip),%r14        # 9 <func0+0x9>
+			5: R_X86_64_PC32	.LC0-0x4
+   9:	41 55                	push   %r13
+   b:	41 54                	push   %r12
+   d:	55                   	push   %rbp
+   e:	53                   	push   %rbx
+   f:	85 f6                	test   %esi,%esi
+  11:	7e 2a                	jle    3d <func0+0x3d>
+  13:	48 63 f6             	movslq %esi,%rsi
+  16:	48 89 fb             	mov    %rdi,%rbx
+  19:	31 ed                	xor    %ebp,%ebp
+  1b:	4c 8d 2c f7          	lea    (%rdi,%rsi,8),%r13
+  1f:	90                   	nop
+  20:	4c 8b 23             	mov    (%rbx),%r12
+  23:	4c 89 e7             	mov    %r12,%rdi
+  26:	e8 00 00 00 00       	call   2b <func0+0x2b>
+			27: R_X86_64_PLT32	strlen-0x4
+  2b:	39 e8                	cmp    %ebp,%eax
+  2d:	0f 4f e8             	cmovg  %eax,%ebp
+  30:	4d 0f 4f f4          	cmovg  %r12,%r14
+  34:	48 83 c3 08          	add    $0x8,%rbx
+  38:	4c 39 eb             	cmp    %r13,%rbx
+  3b:	75 e3                	jne    20 <func0+0x20>
+  3d:	5b                   	pop    %rbx
+  3e:	4c 89 f0             	mov    %r14,%rax
+  41:	5d                   	pop    %rbp
+  42:	41 5c                	pop    %r12
+  44:	41 5d                	pop    %r13
+  46:	41 5e                	pop    %r14
+  48:	c3                   	ret
+
+Disassembly of section .rodata.str1.1:
+
+0000000000000000 <.LC0>:
+	...

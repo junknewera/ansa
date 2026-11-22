@@ -39,7 +39,29 @@ nix develop -c python -B benchmarks/bench.py /tmp/ansa-public-logs/manifest.json
 
 `BENCH_AUTH` указывает на отдельный профиль бенчмарка, уже авторизованный штатной командой ANSA. Запуск без `--output` печатает только расписание, настройки и хеши. `--live` разрешает запросы к модели. Стенд даёт каждой попытке свежие HOME, XDG, Git-репозиторий и сессию. Для живых прогонов используйте отдельного пользователя или контейнер, где агенту доступны ровно нужные данные и инструменты. Shell работает с правами запустившего его пользователя. Секреты остаются в профиле для ANSA. Маршрут OpenRouter принимает модели, которые поддерживает указанный бинарник. Текущая production-сборка закрепляет основную модель OpenRouter. SIWC принимает доступные аккаунту модели.
 
-В созданном манифесте можно заменить `mode` у варианта на `orchestrate` или `orchestrate+`. Для Orchestrate+ добавьте модели ролей. Для других публичных наборов подайте подготовленные входы и независимый проверяющий скрипт. Подготовщик включён для одной задачи Terminal-Bench. Подключение BFCL, DS-1000, вложений в чат и среды других наборов требует соответствующих адаптеров.
+В созданном манифесте можно заменить `mode` у варианта на `orchestrate` или `orchestrate+`. Для Orchestrate+ добавьте модели ролей. Для других публичных наборов подайте подготовленные входы и независимый проверяющий скрипт. Для восьми задач из #73 используйте общий подготовщик ниже.
+
+## Публичные задачи из #73
+
+[План реализации и критерии приёмки](ALL_AROUND.md) описывают все восемь задач. Подготовщик работает без обращения к модели. Он скачивает исходные данные выбранных задач и записывает манифест после проверки всех путей. Укажите свежий каталог и существующий executable. Для подготовки всех восьми задач опустите `--task`.
+
+```sh
+python3 -B benchmarks/prepare_public.py --list
+python3 -B benchmarks/prepare_public.py --task intercode-bash-fs1-48 --task mteb-retrieve \
+  --output /tmp/ansa-public-ab --binary result/bin/ansa --model gpt-6.1-sol \
+  --route siwc --auth-dir "$BENCH_AUTH" --candidate-guidance ./candidate.md
+manifest=/tmp/ansa-public-ab/manifest.json
+python3 -B benchmarks/bench.py "$manifest" > /tmp/ansa-dev-plan.json
+python3 -B benchmarks/bench.py "$manifest" --split holdout > /tmp/ansa-holdout-plan.json
+python3 -B benchmarks/bench.py "$manifest" --frozen-plan /tmp/ansa-dev-plan.json \
+  --output /tmp/ansa-ab-dev --live
+python3 -B benchmarks/bench.py "$manifest" --split holdout --frozen-plan /tmp/ansa-holdout-plan.json \
+  --output /tmp/ansa-ab-holdout --live
+```
+
+В примере `candidate.md` — ваш файл с инструкциями для варианта B. Без `--candidate-guidance` создаётся один вариант Work. Строгое сравнение требует задач с контрольными примерами в обеих выборках. Работа с другим фактором и формат отчёта описаны в [COMPARISON.md](COMPARISON.md).
+
+Для Git нужен клиент Git, для декомпиляции — нативный C-компилятор. Для подготовки SWE-bench нужен `pyarrow`, для оценки патча — Docker и закреплённый SWE-bench harness. Подробности в [описании двух задач с изображениями](IMAGE_TASKS.md). Исходные ревизии и зависимости конкретных задач зафиксированы в адаптерах. Оригиналы изображений хранятся вне рабочего каталога агента. Carbon пока не умеет передавать изображение в пользовательской реплике. Для такой задачи стенд записывает `unsupported` с режимом и моделью, пропускает обращение к провайдеру и исключает пару из числа побед.
 
 ## Манифест
 

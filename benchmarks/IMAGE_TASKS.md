@@ -1,0 +1,38 @@
+# Задачи с изображениями
+
+| ID | Вход | Проверка |
+| --- | --- | --- |
+| `charxiv-reasoning-0` | Оригинальный JPEG фигуры 0 из CharXiv val и вопрос о падении точности между двумя сессиями | Запрос требует только имя модели. Сравнение с ответом CharXiv допускает изменение регистра и конечную точку. |
+| `swebench-chartjs-8567` | Исходники Chart.js на базовом коммите, сообщение из dev split и оригинальный PNG со скриншотом | Адаптер извлекает патч относительно базовой версии и передаёт его официальному SWE-bench с тестами задачи и тремя эталонными PNG. |
+
+Подготовщик сохраняет изображения вне рабочего дерева и связывает каждый файл с первой репликой через `attachments[].turn = 0`. Текущий Carbon принимает текст. Стенд записывает `unsupported` для каждой запланированной конфигурации с вложениями. Критерии для включения реальных прогонов приведены в [плане](ALL_AROUND.md).
+
+## Подготовка
+
+В Python-окружении подготовщика для SWE-bench нужен `pyarrow` (проверено с 18.1.0). CharXiv использует стандартную библиотеку Python и загружает архив изображений размером 141 МБ. Подготовщик проверяет SHA-256 файлов. Архив Chart.js, изображения для проверки и авторский контрольный патч остаются в каталоге оператора.
+
+```sh
+python -B benchmarks/prepare_public.py --task charxiv-reasoning-0 --task swebench-chartjs-8567 \
+  --output /tmp/ansa-image-tasks --model offline --binary result/bin/ansa
+python -B benchmarks/bench.py /tmp/ansa-image-tasks/manifest.json
+```
+
+## Проверка оценщиков
+
+У каждого адаптера есть контрольные исполняемые файлы `operator/control.py` и `operator/verify.py`. Контрпример CharXiv содержит отрицание правильного ответа. Для Chart.js положительный контроль применяет исходный авторский патч, а отрицательный меняет только README. Для воспроизведения контроля укажите пустой рабочий каталог и путь к ответу вне него.
+
+```sh
+task=/tmp/ansa-image-tasks/charxiv-reasoning-0
+control_dir=$(mktemp -d)
+mkdir "$control_dir/workspace"
+"$task/operator/control.py" pass "$control_dir/workspace" "$control_dir/answer.json"
+"$task/operator/verify.py" "$control_dir/workspace" "$control_dir/answer.json"
+```
+
+Оценка Chart.js требует Docker с поддержкой linux/amd64 и пакета SWE-bench, установленного в Python подготовщика на закреплённой ревизии. Образ тестовой среды закреплён по digest. Подготовка входов работает без Docker.
+
+```sh
+python -m pip install 'swebench @ git+https://github.com/SWE-bench/SWE-bench.git@02e7a74ffd0b707aab73d203fe87bdc7c76afc8e'
+```
+
+Проверяющий сохраняет предсказание, имя контейнера и журналы SWE-bench в `swe-evaluation/` рядом с ответом. Официальный harness удаляет контейнер при штатном завершении. После внешнего принудительного прерывания имя для очистки находится в `swe-evaluation/container-name`. Отсутствующее или изменённое изображение теста, отсутствие отчёта или ошибка среды дают код 2. Корректный патч получает 0, ошибка решения — 1.
