@@ -26,9 +26,9 @@ jobs:
       - name: Check Rust targets
         working-directory: rust
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Test orchestration and recovery
+      - name: Test the Rust workspace
         working-directory: rust
-        run: cargo test --locked --test orchestration_run --test runtime_receipts
+        run: cargo test --workspace --locked --no-fail-fast
       - name: Build Carbon test adapter
         working-directory: rust
         run: cargo build --locked --features frontend-test-adapter --example frontend_adapter
