@@ -1,0 +1,56 @@
+name: Chart.js benchmark oracle
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/chartjs-oracle.yml'
+      - 'benchmarks/public_images.py'
+      - 'benchmarks/image_grade.py'
+      - 'benchmarks/check_chartjs_oracle.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  controls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install the official evaluator and its locked runtime dependencies
+        run: |
+          set -eu
+          harness="$RUNNER_TEMP/swebench"
+          revision=$(python3 -c 'import sys; sys.path.insert(0,"benchmarks"); from image_grade import HARNESS; print(HARNESS)')
+          git init -q "$harness"
+          git -C "$harness" fetch --depth 1 https://github.com/SWE-bench/SWE-bench.git "$revision"
+          git -C "$harness" checkout --detach FETCH_HEAD
+          test "$(git -C "$harness" rev-parse HEAD)" = "$revision"
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/tools"
+          "$RUNNER_TEMP/tools/bin/python" -m pip install --disable-pip-version-check uv==0.13.9
+          uv="$RUNNER_TEMP/tools/bin/uv"
+          "$uv" sync --project "$harness" --locked --no-dev --no-install-project --python /usr/bin/python3
+          "$uv" pip install --no-deps --python "$harness/.venv/bin/python" "swebench @ git+file://$harness@$revision"
+          docker info --format 'Docker {{.ServerVersion}} {{.OSType}}/{{.Architecture}}'
+      - name: Prepare the pinned official dev task
+        run: |
+          "$RUNNER_TEMP/swebench/.venv/bin/python" -B benchmarks/prepare_public.py \
+            --task swebench-chartjs-8567 --output "$RUNNER_TEMP/tasks" --binary /usr/bin/true --model offline
+      - name: Grade the gold fix and the unrelated README edit
+        run: |
+          "$RUNNER_TEMP/swebench/.venv/bin/python" -B benchmarks/check_chartjs_oracle.py \
+            "$RUNNER_TEMP/tasks/swebench-chartjs-8567/operator" "$RUNNER_TEMP/oracle"
+      - name: Save upstream reports and test output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: chartjs-oracle
+          path: |
+            ${{ runner.temp }}/oracle/*/swe-evaluation/logs/evaluation/**/report.json
+            ${{ runner.temp }}/oracle/*/swe-evaluation/logs/evaluation/**/run_instance.log
+            ${{ runner.temp }}/oracle/*/swe-evaluation/logs/evaluation/**/test_output.txt
+            ${{ runner.temp }}/oracle/results.json
+          if-no-files-found: warn
