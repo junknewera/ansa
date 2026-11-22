@@ -30,7 +30,6 @@ pub struct Frame {
     pub chat_bounds: Option<(usize, usize, usize)>,
     chat_inset: usize,
     chat_rows: ChatRows,
-    agent_rows: Vec<String>,
     pub(super) activity: Option<Box<Frame>>,
     pub(super) activity_keys: Vec<String>,
     pub(super) activity_scroll: usize,
@@ -82,11 +81,6 @@ impl Frame {
             || self.lines.len() != previous.lines.len()
     }
 
-    pub(super) fn agent_at(&self, x: usize, y: usize) -> Option<&str> {
-        let (left, top, width, _) = self.inspector_bounds?;
-        (left..left + width).contains(&x).then_some(())?;
-        self.agent_rows.get(y.checked_sub(top)?).map(String::as_str)
-    }
     pub(super) fn activity_at(&self, x: usize, y: usize) -> Option<(&Frame, &str)> {
         let (left, top, width, height) = self.inspector_bounds?;
         if !(left..left + width).contains(&x) || !(top..top + height).contains(&y) {
@@ -918,7 +912,6 @@ fn layout_impl(
         terminal_rows: Default::default(),
         chat_bounds: Some((1, available + 1, cols)),
         chat_inset: 0,
-        agent_rows: Vec::new(),
         activity: None,
         activity_keys,
         activity_scroll: wrapped.len().saturating_sub(end),
@@ -954,7 +947,6 @@ pub enum Focus {
 pub enum InspectorKind {
     #[default]
     Plain,
-    Agents,
     Plan,
     Source,
     Diff,
@@ -974,7 +966,6 @@ pub struct Inspector {
     pub offset: usize,
     pub footer: String,
     pub kind: InspectorKind,
-    pub agents: Vec<AgentLine>,
     pub activity: Option<ActivityViewport>,
     pub document: Option<super::markdown::Document>,
     pub markdown: Option<std::sync::Arc<Vec<super::markdown::Row>>>,
@@ -997,7 +988,6 @@ pub struct AgentLine {
     pub id: String,
     pub title: String,
     pub state: String,
-    pub detail: String,
     pub role: AgentRole,
     pub model: String,
     pub activity: String,
@@ -1096,6 +1086,7 @@ pub struct Workspace {
     pub animate: bool,
     pub drafting_plan: bool,
     pub plan_notice: Option<String>,
+    pub orchestration_notice: Option<String>,
     pub draft_notice: bool,
     pub interrupt_hint: &'static str,
     pub result_selected: Option<String>,
@@ -1429,16 +1420,6 @@ fn editor_rows(
         cursor_at.1.min(columns.saturating_sub(1)),
     )
 }
-fn agent_window(panel: &Inspector, available: usize) -> (usize, usize, usize) {
-    let stride = if available >= 4 { 2 } else { 1 };
-    let count = available / stride;
-    let first = panel
-        .selected
-        .unwrap_or_default()
-        .saturating_sub(count.saturating_sub(1));
-    (first, count, stride)
-}
-
 fn inspector_rows(
     panel: &Inspector,
     width: usize,
@@ -1486,26 +1467,6 @@ fn inspector_rows(
     let document_rows = panel.document.as_ref().map(|doc| doc.viewport_rows(width));
     if let Some(activity) = activity {
         rows.extend(activity.lines.iter().skip(1).take(available).cloned());
-    } else if panel.kind == InspectorKind::Agents {
-        let (first, count, stride) = agent_window(panel, available);
-        if panel.agents.is_empty() && available > 0 {
-            rows.push(styled(
-                &clipped("No agents in this conversation", width),
-                MUTED,
-                color,
-            ));
-        }
-        for (index, agent) in panel.agents.iter().enumerate().skip(first).take(count) {
-            let label = heading(&agent.title, &agent.state, width, color);
-            rows.push(if panel.selected == Some(index) && focused {
-                styled(&padded(&plain(&label), width), SELECTED, color)
-            } else {
-                label
-            });
-            if stride == 2 {
-                rows.push(styled(&clipped(&agent.detail, width), MUTED, color));
-            }
-        }
     } else if let Some(rendered) = &panel.rendered {
         rows.extend(
             rendered
@@ -1767,12 +1728,13 @@ pub fn layout_workspace(
     };
     let history = animate_activity(history, ui);
     let side_headings = side.is_some() && chat_height > 0;
-    let plan_notice = ui
+    let notice = ui
         .plan_notice
         .as_deref()
+        .map(|text| (text, if ui.drafting_plan { MUTED } else { AMBER }))
+        .or_else(|| ui.orchestration_notice.as_deref().map(|text| (text, MUTED)))
         .filter(|_| !has_panel && ui.popup.is_none() && chat_height > 1);
-    let chat_rows_count =
-        chat_height - usize::from(side_headings) - usize::from(plan_notice.is_some());
+    let chat_rows_count = chat_height - usize::from(side_headings) - usize::from(notice.is_some());
     let chat = layout_impl(
         side.map_or(history.as_ref(), |side| side.parent_history.as_slice()),
         b"",
@@ -1807,7 +1769,7 @@ pub fn layout_workspace(
         );
     }
     let mut selectable_chat_height = chat_height;
-    if let Some(notice) = plan_notice {
+    if let Some((text, ink)) = notice {
         let row = if ui.reading {
             chat_rows_count
         } else {
@@ -1819,11 +1781,7 @@ pub fn layout_workspace(
         };
         chat_rows.insert(
             row,
-            styled(
-                &clipped(notice, chat_width - inset.len()),
-                if ui.drafting_plan { MUTED } else { AMBER },
-                color,
-            ),
+            styled(&clipped(text, chat_width - inset.len()), ink, color),
         );
         selectable_chat_height = row;
     }
@@ -2018,7 +1976,6 @@ pub fn layout_workspace(
     } else if let Some(panel) = &ui.inspector {
         match panel.kind {
             InspectorKind::Diff => "Tab → diff",
-            InspectorKind::Agents => "Tab → agents",
             InspectorKind::Image => "Tab → chart",
             _ => "Tab → panel",
         }
@@ -2194,21 +2151,6 @@ pub fn layout_workspace(
         },
         activity_keys: Vec::new(),
         activity_scroll: 0,
-        agent_rows: ui
-            .inspector
-            .as_ref()
-            .filter(|_| ui.popup.is_none())
-            .map_or_else(Vec::new, |panel| {
-                let available = inspector_bounds.map_or(0, |(_, _, _, rows)| rows);
-                let (first, count, stride) = agent_window(panel, available);
-                panel
-                    .agents
-                    .iter()
-                    .skip(first)
-                    .take(count)
-                    .flat_map(|agent| std::iter::repeat_n(agent.id.clone(), stride))
-                    .collect()
-            }),
         chat_rows: chat.chat_rows,
         timeline_range: None,
         timeline_total: 0,
@@ -3061,7 +3003,6 @@ mod tests {
                 id: "coordinator".into(),
                 title: "Coordinate the approved step".into(),
                 state: "Running".into(),
-                detail: String::new(),
                 role: AgentRole::Coordinator,
                 model: "gpt-6.1-sol".into(),
                 activity: "planning".into(),

@@ -872,7 +872,6 @@ impl Files {
 }
 struct AgentReader {
     id: String,
-    from_list: bool,
     parent: String,
     title: String,
     pending: bool,
@@ -889,9 +888,6 @@ enum Panel {
         offset: usize,
     },
     Files(Box<Files>),
-    Agents {
-        selected: Option<String>,
-    },
     Terminal,
     Activity(activity::Navigation),
     NativeTerminal {
@@ -1448,10 +1444,11 @@ impl Workbench {
         });
     }
 
-    fn open_agents(&mut self, io: &Io) {
-        self.panel = Some(Panel::Agents { selected: None });
-        self.focus = Focus::Inspector;
-        if self.can_job(io) {
+    fn refresh_agent_summaries(&mut self) {
+        if !self.input_closed
+            && !self.terminating
+            && self.jobs.len() + self.pending_context.len() < MAX_JOBS
+        {
             let factory = self.factory.clone();
             let stop = Cancel::linked(&self.stop);
             self.jobs.spawn_blocking(move || Job::CachedSummaries {
@@ -1479,7 +1476,6 @@ impl Workbench {
             .unwrap_or_else(|| self.conversation_root());
         self.panel = Some(Panel::AgentTranscript(AgentReader {
             id: id.into(),
-            from_list: matches!(self.panel, Some(Panel::Agents { .. })),
             parent,
             title: line.title.clone(),
             pending: false,
@@ -2638,7 +2634,7 @@ impl Workbench {
                 (true, false)
             }
             "/agents" => {
-                self.open_agents(io);
+                self.open_activity();
                 (true, false)
             }
             "/sessions" if argument == "search" => {
@@ -3539,15 +3535,8 @@ impl Workbench {
                     return;
                 }
                 self.orchestration_stop = None;
-                if result.is_err()
-                    && matches!(self.panel, Some(Panel::Agents { .. }))
-                    && self.can_job(io)
-                {
-                    let factory = self.factory.clone();
-                    let stop = Cancel::linked(&self.stop);
-                    self.jobs.spawn_blocking(move || Job::CachedSummaries {
-                        result: factory.summaries(&stop),
-                    });
+                if result.is_err() && matches!(self.panel, Some(Panel::Activity(_))) {
+                    self.refresh_agent_summaries();
                 }
                 let Some(parent) = self.slots.iter_mut().find(|slot| slot.id == owner) else {
                     return;
@@ -4036,15 +4025,6 @@ impl Workbench {
             return;
         }
         self.pending_editor = None;
-        if let Some(Panel::AgentTranscript(reader)) = &self.panel
-            && (reader.from_list || self.activity_back.is_none())
-        {
-            self.panel = Some(Panel::Agents {
-                selected: Some(reader.id.clone()),
-            });
-            self.focus = Focus::Inspector;
-            return;
-        }
         if self.panel.is_some() && self.activity_back.is_some() {
             self.return_to_activity();
             return;
@@ -4293,11 +4273,6 @@ impl Workbench {
             self.select_activity(older);
             return;
         }
-        let agent_rows = if matches!(self.panel, Some(Panel::Agents { .. })) {
-            self.agent_rows()
-        } else {
-            Vec::new()
-        };
         let output_count = match &self.panel {
             Some(Panel::Output { view, .. }) => self.output_lines(&view.text).len(),
             _ => 0,
@@ -4371,14 +4346,6 @@ impl Workbench {
                     } else {
                         files.offset.saturating_add(1).min(files.last_line())
                     };
-                }
-                Some(Panel::Agents { selected }) => {
-                    let mut index = agent_rows
-                        .iter()
-                        .position(|(id, _)| Some(id) == selected.as_ref())
-                        .unwrap_or(0);
-                    delta(&mut index, agent_rows.len());
-                    *selected = agent_rows.get(index).map(|(id, _)| id.clone());
                 }
                 Some(Panel::Output { offset, .. }) => delta(offset, output_count),
                 Some(
@@ -4605,11 +4572,6 @@ impl Workbench {
                     }
                 }
                 Some(Panel::Activity(_)) => self.enter_activity(io),
-                Some(Panel::Agents { selected }) => {
-                    if let Some(id) = selected.clone() {
-                        self.open_agent(&id);
-                    }
-                }
                 Some(Panel::Image { .. }) => self.copy_image_path(io),
                 _ => {}
             }
@@ -4756,16 +4718,6 @@ impl Workbench {
                 // Text selection needs one complete paint. Activity actions
                 // can use the same hit target across an in-flight redraw.
                 if !self.frames.is_empty() {
-                    return;
-                }
-                if matches!(self.panel, Some(Panel::Agents { .. }))
-                    && let Some(id) = self
-                        .displayed
-                        .as_ref()
-                        .and_then(|frame| frame.agent_at(mouse.column, mouse.row))
-                        .map(str::to_owned)
-                {
-                    self.open_agent(&id);
                     return;
                 }
                 let tab = self
@@ -5312,19 +5264,6 @@ impl Workbench {
                 },
                 ..Inspector::default()
             }),
-            Panel::Agents { selected } => {
-                let agents: Vec<_> = self.agent_rows().into_iter().map(|(_, row)| row).collect();
-                Some(Inspector {
-                    title: "Conversation agents".into(),
-                    selected: agents
-                        .iter()
-                        .position(|agent| Some(&agent.id) == selected.as_ref()),
-                    agents,
-                    footer: "Click or Enter to open · ↑/↓ select · Esc back".into(),
-                    kind: InspectorKind::Agents,
-                    ..Inspector::default()
-                })
-            }
             Panel::Image { name, view, .. } => Some(Inspector {
                 title: format!("Chart · {name}"),
                 lines: view.as_ref().map_or_else(
@@ -5570,6 +5509,9 @@ impl Workbench {
             animation_frame: Self::animation_frame(),
             drafting_plan,
             plan_notice,
+            orchestration_notice: self
+                .orchestration_notice()
+                .map(|notice| format!("{notice} · Ctrl+T details")),
             draft_notice: !slot.state.editor.bytes.is_empty()
                 && self.orchestration_summary.contains_key(&slot.id),
             interrupt_hint: if matches!(self.menu, Some(Menu::DraftingPlan)) {
@@ -5694,14 +5636,6 @@ impl Workbench {
         }
     }
     fn render(&mut self, io: &Io, context: &str) {
-        if let Some(Panel::Agents { selected }) = &self.panel {
-            let rows = self.agent_rows();
-            if !rows.iter().any(|(id, _)| Some(id) == selected.as_ref()) {
-                self.panel = Some(Panel::Agents {
-                    selected: rows.into_iter().next().map(|(id, _)| id),
-                });
-            }
-        }
         self.update_displayed(io);
         if self.selection_frame.is_some() {
             return;
@@ -6230,7 +6164,7 @@ pub async fn run_attached(
                                     if let Some(Panel::AgentTranscript(reader)) = &mut work.panel { reader.requested = Some(byte); }
                                     continue;
                                 }
-                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Agents { .. } | Panel::AgentTranscript(_))) && byte >= 32 && byte != 127 { continue; }
+                                if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::AgentTranscript(_))) && byte >= 32 && byte != 127 { continue; }
                                 if work.focus == Focus::Inspector && let Some(Panel::EditDiff { rows, offset, column, .. }) = &mut work.panel {
                                     if byte == b'g' { *offset = 0; continue; }
                                     if byte == b'G' { *offset = rows.len().saturating_sub(file_visible); continue; }

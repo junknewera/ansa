@@ -404,11 +404,10 @@ fn publish_progress(
                         source.binding.requested_model.clone()
                     },
                     activity: if action.is_empty() {
-                        detail.clone()
+                        detail
                     } else {
                         action.into()
                     },
-                    detail,
                 },
             ))
         })
