@@ -54,7 +54,7 @@ impl Journal {
         let header = header(&directory)?;
         let bytes = encode(&header)?;
         local::create(&directory, HEADER, &bytes).map_err(|_| "store_init")?;
-        Ok((Self::new(directory, lock, &bytes), header))
+        Ok((Self::new(directory, lock, sha256(&bytes), 0), header))
     }
 
     pub(super) fn open<H: DeserializeOwned, E: DeserializeOwned + Serialize>(
@@ -63,11 +63,33 @@ impl Journal {
         let directory = fs::private_directory(path).map_err(|_| "store_open_existing")?;
         // An empty or partially created directory cannot become a valid store.
         let lock = local::lock_existing(&directory).map_err(|_| "store_lock")?;
-        let bytes = read(&directory, HEADER)?.ok_or("store_missing_init")?;
+        let mut budget = usize::MAX;
+        let (header, events, previous) = Self::read_chain(&directory, &mut budget)?;
+        let journal = Self::new(directory, lock, previous, events.len() as u16);
+        // A rename can be visible when the writer lost the directory fsync
+        // acknowledgement. Re-establish durability before returning a receipt.
+        journal.directory.sync_all().map_err(|_| "store_sync")?;
+        Ok((journal, header, events))
+    }
+
+    pub(super) fn inspect<H: DeserializeOwned, E: DeserializeOwned + Serialize>(
+        path: &Path,
+        budget: &mut usize,
+    ) -> Result<(H, Vec<E>)> {
+        let directory = fs::private_directory(path).map_err(|_| "store_open_existing")?;
+        let (header, events, _) = Self::read_chain(&directory, budget)?;
+        Ok((header, events))
+    }
+
+    fn read_chain<H: DeserializeOwned, E: DeserializeOwned + Serialize>(
+        directory: &File,
+        budget: &mut usize,
+    ) -> Result<(H, Vec<E>, String)> {
+        let bytes = read(directory, HEADER, budget)?.ok_or("store_missing_init")?;
         let header = decode(&bytes)?;
-        let mut journal = Self::new(directory, lock, &bytes);
-        let (names, more) = local::names(&journal.directory, usize::from(MAX_RECORDS) + 2)
-            .map_err(|_| "store_inventory")?;
+        let mut previous = sha256(&bytes);
+        let (names, more) =
+            local::names(directory, usize::from(MAX_RECORDS) + 2).map_err(|_| "store_inventory")?;
         let mut count = 0;
         for name in names {
             match name.to_str() {
@@ -82,29 +104,26 @@ impl Journal {
         let mut events = Vec::with_capacity(usize::from(count));
         for sequence in 0..count {
             let bytes =
-                read(&journal.directory, &filename(sequence))?.ok_or("store_missing_record")?;
+                read(directory, &filename(sequence), budget)?.ok_or("store_missing_record")?;
             let frame: Frame<E> = decode(&bytes)?;
             if frame.body.sequence != sequence
-                || frame.body.previous != journal.previous
+                || frame.body.previous != previous
                 || frame.sha256 != sha256(&encode(&frame.body)?)
             {
                 return Err("store_record_chain");
             }
-            journal.advance(&bytes);
+            previous = sha256(&bytes);
             events.push(frame.body.event);
         }
-        // A rename can be visible when the writer lost the directory fsync
-        // acknowledgement. Re-establish durability before returning a receipt.
-        journal.directory.sync_all().map_err(|_| "store_sync")?;
-        Ok((journal, header, events))
+        Ok((header, events, previous))
     }
 
-    fn new(directory: File, lock: File, header: &[u8]) -> Self {
+    fn new(directory: File, lock: File, previous: String, next: u16) -> Self {
         Self {
             directory,
             _lock: lock,
-            next: 0,
-            previous: sha256(header),
+            next,
+            previous,
             failed: false,
             #[cfg(test)]
             fault: None,
@@ -177,8 +196,10 @@ fn record_index(name: &str) -> Option<u16> {
     sequence.parse().ok().filter(|value| *value < MAX_RECORDS)
 }
 
-fn read(directory: &File, name: &str) -> Result<Option<Vec<u8>>> {
-    local::read(directory, name, MAX_BYTES).map_err(|_| "store_read")
+fn read(directory: &File, name: &str, budget: &mut usize) -> Result<Option<Vec<u8>>> {
+    let bytes = local::read(directory, name, MAX_BYTES.min(*budget)).map_err(|_| "store_read")?;
+    *budget -= bytes.as_ref().map_or(0, Vec::len);
+    Ok(bytes)
 }
 
 pub(super) fn encode(value: &impl Serialize) -> Result<Vec<u8>> {

@@ -589,11 +589,24 @@ impl Workbench {
         }
         id
     }
+    pub(super) fn agent_views(&self, root: &str) -> impl Iterator<Item = &orchestration::RunView> {
+        let live = self.orchestration_views.get(root);
+        self.agent_history
+            .as_ref()
+            .filter(|(parent, _)| parent == root)
+            .map(|(_, views)| views)
+            .into_iter()
+            .flatten()
+            .filter(move |view| live.is_none_or(|current| view.id != current.id))
+            .chain(live)
+    }
+
     pub(super) fn agent_rows(&self) -> Vec<(String, carbon::AgentLine)> {
         let root = self.conversation_root();
-        let progress = self.orchestration_views.get(&root);
+        let progress: Vec<_> = self.agent_views(&root).collect();
         let mut candidates: Vec<_> = progress
-            .into_iter()
+            .iter()
+            .rev()
             .flat_map(|view| &view.agents)
             .map(|(id, _)| (id.clone(), Some(root.clone()), String::from("agent")))
             .collect();
@@ -656,7 +669,10 @@ impl Workbench {
                 continue;
             }
             if let Some(mut agent) = progress
-                .and_then(|view| view.agents.iter().find(|(agent, _)| agent == id))
+                .iter()
+                .rev()
+                .flat_map(|view| &view.agents)
+                .find(|(agent, _)| agent == id)
                 .map(|(_, agent)| agent.clone())
             {
                 agent.title = format!("{tree}{branch}{}", agent.title);

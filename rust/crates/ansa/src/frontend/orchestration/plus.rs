@@ -366,8 +366,14 @@ impl Phase<'_> {
 }
 
 fn phase_id(task: &Step, stage: &str, cycle: u32, attempt: u8) -> String {
-    let hash = crate::protocol::legacy_json_v1::sha256(task.id.as_bytes());
-    format!("plus-{}-{stage}-{cycle}-{attempt}", &hash[..32])
+    format!(
+        "plus-{}-{stage}-{cycle}-{attempt}",
+        phase_step_key(&task.id)
+    )
+}
+
+pub(super) fn phase_step_key(id: &str) -> String {
+    crate::protocol::legacy_json_v1::sha256(id.as_bytes())[..32].to_owned()
 }
 
 fn assignment(task: &Step, id: String, access: Access, instructions: String) -> Step {

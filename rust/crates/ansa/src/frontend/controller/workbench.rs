@@ -754,6 +754,7 @@ enum Job {
     },
     CachedSummaries {
         result: Result<Vec<SessionSummary>>,
+        agent_history: Option<(String, Vec<orchestration::RunView>)>,
     },
     File {
         token: u64,
@@ -993,6 +994,7 @@ struct Workbench {
     clarification_pending: bool,
     orchestration_progress: Option<tokio::sync::watch::Receiver<Option<orchestration::RunView>>>,
     orchestration_views: BTreeMap<String, orchestration::RunView>,
+    agent_history: Option<(String, Vec<orchestration::RunView>)>,
     orchestration_handoffs: BTreeMap<String, String>,
     orchestration_summary: BTreeMap<String, CommandId>,
     orchestration_mode: Option<OrchestrationMode>,
@@ -1119,6 +1121,7 @@ impl Workbench {
             clarification_pending: false,
             orchestration_progress: None,
             orchestration_views: BTreeMap::new(),
+            agent_history: None,
             orchestration_handoffs: BTreeMap::new(),
             orchestration_summary: BTreeMap::new(),
             orchestration_mode: None,
@@ -1186,6 +1189,7 @@ impl Workbench {
         let stop = Cancel::linked(&value.stop);
         value.jobs.spawn_blocking(move || Job::CachedSummaries {
             result: factory.summaries(&stop),
+            agent_history: None,
         });
         Ok(value)
     }
@@ -1494,15 +1498,37 @@ impl Workbench {
         {
             let factory = self.factory.clone();
             let stop = Cancel::linked(&self.stop);
-            self.jobs.spawn_blocking(move || Job::CachedSummaries {
-                result: factory.summaries(&stop),
+            let parent = self.conversation_root();
+            self.jobs.spawn_blocking(move || {
+                let result = factory.summaries(&stop);
+                let views = orchestration::archive::agent_views(
+                    &factory,
+                    &parent,
+                    result.as_deref().unwrap_or_default(),
+                    &stop,
+                );
+                Job::CachedSummaries {
+                    result,
+                    agent_history: Some((parent, views)),
+                }
             });
         }
     }
 
     fn open_agent(&mut self, id: &str) {
-        let rows = self.agent_rows();
-        let Some((_, line)) = rows.iter().find(|(key, _)| key == id) else {
+        let root = self.conversation_root();
+        let title = self
+            .agent_views(&root)
+            .flat_map(|view| &view.agents)
+            .find(|(key, _)| key == id)
+            .map(|(_, line)| line.title.clone())
+            .or_else(|| {
+                self.agent_rows()
+                    .into_iter()
+                    .find(|(key, _)| key == id)
+                    .map(|(_, line)| line.title)
+            });
+        let Some(title) = title else {
             return;
         };
         let parent = self
@@ -1516,11 +1542,11 @@ impl Workbench {
                     .find(|s| s.entry.id == id)
                     .and_then(|s| s.entry.parent.clone())
             })
-            .unwrap_or_else(|| self.conversation_root());
+            .unwrap_or(root);
         self.panel = Some(Panel::AgentTranscript(AgentReader {
             id: id.into(),
             parent,
-            title: line.title.clone(),
+            title,
             pending: false,
             requested: Some(b'r'),
             next_refresh: Instant::now(),
@@ -4066,7 +4092,15 @@ impl Workbench {
                 }
                 Err(code) => self.report(io, &format!("Could not open saved conversation: {code}")),
             },
-            Job::CachedSummaries { result } => {
+            Job::CachedSummaries {
+                result,
+                agent_history,
+            } => {
+                if let Some((parent, views)) = agent_history
+                    && parent == self.conversation_root()
+                {
+                    self.agent_history = Some((parent, views));
+                }
                 if let Ok(summaries) = result {
                     for slot in &mut self.slots {
                         if slot.title.is_none() {

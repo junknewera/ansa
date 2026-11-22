@@ -1058,15 +1058,10 @@ impl AgentRole {
 
 fn agent_art(role: AgentRole) -> (&'static str, &'static str, [&'static str; 3], &'static str) {
     match role {
-        AgentRole::Research => ("Research", MINT, [" .-. ", "(   )", " '-'\\"], "(o)\\"),
-        AgentRole::Implementation => (
-            "Implementation",
-            VIOLET,
-            [" / \\ ", "< / >", " \\ / "],
-            "</>",
-        ),
-        AgentRole::Coordinator => ("Coordinator", SKY, ["  o  ", " /|\\ ", "o o o"], "-+-"),
-        AgentRole::Review => ("Review", AMBER, ["+---+", "|+ -|", "+---+"], "[+-]"),
+        AgentRole::Research => ("Research", MINT, ["⢴⠫⡇⡯⣲", "⣏⡓⡇⡗⣺", "⠺⣬⠇⣯⠞"], "(o)\\"),
+        AgentRole::Implementation => ("Implementation", VIOLET, [" ⡠⠴⢄ ", "⡔⠁⡼⠉⢢", " ⠑⠼⠊ "], "</>"),
+        AgentRole::Coordinator => ("Coordinator", SKY, ["  ⠿  ", "⡖⠒⣿⠒⢲", "⠿ ⠿ ⠿"], "-+-"),
+        AgentRole::Review => ("Review", AMBER, ["⡏⠉⠉⠷⣄", "⡇⠐⠗ ⢸", "⣇⣀⣈⣉⣸"], "[+-]"),
     }
 }
 
@@ -1650,8 +1645,16 @@ fn inspector_rows(
             });
         }
     }
-    rows.resize(height.saturating_sub(footer + preview.len()), String::new());
+    if !preview.is_empty() {
+        while rows
+            .last()
+            .is_some_and(|line| plain(line).trim().is_empty())
+        {
+            rows.pop();
+        }
+    }
     rows.extend(preview);
+    rows.resize(height.saturating_sub(footer), String::new());
     if footer > 0 && height > 0 {
         rows.push(styled(&clipped(&panel.footer, width), MUTED, color));
     }

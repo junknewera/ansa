@@ -32,6 +32,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+pub(super) mod archive;
 mod plus;
 mod plus_review;
 pub(super) use plus_review::PLUS_REVIEW_SKILL;

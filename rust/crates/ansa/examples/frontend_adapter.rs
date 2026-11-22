@@ -600,7 +600,7 @@ fn workspace_edit(root: &Path) -> Result<i32> {
         None,
     ))
 }
-fn fixture(root: &Path, mode: &str) -> Result<i32> {
+fn fixture(root: &Path, mode: &str, session: Option<&str>) -> Result<i32> {
     ansa_linux::journal::fixture_root(root).map_err(|_| "fixture_owner")?;
     if mode == "workspace-edit" {
         return workspace_edit(root);
@@ -609,7 +609,7 @@ fn fixture(root: &Path, mode: &str) -> Result<i32> {
         return app::openrouter_carbon_fixture(root);
     }
     if mode == "siwc-carbon" {
-        return app::siwc_carbon_fixture(root);
+        return app::siwc_carbon_fixture(root, session);
     }
     let mut io = Io::open(mode != "backpressure" && mode != "large-jsonl")?;
     let hold_terminal_for_cancel = mode == "terminal" && io.raw.is_some();
@@ -868,8 +868,12 @@ fn main() {
         std::process::exit(if result.is_ok() { 0 } else { 125 });
     }
     if args.get(1).is_some_and(|v| v == "--frontend-fixture") {
-        let result = if args.len() == 4 {
-            fixture(Path::new(&args[2]), &args[3])
+        let result = if args.len() == 4 || args.len() == 5 && args[3] == "siwc-carbon" {
+            fixture(
+                Path::new(&args[2]),
+                &args[3],
+                args.get(4).map(String::as_str),
+            )
         } else {
             Err("fixture_arguments")
         };
