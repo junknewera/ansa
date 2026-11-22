@@ -33,6 +33,10 @@ jobs:
         working-directory: rust
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test the Rust workspace
+        # Ubuntu's system zshrc can prompt about runner-owned completion directories.
+        # The terminal tests supply their own interactive shell configuration.
+        env:
+          skip_global_compinit: '1'
         working-directory: rust
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
       - name: Build Carbon test adapter
