@@ -217,7 +217,7 @@ impl Default for Palette {
             foreground: Color(215, 223, 235),
             muted: Color(145, 157, 177),
             background: Color(18, 23, 27),
-            input: Color(29, 35, 39),
+            input: Color(52, 52, 52),
             selection: Color(40, 61, 51),
             success: Color(133, 220, 177),
             warning: Color(232, 189, 117),

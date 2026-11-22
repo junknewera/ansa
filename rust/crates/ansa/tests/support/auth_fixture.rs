@@ -851,6 +851,34 @@ fn case_lazy() -> Result<()> {
     ensure(
         guard.session() != original.session && s.catalogs.load(Ordering::Acquire) == 3,
         "resume_failed_revalidation",
+    )?;
+    let before = m.status()?;
+    ensure(
+        m.renew_login(
+            "different-account",
+            |url| s.browser(url),
+            &Cancel::default(),
+        ) == Err("auth_account_mismatch")
+            && m.status()?.session == before.session,
+        "renewal_replaced_another_account",
+    )?;
+    s.invalid_subject.store(true, Ordering::Release);
+    ensure(
+        m.renew_login(&before.account, |url| s.browser(url), &Cancel::default())
+            .is_err()
+            && m.status()?.session == before.session,
+        "renewal_accepted_a_different_subject",
+    )?;
+    s.invalid_subject.store(false, Ordering::Release);
+    m.renew_login(&before.account, |url| s.browser(url), &Cancel::default())?;
+    let after = m.status()?;
+    guard.check_dispatch(1, &Cancel::default())?;
+    ensure(
+        after.account == before.account
+            && after.session != before.session
+            && guard.session() == after.session
+            && s.catalogs.load(Ordering::Acquire) == 4,
+        "interactive_renewal_did_not_rebind_same_account",
     )
 }
 fn case_permission() -> Result<()> {
@@ -1307,11 +1335,21 @@ fn case_logout_crash() -> Result<()> {
 fn case_logout_marker() -> Result<()> {
     let (temp, s, m) = fresh()?;
     s.login(&m)?;
+    let account = m.status()?.account;
     crash(
         &temp.root,
         "logout-marker",
         s.now.load(Ordering::Acquire),
         6,
+    )?;
+    ensure(
+        m.renew_login(
+            &account,
+            |_| Err("fixture_browser_unexpected"),
+            &Cancel::default(),
+        ) == Err("auth_required")
+            && !m.status()?.logged_in,
+        "renewal_cleared_logout_marker",
     )?;
     ensure(
         m.login(

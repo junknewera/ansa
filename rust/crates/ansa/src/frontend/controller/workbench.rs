@@ -603,6 +603,11 @@ enum FileValue {
     Image(graphics::Image),
 }
 enum Job {
+    Login {
+        owner: String,
+        token: u64,
+        result: Result<()>,
+    },
     AgentTranscript {
         token: u64,
         result: Result<crate::frontend::sessions::AgentTranscript>,
@@ -1154,7 +1159,7 @@ impl Workbench {
     }
     fn interrupt(&mut self, io: &Io, now: Instant) -> bool {
         if matches!(self.menu, Some(Menu::DraftingPlan | Menu::Roles(_)))
-            || matches!(&self.menu, Some(Menu::Loading(title)) if title == "Orchestrate+ role models")
+            || matches!(&self.menu, Some(Menu::Loading(title)) if matches!(title.as_str(), "Orchestrate+ role models" | "ChatGPT sign-in"))
         {
             self.disarm_exit();
             self.escape(io);
@@ -2091,7 +2096,11 @@ impl Workbench {
 
     fn cycle_mode(&mut self, io: &Io) {
         let slot = &mut self.slots[self.current];
-        if !matches!(slot.kind, Kind::Main | Kind::Fork) || slot.active() {
+        if !matches!(slot.kind, Kind::Main | Kind::Fork) {
+            return;
+        }
+        if slot.active() || self.orchestration_stop.is_some() {
+            self.report(io, "Mode can change after the current request finishes");
             return;
         }
         self.refinement = None;
@@ -2123,6 +2132,35 @@ impl Workbench {
         self.report(io, mode);
     }
 
+    fn open_login(&mut self, io: &Io) -> bool {
+        if !self.factory.supports_login() {
+            self.report(io, "/login is available on the ChatGPT route");
+            return false;
+        }
+        if self.slots.iter().any(|slot| !slot.closed && slot.active())
+            || self.orchestration_stop.is_some()
+        {
+            self.report(io, "Wait for the current task to finish before signing in");
+            return false;
+        }
+        if !self.can_job(io) {
+            return false;
+        }
+        self.cancel_modal();
+        let owner = self.slots[self.current].id.clone();
+        let token = self.modal_token;
+        let stop = Cancel::linked(&self.stop);
+        self.modal_stop = Some(stop.clone());
+        self.menu = Some(Menu::Loading("ChatGPT sign-in".into()));
+        let factory = self.factory.clone();
+        self.jobs.spawn_blocking(move || Job::Login {
+            owner,
+            token,
+            result: factory.renew_login(&stop),
+        });
+        true
+    }
+
     fn start_orchestration_plan(
         &mut self,
         text: &str,
@@ -2130,6 +2168,18 @@ impl Workbench {
         repair: bool,
         io: &Io,
     ) -> bool {
+        if self.slots[self.current]
+            .state
+            .snapshot
+            .as_ref()
+            .is_some_and(|view| view.state == "paused")
+        {
+            self.report(
+                io,
+                "Use /sessions to resume the paused request or /cancel before sending a new task",
+            );
+            return false;
+        }
         if !matches!(self.slots[self.current].kind, Kind::Main | Kind::Fork) {
             self.report(io, "Open the main conversation to delegate work");
             return false;
@@ -2493,6 +2543,11 @@ impl Workbench {
             .unwrap_or((text.trim_start(), ""));
         let argument = raw_argument.trim();
         match commands::canonical(command) {
+            "/login" if argument.is_empty() => (self.open_login(io), false),
+            "/login" => {
+                self.report(io, "Use /login without arguments");
+                (false, false)
+            }
             "/terminals" => {
                 if argument.is_empty() {
                     self.open_activity();
@@ -3130,6 +3185,7 @@ impl Workbench {
                     && *token == self.modal_token
             }
             Job::Sessions { owner, token, .. }
+            | Job::Login { owner, token, .. }
             | Job::SessionSearch { owner, token, .. }
             | Job::SessionSearchSource { owner, token, .. }
             | Job::Models { owner, token, .. }
@@ -3177,6 +3233,24 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
+            Job::Login { result, .. } => {
+                self.menu = None;
+                self.modal_stop = None;
+                match result {
+                    Ok(()) => {
+                        self.models_cache = None;
+                        self.models_refreshed = None;
+                        self.report(io, "Signed in with ChatGPT");
+                    }
+                    Err("auth_browser_unavailable") => {
+                        self.report(
+                            io,
+                            "Could not open the browser · use ansa --login for the sign-in link",
+                        );
+                    }
+                    Err(code) => self.report(io, &format!("ChatGPT sign-in failed ({code})")),
+                }
+            }
             Job::AgentTranscript { token, result } => {
                 if token == self.file_token
                     && let Some(Panel::AgentTranscript(reader)) = &mut self.panel
@@ -4847,6 +4921,12 @@ impl Workbench {
                     },
                 }
             }
+            Menu::Loading(title) if title == "ChatGPT sign-in" => Popup {
+                title: title.clone(),
+                subtitle: "Continue in your browser".into(),
+                footer: "Esc or Ctrl+C cancel".into(),
+                ..Popup::default()
+            },
             Menu::Loading(title) => Popup {
                 title: title.clone(),
                 subtitle: "Loading…".into(),
@@ -5335,6 +5415,31 @@ impl Workbench {
         breadcrumb.reverse();
         let snapshot = slot.state.snapshot.as_ref();
         let generation = snapshot.map(|s| &s.generation);
+        let drafting_plan = matches!(self.menu, Some(Menu::DraftingPlan));
+        let plan_notice = if drafting_plan {
+            Some(slot.state.wait_clock.text().map_or_else(
+                || "Drafting a plan".into(),
+                |wait| format!("Drafting a plan · {wait}"),
+            ))
+        } else {
+            snapshot
+                .filter(|view| {
+                    view.state == "paused"
+                        && view
+                            .submit
+                            .as_ref()
+                            .is_some_and(|id| id.0.starts_with("draft-"))
+                })
+                .map(|view| {
+                    let error = super::diagnostics::error(&view.diagnostic);
+                    let actions = if view.resume_available {
+                        " · /sessions resume · /cancel discard"
+                    } else {
+                        " · /cancel discard"
+                    };
+                    format!("Plan paused · {error}{actions}")
+                })
+        };
         Workspace {
             breadcrumb: breadcrumb.join(" / "),
             model: if slot.kind == Kind::Console {
@@ -5365,7 +5470,8 @@ impl Workbench {
                 .map(|completion| completion.popup(completion.exact_command(&slot.state.editor))),
             animate: self.animation_enabled(),
             animation_frame: Self::animation_frame(),
-            drafting_plan: matches!(self.menu, Some(Menu::DraftingPlan)),
+            drafting_plan,
+            plan_notice,
             draft_notice: !slot.state.editor.bytes.is_empty()
                 && self.orchestration_summary.contains_key(&slot.id),
             interrupt_hint: if matches!(self.menu, Some(Menu::DraftingPlan)) {
@@ -5941,7 +6047,9 @@ pub async fn run_attached(
                     slot.refresh(io, now);
                 }
                 dirty |= slot.state.progress.tick(now);
-                if slot.state.explicit_status { dirty |= slot.state.wait_clock.tick(now); }
+                if slot.state.explicit_status || (current == index && matches!(work.menu, Some(Menu::DraftingPlan))) {
+                    dirty |= slot.state.wait_clock.tick(now);
+                }
             }
             for (id, accepted) in admissions {
                 if !accepted {

@@ -308,11 +308,12 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     assert 'get_test_value' not in visible(screen)
     answer_fg = screen.vt.attribute(answer)[0]
     user_bg = screen.vt.attribute('VISUAL_TASK', last=True)[1]
-    assert user_bg is not None and screen.vt.attribute('VISUAL_TASK', last=True)[2], 'user text lost its visual emphasis'
+    assert user_bg is not None and not screen.vt.attribute('VISUAL_TASK', last=True)[2]
     row, col = screen.vt.location('VISUAL_TASK', last=True)
     assert not screen.vt.line(row + 1) and 'PARAGRAPH' in screen.vt.line(row + 2)
-    assert all(attr[1] == user_bg for attr in screen.vt.attrs[row + 1][col - 2:col + len('VISUAL_TASK')])
-    assert screen.vt.attrs[row + 1][col + len('VISUAL_TASK')][1] is None
+    for message_row in range(row, row + 3):
+        assert all(attr[1] == user_bg for attr in screen.vt.attrs[message_row][col - 2:screen.vt.cols - 1])
+        assert screen.vt.attrs[message_row][-1][1] is None
     assert screen.vt.attrs[row + 3][col - 2][1] is None
     native_background(screen, answer)
     screen.send('VISUAL_DRAFT Ж')

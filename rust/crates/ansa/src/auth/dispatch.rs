@@ -1,7 +1,7 @@
 //! Auth guard owned by the serialized dispatch path; retains no bearer.
 use super::{
     Cancel, Result,
-    manager::{AuthManager, Status},
+    manager::{AuthManager, Lease, Status},
 };
 use crate::{
     protocol::json::Json,
@@ -141,18 +141,25 @@ impl Authorization {
             .find(|model| model.model == request.binding.requested_model)
             .and_then(|model| model.context_window)
     }
+    fn verify_session(&self, current: &Lease, resumed: bool) -> Result<()> {
+        if current.account != self.account {
+            return Err("auth_account_mismatch");
+        }
+        if current.session != self.session
+            && !resumed
+            && !self.auth.explicitly_renewed(&current.session)
+        {
+            return Err("auth_required");
+        }
+        Ok(())
+    }
     pub fn check_generation(
         &mut self,
         selection: &GenerationSelection,
         cancel: &Cancel,
     ) -> Result<()> {
         let current = self.auth.access(cancel, false)?;
-        if current.account != self.account {
-            return Err("auth_account_mismatch");
-        }
-        if current.session != self.session {
-            return Err("auth_required");
-        }
+        self.verify_session(&current, false)?;
         let models = catalog_models(&self.auth.models(cancel)?, Some(&selection.model))?;
         allowed_live(&self.auth, &models, selection)?;
         let verified = self.auth.access(cancel, false)?;
@@ -161,6 +168,10 @@ impl Authorization {
         }
         if verified.session != current.session {
             return Err("auth_required");
+        }
+        if current.session != self.session {
+            self.session = current.session;
+            self.model_checked = false;
         }
         self.models = models;
         Ok(())
@@ -204,28 +215,22 @@ impl Authorization {
     /// explicit model the next provider request selects.
     pub fn check_account(&mut self, epoch: u64, cancel: &Cancel) -> Result<()> {
         let current = self.auth.access(cancel, false)?;
-        if current.account != self.account {
-            return Err("auth_account_mismatch");
-        }
-        if epoch == self.epoch && current.session != self.session {
-            return Err("auth_required");
+        self.verify_session(&current, epoch != self.epoch)?;
+        if current.session != self.session {
+            self.session = current.session;
+            self.model_checked = false;
+            self.models.clear();
         }
         if epoch != self.epoch {
             self.model_checked = false;
         }
-        self.session = current.session;
         self.epoch = epoch;
         Ok(())
     }
     pub fn check_dispatch(&mut self, epoch: u64, cancel: &Cancel) -> Result<()> {
         let current = self.auth.access(cancel, false)?;
-        if current.account != self.account {
-            return Err("auth_account_mismatch");
-        }
-        if epoch == self.epoch && current.session != self.session {
-            return Err("auth_required");
-        }
-        if !self.model_checked || epoch != self.epoch {
+        self.verify_session(&current, epoch != self.epoch)?;
+        if !self.model_checked || epoch != self.epoch || current.session != self.session {
             let catalog = self.auth.models(cancel)?;
             let models = catalog_models(&catalog, Some(&self.model))?;
             allowed_live(

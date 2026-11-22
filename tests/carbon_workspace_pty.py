@@ -1008,7 +1008,7 @@ def completion_and_help(screen, root, cwd):
     command_rows = [match for row in range(screen.vt.rows)
                     if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
-    expected = {"/model", "/effort", "/theme", "/files", "/agents", "/sessions",
+    expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
                 "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
                 "/orchestrate", "/orchestrate+", "/terminals"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
@@ -1944,12 +1944,44 @@ def siwc_orchestration(screen, root, cwd):
           and "Tab mode" in screen.vt.line(-2), "coordinator is idle before lock test")
     paint_quiet(screen)
 
+    timed_out = "SYNTHETIC_PLAN_TIMEOUT"
+    screen.send(timed_out + "\r")
+    until(screen, lambda frame: "Plan paused" in body(screen) and "http_timeout" in frame
+          and screen.vt.line(-4) == "  › " + timed_out, "a transport timeout is visible next to the request")
+    timeout_turn, = (row["turn"] for row in records(root)
+                     if row["kind"] == "accepted" and row["text"] == timed_out)
+    assert [(row["kind"], row.get("diagnostic")) for row in records(root)
+            if row.get("turn") == timeout_turn] == [("accepted", None), ("pause", "http_timeout")]
+    screen.send(b"\x13\x03")
+    until(screen, lambda _: screen.vt.line(-4) == "  ›", "Ctrl+S cannot freeze the paused composer")
+    screen.send(b"AFTER_TIMEOUT\t")
+    until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2)
+          and screen.vt.line(-4) == "  › AFTER_TIMEOUT", "Tab after a timeout preserves typed text")
+    screen.send(b"\r")
+    until(screen, lambda _: screen.vt.line(-4) == "  › AFTER_TIMEOUT"
+          and "Plan paused" in body(screen), "Enter preserves a new draft while the prior plan can resume")
+    assert not any(row.get("text") == "AFTER_TIMEOUT" for row in records(root))
+    screen.send(b"\x03")
+    until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear the composer before a local command")
+    local(screen, "/cancel")
+    until(screen, lambda _: any(row["kind"] == "cancel" and row["turn"] == timeout_turn
+                                for row in records(root)), "discard the timed out plan explicitly")
+    local(screen, "/basic")
+    until(screen, lambda _: "Orchestrate" not in screen.vt.line(-2), "switch to work after timeout")
+    screen.send(b"AFTER_TIMEOUT\r")
+    until(screen, lambda frame: completed(root, "AFTER_TIMEOUT") and "SIWC_CARBON_DONE" in frame,
+          "the next request is sent successfully")
+    local(screen, "/orchestrate")
+    until(screen, lambda _: "Orchestrate" in screen.vt.line(-2) and "Tab mode" in screen.vt.line(-2),
+          "orchestration is idle before holding the auth lock")
+
     with (root / "home/.ansa/auth/lock").open("rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         screen.send(b"Cancel this draft\r")
         until(screen, lambda _: "Drafting a plan" in screen.vt.line(-1),
               "plan waits in the footer for the shared account lock")
-        assert "Drafting a plan" not in body(screen) and screen.vt.line(-4) == "  ›"
+        until(screen, lambda _: "Drafting a plan" in body(screen) and screen.vt.line(-4) == "  ›",
+              "planning status is also visible below the request")
         screen.send(b"\x03")
         until(screen, lambda frame: "Drafting a plan" not in frame
               and screen.vt.line(-4) == "  › Cancel this draft", "cancel keeps the pending draft")
@@ -1962,8 +1994,30 @@ def siwc_orchestration(screen, root, cwd):
         until(screen, lambda _: cancelled_draft(), "the exact pending draft was cancelled durably")
         screen.send(b"\x03")
         until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear the pending draft")
+        before_login = journals(root)
+        local(screen, "/login")
+        until(screen, lambda _: "Continue in your browser" in popup_text(screen), "in-chat sign-in starts")
+        screen.send(b"\x03")
+        until(screen, lambda frame: "ChatGPT sign-in" not in frame, "Ctrl+C cancels sign-in")
+        assert journals(root) == before_login
         local(screen, "/exit")
         assert screen.finish()["exit"] == 0, "exit waited for the locked account after cancelling"
+
+    # Remove only the seeded fixture token, then use the actual startup command
+    # with a synthetic provider that rejects OAuth discovery before opening a browser.
+    (root / "home/.ansa/auth/credentials.json").unlink()
+    before = journals(root)
+    startup = Pty(screen.child.args[0], root, root / "home", cwd, "siwc-carbon", True)
+    try:
+        startup.wait("Enter /login to open your browser, or /exit to quit.")
+        startup.send("/login\r")
+        startup.wait("ChatGPT sign-in failed (fixture_unexpected_exchange)")
+        startup.send("/exit\r")
+        result = startup.finish()
+        assert result["exit"] == 0 and result["termios_restored"] and result["flags_restored"]
+        assert journals(root) == before, "startup sign-in did not create an empty conversation"
+    finally:
+        startup.close()
     return "normal"
 
 

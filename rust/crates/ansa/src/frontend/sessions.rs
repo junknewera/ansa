@@ -404,6 +404,15 @@ impl Factory {
         }
     }
 
+    pub(super) fn supports_login(&self) -> bool {
+        self.auth.is_some()
+    }
+
+    pub(super) fn renew_login(&self, stop: &Cancel) -> Result<()> {
+        let manager = self.auth.as_ref().ok_or("auth_required")?;
+        super::app::renew_in_browser(manager, &self.account, stop)
+    }
+
     pub(super) fn require_orchestration_route(
         &self,
         source: &Request,

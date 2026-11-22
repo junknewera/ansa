@@ -617,8 +617,6 @@ fn layout_impl(
         let assistant = entry.role == "assistant";
         let queued = entry.role == "queued_user";
         let user = entry.role == "user" || queued;
-        let mut blank_rows = Vec::new();
-        let mut message_width = 0;
         let mut fence = false;
         let mut first = true;
         let mut blank = false;
@@ -693,7 +691,7 @@ fn layout_impl(
                     continue;
                 }
                 let cp = text[at..].chars().next().expect("char boundary");
-                styles.push((visible.len(), bold || heading || (user && !queued), code));
+                styles.push((visible.len(), bold || heading, code));
                 visible.push(cp);
                 at += cp.len_utf8();
             }
@@ -775,33 +773,21 @@ fn layout_impl(
                 if color {
                     line.push_str(reset);
                 }
-                let row_start = pos;
                 pos = end;
                 let space = pos < chars.len() && chars[pos].glyph.text == " ";
                 if space {
                     pos += 1;
                 }
-                if color && user && !queued {
-                    if empty {
-                        blank_rows.push(wrapped.len());
-                    } else {
-                        let width = chars[row_start..end].iter().map(|ch| ch.glyph.width).sum();
-                        message_width = message_width.max(width);
-                    }
-                }
                 wrapped.push(ChatRow {
                     text: line,
                     join: (pos < chars.len()).then_some(if space { " " } else { "" }),
-                    ..ChatRow::default()
+                    background_width: if color && user && !queued { cols } else { 0 },
                 });
                 if pos >= chars.len() {
                     break;
                 }
             }
             first = false;
-        }
-        for row in blank_rows {
-            wrapped[row].background_width = message_width;
         }
     }
     let available = max_rows - if full { 5 } else { 3 };
@@ -840,7 +826,8 @@ fn layout_impl(
     let mut lines = vec![header];
     lines.extend(wrapped[begin..end].iter().map(|line| {
         if line.background_width > 0 {
-            styled(&" ".repeat(line.background_width), USER_MESSAGE, color)
+            let padding = line.background_width.saturating_sub(cells(&line.text));
+            format!("{}{USER_MESSAGE}{}{RESET}", line.text, " ".repeat(padding))
         } else {
             line.text.clone()
         }
@@ -1108,6 +1095,7 @@ pub struct Workspace {
     pub animation_frame: u8,
     pub animate: bool,
     pub drafting_plan: bool,
+    pub plan_notice: Option<String>,
     pub draft_notice: bool,
     pub interrupt_hint: &'static str,
     pub result_selected: Option<String>,
@@ -1779,7 +1767,12 @@ pub fn layout_workspace(
     };
     let history = animate_activity(history, ui);
     let side_headings = side.is_some() && chat_height > 0;
-    let chat_rows_count = chat_height - usize::from(side_headings);
+    let plan_notice = ui
+        .plan_notice
+        .as_deref()
+        .filter(|_| !has_panel && ui.popup.is_none() && chat_height > 1);
+    let chat_rows_count =
+        chat_height - usize::from(side_headings) - usize::from(plan_notice.is_some());
     let chat = layout_impl(
         side.map_or(history.as_ref(), |side| side.parent_history.as_slice()),
         b"",
@@ -1812,6 +1805,27 @@ pub fn layout_workspace(
             0,
             ruled_title("Main conversation", chat_width - inset.len(), MINT, color),
         );
+    }
+    let mut selectable_chat_height = chat_height;
+    if let Some(notice) = plan_notice {
+        let row = if ui.reading {
+            chat_rows_count
+        } else {
+            chat.chat_rows
+                .wrapped
+                .len()
+                .saturating_sub(chat.chat_rows.first)
+                .min(chat_rows_count)
+        };
+        chat_rows.insert(
+            row,
+            styled(
+                &clipped(notice, chat_width - inset.len()),
+                if ui.drafting_plan { MUTED } else { AMBER },
+                color,
+            ),
+        );
+        selectable_chat_height = row;
     }
     for line in &mut chat_rows {
         line.insert_str(0, inset);
@@ -2169,7 +2183,7 @@ pub fn layout_workspace(
         },
         chat_bounds: (ui.popup.is_none() && side.is_none()).then_some((
             3,
-            3 + chat_height,
+            3 + selectable_chat_height,
             chat_width,
         )),
         chat_inset: inset.len(),
