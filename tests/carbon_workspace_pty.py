@@ -1294,11 +1294,13 @@ def session_agent_titles_restart(screen, root, cwd):
     assert "· Done" in visible(restarted), "restarted completed agents lost their observed status"
     assert not re.search(r"\bs_\d+_", restarted.vt.line(1)) and journals(root) == before
     escape(restarted)
-    escape(restarted)
     until(restarted, lambda frame: not agents_open(restarted) and "Agent transcript" not in frame,
           "focus returned to conversation")
     followup = "Use the previous proposed plan in this conversation"
-    restarted.send(followup + "\r")
+    restarted.send(followup)
+    until(restarted, lambda _: restarted.vt.line(-4) == "  › " + followup,
+          "complete follow-up draft after leaving the Agents pane")
+    restarted.send(b"\r")
     until(restarted, lambda frame: completed(root, followup) and ready(restarted),
           "ordinary Work turn uses the saved conversation after restart")
     accepted = [row for row in records(root) if row["kind"] == "accepted"]
@@ -1753,7 +1755,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     open_activity(screen)
     until(screen, lambda frame: all(label in frame for label in (
         "Proposed plan", "Approved plan", "0/2 steps done",
-        "Implementation · gpt-6.1-luna", "⡔⠁⡼⠉⢢", "Running",
+        "Implementation · gpt-6.1-luna", "▌ ▞ ▐", "Running",
     )),
           "worker active and historical plan links loaded before the first step")
     assert activity_body(screen).count("Proposed plan") == 1 and prompt not in activity_body(screen)
@@ -1810,7 +1812,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     escape(screen)
     until(screen, lambda _: held("whole-review") and agents_open(screen)
           and running_card("Review · gpt-6.2-sol", "PLUS_CARBON_PLAN")
-          and "⡇⠐⠗ ⢸" in visible(screen),
+          and "▌▟▖▀▜" in visible(screen),
           "already-open Activity receives the running strong reviewer", timeout=35)
     escape(screen)
     if reading(screen):

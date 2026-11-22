@@ -1058,10 +1058,10 @@ impl AgentRole {
 
 fn agent_art(role: AgentRole) -> (&'static str, &'static str, [&'static str; 3], &'static str) {
     match role {
-        AgentRole::Research => ("Research", MINT, ["⢴⠫⡇⡯⣲", "⣏⡓⡇⡗⣺", "⠺⣬⠇⣯⠞"], "(o)\\"),
-        AgentRole::Implementation => ("Implementation", VIOLET, [" ⡠⠴⢄ ", "⡔⠁⡼⠉⢢", " ⠑⠼⠊ "], "</>"),
-        AgentRole::Coordinator => ("Coordinator", SKY, ["  ⠿  ", "⡖⠒⣿⠒⢲", "⠿ ⠿ ⠿"], "-+-"),
-        AgentRole::Review => ("Review", AMBER, ["⡏⠉⠉⠷⣄", "⡇⠐⠗ ⢸", "⣇⣀⣈⣉⣸"], "[+-]"),
+        AgentRole::Research => ("Research", MINT, ["▟▜ ▛▙", "▙▜ ▛▟", "▝█ █▘"], "(o)\\"),
+        AgentRole::Implementation => ("Implementation", VIOLET, ["▗▘▗▀▖", "▌ ▞ ▐", "▝▄▘▗▘"], "</>"),
+        AgentRole::Coordinator => ("Coordinator", SKY, ["  █  ", "▐▀█▀▌", "█▌█▐█"], "-+-"),
+        AgentRole::Review => ("Review", AMBER, ["▛▀▀▚ ", "▌▟▖▀▜", "▙▄▄▄▟"], "[+-]"),
     }
 }
 
