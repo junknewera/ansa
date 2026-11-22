@@ -413,7 +413,7 @@ impl Owner {
         }
         let journal = self.journal_identity.ok_or("child_requires_journal")?;
         let mut tool_evidence = None;
-        let mut pause_diagnostic = None;
+        let mut pause = None;
         let state = match self.state.submits.get(&lookup.command.0) {
             Some(receipt) => {
                 Self::match_child_submit(receipt, lookup)?;
@@ -427,7 +427,7 @@ impl Owner {
                     })
                     .ok_or("child_attempt_not_current")?;
                 if turn.paused && !turn.diagnostic.is_empty() {
-                    pause_diagnostic = Some(turn.diagnostic.clone());
+                    pause = Some((turn.diagnostic.clone(), turn.resumes.len()));
                 }
                 let quiescent = !self.busy()
                     && self.pending_outcome.is_none()
@@ -526,7 +526,7 @@ impl Owner {
                     Activity::Finished(_) => None,
                 }),
             tool_evidence,
-            pause_diagnostic,
+            pause,
             state,
         })
     }

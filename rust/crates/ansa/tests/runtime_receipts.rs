@@ -107,9 +107,13 @@ async fn parked_plan_resumes_the_same_request_after_a_tool_budget_pause() {
     let executions = Arc::new(AtomicUsize::new(0));
     let leases = Arc::new(AtomicUsize::new(0));
     let active_leases = leases.clone();
+    let admissions = AtomicUsize::new(0);
     let options = Options {
         directory: Some(root.journal()),
         plan_guard: Some(Arc::new(move || {
+            if admissions.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err("terminal_workspace_busy");
+            }
             assert_eq!(active_leases.fetch_add(1, Ordering::SeqCst), 0);
             Ok(Box::new(Lease(active_leases.clone())))
         })),
@@ -198,6 +202,24 @@ async fn parked_plan_resumes_the_same_request_after_a_tool_budget_pause() {
     f::post(
         &handle,
         "resume-assignment-2",
+        CommandPayload::Resume(request.clone()),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    f::until(&handle, |payload| {
+        matches!(payload, EventPayload::RuntimeError { diagnostic, .. } if diagnostic == "terminal_workspace_busy")
+    })
+    .await;
+    assert_eq!(
+        parts(&root),
+        before,
+        "busy workspace advanced the paused turn"
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    f::post(
+        &handle,
+        "resume-assignment-3",
         CommandPayload::Resume(request.clone()),
         "task",
         PostStatus::Accepted,

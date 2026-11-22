@@ -221,6 +221,7 @@ impl Phase<'_> {
             if phase.child_cancelled(&id) {
                 return Err("orchestration_candidate_child_cancelled");
             }
+            let mut last_budget_resume = None;
             let status = match proof.state() {
                 ChildAttemptState::Missing => {
                     phase
@@ -233,6 +234,7 @@ impl Phase<'_> {
                     recovery_required: false,
                     ..
                 } => {
+                    last_budget_resume = proof.budget_pause_generation();
                     phase
                         .resume_child(&id, &proof, &child.runtime.handle(), now()?, self.stop)
                         .await?
@@ -289,9 +291,12 @@ impl Phase<'_> {
                         ..
                     }
                 ) {
-                    if proof.pause_diagnostic() == Some("tool_round_limit")
+                    if let Some(generation) = proof.budget_pause_generation()
+                        && last_budget_resume != Some(generation)
                         && !phase.submissions_exhausted()
                     {
+                        // An accepted Resume can fail workspace admission before it is journaled.
+                        last_budget_resume = Some(generation);
                         let status = phase
                             .resume_child(&id, &proof, &child.runtime.handle(), now()?, self.stop)
                             .await?;
