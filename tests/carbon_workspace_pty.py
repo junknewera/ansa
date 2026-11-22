@@ -149,13 +149,30 @@ def agents_open(screen):
                for line in visible(screen).splitlines())
 
 
+def reopen_agents(screen, root, cwd, parent_id):
+    local(screen, "/exit")
+    assert screen.finish()["exit"] == 0
+    binary = screen.child.args[0]
+    resumed = Pty(binary, root, root / "home", cwd, "", True, size=(140, 38),
+                  argv=["--frontend-fixture", str(root), "siwc-carbon", parent_id])
+    resumed.vt = Terminal(140, 38)
+    screen.additional_screens = [("archived-agents", resumed)]
+    until(resumed, lambda frame: "Tab mode" in frame and ready(resumed, "gpt-6.2-sol"),
+          "saved conversation restored")
+    resumed.send(b"\x14")
+    until(resumed, lambda _: agents_open(resumed), "opened saved Agents panel")
+    return resumed
+
+
 def open_helper(screen, by_mouse=False):
     local(screen, "/agents")
     until(screen, lambda frame: agents_open(screen) and helper_title(frame), "helper cards in Activity")
     if by_mouse:
         paint_quiet(screen)
         row = next(row for row in range(screen.vt.rows) if helper_title(screen.vt.line(row)))
-        click(screen, screen.vt.line(row).index("─ ") + 2, row)
+        line = screen.vt.line(row)
+        title = next(title for title in ("Найти файлы", "Проверить, достаточно") if title in line)
+        click(screen, line.index(title), row)
     else:
         paint_quiet(screen)
         screen.send(b"\t\r")
@@ -1277,11 +1294,13 @@ def session_agent_titles_restart(screen, root, cwd):
     assert "· Done" in visible(restarted), "restarted completed agents lost their observed status"
     assert not re.search(r"\bs_\d+_", restarted.vt.line(1)) and journals(root) == before
     escape(restarted)
-    escape(restarted)
     until(restarted, lambda frame: not agents_open(restarted) and "Agent transcript" not in frame,
           "focus returned to conversation")
     followup = "Use the previous proposed plan in this conversation"
-    restarted.send(followup + "\r")
+    restarted.send(followup)
+    until(restarted, lambda _: restarted.vt.line(-4) == "  › " + followup,
+          "complete follow-up draft after leaving the Agents pane")
+    restarted.send(b"\r")
     until(restarted, lambda frame: completed(root, followup) and ready(restarted),
           "ordinary Work turn uses the saved conversation after restart")
     accepted = [row for row in records(root) if row["kind"] == "accepted"]
@@ -1736,9 +1755,10 @@ def siwc_orchestrate_plus(screen, root, cwd):
     open_activity(screen)
     until(screen, lambda frame: all(label in frame for label in (
         "Proposed plan", "Approved plan", "0/2 steps done",
-        "Implementation · gpt-6.1-luna", "< / >", "Running",
+        "Implementation · gpt-6.1-luna", "Running",
     )),
           "worker active and historical plan links loaded before the first step")
+    assert "█    █    █" not in activity_body(screen), "compact panel reserves space for text"
     assert activity_body(screen).count("Proposed plan") == 1 and prompt not in activity_body(screen)
     assert prompt in body(screen) and "PLUS_CARBON_PLAN" not in body(screen)
     paint_quiet(screen)
@@ -1769,7 +1789,8 @@ def siwc_orchestrate_plus(screen, root, cwd):
     screen.wait(b"\x1b[H\x1b[2J", since=at)
     local(screen, "/agents")
     until(screen, lambda frame: agents_open(screen) and prompt in frame
-          and running_card("Implementation · gpt-6.1-luna", "Set report to after fixture"),
+          and running_card("Implementation · gpt-6.1-luna", "Set report to after fixture")
+          and "█    █    █  Implementation" in frame,
           "/agents shows running worker beside the main conversation")
     stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert stages == [*before_approval, "worker-rejected"], stages
@@ -1793,7 +1814,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     escape(screen)
     until(screen, lambda _: held("whole-review") and agents_open(screen)
           and running_card("Review · gpt-6.2-sol", "PLUS_CARBON_PLAN")
-          and "|+ -|" in visible(screen),
+          and "█ ▀█▀   ▀▀█" in visible(screen),
           "already-open Activity receives the running strong reviewer", timeout=35)
     escape(screen)
     if reading(screen):
@@ -1885,7 +1906,32 @@ def siwc_orchestrate_plus(screen, root, cwd):
             if turns:
                 reviewers.append(turns)
     assert reviewers == [["plus-review-0", "plus-review-1"]], reviewers
-    local(screen, "/exit")
+    before = journals(root)
+    archive = reopen_agents(screen, root, cwd, checkout.parent.parent.name)
+    paint_quiet(archive)
+    archive.send(b"\t")
+    until(archive, lambda _: "Tab → chat" in archive.vt.line(-2),
+          "keyboard focus moved to the archived Agents pane")
+    archive.send(b"g")
+    until(archive, lambda _: "quick / Set report to after fixture" in activity_body(archive)
+          and "3 attempts" in activity_body(archive)
+          and "└─ 03" in activity_body(archive) and "0 calls" in activity_body(archive),
+          "archive restores original step and numbered attempts")
+    assert activity_body(archive).count("Set report to after fixture") == 1
+    for _ in range(12):
+        archive.send(b"\x1b[B")
+        paint_quiet(archive)
+        if "Attempt 01" in visible(archive):
+            break
+    else:
+        raise AssertionError(("archived attempt preview", visible(archive)))
+    archive.send(b"\r")
+    until(archive, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
+          "selected archived attempt opens its original journal")
+    assert journals(root) == before
+    local(archive, "/exit")
+    archive.result = archive.finish()
+    assert archive.result["exit"] == 0
     return "normal"
 
 
@@ -2008,7 +2054,19 @@ def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
     assert stages == [
         "strong-plan", "worker-blocked", "verify-blocked", "stopped-summary", "later-work",
     ], stages
-    local(screen, "/exit")
+    if reject:
+        local(screen, "/exit")
+    else:
+        before = journals(root)
+        archive = reopen_agents(screen, root, cwd, run.parent.name)
+        until(archive, lambda _: "status /" in activity_body(archive)
+              and "Coordinator · gpt-6.1-sol" in activity_body(archive)
+              and activity_body(archive).count("× Blocked") == 2,
+              "archive uses actual blocked verdicts and role models")
+        assert journals(root) == before
+        local(archive, "/exit")
+        archive.result = archive.finish()
+        assert archive.result["exit"] == 0
     return "normal"
 
 

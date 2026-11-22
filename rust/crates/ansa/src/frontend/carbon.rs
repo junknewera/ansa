@@ -580,8 +580,8 @@ fn layout_impl(
             let lines = match entry.role.as_str() {
                 "tool_agent_attempt" => {
                     let mut prefix = String::new();
-                    if cols >= 25 {
-                        let (_, ink, avatar, _) = agent_art(agent.role);
+                    if cols >= AGENT_ICON_MIN_WIDTH {
+                        let (_, ink, avatar) = agent_art(agent.role);
                         let row = entry
                             .text
                             .rsplit_once(' ')
@@ -589,8 +589,8 @@ fn layout_impl(
                         let pixels = row
                             .and_then(|index| avatar.get(index))
                             .copied()
-                            .unwrap_or("     ");
-                        prefix.push_str(&styled(pixels, ink, color));
+                            .unwrap_or_default();
+                        prefix.push_str(&styled(&padded(pixels, AGENT_ICON_WIDTH), ink, color));
                     }
                     prefix.push_str(&styled(&format!("  {}  ", entry.text), MUTED, color));
                     let calls = agent.tool_calls.map_or_else(
@@ -1056,32 +1056,38 @@ impl AgentRole {
     }
 }
 
-fn agent_art(role: AgentRole) -> (&'static str, &'static str, [&'static str; 3], &'static str) {
+const AGENT_ICON_WIDTH: usize = 11;
+const AGENT_ICON_INSET: usize = AGENT_ICON_WIDTH + 2;
+const AGENT_ICON_MIN_WIDTH: usize = AGENT_ICON_INSET + 36;
+
+fn agent_art(role: AgentRole) -> (&'static str, &'static str, [&'static str; 3]) {
     match role {
-        AgentRole::Research => ("Research", MINT, [" .-. ", "(   )", " '-'\\"], "(o)\\"),
+        AgentRole::Research => (
+            "Research",
+            MINT,
+            [" ▄█▀█ ██▀▄", "█▀▄██ █▄█▀█", " ▀█▄█ █▄█▀"],
+        ),
         AgentRole::Implementation => (
             "Implementation",
             VIOLET,
-            [" / \\ ", "< / >", " \\ / "],
-            "</>",
+            ["  ▄▀   █ ▀▄", "█    █    █", " ▀▄ █    ▄▀"],
         ),
-        AgentRole::Coordinator => ("Coordinator", SKY, ["  o  ", " /|\\ ", "o o o"], "-+-"),
-        AgentRole::Review => ("Review", AMBER, ["+---+", "|+ -|", "+---+"], "[+-]"),
+        AgentRole::Coordinator => ("Coordinator", SKY, ["    ▀█▀", " █▀▀▀█▀▀▀█", "███ ███ ███"]),
+        AgentRole::Review => (
+            "Review",
+            AMBER,
+            ["█▀▀█▀▀▀▀█▄", "█ ▀█▀   ▀▀█", "█▄▄▄▄███▄▄█"],
+        ),
     }
 }
 
 fn agent_card(agent: &AgentLine, width: usize, color: bool, group: Option<&str>) -> Vec<String> {
-    let (role, ink, avatar, badge) = agent_art(agent.role);
-    let compact = width < 25;
-    let content = width - if compact { 0 } else { 7 };
+    let (role, ink, avatar) = agent_art(agent.role);
+    let compact = width < AGENT_ICON_MIN_WIDTH;
+    let content = width - if compact { 0 } else { AGENT_ICON_INSET };
     let title = styled(&clipped(&agent.title, content), "\x1b[1m", color);
-    let role_label = if compact && content >= cells(badge) + 2 {
-        format!("{badge} {role}")
-    } else {
-        role.to_owned()
-    };
-    let mut meta = styled(&clipped(&role_label, content), ink, color);
-    let remaining = content.saturating_sub(cells(&role_label));
+    let mut meta = styled(&clipped(role, content), ink, color);
+    let remaining = content.saturating_sub(cells(role));
     if !agent.model.is_empty() && remaining > 3 {
         let model = clipped(&agent.model, remaining - 3);
         meta.push_str(&styled(&format!(" · {model}"), MUTED, color));
@@ -1099,7 +1105,10 @@ fn agent_card(agent: &AgentLine, width: usize, color: bool, group: Option<&str>)
             return vec![if compact {
                 meta
             } else {
-                format!("{}  {meta}", styled(avatar[0], ink, color))
+                format!(
+                    "{}  {meta}",
+                    styled(&padded(avatar[0], AGENT_ICON_WIDTH), ink, color)
+                )
             }];
         }
         Some(_) => [
@@ -1119,7 +1128,12 @@ fn agent_card(agent: &AgentLine, width: usize, color: bool, group: Option<&str>)
     avatar
         .into_iter()
         .zip(lines)
-        .map(|(pixels, text)| format!("{}  {text}", styled(pixels, ink, color)))
+        .map(|(pixels, text)| {
+            format!(
+                "{}  {text}",
+                styled(&padded(pixels, AGENT_ICON_WIDTH), ink, color)
+            )
+        })
         .collect()
 }
 
@@ -1650,8 +1664,16 @@ fn inspector_rows(
             });
         }
     }
-    rows.resize(height.saturating_sub(footer + preview.len()), String::new());
+    if !preview.is_empty() {
+        while rows
+            .last()
+            .is_some_and(|line| plain(line).trim().is_empty())
+        {
+            rows.pop();
+        }
+    }
     rows.extend(preview);
+    rows.resize(height.saturating_sub(footer), String::new());
     if footer > 0 && height > 0 {
         rows.push(styled(&clipped(&panel.footer, width), MUTED, color));
     }

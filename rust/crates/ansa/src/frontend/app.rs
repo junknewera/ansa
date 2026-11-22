@@ -758,7 +758,7 @@ pub fn openrouter_carbon_fixture(root: &Path) -> Result<i32> {
 }
 
 #[cfg(feature = "frontend-test-adapter")]
-pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
+pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
     use crate::{auth::manager::HttpReply, transport::http::Head};
     use serde_json::{Value, json};
     const MODEL: &str = "gpt-6.2-sol";
@@ -779,6 +779,9 @@ pub fn siwc_carbon_fixture(root: &Path) -> Result<i32> {
             flag.into(),
             path.to_str().ok_or("fixture_workspace")?.into(),
         ]);
+    }
+    if let Some(id) = session {
+        args.extend(["--session".into(), id.into()]);
     }
     text_with_providers(
         &args,

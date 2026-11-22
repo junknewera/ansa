@@ -542,6 +542,21 @@ impl State {
 
 /// A live owner has an exclusive journal lease. Reopen does not authorize
 /// dispatch until the original child stores are reconciled from native receipts.
+/// Observations for presentation only. This value cannot dispatch or append.
+pub(crate) struct RunInspection {
+    pub(crate) plan: Plan,
+    pub(crate) context: Option<RunContext>,
+    pub(crate) children: Vec<InspectedChild>,
+}
+
+pub(crate) struct InspectedChild {
+    pub(crate) step: String,
+    pub(crate) session: String,
+    pub(crate) result: Option<ChildResult>,
+    pub(crate) tool_calls: Option<usize>,
+    pub(crate) cancelled: bool,
+}
+
 pub struct Run {
     header: Header,
     state: State,
@@ -620,13 +635,7 @@ impl Run {
 
     pub fn open(path: &Path, expected: &RunId) -> Result<Self> {
         let (journal, header, events): (_, Header, Vec<Event>) = Journal::open(path)?;
-        if &header.identity != expected {
-            return Err("run_identity");
-        }
-        let mut state = State::new(&header)?;
-        for event in events {
-            state.apply(&expected.parent_session, &event)?;
-        }
+        let state = Self::replay(&header, events, expected)?;
         Ok(Self {
             header,
             state,
@@ -634,6 +643,57 @@ impl Run {
             needs_reconciliation: true,
             storage_failed: false,
         })
+    }
+
+    pub(crate) fn inspect(
+        path: &Path,
+        expected: &RunId,
+        budget: &mut usize,
+    ) -> Result<RunInspection> {
+        let (header, events): (Header, Vec<Event>) = Journal::inspect(path, budget)?;
+        let state = Self::replay(&header, events, expected)?;
+        let children = state
+            .children
+            .into_iter()
+            .map(|(step, child)| {
+                let (result, tool_calls, cancelled) = match child.outcome {
+                    Some(Outcome::Result {
+                        value,
+                        tool_evidence,
+                        ..
+                    }) => (
+                        Some(value),
+                        tool_evidence.map(|evidence| evidence.dispatched),
+                        false,
+                    ),
+                    Some(Outcome::Cancelled) => (None, None, true),
+                    _ => (None, None, false),
+                };
+                InspectedChild {
+                    step,
+                    session: child.binding.session,
+                    result,
+                    tool_calls,
+                    cancelled,
+                }
+            })
+            .collect();
+        Ok(RunInspection {
+            plan: state.plan,
+            context: header.context,
+            children,
+        })
+    }
+
+    fn replay(header: &Header, events: Vec<Event>, expected: &RunId) -> Result<State> {
+        if &header.identity != expected {
+            return Err("run_identity");
+        }
+        let mut state = State::new(header)?;
+        for event in events {
+            state.apply(&expected.parent_session, &event)?;
+        }
+        Ok(state)
     }
 
     pub fn plan(&self) -> &Plan {
@@ -1151,6 +1211,8 @@ fn plus_reopen_preserves_completed_effects_active_task_and_saved_clarification()
         Some(context),
     )
     .unwrap();
+    let inspected = Run::inspect(&path, &identity, &mut (64 * 1024)).unwrap();
+    assert_eq!(inspected.plan, *run.plan());
     let completed = ChildResult {
         status: ChildStatus::Completed,
         summary: "Verified output".into(),

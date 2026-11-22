@@ -109,11 +109,14 @@ impl Workbench {
             return self.terminal_activity();
         }
         let rows = self.agent_rows();
-        let view = self.orchestration_views.get(&self.conversation_root());
         let mut entries = Vec::new();
         let mut grouped = std::collections::BTreeSet::new();
-        for step in view.into_iter().flat_map(|view| view.plan.steps()) {
-            let agents: Vec<_> = rows
+        for (view, step) in self
+            .agent_views(&self.conversation_root())
+            .flat_map(|view| view.plan.steps().iter().map(move |step| (view, step)))
+        {
+            let agents: Vec<_> = view
+                .agents
                 .iter()
                 .rev()
                 .map(|(_, agent)| agent)
@@ -122,7 +125,7 @@ impl Workbench {
             if agents.is_empty() {
                 continue;
             }
-            grouped.insert(step.id.as_str());
+            grouped.extend(agents.iter().map(|agent| agent.id.as_str()));
             if agents.len() == 1 {
                 entries.push(agent_entry(
                     "agent_card",
@@ -186,12 +189,7 @@ impl Workbench {
             rows.iter()
                 .rev()
                 .map(|(_, agent)| agent)
-                .filter(|agent| {
-                    !agent
-                        .step
-                        .as_deref()
-                        .is_some_and(|step| grouped.contains(step))
-                })
+                .filter(|agent| !grouped.contains(agent.id.as_str()))
                 .map(|agent| agent_entry("agent_card", String::new(), Some(agent), true)),
         );
         entries
