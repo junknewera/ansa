@@ -276,6 +276,27 @@ pub struct SavedTurn {
     pub resume_round: usize,
     pub resume_operation: usize,
 }
+impl SavedTurn {
+    /// A segment pause can admit this entire batch after Resume. The other bounds cannot.
+    pub(crate) fn tool_budget_pause(&self, batch: usize) -> Option<&'static str> {
+        if batch == 0 {
+            return None;
+        }
+        let completed = self.operation_offset + self.results.len();
+        if self.rounds >= 64 || completed + batch > 256 {
+            Some("tool_turn_limit")
+        } else if batch > self.call_limit {
+            Some("tool_batch_limit")
+        } else if self.rounds.saturating_sub(self.resume_round) >= self.round_limit
+            || completed.saturating_sub(self.resume_operation) + batch > self.call_limit
+        {
+            Some("tool_round_limit")
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ContextUsage {
     binding: Binding,
@@ -1277,21 +1298,10 @@ impl State {
                         )?;
                     }
                     let completed = current.operation_offset + current.results.len();
-                    if !response.calls().is_empty() {
-                        need(
-                            current.rounds < 64
-                                && current.rounds.saturating_sub(current.resume_round)
-                                    < current.round_limit
-                                && completed <= 256
-                                && response.calls().len() <= 256 - completed
-                                && completed.saturating_sub(current.resume_operation)
-                                    <= current.call_limit
-                                && response.calls().len()
-                                    <= current.call_limit
-                                        - completed.saturating_sub(current.resume_operation),
-                            "session_turn_limits",
-                        )?;
-                    }
+                    need(
+                        current.tool_budget_pause(response.calls().len()).is_none(),
+                        "session_turn_limits",
+                    )?;
                     if current.tools_response.is_some() {
                         need(
                             current.results.iter().all(|r| {

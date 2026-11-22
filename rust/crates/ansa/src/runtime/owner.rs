@@ -1997,17 +1997,8 @@ impl Owner {
                             self.pause("plan_mode_read_only");
                             return Ok(());
                         }
-                        let completed = current.operation_offset + current.results.len();
-                        if !response.calls().is_empty()
-                            && (current.rounds >= 64
-                                || current.rounds - current.resume_round >= current.round_limit
-                                || completed > 256
-                                || response.calls().len() > 256 - completed
-                                || completed - current.resume_operation > current.call_limit
-                                || response.calls().len()
-                                    > current.call_limit - (completed - current.resume_operation))
-                        {
-                            self.pause("tool_round_limit");
+                        if let Some(reason) = current.tool_budget_pause(response.calls().len()) {
+                            self.pause(reason);
                             return Ok(());
                         }
                         let turn = self.turn();

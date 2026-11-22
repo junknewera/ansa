@@ -152,6 +152,8 @@ fn explanation(code: &str) -> &'static str {
         "auth_required" => "Sign in again",
         "provider_policy_denied" => "Provider denied the request",
         "provider_usage_limit" => "Provider usage limit reached",
+        "tool_turn_limit" => "Tool limit for the entire turn reached",
+        "tool_batch_limit" => "Tool batch exceeds the configured per-segment allowance",
         "tool_round_limit" => "Tool budget reached",
         "siwc_structured_format_unconfirmed" => "ChatGPT did not confirm the strict plan format",
         "model_context_limit" => "The request exceeds the model's context window",
