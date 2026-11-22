@@ -15,7 +15,7 @@ pub(super) fn items(request: &Value, input: &[Value], index: usize) -> Result<Ve
             .to_string()
     };
     let text = match format {
-        Some("ansa_orchestration_plan_v4") => json!({
+        Some("ansa_orchestration_plan_v5") => json!({
             "schema_version":1, "requested_outcome":"implementation","summary":"Budget regression",
             "steps":[{"id":"edit","task":"Read and update report.txt","access":"write","paths":["report.txt"],"depends_on":[],"acceptance":"report.txt contains UPDATED"}],
             "checks":[{"path":"report.txt","contains":"UPDATED"}],"command_checks":[{"argv":["git","diff","--check"]}],"manual_checks":[],"read_folder":null

@@ -316,7 +316,10 @@ impl State {
     fn apply(&mut self, parent: &str, event: &Event) -> Result<()> {
         match event {
             Event::Approved { digest }
-                if !self.approved && !self.cancelled && digest == &self.digest =>
+                if !self.approved
+                    && !self.cancelled
+                    && !self.plan.is_plan_only()
+                    && digest == &self.digest =>
             {
                 self.approved = true;
             }
@@ -519,7 +522,10 @@ impl State {
                 report.validate()?;
                 if self.plus_active.as_ref() != Some(step)
                     || report.status == ChildStatus::Completed
-                    || !matches!(phase.as_str(), "coordinator planning" | "strong escalation")
+                    || !matches!(
+                        phase.as_str(),
+                        "coordinator planning" | "coordinator verification" | "strong escalation"
+                    )
                 {
                     return Err("run_plus_stop");
                 }

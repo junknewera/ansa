@@ -1001,7 +1001,7 @@ fn plus_fixture_response(
     };
     let mut edit = None;
     let (stage, role, text) = match format {
-        Some("ansa_orchestration_plan_v4") if implement => {
+        Some("ansa_orchestration_plan_v5") if implement => {
             let repair = request["instructions"]
                 .as_str()
                 .is_some_and(|text| text.contains("Keep requested_outcome as implementation"));
@@ -1024,7 +1024,15 @@ fn plus_fixture_response(
             }
         }
         _ if implement => return Err("fixture_dispatch_without_implementation_approval"),
-        Some("ansa_orchestration_plan_v4") if blocked => (
+        Some("ansa_orchestration_plan_v5") if task == "PLUS_PLAN_ONLY" => (
+            "plan-only", strong,
+            json!({
+                "schema_version":1,"requested_outcome":"plan_only","summary":"A tiny museum",
+                "steps":[{"id":"exhibit","task":"Put a sock on the table","access":"read","paths":[],"depends_on":[],"acceptance":"The reader has a plan"}],
+                "checks":[],"manual_checks":[],"command_checks":[],"read_folder":null
+            }).to_string(),
+        ),
+        Some("ansa_orchestration_plan_v5") if blocked => (
             "strong-plan", strong,
             json!({
                 "schema_version":1,"requested_outcome":"investigation","summary":"PLUS_BLOCKED_PLAN","steps":[
@@ -1032,7 +1040,7 @@ fn plus_fixture_response(
                 ],"checks":[],"manual_checks":[],"command_checks":[],"read_folder":null
             }).to_string(),
         ),
-        Some("ansa_orchestration_plan_v4") if !seen("SURVEY_FOR_IMPLEMENTATION") => (
+        Some("ansa_orchestration_plan_v5") if !seen("SURVEY_FOR_IMPLEMENTATION") => (
             "survey-for-implementation", strong,
             json!({
                 "schema_version":1,"requested_outcome":"implementation","summary":"SURVEY_FOR_IMPLEMENTATION","steps":[
@@ -1040,7 +1048,7 @@ fn plus_fixture_response(
                 ],"checks":[],"manual_checks":[],"command_checks":[],"read_folder":null
             }).to_string(),
         ),
-        Some("ansa_orchestration_plan_v4") => (
+        Some("ansa_orchestration_plan_v5") => (
             if model == strong.0 { "strong-plan" } else { "medium-plan" },
             if model == strong.0 { strong } else { medium },
             json!({
@@ -1085,9 +1093,7 @@ fn plus_fixture_response(
             }
         }
         Some("ansa_child_result_v1") if task.starts_with("Resolve a failed approved task") => {
-            if blocked && task.matches("Read-only Git status unavailable").count() == 3 {
-                ("escalate-blocked", strong, desired("blocked", "Approved read-only tools cannot run Git status", &["Repository status remains unverified"]))
-            } else if task.matches("WORKER_WITHOUT_EVIDENCE").count() != 3 {
+            if task.matches("WORKER_WITHOUT_EVIDENCE").count() != 3 {
                 return Err("fixture_escalation_context");
             } else if task.contains("\nTask quick\n") {
                 ("escalate-quick", strong, completed("QUICK_DECISION"))
@@ -1137,7 +1143,7 @@ fn plus_fixture_response(
         }
         None if blocked && task == "PLUS_BLOCKED_FOLLOWUP" => {
             if !input.iter().filter_map(prompt).any(|message| {
-                message.contains("Approved read-only tools cannot run Git status")
+                message.contains("Git state could not be independently verified")
                     && message.contains(r#""orchestration_outcome":"stopped""#)
             }) {
                 return Err("fixture_parent_context");
@@ -1145,9 +1151,9 @@ fn plus_fixture_response(
             ("later-work", (model, ""), "PLUS_BLOCKED_CONTEXT_RETAINED".into())
         }
         None if blocked => {
-            if !task.contains("Approved read-only tools cannot run Git status")
+            if !task.contains("Git state could not be independently verified")
                 || !task.contains(r#""orchestration_outcome":"stopped""#)
-                || !task.contains(r#""phase":"strong escalation""#)
+                || !task.contains(r#""phase":"coordinator verification""#)
                 || request["tools"].as_array().is_none_or(|tools| !tools.is_empty())
                 || task.contains("WORKER_WITHOUT_EVIDENCE")
             {

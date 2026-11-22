@@ -11,6 +11,7 @@ pub enum FinalFormat {
     OrchestrationPlanWithCommands,
     OrchestrationPlanWithReadFolder,
     OrchestrationPlanWithOutcome,
+    OrchestrationPlanWithPresentation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +31,13 @@ pub struct ChildResult {
 }
 
 impl ChildResult {
+    const EMPTY_SUMMARY: &str = "The agent returned an empty report.";
+
+    pub(crate) fn is_confirmed_blocker(&self) -> bool {
+        self.status == ChildStatus::Blocked
+            && (self.summary != Self::EMPTY_SUMMARY || !self.findings.is_empty())
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         // Account for the object, status, summary and findings array.
         if self.findings.len() > Json::FRAME_NODES - 4 {
@@ -60,7 +68,7 @@ impl ChildResult {
                 result.summary.clone_from(finding);
             } else {
                 result.status = ChildStatus::Blocked;
-                result.summary = "The agent returned an empty report.".into();
+                result.summary = Self::EMPTY_SUMMARY.into();
             }
         }
         Ok(result)
@@ -75,6 +83,7 @@ impl FinalFormat {
             Self::OrchestrationPlanWithCommands => "ansa_orchestration_plan_v2",
             Self::OrchestrationPlanWithReadFolder => "ansa_orchestration_plan_v3",
             Self::OrchestrationPlanWithOutcome => "ansa_orchestration_plan_v4",
+            Self::OrchestrationPlanWithPresentation => "ansa_orchestration_plan_v5",
         }
     }
 
@@ -85,6 +94,7 @@ impl FinalFormat {
             "ansa_orchestration_plan_v2" => Ok(Self::OrchestrationPlanWithCommands),
             "ansa_orchestration_plan_v3" => Ok(Self::OrchestrationPlanWithReadFolder),
             "ansa_orchestration_plan_v4" => Ok(Self::OrchestrationPlanWithOutcome),
+            "ansa_orchestration_plan_v5" => Ok(Self::OrchestrationPlanWithPresentation),
             _ => Err("unknown_final_format"),
         }
     }
@@ -97,7 +107,8 @@ impl FinalFormat {
             Self::OrchestrationPlan
             | Self::OrchestrationPlanWithCommands
             | Self::OrchestrationPlanWithReadFolder
-            | Self::OrchestrationPlanWithOutcome => Json::parse(
+            | Self::OrchestrationPlanWithOutcome
+            | Self::OrchestrationPlanWithPresentation => Json::parse(
                 r#"{"type":"object","properties":{"schema_version":{"type":"integer","enum":[1]},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"task":{"type":"string"},"access":{"type":"string","enum":["read","write"]},"paths":{"type":"array","items":{"type":"string"}},"depends_on":{"type":"array","items":{"type":"string"}},"acceptance":{"type":"string"}},"required":["id","task","access","paths","depends_on","acceptance"],"additionalProperties":false}},"checks":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"contains":{"type":"string"}},"required":["path","contains"],"additionalProperties":false}},"manual_checks":{"type":"array","items":{"type":"string"}}},"required":["schema_version","summary","steps","checks","manual_checks"],"additionalProperties":false}"#,
             )?,
         };
@@ -114,12 +125,13 @@ impl FinalFormat {
                 Json::parse(r#"{"type":["string","null"]}"#)?,
             )?;
         }
-        if self == Self::OrchestrationPlanWithOutcome {
-            schema = require_property(
-                schema,
-                "requested_outcome",
-                Json::parse(r#"{"type":"string","enum":["implementation","investigation"]}"#)?,
-            )?;
+        if self.has_outcome() {
+            let outcome = if self == Self::OrchestrationPlanWithPresentation {
+                r#"{"type":"string","enum":["implementation","investigation","plan_only"]}"#
+            } else {
+                r#"{"type":"string","enum":["implementation","investigation"]}"#
+            };
+            schema = require_property(schema, "requested_outcome", Json::parse(outcome)?)?;
         }
         Json::object(vec![
             ("type", Json::string("json_schema")?),
@@ -164,19 +176,31 @@ impl FinalFormat {
         } else if value.has("read_folder") {
             return Err("plan_schema_version");
         }
-        if (self == Self::OrchestrationPlanWithOutcome) != value.has("requested_outcome") {
+        if self.has_outcome() != value.has("requested_outcome") {
             return Err("plan_schema_version");
         }
-        if self == Self::OrchestrationPlanWithOutcome {
-            value.text_field("requested_outcome")?;
+        if self.has_outcome()
+            && value.text_field("requested_outcome")? == "plan_only"
+            && self != Self::OrchestrationPlanWithPresentation
+        {
+            return Err("plan_schema_version");
         }
         crate::orchestration::plan::Plan::parse(text)
+    }
+
+    pub(crate) fn has_outcome(self) -> bool {
+        matches!(
+            self,
+            Self::OrchestrationPlanWithOutcome | Self::OrchestrationPlanWithPresentation
+        )
     }
 
     pub(crate) fn has_read_folder(self) -> bool {
         matches!(
             self,
-            Self::OrchestrationPlanWithReadFolder | Self::OrchestrationPlanWithOutcome
+            Self::OrchestrationPlanWithReadFolder
+                | Self::OrchestrationPlanWithOutcome
+                | Self::OrchestrationPlanWithPresentation
         )
     }
 
@@ -186,6 +210,7 @@ impl FinalFormat {
             Self::OrchestrationPlanWithCommands
                 | Self::OrchestrationPlanWithReadFolder
                 | Self::OrchestrationPlanWithOutcome
+                | Self::OrchestrationPlanWithPresentation
         )
     }
 }

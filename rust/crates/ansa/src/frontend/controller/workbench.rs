@@ -3638,6 +3638,15 @@ impl Workbench {
                 self.menu = None;
                 match result {
                     Ok(proposal) => {
+                        if proposal.plan.is_plan_only() {
+                            let slot = &mut self.slots[self.current];
+                            slot.state.editor.clear();
+                            slot.state.input_history.reset();
+                            slot.state.status.clear();
+                            slot.show_latest();
+                            self.refinement = None;
+                            return;
+                        }
                         let blocked = proposal.plan.execution_ready().err();
                         if blocked == Some("orchestration_implementation_required")
                             && !proposal.read_only
@@ -5024,12 +5033,16 @@ impl Workbench {
                         None
                     });
                 if let Some(tab) = tab {
-                    if tab == 1 && matches!(self.panel, Some(Panel::Activity(_))) {
-                        self.activity_shell();
-                        return;
-                    }
-                    if tab == 0 && matches!(self.panel, Some(Panel::NativeTerminal { .. })) {
-                        self.return_to_activity();
+                    if matches!(
+                        self.panel,
+                        Some(Panel::Activity(_) | Panel::NativeTerminal { .. })
+                    ) {
+                        match tab {
+                            0 => self.open_agents(),
+                            1 => self.open_activity(),
+                            2 => self.activity_shell(),
+                            _ => {}
+                        }
                         return;
                     }
                     if tab == 1 && matches!(self.panel, Some(Panel::Files(_))) {
@@ -5507,7 +5520,8 @@ impl Workbench {
             Panel::Activity(navigation) => Some(self.activity_inspector(navigation)),
             Panel::NativeTerminal { view, .. } => Some(Inspector {
                 tabs: activity::tabs(),
-                selected_tab: 1,
+                selected_tab: 2,
+                kind: InspectorKind::Agents,
                 title: view
                     .as_ref()
                     .map_or_else(|| "Agent terminal".into(), |view| view.title.clone()),
@@ -5804,7 +5818,7 @@ impl Workbench {
             plan_notice,
             orchestration_notice: self
                 .orchestration_notice()
-                .map(|notice| format!("{notice} · Ctrl+T details")),
+                .map(|notice| format!("{notice} · Ctrl+T Agents")),
             draft_notice: !slot.state.editor.bytes.is_empty()
                 && (slot.pending_summary.is_some()
                     || self.orchestration_summary.contains_key(&slot.id)),
@@ -6563,7 +6577,7 @@ pub async fn run_attached(
                                     Action::HistoryOlder | Action::HistoryNewer => work.navigate(action == Action::HistoryOlder),
                                     Action::PageUp => work.page(true), Action::PageDown => work.page(false),
                                     Action::OpenFiles => { work.open_file(work.factory.settings.cwd.clone(), io); }
-                                    Action::OpenTerminals => { work.open_activity(); }
+                                    Action::OpenTerminals => { work.open_agents(); }
                                     Action::ToggleTools => { let slot = &mut work.slots[work.current]; slot.state.tools_expanded = !slot.state.tools_expanded; slot.state.reading = None; }
                                     Action::CopyHistory => work.slots[work.current].state.start_copy(io),
                                     Action::Overflow => { work.report(io, "ansa: submit_size"); work.slots[work.current].state.exit = 1; work.slots[work.current].state.editor.clear(); work.slots[work.current].state.input_history.reset(); }

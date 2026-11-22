@@ -1014,30 +1014,37 @@ impl AgentRole {
 }
 
 fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
-    let (role, ink, avatar) = match agent.role {
-        AgentRole::Research => ("Research", MINT, ["■■■", "■ ■", "■■■"]),
-        AgentRole::Implementation => ("Implementation", VIOLET, ["■ ■", "■■■", "■ ■"]),
-        AgentRole::Coordinator => ("Coordinator", SKY, [" ■ ", "■■■", " ■ "]),
-        AgentRole::Review => ("Review", AMBER, ["  ■", "■ ■", " ■ "]),
+    let (role, ink, avatar, badge) = match agent.role {
+        AgentRole::Research => ("Research", MINT, [" .-. ", "(   )", " '-'\\"], "(o)\\"),
+        AgentRole::Implementation => (
+            "Implementation",
+            VIOLET,
+            [" / \\ ", "< / >", " \\ / "],
+            "</>",
+        ),
+        AgentRole::Coordinator => ("Coordinator", SKY, ["  o  ", " /|\\ ", "o o o"], "-+-"),
+        AgentRole::Review => ("Review", AMBER, ["+---+", "|+ -|", "+---+"], "[+-]"),
     };
     let compact = width < 25;
-    let content = width - if compact { 0 } else { 5 };
+    let content = width - if compact { 0 } else { 7 };
     let title = styled(&clipped(&agent.title, content), "\x1b[1m", color);
-    let meta = if agent.model.is_empty() {
-        role.to_owned()
-    } else if width < 42 {
-        format!("{} · {role}", agent.model)
+    let role_label = if compact && content >= cells(badge) + 2 {
+        format!("{badge} {role}")
     } else {
-        format!("{role} · {}", agent.model)
+        role.to_owned()
     };
-    let meta = styled(&clipped(&meta, content), ink, color);
-    let (symbol, status_ink) = match agent.state.as_str() {
-        "Completed" => ("✓", MINT),
-        "Running" => ("●", VIOLET),
-        "Paused" => ("◷", AMBER),
-        _ => ("×", RED),
+    let mut meta = styled(&clipped(&role_label, content), ink, color);
+    let remaining = content.saturating_sub(cells(&role_label));
+    if !agent.model.is_empty() && remaining > 3 {
+        let model = clipped(&agent.model, remaining - 3);
+        meta.push_str(&styled(&format!(" · {model}"), MUTED, color));
+    }
+    let (status, status_ink) = match agent.state.as_str() {
+        "Completed" => ("· Done".into(), MUTED),
+        "Running" => ("· Running".into(), MUTED),
+        "Paused" => ("◷ Paused".into(), AMBER),
+        state => (format!("× {state}"), RED),
     };
-    let status = format!("{symbol} {}", agent.state);
     let remaining = content.saturating_sub(cells(&status));
     let mut status = styled(&clipped(&status, content), status_ink, color);
     if !agent.activity.is_empty() && remaining > 3 {
@@ -1337,7 +1344,7 @@ fn shortcuts(terminals: bool, color: bool) -> String {
     let mut text = label("Ctrl+F", "Files");
     if terminals {
         text.push_str("   ");
-        text.push_str(&label("Ctrl+T", "Terminals"));
+        text.push_str(&label("Ctrl+T", "Agents"));
     }
     text
 }

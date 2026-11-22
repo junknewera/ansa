@@ -259,7 +259,7 @@ pub fn help(selected: usize) -> Popup {
 pub(crate) fn help_with_commands(selected: usize, commands: &[Command]) -> Popup {
     Popup {
         title: "ANSA commands".into(),
-        subtitle: "Ctrl+F files · Ctrl+T terminals · Ctrl+O tool details".into(),
+        subtitle: "Ctrl+F files · Ctrl+T agents · Ctrl+O tool details".into(),
         items: commands
             .iter()
             .map(|command| Choice {

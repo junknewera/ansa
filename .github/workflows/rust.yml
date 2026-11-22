@@ -48,6 +48,7 @@ jobs:
             --binary rust/target/debug/examples/frontend_adapter \
             --case siwc-orchestrate-plus \
             --case siwc-orchestrate-plus-budget \
+            --case siwc-orchestrate-plus-plan-only \
             --case siwc-orchestrate-plus-blocked \
             --case siwc-orchestrate-plus-implement \
             --case siwc-orchestrate-plus-blocked-rejected \

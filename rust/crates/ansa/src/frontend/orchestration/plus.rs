@@ -599,6 +599,9 @@ async fn task_work(
                 )
                 .await?;
             coordinator_session = Some(verdict.session.clone());
+            if verdict.result.is_confirmed_blocker() {
+                return Err(blocked_task("coordinator verification", &verdict.result));
+            }
             if failed_evaluation(&worker.result, &verdict.result).is_none() {
                 return Ok((
                     worker,
@@ -669,6 +672,9 @@ async fn task_work(
                             .map_or(Conversation::Start, Conversation::Continue),
                     )
                     .await?;
+                if verdict.result.is_confirmed_blocker() {
+                    return Err(blocked_task("coordinator verification", &verdict.result));
+                }
                 let failure = failed_evaluation(&worker.result, &verdict.result);
                 if failure.is_none() {
                     return Ok((

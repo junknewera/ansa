@@ -13,7 +13,7 @@ pub(super) fn latest() -> GetTranscript {
 }
 
 pub(super) fn tabs() -> Vec<String> {
-    vec!["Activity".into(), "Shell".into()]
+    vec!["Agents".into(), "Activity".into(), "Shell".into()]
 }
 
 #[derive(Clone, Default)]
@@ -122,7 +122,7 @@ impl Workbench {
     }
 
     pub(super) fn activity_shell(&mut self) {
-        if matches!(&self.panel, Some(Panel::Activity(pane)) if pane.agents_only) {
+        if matches!(&self.panel, Some(Panel::NativeTerminal { .. })) {
             return;
         }
         if let Some(Panel::Activity(navigation)) = self.panel.take() {
@@ -138,6 +138,7 @@ impl Workbench {
         if navigation.agents_only {
             return Inspector {
                 title: "Agents".into(),
+                tabs: tabs(),
                 lines: vec!["No agents in this conversation".into()],
                 footer: "Click to open · Tab focus · Esc close".into(),
                 kind: InspectorKind::Agents,
@@ -163,6 +164,8 @@ impl Workbench {
         Inspector {
             title,
             tabs: tabs(),
+            selected_tab: 1,
+            kind: InspectorKind::Agents,
             lines: vec![if slot.state.snapshot.is_some() && page.is_some() {
                 "No activity in this part of the conversation".into()
             } else {
@@ -361,7 +364,7 @@ impl Workbench {
 
     pub(super) fn activity_key(&mut self, byte: u8) -> bool {
         if matches!(self.panel, Some(Panel::NativeTerminal { .. })) && byte == b'a' {
-            self.return_to_activity();
+            self.open_activity();
             return true;
         }
         if !matches!(self.panel, Some(Panel::Activity(_))) {
