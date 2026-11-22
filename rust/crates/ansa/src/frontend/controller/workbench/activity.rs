@@ -67,6 +67,7 @@ impl Workbench {
         }
         self.panel = Some(Panel::Activity(Navigation::default()));
         self.focus = Focus::Inspector;
+        self.refresh_agent_summaries();
     }
 
     pub(super) fn return_to_activity(&mut self) {
@@ -92,7 +93,7 @@ impl Workbench {
     pub(super) fn activity_inspector(&self, navigation: &Navigation) -> Inspector {
         let slot = &self.slots[self.current];
         let page = slot.activity_timeline.as_ref();
-        let entries = page.map_or_else(Vec::new, |_| self.terminal_activity());
+        let entries = self.terminal_activity();
         let title = page.filter(|page| page.end < page.total).map_or_else(
             || "Terminals".into(),
             |page| {
@@ -276,7 +277,10 @@ impl Workbench {
         {
             navigation.scroll = frame.activity_scroll;
         }
-        let previous = navigation.clone();
+        let mut previous = navigation.clone();
+        if previous.scroll == 0 && key.starts_with("agent:") {
+            previous.selected = None;
+        }
         self.activate_result(key, edit, output, io);
         match &self.panel {
             Some(Panel::Activity(_) | Panel::Output { .. }) => {}

@@ -141,11 +141,13 @@ def approve_helpers(screen, prompt):
 
 def open_helper(screen, by_mouse=False):
     local(screen, "/agents")
-    until(screen, lambda frame: "Conversation agents" in frame and helper_title(frame), "helper roster")
+    until(screen, lambda frame: activity_open(screen) and helper_title(frame), "helper cards in Activity")
     if by_mouse:
-        row = next(row for row in range(screen.vt.rows) if "└─ " in screen.vt.line(row) or "├─ " in screen.vt.line(row))
+        paint_quiet(screen)
+        row = next(row for row in range(screen.vt.rows) if helper_title(screen.vt.line(row)))
         click(screen, screen.vt.line(row).index("─ ") + 2, row)
     else:
+        paint_quiet(screen)
         screen.send(b"\r")
     until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame
           and "Синтетический результат проверки" in frame, "read completed helper in the parent session")
@@ -244,9 +246,9 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     for _ in range(8): screen.drain(.01)
     assert "Agent transcript" in visible(screen) and journals(root) == before
     escape(screen)
-    until(screen, lambda frame: "Conversation agents" in frame and ready(screen), "Esc restores roster")
+    until(screen, lambda _: activity_open(screen) and ready(screen), "Esc restores Activity")
     escape(screen)
-    until(screen, lambda frame: "Conversation agents" not in frame and ready(screen), "Esc restores parent input")
+    until(screen, lambda _: not activity_open(screen) and ready(screen), "Esc restores parent input")
 
 
 def split_source_scroll(screen, root, cwd):
@@ -1237,10 +1239,12 @@ def session_agent_titles_restart(screen, root, cwd):
     open_helper(screen)
     escape(screen)
     until(screen, lambda frame: "PARENT_TITLE" in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
-    until(screen, lambda frame: "Conversation agents" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "Esc restored roster with both completed helpers")
+    until(screen, lambda frame: activity_open(screen) and "Найти файлы" in frame
+          and "Проверить, достаточно" in frame, "Esc restored Activity with both completed helpers")
     assert not re.search(r"\bs_\d+_", screen.vt.line(1)), "agent breadcrumb displays an ID instead of a title"
     escape(screen)
-    until(screen, lambda frame: "Conversation agents" not in frame and not helper_title(screen.vt.line(1)), "agent inspector closed before session command")
+    until(screen, lambda _: not activity_open(screen) and not helper_title(screen.vt.line(1)),
+          "Activity closed before session command")
     local(screen, "/sessions")
     until(screen, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame and "PARENT_TITLE" in frame, "human-readable root session picker")
     assert not helper_title(popup_text(screen)), "agents leaked into conversation picker"
@@ -1258,12 +1262,13 @@ def session_agent_titles_restart(screen, root, cwd):
     screen.additional_screens = [("restart", restarted)]
     until(restarted, lambda frame: "PARENT_TITLE" in restarted.vt.line(1) and ready(restarted), "saved parent title restored")
     local(restarted, "/agents")
-    until(restarted, lambda frame: "Conversation agents" in frame and "Найти файлы" in frame and "Проверить, достаточно" in frame, "completed agent tree rebuilt from journals")
+    until(restarted, lambda frame: activity_open(restarted) and "Найти файлы" in frame
+          and "Проверить, достаточно" in frame, "completed agent cards rebuilt from journals")
     assert "Completed" in visible(restarted), "restarted completed agents lost their observed status"
     assert not re.search(r"\bs_\d+_", restarted.vt.line(1)) and journals(root) == before
     escape(restarted)
     escape(restarted)
-    until(restarted, lambda frame: "Conversation agents" not in frame and "Agent transcript" not in frame,
+    until(restarted, lambda frame: not activity_open(restarted) and "Agent transcript" not in frame,
           "focus returned to conversation")
     followup = "Use the previous proposed plan in this conversation"
     restarted.send(followup + "\r")
@@ -1492,10 +1497,15 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     assert not check_marker.exists()
     screen.send(b"\r")
     store = root / "home/.ansa/orchestration"
-    until(screen, lambda frame: "Agent paused" in frame and "resume with /sessions" in frame and any(
-        row["kind"] == "pause" and row.get("diagnostic") == "tool_round_limit"
-        for _, rows in reviewer_records() for row in rows),
-        "read-only reviewer paused at the tool round limit", timeout=15)
+    pause = "Orchestration paused · Tool budget reached (tool_round_limit) · /sessions for options"
+    until(screen, lambda _: pause in body(screen)
+          and "Ctrl+C stop" not in screen.vt.line(-2)
+          and any(row["kind"] == "pause" and row.get("diagnostic") == "tool_round_limit"
+                  for _, rows in reviewer_records() for row in rows),
+          "chat shows why the read-only reviewer stopped and how to resume", timeout=15)
+    open_activity(screen)
+    until(screen, lambda frame: pause in frame, "Activity also shows the paused run")
+    close_activity(screen)
     checkout, = store.glob("*/*/checkout")
     run = checkout.parent
     frozen = (run / "candidate-0").read_text()
@@ -1514,6 +1524,10 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     restarted = start(screen.child.args[0], root, root / "home", cwd,
                       argv_extra=["--session", run.parent.name])
     screen.additional_screens = [("restart", restarted)]
+    open_activity(restarted)
+    until(restarted, lambda frame: "Paused · Tool budget reached (tool_round_limit)" in frame,
+          "archived agent card shows the original cause after restart")
+    close_activity(restarted)
     local(restarted, "/sessions")
     until(restarted, lambda frame: "Resume orchestration" in frame, "saved run can resume")
     restarted.send(b"\r")
@@ -1586,7 +1600,9 @@ def openrouter_orchestration(screen, root, cwd):
     open_activity(screen)
     until(screen, lambda frame: "0/1 steps done" in frame, "read-only plan starts despite a post-report recommendation")
     close_activity(screen)
-    assert "Work plan" not in body(screen) and "0/1 steps done" not in body(screen)
+    until(screen, lambda _: "Agents · 0/1 steps done · Ctrl+T details" in body(screen),
+          "chat shows compact progress")
+    assert "OPENROUTER_CARBON_PLAN" not in body(screen)
     local(screen, "/effort low")
     until(screen, lambda frame: "Wait for orchestration to finish before switching models" in frame,
           "the orchestration generation remains fixed while a helper runs")
@@ -1596,12 +1612,15 @@ def openrouter_orchestration(screen, root, cwd):
     assert "Draft · send after the task finishes" not in visible(screen)
     open_activity(screen)
     held_child.unlink()
-    until(screen, lambda frame: "Coordinator is writing the summary" in frame
+    until(screen, lambda frame: "Writing the summary" in frame
           and "Draft · send after the task finishes" in frame, "summary phase comes from coordinator state")
     close_activity(screen)
-    assert "Coordinator is writing the summary" not in body(screen)
+    until(screen, lambda _: "Writing the summary · Ctrl+T details" in body(screen),
+          "chat shows the main agent's summary phase")
     held_summary.unlink()
-    until(screen, lambda frame: "OPENROUTER_CARBON_DONE" in frame, "coordinator summary", timeout=15)
+    until(screen, lambda frame: "OPENROUTER_CARBON_DONE" in frame
+          and "Ctrl+T details" not in frame and "(response preview)" not in frame,
+          "main agent's committed summary", timeout=15)
     assert "Approved plan" not in body(screen)
     assert "summarize fixture" in visible(screen) and "END_OF_USER_REQUEST" in visible(screen) and "keep draft" in screen.vt.line(-4)
     assert not any(row.get("text") == "keep draft" for row in records(root))
@@ -1614,6 +1633,7 @@ def openrouter_orchestration(screen, root, cwd):
     until(screen, lambda _: activity_open(screen), "approved plan returns to Activity")
     close_activity(screen)
     screen.send(b"\x03")
+    until(screen, lambda _: "keep draft" not in screen.vt.line(-4), "draft cleared")
     local(screen, "/exit")
     return "normal"
 
@@ -1688,22 +1708,26 @@ def siwc_orchestrate_plus(screen, root, cwd):
         trace = root / "plus-requests.jsonl"
         return f'"stage":"{stage}"' in trace.read_text() if trace.is_file() else False
 
-    def running_role(detail, title):
+    def running_card(detail, title):
         rows = visible(screen).splitlines()
-        return any(detail in row and title in rows[index - 1] and "Running" in rows[index - 1]
-                   for index, row in enumerate(rows) if index)
+        return any(detail in row and title in rows[index - 1] and "Running" in rows[index + 1]
+                   for index, row in enumerate(rows[1:-1], start=1))
 
     screen.send(b"\r")
-    until(screen, lambda _: held("coordinate") and body(screen).count(prompt) == 1,
-          "repaired proposal leaves one visible user request in the main conversation")
-    assert all(label not in body(screen) for label in ("Work plan", "0/2 steps done", "Coordinator · gpt-6.1-sol"))
+    until(screen, lambda _: held("coordinate") and body(screen).count(prompt) == 1
+          and "Agents · 0/2 steps done · Ctrl+T details" in body(screen),
+          "the main conversation shows one request and compact progress")
+    assert all(label not in body(screen) for label in (
+        "PLUS_CARBON_PLAN", "Coordinator · gpt-6.1-sol", "Conversation agents",
+    ))
     open_activity(screen)
     until(screen, lambda frame: all(label in frame for label in (
-        "Proposed plan", "Work plan", "□ Set report to after fixture", "0/2 steps done",
+        "Proposed plan", "Approved plan", "0/2 steps done",
         "Coordinator · gpt-6.1-sol", "Running · planning",
     )),
           "coordinator active and historical plan links loaded before the first step")
     assert body(screen).count("Proposed plan") == 1 and prompt not in body(screen)
+    assert "PLUS_CARBON_PLAN" not in body(screen)
     paint_quiet(screen)
     row = next(index for index, line in enumerate(visible(screen).splitlines())
                if "Coordinator · gpt-6.1-sol" in line)
@@ -1720,42 +1744,37 @@ def siwc_orchestrate_plus(screen, root, cwd):
     escape(screen)
     until(screen, lambda frame: activity_open(screen) and "0/2 steps done" in frame,
           "Escape restores the coordinator's live activity")
-    row = next(index for index, line in enumerate(visible(screen).splitlines())
-               if "0/2 steps done" in line)
-    click(screen, screen.vt.line(row).index("0/2 steps done"), row)
-    until(screen, lambda frame: "Conversation agents" in frame
-          and running_role("Coordinator · planning · gpt-6.1-sol", "Set report to after fixture"),
-          "clickable live activity opens the running coordinator")
-    escape(screen)
-    until(screen, lambda frame: activity_open(screen) and "Conversation agents" not in frame,
-          "Escape returns from the roster to Activity")
-    close_activity(screen)
-    local(screen, "/agents")
-    until(screen, lambda frame: "Conversation agents" in frame
-          and running_role("Coordinator · planning · gpt-6.1-sol", "Set report to after fixture"),
-          "/agents opens the same running coordinator")
+    select_result(screen, "Approved plan")
     screen.send(b"\r")
-    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
-          "Enter opens the running coordinator's transcript")
+    until(screen, lambda frame: "PLUS_CARBON_PLAN" in frame, "approved plan opens on demand")
     escape(screen)
-    until(screen, lambda frame: "Conversation agents" in frame, "Escape returns to live roster")
+    until(screen, lambda _: activity_open(screen), "Escape returns from the plan to Activity")
+    close_activity(screen)
+    at = len(screen.raw)
+    screen.resize(140, 38)
+    screen.vt = Terminal(140, 38)
+    screen.wait(b"\x1b[H\x1b[2J", since=at)
+    local(screen, "/agents")
+    until(screen, lambda frame: activity_open(screen) and "Conversation agents" not in frame
+          and running_card("Coordinator · gpt-6.1-sol", "Set report to after fixture"),
+          "/agents opens the same Activity with the running coordinator")
     holds["coordinate"].unlink()
 
-    worker = "Worker · gpt-6.1-luna"
+    worker = "Implementation · gpt-6.1-luna"
     until(screen, lambda _: held("worker-rejected")
-          and running_role(worker, "Set report to after fixture"),
-          "already-open roster receives the newly created worker")
+          and running_card(worker, "Set report to after fixture"),
+          "already-open Activity receives the newly created worker")
     row = next(index - 1 for index, line in enumerate(visible(screen).splitlines()) if worker in line)
     click(screen, screen.vt.line(row).index("Set report to after fixture"), row)
     until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
           "mouse opens the running worker's transcript")
     escape(screen)
-    until(screen, lambda frame: "Conversation agents" in frame, "Escape restores live roster")
+    until(screen, lambda _: activity_open(screen), "Escape restores live Activity")
     holds["worker-rejected"].unlink()
 
-    until(screen, lambda frame: held("whole-review") and "Conversation agents" in frame
-          and running_role("Strong reviewer · gpt-6.2-sol", "PLUS_CARBON_PLAN"),
-          "already-open roster receives the running strong reviewer", timeout=35)
+    until(screen, lambda _: held("whole-review") and activity_open(screen)
+          and running_card("Review · gpt-6.2-sol", "PLUS_CARBON_PLAN"),
+          "already-open Activity receives the running strong reviewer", timeout=35)
     escape(screen)
     if reading(screen):
         escape(screen)
@@ -1768,6 +1787,9 @@ def siwc_orchestrate_plus(screen, root, cwd):
                 and any(event["kind"] == "done" and event["turn"] in turns for event in rows))
 
     until(screen, completed_plus_synthesis, "durable Plus synthesis and idle composer", timeout=45)
+    assert all(label not in body(screen) for label in (
+        "Ctrl+T details", "Conversation agents", "Coordinator · gpt-6.1-sol",
+    ))
 
     checkout, = ledgers.glob("*/*/checkout")
     assert git("show", "ansa-result:report.txt", path=checkout) == "after fixture reviewed\n"
@@ -1781,6 +1803,10 @@ def siwc_orchestrate_plus(screen, root, cwd):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol")
           and all("Orchestrate+" not in screen.vt.line(row) for row in (0, -2)),
           "return to Work in the same conversation")
+    local(screen, "/agents")
+    until(screen, lambda frame: activity_open(screen) and "Conversation agents" not in frame
+          and "Review · gpt-6.2-sol" in frame, "Work opens the same completed agent cards")
+    close_activity(screen)
     followup = "PLUS_WORK_FOLLOWUP"
     screen.send(followup + "\r")
     until(screen, lambda frame: completed(root, followup) and "PLUS_CONTINUITY_OK" in frame,
