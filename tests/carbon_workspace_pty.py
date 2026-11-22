@@ -1755,9 +1755,10 @@ def siwc_orchestrate_plus(screen, root, cwd):
     open_activity(screen)
     until(screen, lambda frame: all(label in frame for label in (
         "Proposed plan", "Approved plan", "0/2 steps done",
-        "Implementation · gpt-6.1-luna", "▌ ▞ ▐", "Running",
+        "Implementation · gpt-6.1-luna", "Running",
     )),
           "worker active and historical plan links loaded before the first step")
+    assert "█    █    █" not in activity_body(screen), "compact panel reserves space for text"
     assert activity_body(screen).count("Proposed plan") == 1 and prompt not in activity_body(screen)
     assert prompt in body(screen) and "PLUS_CARBON_PLAN" not in body(screen)
     paint_quiet(screen)
@@ -1788,7 +1789,8 @@ def siwc_orchestrate_plus(screen, root, cwd):
     screen.wait(b"\x1b[H\x1b[2J", since=at)
     local(screen, "/agents")
     until(screen, lambda frame: agents_open(screen) and prompt in frame
-          and running_card("Implementation · gpt-6.1-luna", "Set report to after fixture"),
+          and running_card("Implementation · gpt-6.1-luna", "Set report to after fixture")
+          and "█    █    █  Implementation" in frame,
           "/agents shows running worker beside the main conversation")
     stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert stages == [*before_approval, "worker-rejected"], stages
@@ -1812,7 +1814,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     escape(screen)
     until(screen, lambda _: held("whole-review") and agents_open(screen)
           and running_card("Review · gpt-6.2-sol", "PLUS_CARBON_PLAN")
-          and "▌▟▖▀▜" in visible(screen),
+          and "█ ▀█▀   ▀▀█" in visible(screen),
           "already-open Activity receives the running strong reviewer", timeout=35)
     escape(screen)
     if reading(screen):
