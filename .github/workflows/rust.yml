@@ -13,10 +13,16 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      ANSA_ANALYSIS_PYTHON: /usr/bin/python3
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Install analysis and shell test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3-matplotlib python3-pil zsh
       - name: Install the repository toolchain
         working-directory: rust
         run: rustup show active-toolchain
@@ -28,7 +34,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test the Rust workspace
         working-directory: rust
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
       - name: Build Carbon test adapter
         working-directory: rust
         run: cargo build --locked --features frontend-test-adapter --example frontend_adapter
