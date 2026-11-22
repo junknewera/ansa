@@ -1274,7 +1274,7 @@ def session_agent_titles_restart(screen, root, cwd):
     local(restarted, "/agents")
     until(restarted, lambda frame: agents_open(restarted) and "Найти файлы" in frame
           and "Проверить, достаточно" in frame, "completed agent cards rebuilt from journals")
-    assert "Completed" in visible(restarted), "restarted completed agents lost their observed status"
+    assert "· Done" in visible(restarted), "restarted completed agents lost their observed status"
     assert not re.search(r"\bs_\d+_", restarted.vt.line(1)) and journals(root) == before
     escape(restarted)
     escape(restarted)

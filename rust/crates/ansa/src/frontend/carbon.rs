@@ -1015,7 +1015,7 @@ impl AgentRole {
 
 fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
     let (role, ink, avatar, badge) = match agent.role {
-        AgentRole::Research => ("Research", MINT, [" .-. ", "(   )", " `-'\\"], "(o)\\"),
+        AgentRole::Research => ("Research", MINT, [" .-. ", "(   )", " '-'\\"], "(o)\\"),
         AgentRole::Implementation => (
             "Implementation",
             VIOLET,
@@ -1028,29 +1028,23 @@ fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
     let compact = width < 25;
     let content = width - if compact { 0 } else { 7 };
     let title = styled(&clipped(&agent.title, content), "\x1b[1m", color);
-    let meta = if agent.model.is_empty() {
+    let role_label = if compact && content >= cells(badge) + 2 {
+        format!("{badge} {role}")
+    } else {
         role.to_owned()
-    } else if width < 42 {
-        format!("{} · {role}", agent.model)
-    } else {
-        format!("{role} · {}", agent.model)
     };
-    let meta = if compact && content >= cells(badge) + 2 {
-        format!(
-            "{} {}",
-            styled(badge, ink, color),
-            styled(&clipped(&meta, content - cells(badge) - 1), ink, color)
-        )
-    } else {
-        styled(&clipped(&meta, content), ink, color)
+    let mut meta = styled(&clipped(&role_label, content), ink, color);
+    let remaining = content.saturating_sub(cells(&role_label));
+    if !agent.model.is_empty() && remaining > 3 {
+        let model = clipped(&agent.model, remaining - 3);
+        meta.push_str(&styled(&format!(" · {model}"), MUTED, color));
+    }
+    let (status, status_ink) = match agent.state.as_str() {
+        "Completed" => ("· Done".into(), MUTED),
+        "Running" => ("· Running".into(), MUTED),
+        "Paused" => ("◷ Paused".into(), AMBER),
+        state => (format!("× {state}"), RED),
     };
-    let (symbol, status_ink) = match agent.state.as_str() {
-        "Completed" => ("✓", MINT),
-        "Running" => ("●", VIOLET),
-        "Paused" => ("◷", AMBER),
-        _ => ("×", RED),
-    };
-    let status = format!("{symbol} {}", agent.state);
     let remaining = content.saturating_sub(cells(&status));
     let mut status = styled(&clipped(&status, content), status_ink, color);
     if !agent.activity.is_empty() && remaining > 3 {
