@@ -205,7 +205,7 @@ impl ForkSeed {
                     ("state", Json::string(&entry.state)?),
                     (
                         "mode",
-                        Json::string(if entry.mode == AgentMode::Plan {
+                        Json::string(if entry.mode.read_only() {
                             "plan"
                         } else {
                             "basic"
@@ -481,7 +481,7 @@ impl State {
                 Ok::<_, &'static str>(CompletedDraft {
                     plan: response.orchestration_plan()?,
                     prompt,
-                    read_only: turn.receipt.mode == AgentMode::Plan,
+                    read_only: turn.receipt.mode.read_only(),
                     skill: draft.skill.clone(),
                     profile: draft.role_profile()?,
                 })
@@ -649,6 +649,25 @@ impl State {
                         } else {
                             "Write the answer to the user based on the completed work and the evidence provided. Summarize findings and remaining uncertainty."
                         }
+                    ),
+                    exact_state: provenance,
+                },
+                empty.advertisement().clone(),
+            )
+        } else if mode == AgentMode::OrchestrationChat {
+            let provenance = Json::object(vec![
+                ("base_epoch", Json::string(&self.epoch.id)?),
+                ("base_state", self.epoch.exact_state.clone()),
+                ("purpose", Json::string("orchestration_chat")?),
+            ])?;
+            let empty = crate::tools::registry::Registry::new().snapshot();
+            (
+                Epoch {
+                    id: sha256(provenance.dump().as_bytes()),
+                    instructions: format!(
+                        "{}\n{}",
+                        self.epoch.instructions,
+                        "You are the main agent in this conversation. Helpers are executing an already approved plan. Answer the user's question directly using the conversation. Do not claim results or progress you have not received. Use /agents for live progress and /clarify TEXT to relay an explicit instruction within the approved plan. You cannot change the plan or the assigned work from this chat."
                     ),
                     exact_state: provenance,
                 },
@@ -1085,7 +1104,7 @@ impl State {
                         == self.next_request.checked_add(1).ok_or("session_submit")?,
                 "session_submit",
             )?;
-            let mode = match if event.has("mode") {
+            let mut mode = match if event.has("mode") {
                 event.text_field("mode")?
             } else {
                 "basic"
@@ -1095,12 +1114,23 @@ impl State {
                 _ => return Err("session_mode"),
             };
             let internal = event.has("handoff");
+            if event.has("orchestration_chat") {
+                need(
+                    event.field("orchestration_chat")?.boolean()?
+                        && mode == AgentMode::Plan
+                        && !internal
+                        && !event.has("draft")
+                        && self.configuration.final_format().is_none(),
+                    "session_orchestration_chat",
+                )?;
+                mode = AgentMode::OrchestrationChat;
+            }
             if internal {
                 need(
                     event.field("handoff")?.boolean()? && mode == AgentMode::Plan,
                     "session_handoff",
                 )?;
-            } else {
+            } else if mode != AgentMode::OrchestrationChat {
                 self.user_mode = mode;
             }
             let draft = if event.has("draft") {
@@ -1502,4 +1532,66 @@ impl State {
         )?;
         Ok(Some(current.receipt.clone()))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn orchestration_chat_replays_exact_context_without_changing_mode() {
+    let tools = crate::frontend::app::pure_tools().unwrap();
+    let configuration = Request::new(
+        crate::frontend::app::binding(),
+        Epoch {
+            id: "chat-test".into(),
+            instructions: "Base instructions".into(),
+            exact_state: Json::parse("{}").unwrap(),
+        },
+        tools.advertisement().clone(),
+        vec![],
+    )
+    .unwrap();
+    let mut state = State::new(
+        "chat".into(),
+        configuration,
+        tools.read_only().advertisement().clone(),
+    );
+    state.apply(&state.initialization().unwrap()).unwrap();
+    let text = "Explain what is approved.\nWhich work can proceed?";
+    let request = state
+        .request_for(text, AgentMode::OrchestrationChat)
+        .unwrap();
+    let accepted = Json::object(vec![
+        ("kind", Json::string("accepted").unwrap()),
+        ("command", Json::string("chat-submit").unwrap()),
+        ("turn", Json::string("chat-turn").unwrap()),
+        ("request", Json::string("request_1").unwrap()),
+        ("request_number", num(1).unwrap()),
+        ("text", Json::string(text).unwrap()),
+        ("mode", Json::string("plan").unwrap()),
+        ("orchestration_chat", Json::parse("true").unwrap()),
+        ("operation_run", Json::string("run").unwrap()),
+        ("next", request.save().unwrap()),
+        ("compact", Json::parse("false").unwrap()),
+    ])
+    .unwrap();
+    let tampered = accepted
+        .with(
+            "next",
+            state
+                .request_for(text, AgentMode::Plan)
+                .unwrap()
+                .save()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(state.apply(&tampered), Err("session_request_conflict"));
+    state.apply(&accepted).unwrap();
+    let turn = state.turn.as_ref().unwrap();
+    assert_eq!(turn.receipt.mode, AgentMode::OrchestrationChat);
+    assert_eq!(state.user_mode, AgentMode::Basic);
+    assert!(turn.next.tools.descriptors.is_empty());
+    assert_eq!(
+        turn.next.input.last().unwrap().text_field("content"),
+        Ok(text)
+    );
+    assert_eq!(turn.next.save().unwrap(), request.save().unwrap());
 }

@@ -139,16 +139,21 @@ def approve_helpers(screen, prompt):
     assert "Синтетический результат проверки" not in visible(screen), "helper report shown as a chat message"
 
 
+def agents_open(screen):
+    return any(re.search(r"(?:^|│ )Agents\s*$", line)
+               for line in visible(screen).splitlines())
+
+
 def open_helper(screen, by_mouse=False):
     local(screen, "/agents")
-    until(screen, lambda frame: activity_open(screen) and helper_title(frame), "helper cards in Activity")
+    until(screen, lambda frame: agents_open(screen) and helper_title(frame), "helper cards in Activity")
     if by_mouse:
         paint_quiet(screen)
         row = next(row for row in range(screen.vt.rows) if helper_title(screen.vt.line(row)))
         click(screen, screen.vt.line(row).index("─ ") + 2, row)
     else:
         paint_quiet(screen)
-        screen.send(b"\r")
+        screen.send(b"\t\r")
     until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame
           and "Синтетический результат проверки" in frame, "read completed helper in the parent session")
 
@@ -240,15 +245,15 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     before = journals(root)
     screen.send("CHILD_DRAFT Ж")
     paint_quiet(screen)
-    assert screen.vt.line(-4) == "  ›" and "Agent transcript" in visible(screen)
+    assert screen.vt.line(-4) == "  › CHILD_DRAFT Ж" and "Agent transcript" in visible(screen)
     mouse(screen, 64, 2, 5)
     screen.send(b"\x1bg")
     for _ in range(8): screen.drain(.01)
     assert "Agent transcript" in visible(screen) and journals(root) == before
     escape(screen)
-    until(screen, lambda _: activity_open(screen) and ready(screen), "Esc restores Activity")
+    until(screen, lambda _: agents_open(screen) and ready(screen), "Esc restores the agent list")
     escape(screen)
-    until(screen, lambda _: not activity_open(screen) and ready(screen), "Esc restores parent input")
+    until(screen, lambda _: not agents_open(screen) and ready(screen), "Esc closes the agent list")
 
 
 def split_source_scroll(screen, root, cwd):
@@ -1012,7 +1017,7 @@ def completion_and_help(screen, root, cwd):
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
                 "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
-                "/orchestrate", "/orchestrate+", "/terminals", "/accept"}
+                "/orchestrate", "/orchestrate+", "/terminals", "/accept", "/clarify"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"
@@ -1239,12 +1244,12 @@ def session_agent_titles_restart(screen, root, cwd):
     open_helper(screen)
     escape(screen)
     until(screen, lambda frame: "PARENT_TITLE" in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
-    until(screen, lambda frame: activity_open(screen) and "Найти файлы" in frame
-          and "Проверить, достаточно" in frame, "Esc restored Activity with both completed helpers")
+    until(screen, lambda frame: agents_open(screen) and "Найти файлы" in frame
+          and "Проверить, достаточно" in frame, "Esc restores both completed helpers")
     assert not re.search(r"\bs_\d+_", screen.vt.line(1)), "agent breadcrumb displays an ID instead of a title"
     escape(screen)
-    until(screen, lambda _: not activity_open(screen) and not helper_title(screen.vt.line(1)),
-          "Activity closed before session command")
+    until(screen, lambda _: not agents_open(screen) and not helper_title(screen.vt.line(1)),
+          "Agent list closed before session command")
     local(screen, "/sessions")
     until(screen, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame and "PARENT_TITLE" in frame, "human-readable root session picker")
     assert not helper_title(popup_text(screen)), "agents leaked into conversation picker"
@@ -1262,13 +1267,13 @@ def session_agent_titles_restart(screen, root, cwd):
     screen.additional_screens = [("restart", restarted)]
     until(restarted, lambda frame: "PARENT_TITLE" in restarted.vt.line(1) and ready(restarted), "saved parent title restored")
     local(restarted, "/agents")
-    until(restarted, lambda frame: activity_open(restarted) and "Найти файлы" in frame
+    until(restarted, lambda frame: agents_open(restarted) and "Найти файлы" in frame
           and "Проверить, достаточно" in frame, "completed agent cards rebuilt from journals")
     assert "Completed" in visible(restarted), "restarted completed agents lost their observed status"
     assert not re.search(r"\bs_\d+_", restarted.vt.line(1)) and journals(root) == before
     escape(restarted)
     escape(restarted)
-    until(restarted, lambda frame: not activity_open(restarted) and "Agent transcript" not in frame,
+    until(restarted, lambda frame: not agents_open(restarted) and "Agent transcript" not in frame,
           "focus returned to conversation")
     followup = "Use the previous proposed plan in this conversation"
     restarted.send(followup + "\r")
@@ -1464,7 +1469,7 @@ def orchestration_candidate(screen, root, cwd):
     return "normal"
 
 
-def orchestration_review_resume(screen, root, cwd, exhausted=False):
+def orchestration_review_resume(screen, root, cwd, more_segments=False):
     def git(*args, path=cwd):
         return subprocess.check_output(["git", *args], cwd=path, text=True).strip()
 
@@ -1513,7 +1518,7 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     assert check_marker.read_text() == "x"
     (reviewer, paused), = reviewer_records()
     reads = ["ansa-candidate.diff", "approved-plan.json", "checkout/report.txt"]
-    rounds = 1 if exhausted else 2
+    rounds = 1 if more_segments else 2
     assert [row["invocation"]["arguments"]["path"] for row in paused
             if row["kind"] == "intent"] == reads[:rounds]
     assert sum(row["kind"] == "outcome" for row in paused) == rounds
@@ -1531,32 +1536,25 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     local(restarted, "/sessions")
     until(restarted, lambda frame: "Resume orchestration" in frame, "saved run can resume")
     restarted.send(b"\r")
-    if exhausted:
-        expected = "Plan stopped (run_budget)"
-        until(restarted, lambda frame: expected in frame or "run_step_unavailable" in frame,
-              "explicit reviewer resume", timeout=15)
-        assert expected in visible(restarted), visible(restarted)
+    if more_segments:
+        until(restarted, lambda _: pause in body(restarted)
+              and "Ctrl+C stop" not in restarted.vt.line(-2)
+              and any(sum(row["kind"] == "pause" for row in rows) == 2
+                      for _, rows in reviewer_records()),
+              "review reaches a second resumable segment", timeout=15)
         assert not (run / "release.json").exists()
-        assert not (run / "summary-admitted").exists()
-        assert subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/heads/ansa-result"],
-                              cwd=checkout, check=False).returncode == 1
-        before = journals(root)
         local(restarted, "/sessions")
-        until(restarted, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame,
-              "session picker after reviewer exhaustion")
-        assert "Resume orchestration" not in visible(restarted)
-        escape(restarted)
-        assert journals(root) == before, "Session picker continued an exhausted review"
-    else:
-        until(restarted, lambda _: (run / "summary-admitted").is_file(), "durable candidate acceptance", timeout=15)
-        assert "Verified changes" not in body(restarted)
-        open_activity(restarted)
-        until(restarted, lambda frame: "Independent review · passed" in frame, "resumed verification in Activity")
-        select_result(restarted, "report.txt · +1 −1")
+        until(restarted, lambda frame: "Resume orchestration" in frame, "resume the same reviewer again")
         restarted.send(b"\r")
-        until(restarted, lambda frame: "Verified changes" in frame and "after fixture review-resume" in frame, "resumed candidate diff")
-        assert git("rev-parse", "ansa-result", path=checkout) == frozen
-        assert json.loads((run / "release.json").read_text())["candidate"] == frozen
+    until(restarted, lambda _: (run / "summary-admitted").is_file(), "durable candidate acceptance", timeout=15)
+    assert "Verified changes" not in body(restarted)
+    open_activity(restarted)
+    until(restarted, lambda frame: "Independent review · passed" in frame, "resumed verification in Activity")
+    select_result(restarted, "report.txt · +1 −1")
+    restarted.send(b"\r")
+    until(restarted, lambda frame: "Verified changes" in frame and "after fixture review-resume" in frame, "resumed candidate diff")
+    assert git("rev-parse", "ansa-result", path=checkout) == frozen
+    assert json.loads((run / "release.json").read_text())["candidate"] == frozen
     assert git("rev-parse", "HEAD") == original and git("status", "--short") == previous_status
     assert report.read_text() == "before fixture review-resume\n"
     assert check_marker.read_text() == "x", "Resume repeated the required command"
@@ -1564,12 +1562,10 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     assert resumed_reviewer == reviewer and resumed[:len(paused)] == paused
     assert [row["kind"] for row in resumed[len(paused):] if row["kind"] in
             ("accepted", "resume", "cancel", "pause", "done")] == [
-        "resume", "pause" if exhausted else "done",
+        *(["resume", "pause"] if more_segments else []), "resume", "done",
     ]
-    if exhausted:
-        assert resumed[-1]["diagnostic"] == "tool_round_limit"
     assert [row["invocation"]["arguments"]["path"] for row in resumed[len(paused):]
-            if row["kind"] == "intent"] == reads[rounds:2 * rounds]
+            if row["kind"] == "intent"] == reads[rounds:]
     edit_intents = [row for row in records(root)
                     if row["kind"] == "intent" and row["invocation"]["name"] == "edit_file"]
     assert len(edit_intents) == 1, "Resume dispatched another edit"
@@ -1717,6 +1713,18 @@ def siwc_orchestrate_plus(screen, root, cwd):
     until(screen, lambda _: held("worker-rejected") and body(screen).count(prompt) == 1
           and "Agents · 0/2 steps done · Ctrl+T details" in body(screen),
           "the main conversation shows one request and compact progress")
+    def active_question(text):
+        return next((row for row in records(root)
+                     if row["kind"] == "accepted" and row["text"] == text), None)
+
+    cancelled_chat = "PLUS_CANCEL_CHAT"
+    screen.send(cancelled_chat + "\r")
+    until(screen, lambda frame: active_question(cancelled_chat) and cancelled_chat in frame,
+          "the main chat accepts a question while the worker owns the SIWC stream")
+    screen.send(b"\x03")
+    until(screen, lambda _: any(row["kind"] == "cancel" and
+          row["turn"] == active_question(cancelled_chat)["turn"] for row in records(root)),
+          "Ctrl+C cancels the waiting main turn without stopping the worker")
     assert all(label not in body(screen) for label in (
         "PLUS_CARBON_PLAN", "Implementation · gpt-6.1-luna", "Conversation agents",
     ))
@@ -1755,14 +1763,30 @@ def siwc_orchestrate_plus(screen, root, cwd):
     screen.vt = Terminal(140, 38)
     screen.wait(b"\x1b[H\x1b[2J", since=at)
     local(screen, "/agents")
-    until(screen, lambda frame: activity_open(screen) and "Conversation agents" not in frame
+    until(screen, lambda frame: agents_open(screen) and prompt in frame
           and running_card("Implementation · gpt-6.1-luna", "Set report to after fixture"),
-          "/agents opens the same Activity with the running worker")
+          "/agents shows running worker beside the main conversation")
     stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert stages == [*before_approval, "worker-rejected"], stages
+    paint_quiet(screen)
+    row = next(i for i in range(screen.vt.rows) if "Implementation · gpt-6.1-luna" in screen.vt.line(i))
+    click(screen, screen.vt.line(row).index("Implementation"), row)
+    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame
+          and "Verified dependencies" not in frame, "worker chat opens in the right panel")
+    click(screen, 4, screen.vt.rows - 4)
+    question = "PLUS_CHAT_QUESTION"
+    screen.send(question + "\r")
+    until(screen, lambda frame: active_question(question) and question in frame
+          and "Agent transcript" in frame, "the left chat accepts a question with the transcript open")
+    assert not held("active-chat"), "main chat bypassed the SIWC lease"
     holds["worker-rejected"].unlink()
-
-    until(screen, lambda _: held("whole-review") and activity_open(screen)
+    until(screen, lambda frame: "WORKER_WITHOUT_EVIDENCE" in frame,
+          "open transcript receives the completed report without refresh", timeout=15)
+    until(screen, lambda frame: completed(root, question) and "PLUS_CHAT_ANSWER" in frame,
+          "the main agent replies in the same chat after the worker's response boundary")
+    assert '"findings":' not in visible(screen)
+    escape(screen)
+    until(screen, lambda _: held("whole-review") and agents_open(screen)
           and running_card("Review · gpt-6.2-sol", "PLUS_CARBON_PLAN"),
           "already-open Activity receives the running strong reviewer", timeout=35)
     escape(screen)
@@ -1794,9 +1818,10 @@ def siwc_orchestrate_plus(screen, root, cwd):
           and all("Orchestrate+" not in screen.vt.line(row) for row in (0, -2)),
           "return to Work in the same conversation")
     local(screen, "/agents")
-    until(screen, lambda frame: activity_open(screen) and "Conversation agents" not in frame
-          and "Review · gpt-6.2-sol" in frame, "Work opens the same completed agent cards")
-    close_activity(screen)
+    until(screen, lambda frame: agents_open(screen) and "Review · gpt-6.2-sol" in frame,
+          "Work opens the same completed agent cards")
+    escape(screen)
+    until(screen, lambda _: not agents_open(screen), "close the agent list")
     followup = "PLUS_WORK_FOLLOWUP"
     screen.send(followup + "\r")
     until(screen, lambda frame: completed(root, followup) and "PLUS_CONTINUITY_OK" in frame,
@@ -1806,7 +1831,13 @@ def siwc_orchestrate_plus(screen, root, cwd):
     assert first_draft["text"] == prompt
     summary_turn, = [row for row in accepted if row.get("handoff")]
     continued, = [row for row in accepted if row["text"] == followup]
-    for row in (first_draft, repair_draft, summary_turn, continued):
+    chat_turn = active_question(question)
+    assert chat_turn["mode"] == "plan" and chat_turn["orchestration_chat"] is True
+    assert not chat_turn.get("handoff")
+    assert any(item.get("content") == question for item in chat_turn["next"]["input"])
+    assert any("PLUS_CHAT_ANSWER" in str(item.get("content")) for item in continued["next"]["input"]
+               if item.get("role") == "assistant")
+    for row in (first_draft, repair_draft, chat_turn, summary_turn, continued):
         request = row["next"]
         assert request["binding"]["requested_model"] == "gpt-6.2-sol"
         assert request["effort"] == "high"
@@ -1815,7 +1846,8 @@ def siwc_orchestrate_plus(screen, root, cwd):
                if item.get("role") == "assistant")
     trace = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert trace == [
-        "prior-work", "survey-for-implementation", "strong-plan", *["worker-rejected", "reject"] * 3,
+        "prior-work", "survey-for-implementation", "strong-plan", "worker-rejected", "active-chat",
+        "reject", *["worker-rejected", "reject"] * 2,
         "escalate-quick", "quick-fix", "quick-verify",
         *["worker-rejected", "reject"] * 3, "escalate-fresh", "fresh-coordinate",
         "fresh-worker", "fresh-verify", "whole-review", "review-coordinate",
@@ -2180,7 +2212,7 @@ def active_plan_clarification(screen, root, cwd):
 
     until(screen, lambda _: any(event.get("event") == "post" and event["step"] == "first" for event in events()), "first step running")
     clarification = "Focus the comparison on the first line"
-    screen.send(clarification + "\r")
+    screen.send("/clarify " + clarification + "\r")
     open_activity(screen)
     until(screen, lambda frame: "Coordinator receives the clarification" in frame, "clarification status in Activity")
     close_activity(screen)
@@ -2213,7 +2245,7 @@ def main():
              ("session-agent-titles-restart", session_agent_titles_restart),
              ("orchestration-candidate", orchestration_candidate),
              ("orchestration-review-resume", orchestration_review_resume),
-             ("orchestration-review-resume-exhausted", lambda *a: orchestration_review_resume(*a, True)),
+             ("orchestration-review-resume-multiple", lambda *a: orchestration_review_resume(*a, True)),
              ("active-plan-clarification", active_plan_clarification),
              ("terminal-interrupt-app-escape", terminal_interrupt_and_app_escape),
              ("terminal-eof-exit", terminal_eof_and_exit),
@@ -2278,7 +2310,7 @@ def main():
                     directory = home / ".ansa"
                     directory.mkdir(mode=0o700, exist_ok=True)
                     config = directory / "config.json"
-                    rounds = 1 if name.endswith("-exhausted") else 2
+                    rounds = 1 if name.endswith("-multiple") else 2
                     config.write_text(json.dumps({"schema_version": 1, "tool_rounds": rounds, "tool_calls": 4}))
                     config.chmod(0o600)
                 screen = start(args.binary.resolve(), root, home, cwd, {"EDITOR": str(editor_path)})

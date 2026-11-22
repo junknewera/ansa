@@ -310,15 +310,21 @@ pub fn authorized(
     auth: Arc<AuthManager>,
     model: String,
 ) -> Result<(String, Generate, RuntimeOptions)> {
-    authorized_with_cancel(auth, model, &Cancel::default())
+    authorized_in_workspace(auth, model, &Cancel::default(), Default::default(), true)
 }
 
-pub(super) fn authorized_with_cancel(
+pub(super) fn authorized_in_workspace(
     auth: Arc<AuthManager>,
     model: String,
     stop: &Cancel,
+    lane: super::sessions::SiwcLane,
+    foreground: bool,
 ) -> Result<(String, Generate, RuntimeOptions)> {
-    let guard = Authorization::new(auth.clone(), &auth.status_with_cancel(stop)?, model)?;
+    let status = {
+        let _permit = lane.enter(foreground, stop)?;
+        auth.status_with_cancel(stop)?
+    };
+    let guard = Authorization::new(auth.clone(), &status, model)?;
     let account = guard.account().to_owned();
     let guard = Arc::new(Mutex::new(guard));
     let check = guard.clone();
@@ -329,7 +335,9 @@ pub(super) fn authorized_with_cancel(
     let lease = guard;
     let generate_auth = auth.clone();
     let lease_auth = auth;
+    let generate_lane = lane.clone();
     let generate: Generate = Arc::new(move |request, cancel, preview| {
+        let _permit = generate_lane.enter(foreground, cancel)?;
         let (session, window) = {
             let provider = provider.lock().map_err(|_| "auth_state")?;
             (
@@ -359,32 +367,39 @@ pub(super) fn authorized_with_cancel(
             })
     });
     let compact_generate = generate.clone();
+    let request_lane = lane.clone();
+    let selection_lane = lane.clone();
+    let dispatch_lane = lane.clone();
     let options = RuntimeOptions {
         model_window: Arc::new(move |request| catalog.try_lock().ok()?.context_window(request)),
         check_request: Arc::new(move |request, epoch, cancel| {
+            let _permit = request_lane.enter(foreground, cancel)?;
             request_check
                 .lock()
                 .map_err(|_| "auth_state")?
                 .check_request(request, epoch, cancel)
         }),
         select_generation: Arc::new(move |value, cancel| {
+            let _permit = selection_lane.enter(foreground, cancel)?;
             selection
                 .lock()
                 .map_err(|_| "auth_state")?
                 .check_generation(value, cancel)
         }),
         check_dispatch: Arc::new(move |epoch, cancel| {
+            let _permit = dispatch_lane.enter(foreground, cancel)?;
             check
                 .lock()
                 .map_err(|_| "auth_state")?
                 .check_account(epoch, cancel)
         }),
         tool_guard: Arc::new(move |cancel| {
+            let permit = lane.enter(foreground, cancel)?;
             let session = lease.lock().map_err(|_| "auth_state")?.session().to_owned();
             let owned = lease_auth.hold_execution(&session, cancel)?;
             let stop = owned.cancel().clone();
             Ok(Lease {
-                ownership: Box::new(owned),
+                ownership: Box::new((owned, permit)),
                 stop,
             })
         }),
@@ -451,6 +466,7 @@ fn text_with_providers(
     bound.requested_model = settings.model.clone();
     bound.returned_model = settings.returned_model.clone();
     let mut workspace_auth = None;
+    let siwc_lane = super::sessions::SiwcLane::default();
     let openrouter = parsed
         .openrouter
         .then(|| load_openrouter(&parsed.auth))
@@ -470,12 +486,21 @@ fn text_with_providers(
         )
     } else {
         let auth = load_siwc(&parsed.auth)?;
-        let (account, generate, options) = match authorized(auth.clone(), settings.model.clone()) {
+        let authorize = || {
+            authorized_in_workspace(
+                auth.clone(),
+                settings.model.clone(),
+                &Cancel::default(),
+                siwc_lane.clone(),
+                true,
+            )
+        };
+        let (account, generate, options) = match authorize() {
             Err("auth_required") if interactive => {
                 if !login_at_startup(&auth)? {
                     return Ok(0);
                 }
-                authorized(auth.clone(), settings.model.clone())?
+                authorize()?
             }
             result => result?,
         };
@@ -490,7 +515,8 @@ fn text_with_providers(
         bound.account.clone(),
         workspace_auth,
     )
-    .with_carbon_frontend(interactive);
+    .with_carbon_frontend(interactive)
+    .with_siwc_lane(siwc_lane);
     factory.harness_trial = parsed.harness_trial;
     if let Some(route) = openrouter {
         factory = factory.with_openrouter(route);
@@ -1092,8 +1118,19 @@ fn plus_fixture_response(
         None if task == "PLUS_BASE_CONTEXT" => {
             ("prior-work", (model, ""), "PLUS_CONTEXT_READY".into())
         }
+        None if task == "PLUS_CHAT_QUESTION" => {
+            if !seen("PLUS_CONTEXT_READY")
+                || !seen("PLUS_CARBON_PLAN")
+                || request["tools"] != json!([])
+                || request["instructions"].as_str().is_none_or(|text| !text.contains("Answer the user's question directly"))
+            {
+                return Err("fixture_parent_context");
+            }
+            ("active-chat", strong, "PLUS_CHAT_ANSWER".into())
+        }
+        None if task == "PLUS_CANCEL_CHAT" => return Err("fixture_cancelled_chat_dispatched"),
         None if task == "PLUS_WORK_FOLLOWUP" => {
-            if !seen("PLUS_CARBON_PLAN") || !seen("PLUS_CARBON_DONE") {
+            if !seen("PLUS_CARBON_PLAN") || !seen("PLUS_CHAT_ANSWER") || !seen("PLUS_CARBON_DONE") {
                 return Err("fixture_parent_context");
             }
             ("later-work", strong, "PLUS_CONTINUITY_OK".into())

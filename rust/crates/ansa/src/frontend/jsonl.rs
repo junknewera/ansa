@@ -31,11 +31,7 @@ fn object(v: Vec<(&str, Json)>) -> Json {
     Json::object(v).expect("unique static fields")
 }
 pub fn mode(v: AgentMode) -> &'static str {
-    if v == AgentMode::Plan {
-        "plan"
-    } else {
-        "basic"
-    }
+    if v.read_only() { "plan" } else { "basic" }
 }
 pub fn execution(v: Execution) -> &'static str {
     match v {

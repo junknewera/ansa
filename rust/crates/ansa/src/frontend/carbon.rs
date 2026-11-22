@@ -947,6 +947,7 @@ pub enum Focus {
 pub enum InspectorKind {
     #[default]
     Plain,
+    Agents,
     Plan,
     Source,
     Diff,
@@ -964,6 +965,7 @@ pub struct Inspector {
     /// Index in the complete lines collection, before viewport scrolling.
     pub selected: Option<usize>,
     pub offset: usize,
+    pub follow_tail: bool,
     pub footer: String,
     pub kind: InspectorKind,
     pub activity: Option<ActivityViewport>,
@@ -1500,7 +1502,12 @@ fn inspector_rows(
             rows.push(diff_line(&text, row.kind, width, color));
         }
     } else if let Some(markdown) = document_rows.as_deref().or(panel.markdown.as_deref()) {
-        for line in markdown.iter().skip(panel.offset).take(available) {
+        let offset = if panel.follow_tail {
+            markdown.len().saturating_sub(available)
+        } else {
+            panel.offset
+        };
+        for line in markdown.iter().skip(offset).take(available) {
             let mut rendered = String::new();
             for span in &line.spans {
                 let mut style = String::new();
@@ -1669,12 +1676,16 @@ pub fn layout_workspace(
         .inspector
         .as_ref()
         .is_some_and(|panel| panel.activity.is_some());
+    let agents_panel = ui
+        .inspector
+        .as_ref()
+        .is_some_and(|p| p.kind == InspectorKind::Agents);
     let has_panel = ui.inspector.is_some() || side.is_some();
     let side_by_side = has_panel
         && !plan
-        && !activity_panel
+        && (!activity_panel || agents_panel)
         && !ui.wide_diff
-        && (width >= 100 || (picture || side.is_some()) && width >= 63);
+        && (width >= 100 || (agents_panel || picture || side.is_some()) && width >= 63);
     let panel_width = if side_by_side {
         if picture || side.is_some() {
             width / 2
@@ -1710,7 +1721,7 @@ pub fn layout_workspace(
     );
     let body_height = height.saturating_sub(7 + editor.len()).max(1);
     let stacked = has_panel && !side_by_side;
-    let chat_height = if ui.wide_diff || activity_panel {
+    let chat_height = if ui.wide_diff || activity_panel && !agents_panel {
         0
     } else if plan {
         1
@@ -1733,7 +1744,7 @@ pub fn layout_workspace(
         .as_deref()
         .map(|text| (text, if ui.drafting_plan { MUTED } else { AMBER }))
         .or_else(|| ui.orchestration_notice.as_deref().map(|text| (text, MUTED)))
-        .filter(|_| !has_panel && ui.popup.is_none() && chat_height > 1);
+        .filter(|_| (!has_panel || agents_panel) && ui.popup.is_none() && chat_height > 1);
     let chat_rows_count = chat_height - usize::from(side_headings) - usize::from(notice.is_some());
     let chat = layout_impl(
         side.map_or(history.as_ref(), |side| side.parent_history.as_slice()),

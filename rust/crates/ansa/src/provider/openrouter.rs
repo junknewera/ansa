@@ -23,7 +23,7 @@ type Result<T> = std::result::Result<T, &'static str>;
 
 pub(crate) use crate::provider::request::OPENROUTER_MODEL as MODEL;
 pub(crate) const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
-const REQUEST_TIMEOUT_MS: u64 = 60_000;
+const ROUTE_CHECK_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const ENDPOINT: &str = "fireworks/us";
 pub(crate) const PROVIDER: &str = "Fireworks";
 pub(crate) const ROLE_CATALOG: &str = "https://openrouter.ai/api/v1/models?providers=fireworks&supported_parameters=structured_outputs,tools,tool_choice";
@@ -106,7 +106,7 @@ impl OpenRouter {
     }
 
     pub(crate) fn role_models(&self, stop: &Cancel) -> Result<Vec<(String, String, Vec<String>)>> {
-        let response = self.send("GET", ROLE_CATALOG, None, 10_000, stop)?;
+        let response = self.send("GET", ROLE_CATALOG, None, Some(10_000), stop)?;
         let rows = response["data"].as_array().ok_or("openrouter_catalog")?;
         let mut models = BTreeMap::new();
         for row in rows {
@@ -164,7 +164,7 @@ impl OpenRouter {
         method: &'static str,
         url: &str,
         body: Option<Value>,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         stop: &Cancel,
     ) -> Result<Value> {
         stop.check()?;
@@ -180,7 +180,7 @@ impl OpenRouter {
                 body: Secret::new(body),
                 bearer: (url == API).then(|| self.key.clone()),
                 body_limit: 512 * 1024,
-                timeout_ms: Some(timeout_ms),
+                timeout_ms,
             },
             stop,
         )?;
@@ -241,13 +241,13 @@ impl OpenRouter {
                     .is_none_or(|retry| Instant::now() >= retry))
         {
             let timeout = if require_catalog {
-                REQUEST_TIMEOUT_MS
+                ROUTE_CHECK_TIMEOUT_MS
             } else {
                 10_000
             };
             let url = format!("https://openrouter.ai/api/v1/models/{model}/endpoints");
             let catalog = self
-                .send("GET", &url, None, timeout, stop)
+                .send("GET", &url, None, Some(timeout), stop)
                 .and_then(|response| {
                     let endpoint = catalog_endpoint(&response, model)?;
                     route.accepts_effort = endpoint["supported_parameters"]
@@ -281,7 +281,7 @@ impl OpenRouter {
             probe["model"] = json!(model);
             probe["provider"] = route_for(model);
             verify_probe_for(
-                &self.send("POST", API, Some(probe), REQUEST_TIMEOUT_MS, stop)?,
+                &self.send("POST", API, Some(probe), Some(ROUTE_CHECK_TIMEOUT_MS), stop)?,
                 model,
             )?;
             route.strict_verified = true;
@@ -327,7 +327,7 @@ impl OpenRouter {
         if request.final_format() == Some(FinalFormat::ChildResult)
             && !request.tools.descriptors.is_empty()
         {
-            let response = self.send("POST", API, Some(body.clone()), REQUEST_TIMEOUT_MS, stop)?;
+            let response = self.send("POST", API, Some(body.clone()), None, stop)?;
             if choice(&response, model)?["finish_reason"] == "tool_calls" {
                 return decode(request, &response).map(attach_context);
             }
@@ -339,7 +339,7 @@ impl OpenRouter {
                 body["tool_choice"] = json!("none");
             }
         }
-        let response = self.send("POST", API, Some(body), REQUEST_TIMEOUT_MS, stop)?;
+        let response = self.send("POST", API, Some(body), None, stop)?;
         let admitted = decode(request, &response)?;
         if request.final_format().is_some() && !admitted.calls().is_empty() {
             return Err("openrouter_final_has_tools");
@@ -634,9 +634,12 @@ mod tests {
             Arc::new(move |request: &HttpRequest, _: &Cancel| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 if request.url == CATALOG {
+                    assert_eq!(request.timeout_ms, Some(10_000));
                     return Ok(reply(json!({"error":"catalog fixture unavailable"})));
                 }
                 assert_eq!(request.url, API);
+                assert_eq!(request.timeout_ms, None);
+                assert_eq!(request.body_limit, 512 * 1024);
                 Ok(reply(response("done")))
             })
         };
@@ -665,6 +668,7 @@ mod tests {
             let data = match index {
                 0 => {
                     assert_eq!(req.url, ROLE_CATALOG);
+                    assert_eq!(req.timeout_ms, Some(10_000));
                     assert!(req.bearer.is_none());
                     json!({"data":[{"id":model, "name":"Worker", "supported_parameters":["structured_outputs","response_format","tools","tool_choice","reasoning_effort"]}]})
                 }
@@ -728,7 +732,7 @@ mod tests {
                 let call = calls.fetch_add(1, Ordering::AcqRel);
                 if call == 0 {
                     assert_eq!(request.url, CATALOG);
-                    assert_eq!(request.timeout_ms, Some(REQUEST_TIMEOUT_MS));
+                    assert_eq!(request.timeout_ms, Some(ROUTE_CHECK_TIMEOUT_MS));
                     assert!(request.bearer.is_none());
                     return Ok(reply(
                         json!({"data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"context_length":1000000,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}}),
@@ -736,6 +740,10 @@ mod tests {
                 }
                 let body: Value = serde_json::from_str(request.body.expose()).unwrap();
                 assert_eq!(body["provider"], route());
+                assert_eq!(
+                    request.timeout_ms,
+                    (call == 1).then_some(ROUTE_CHECK_TIMEOUT_MS)
+                );
                 let value = match call {
                     1 => {
                         assert_eq!(
@@ -830,6 +838,11 @@ mod tests {
                 tokens: Some(500_000)
             })
         );
+        stop.cancel();
+        assert!(matches!(
+            route.generate(&request, &stop),
+            Err("auth_cancelled")
+        ));
         assert_eq!(calls.load(Ordering::Acquire), 6);
         assert_eq!(
             verify_probe(&response(r#"{"value":"wrong","value":"schema-enforced"}"#)),

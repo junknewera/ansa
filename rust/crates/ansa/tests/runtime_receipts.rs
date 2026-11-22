@@ -566,7 +566,11 @@ async fn structured_child_result_keeps_its_schema_across_tool_replay_and_reopen(
         text: "explain the result".into(),
         mode: AgentMode::Basic,
     };
-    let final_json = r#"{"status":"completed","summary":"The report is present","findings":["Verified the fixture"]}"#;
+    let final_json = r#"{
+        "status": "completed",
+        "summary": "The report is present",
+        "findings": ["", "Verified the fixture", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+    }"#;
     let expected = config.json().unwrap().field("text").unwrap().clone();
     assert!(
         expected
@@ -666,7 +670,27 @@ async fn structured_child_result_keeps_its_schema_across_tool_replay_and_reopen(
     };
     let result = response.child_result().unwrap();
     assert_eq!(result.status, ChildStatus::Completed);
-    assert_eq!(result.findings, ["Verified the fixture"]);
+    assert_eq!(
+        result.findings,
+        [
+            "Verified the fixture",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "10"
+        ]
+    );
+    let native_items = response.items().to_vec();
+    let content = native_items[0].value().field("content").unwrap();
+    assert_eq!(
+        content.elements().unwrap()[0].text_field("text"),
+        Ok(final_json)
+    );
     f::finish(&mut runtime).await;
 
     let mut reopened = Runtime::new(
@@ -696,6 +720,7 @@ async fn structured_child_result_keeps_its_schema_across_tool_replay_and_reopen(
         panic!("structured result lost on reopen")
     };
     assert_eq!(original, request);
+    assert_eq!(response.items(), native_items.as_slice());
     assert_eq!(response.child_result(), Ok(result));
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     f::finish(&mut reopened).await;

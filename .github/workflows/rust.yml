@@ -52,3 +52,14 @@ jobs:
             --case siwc-orchestrate-plus-implement \
             --case siwc-orchestrate-plus-blocked-rejected \
             --output "${RUNNER_TEMP}/carbon-plus"
+      - name: Exercise Carbon navigation and repeated resume
+        run: |
+          python3 -B tests/carbon_workspace_pty.py \
+            --binary rust/target/debug/ansa \
+            --case mouse-history-send-child-escape \
+            --case slash-completion-help \
+            --case session-agent-titles-restart \
+            --case active-plan-clarification \
+            --case orchestration-review-resume \
+            --case orchestration-review-resume-multiple \
+            --output "${RUNNER_TEMP}/carbon-agent-navigation"

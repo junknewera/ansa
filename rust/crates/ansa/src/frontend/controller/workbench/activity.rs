@@ -20,6 +20,7 @@ pub(super) fn tabs() -> Vec<String> {
 pub(super) struct Navigation {
     scroll: usize,
     selected: Option<String>,
+    pub(super) agents_only: bool,
 }
 
 impl Slot {
@@ -44,7 +45,7 @@ impl Slot {
 
 impl Workbench {
     pub(super) fn open_activity(&mut self) {
-        if matches!(self.panel, Some(Panel::Activity(_))) {
+        if matches!(&self.panel, Some(Panel::Activity(pane)) if !pane.agents_only) {
             self.focus = Focus::Inspector;
             return;
         }
@@ -70,11 +71,48 @@ impl Workbench {
         self.refresh_agent_summaries();
     }
 
+    pub(super) fn open_agents(&mut self) {
+        self.file_token = self.file_token.wrapping_add(1);
+        self.selection = None;
+        self.tool_press = None;
+        self.wide_diff = false;
+        self.activity_back = None;
+        self.panel = Some(Panel::Activity(Navigation {
+            agents_only: true,
+            ..Navigation::default()
+        }));
+        self.focus = Focus::Chat;
+        self.refresh_agent_summaries();
+    }
+
+    fn activity_entries(&self, navigation: &Navigation) -> Vec<Entry> {
+        if !navigation.agents_only {
+            return self.terminal_activity();
+        }
+        self.agent_rows()
+            .into_iter()
+            .rev()
+            .map(|(id, agent)| Entry {
+                role: "agent_card".into(),
+                text: String::new(),
+                action: Some(format!("agent:{id}")),
+                status: None,
+                edit: None,
+                output: None,
+                agent: Some(Arc::new(agent)),
+            })
+            .collect()
+    }
+
     pub(super) fn return_to_activity(&mut self) {
         if let Some(navigation) = self.activity_back.take() {
             self.file_token = self.file_token.wrapping_add(1);
+            self.focus = if navigation.agents_only {
+                Focus::Chat
+            } else {
+                Focus::Inspector
+            };
             self.panel = Some(Panel::Activity(navigation));
-            self.focus = Focus::Inspector;
             self.selection = None;
             self.tool_press = None;
             self.wide_diff = false;
@@ -84,6 +122,9 @@ impl Workbench {
     }
 
     pub(super) fn activity_shell(&mut self) {
+        if matches!(&self.panel, Some(Panel::Activity(pane)) if pane.agents_only) {
+            return;
+        }
         if let Some(Panel::Activity(navigation)) = self.panel.take() {
             self.activity_back = Some(navigation);
             self.inspect_terminal("");
@@ -93,7 +134,21 @@ impl Workbench {
     pub(super) fn activity_inspector(&self, navigation: &Navigation) -> Inspector {
         let slot = &self.slots[self.current];
         let page = slot.activity_timeline.as_ref();
-        let entries = self.terminal_activity();
+        let entries = self.activity_entries(navigation);
+        if navigation.agents_only {
+            return Inspector {
+                title: "Agents".into(),
+                lines: vec!["No agents in this conversation".into()],
+                footer: "Click to open · Tab focus · Esc close".into(),
+                kind: InspectorKind::Agents,
+                activity: Some(carbon::ActivityViewport {
+                    entries,
+                    scroll: navigation.scroll,
+                    selected: navigation.selected.clone(),
+                }),
+                ..Inspector::default()
+            };
+        }
         let title = page.filter(|page| page.end < page.total).map_or_else(
             || "Terminals".into(),
             |page| {
@@ -135,6 +190,14 @@ impl Workbench {
             .as_ref()
             .and_then(|frame| frame.activity.as_ref())
             .map_or((0, 0), |frame| (frame.scroll_limit, frame.activity_scroll));
+        if navigation.agents_only {
+            navigation.scroll = if older {
+                scroll.saturating_add(step).min(limit)
+            } else {
+                scroll.saturating_sub(step)
+            };
+            return;
+        }
         let slot = &mut self.slots[self.current];
         if let Some(page) = &slot.activity_timeline
             && page.query != slot.activity_query
@@ -172,6 +235,9 @@ impl Workbench {
     }
 
     pub(super) fn select_activity(&mut self, older: bool) {
+        let Some(Panel::Activity(pane)) = &self.panel else {
+            return;
+        };
         let frame = self
             .displayed
             .as_ref()
@@ -181,7 +247,7 @@ impl Workbench {
             &frame.activity_keys
         } else {
             pending = self
-                .terminal_activity()
+                .activity_entries(pane)
                 .into_iter()
                 .filter_map(|entry| entry.action)
                 .collect::<Vec<_>>();
@@ -228,7 +294,7 @@ impl Workbench {
                     .map(|(_, key)| (key.clone(), frame.edit_view(key), frame.output_view(key)))
             })
             .or_else(|| {
-                self.terminal_activity()
+                self.activity_entries(navigation)
                     .into_iter()
                     .rev()
                     .find_map(|entry| {
@@ -281,7 +347,11 @@ impl Workbench {
         if previous.scroll == 0 && key.starts_with("agent:") {
             previous.selected = None;
         }
+        let agents_only = previous.agents_only;
         self.activate_result(key, edit, output, io);
+        if agents_only && matches!(self.panel, Some(Panel::AgentTranscript(_))) {
+            self.focus = Focus::Chat;
+        }
         match &self.panel {
             Some(Panel::Activity(_) | Panel::Output { .. }) => {}
             Some(_) => self.activity_back = Some(previous),
@@ -306,7 +376,7 @@ impl Workbench {
                 };
                 navigation.selected = None;
                 navigation.scroll = if byte == b'g' { usize::MAX } else { 0 };
-                if byte == b'G' {
+                if byte == b'G' && !navigation.agents_only {
                     self.slots[self.current].activity_query = latest();
                 }
             }

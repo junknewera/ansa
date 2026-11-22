@@ -3,7 +3,6 @@ use crate::{protocol::json::Json, provider::native::NativeItem};
 use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, &'static str>;
-const MAX_FINDINGS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalFormat {
@@ -32,13 +31,39 @@ pub struct ChildResult {
 
 impl ChildResult {
     pub(crate) fn validate(&self) -> Result<()> {
-        if !valid_text(&self.summary)
-            || self.findings.len() > MAX_FINDINGS
-            || self.findings.iter().any(|finding| !valid_text(finding))
-        {
-            return Err("child_result_limit");
+        // Account for the object, status, summary and findings array.
+        if self.findings.len() > Json::FRAME_NODES - 4 {
+            return Err("child_result_node_limit");
+        }
+        if !valid_text(&self.summary) || self.findings.iter().any(|finding| !valid_text(finding)) {
+            return Err("child_result_text");
         }
         Ok(())
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        // The native message stores this JSON as a string, so its own frame
+        // does not account for the nodes inside the structured result.
+        Json::parse(text).map_err(|error| match error {
+            "json_byte_limit" => "child_result_byte_limit",
+            "json_structure_limit" => "child_result_node_limit",
+            _ => "child_result_schema",
+        })?;
+        let mut result: Self = serde_json::from_str(text).map_err(|_| "child_result_schema")?;
+        normalize_text(&mut result.summary);
+        result.findings.retain_mut(|finding| {
+            normalize_text(finding);
+            !finding.trim().is_empty()
+        });
+        if result.summary.trim().is_empty() {
+            if let Some(finding) = result.findings.first() {
+                result.summary.clone_from(finding);
+            } else {
+                result.status = ChildStatus::Blocked;
+                result.summary = "The agent returned an empty report.".into();
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -115,10 +140,7 @@ impl FinalFormat {
         if self != Self::ChildResult {
             return Err("child_result_format_required");
         }
-        let parsed: ChildResult =
-            serde_json::from_str(terminal_text(items)?).map_err(|_| "child_result_schema")?;
-        parsed.validate()?;
-        Ok(parsed)
+        ChildResult::parse(terminal_text(items)?)
     }
 
     pub(super) fn plan(self, items: &[NativeItem]) -> Result<crate::orchestration::plan::Plan> {
@@ -216,8 +238,62 @@ pub(super) fn reject_refusal(items: &[NativeItem]) -> Result<()> {
 }
 
 fn valid_text(text: &str) -> bool {
-    !text.trim().is_empty()
-        && text
-            .chars()
-            .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+    !text.trim().is_empty() && !text.contains(disallowed_control)
+}
+
+fn disallowed_control(ch: char) -> bool {
+    ch.is_control() && !matches!(ch, '\n' | '\t')
+}
+
+fn normalize_text(text: &mut String) {
+    if text.contains(disallowed_control) {
+        *text = text.replace(disallowed_control, " ");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_result_keeps_findings_and_discards_blank_evidence() {
+        let expected: Vec<_> = (1..=12).map(|index| format!("finding {index}")).collect();
+        let mut findings = expected.clone();
+        findings.insert(0, "\t \u{1b}".into());
+        findings.push("first\0second\n\tthird".into());
+        let text = serde_json::json!({
+            "status": "completed",
+            "summary": "  \r",
+            "findings": findings,
+        })
+        .to_string();
+
+        let result = ChildResult::parse(&text).unwrap();
+        assert_eq!(result.status, ChildStatus::Completed);
+        assert_eq!(result.summary, "finding 1");
+        assert_eq!(&result.findings[..12], expected.as_slice());
+        assert_eq!(result.findings[12], "first second\n\tthird");
+        assert_eq!(result.validate(), Ok(()));
+
+        let without_evidence =
+            ChildResult::parse(r#"{"status":"completed","summary":"Done","findings":[""]}"#)
+                .unwrap();
+        assert!(without_evidence.findings.is_empty());
+
+        let empty = ChildResult::parse(r#"{"status":"completed","summary":" ","findings":[" " ]}"#)
+            .unwrap();
+        assert_eq!(empty.status, ChildStatus::Blocked);
+        assert_eq!(empty.validate(), Ok(()));
+    }
+
+    #[test]
+    fn child_result_rejects_json_over_the_frame_node_limit() {
+        let text = serde_json::json!({
+            "status": "completed",
+            "summary": "Done",
+            "findings": vec![""; Json::FRAME_NODES],
+        })
+        .to_string();
+        assert_eq!(ChildResult::parse(&text), Err("child_result_node_limit"));
+    }
 }

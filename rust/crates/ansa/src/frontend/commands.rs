@@ -73,6 +73,10 @@ const COMMANDS: &[Command] = &[
         description: "Confirm manual checks for a completed plan",
     },
     Command {
+        name: "/clarify",
+        description: "Send an instruction within the approved plan",
+    },
+    Command {
         name: "/help",
         description: "Commands and shortcuts",
     },

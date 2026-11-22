@@ -30,6 +30,12 @@ id_type!(RuntimeIncarnation);
 pub enum AgentMode {
     Basic,
     Plan,
+    OrchestrationChat,
+}
+impl AgentMode {
+    pub(crate) fn read_only(self) -> bool {
+        self != Self::Basic
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submit {
@@ -261,7 +267,9 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
             if submit.text.is_empty() || !Json::text_fits_frame(&submit.text) {
                 return Err("submit_size");
             }
-            if submit.mode != AgentMode::Basic && submit.mode != AgentMode::Plan {
+            if submit.mode == AgentMode::OrchestrationChat
+                && !matches!(command.payload, CommandPayload::Submit(_))
+            {
                 return Err("submit_mode");
             }
             if matches!(command.payload, CommandPayload::Handoff(_))

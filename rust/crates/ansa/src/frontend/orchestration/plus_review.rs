@@ -69,7 +69,7 @@ fn brief(result: &ChildResult) -> serde_json::Value {
     serde_json::json!({
         "status": result.status,
         "summary": token_prefix(&result.summary, 600),
-        "findings": result.findings.iter().map(|finding| token_prefix(finding, 160)).collect::<Vec<_>>(),
+        "findings": super::plus::findings_excerpts(result, 160),
     })
 }
 
