@@ -69,6 +69,10 @@ const COMMANDS: &[Command] = &[
         description: "Copy the confirmed transcript",
     },
     Command {
+        name: "/accept",
+        description: "Confirm manual checks for a completed plan",
+    },
+    Command {
         name: "/help",
         description: "Commands and shortcuts",
     },

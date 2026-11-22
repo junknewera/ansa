@@ -64,6 +64,8 @@ pub(crate) struct RunContext {
     pub conversation_plan: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plus_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_timeout_ms: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -223,10 +225,12 @@ impl State {
             || !valid_id(&header.identity.run)
             || !(1..=64).contains(&budget.submissions)
             || budget.deadline <= budget.started_at
-            || header
-                .context
-                .as_ref()
-                .is_some_and(|context| context.prompt.is_empty())
+            || header.context.as_ref().is_some_and(|context| {
+                context.prompt.is_empty()
+                    || context
+                        .check_timeout_ms
+                        .is_some_and(|ms| !(1..=600_000).contains(&ms))
+            })
         {
             return Err("run_configuration");
         }
@@ -1092,6 +1096,7 @@ fn plus_reopen_preserves_completed_effects_active_task_and_saved_clarification()
         handoff_tokens: None,
         conversation_plan: false,
         plus_profile: Some(r#"{"version":1,"strong":{"model":"strong","effort":"high"},"medium":{"model":"medium","effort":null},"weak":{"model":"weak","effort":null}}"#.into()),
+        check_timeout_ms: None,
     };
     let mut run = Run::create_with_context(
         &path,

@@ -603,6 +603,12 @@ enum FileValue {
     Image(graphics::Image),
 }
 enum Job {
+    ManualAccepted {
+        owner: String,
+        token: u64,
+        run: String,
+        result: Result<orchestration::Candidate>,
+    },
     Login {
         owner: String,
         token: u64,
@@ -2543,6 +2549,54 @@ impl Workbench {
             .unwrap_or((text.trim_start(), ""));
         let argument = raw_argument.trim();
         match commands::canonical(command) {
+            "/accept" => {
+                let mut words = argument.split_whitespace();
+                let (Some(run), Some(commit), None) = (words.next(), words.next(), words.next())
+                else {
+                    self.report(
+                        io,
+                        "Use /accept RUN COMMIT after completing the manual checks",
+                    );
+                    return (false, false);
+                };
+                let slot = &self.slots[self.current];
+                if !matches!(slot.kind, Kind::Main | Kind::Fork)
+                    || slot.state.mode == AgentMode::Plan
+                {
+                    self.report(
+                        io,
+                        "Open the original conversation in Work mode to accept the candidate",
+                    );
+                    return (false, false);
+                }
+                if self.slots[self.current].active()
+                    || self.orchestration_stop.is_some()
+                    || !self.can_job(io)
+                {
+                    self.report(io, "Wait for the current task to finish");
+                    return (false, false);
+                }
+                self.cancel_modal();
+                let owner = self.slots[self.current].id.clone();
+                let token = self.modal_token;
+                let run = run.to_owned();
+                let commit = commit.to_owned();
+                let stop = Cancel::linked(&self.stop);
+                self.modal_stop = Some(stop.clone());
+                self.menu = Some(Menu::Loading("Confirming manual checks".into()));
+                let factory = self.factory.clone();
+                self.jobs.spawn_blocking(move || {
+                    let result =
+                        orchestration::accept_manual_checks(&factory, &owner, &run, &commit, &stop);
+                    Job::ManualAccepted {
+                        owner,
+                        token,
+                        run,
+                        result,
+                    }
+                });
+                (true, false)
+            }
             "/login" if argument.is_empty() => (self.open_login(io), false),
             "/login" => {
                 self.report(io, "Use /login without arguments");
@@ -3186,6 +3240,7 @@ impl Workbench {
             }
             Job::Sessions { owner, token, .. }
             | Job::Login { owner, token, .. }
+            | Job::ManualAccepted { owner, token, .. }
             | Job::SessionSearch { owner, token, .. }
             | Job::SessionSearchSource { owner, token, .. }
             | Job::Models { owner, token, .. }
@@ -3233,6 +3288,20 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
+            Job::ManualAccepted { run, result, .. } => {
+                self.menu = None;
+                self.modal_stop = None;
+                match result {
+                    Ok(candidate) => {
+                        self.slots[self.current]
+                            .remember_candidate(ux::CandidateView::new(run, candidate));
+                        self.report(io, "Manual checks recorded · ansa-result is ready");
+                    }
+                    Err(code) => {
+                        self.report(io, &format!("Could not accept the candidate ({code})"))
+                    }
+                }
+            }
             Job::Login { result, .. } => {
                 self.menu = None;
                 self.modal_stop = None;
@@ -4567,9 +4636,34 @@ impl Workbench {
             }
             return;
         }
-        if matches!(&self.menu, Some(Menu::Orchestration { .. })) {
-            if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
-                self.page(mouse.kind == MouseKind::WheelUp);
+        if matches!(&self.panel, Some(Panel::Orchestration { .. }))
+            && self
+                .menu
+                .as_ref()
+                .is_none_or(|menu| matches!(menu, Menu::Orchestration { .. }))
+        {
+            match mouse.kind {
+                MouseKind::Press => {
+                    self.update_displayed(io);
+                    self.selection = None;
+                    self.tool_press = None;
+                    if self.frames.is_empty() && !io.writer.failed() {
+                        self.selection = self
+                            .displayed
+                            .clone()
+                            .and_then(|frame| Selection::inspector(frame, mouse.column, mouse.row));
+                    }
+                }
+                MouseKind::Drag => {
+                    if let Some(selection) = &mut self.selection {
+                        selection.drag(mouse.column, mouse.row);
+                    }
+                }
+                MouseKind::Release => self.copy_selection(mouse, io),
+                MouseKind::WheelUp | MouseKind::WheelDown => {
+                    self.selection = None;
+                    self.page(mouse.kind == MouseKind::WheelUp);
+                }
             }
             return;
         }
@@ -4801,15 +4895,7 @@ impl Workbench {
                     }
                     return;
                 }
-                if let Some(mut selection) = self.selection.take()
-                    && let Some(text) = selection.finish(mouse.column, mouse.row)
-                    && !io.writer.clipboard(&text)
-                {
-                    self.report(
-                        io,
-                        "Could not copy selection. The clipboard limit or output queue is full",
-                    );
-                }
+                self.copy_selection(mouse, io);
             }
             MouseKind::WheelUp => {
                 self.selection = None;
@@ -4819,6 +4905,18 @@ impl Workbench {
                 self.selection = None;
                 self.page(false);
             }
+        }
+    }
+
+    fn copy_selection(&mut self, mouse: MouseEvent, io: &Io) {
+        if let Some(mut selection) = self.selection.take()
+            && let Some(text) = selection.finish(mouse.column, mouse.row)
+            && !io.writer.clipboard(&text)
+        {
+            self.report(
+                io,
+                "Could not copy selection. The clipboard limit or output queue is full",
+            );
         }
     }
     fn popup(&self) -> Option<Popup> {

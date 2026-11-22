@@ -1010,7 +1010,7 @@ def completion_and_help(screen, root, cwd):
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
                 "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
-                "/orchestrate", "/orchestrate+", "/terminals"}
+                "/orchestrate", "/orchestrate+", "/terminals", "/accept"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"
@@ -1182,17 +1182,26 @@ def plan_agent_inherits(screen, root, cwd):
     escape(screen)
     screen.send(b"\t")
     until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "third Tab mode")
-    screen.send("ORCHESTRATION_BLOCKED_WRITE_FIXTURE\r")
-    until(screen, lambda frame: "A manual check is required before starting" in frame and "[Refine]" in frame,
-          "write plan explains blocked approval before Enter")
-    screen.send(b"\x1b[A\r")
-    until(screen, lambda frame: "[Start unavailable]" in frame, "blocked write plan remains open")
+    screen.send("ORCHESTRATION_MANUAL_CHECKS_FIXTURE\r")
+    until(screen, lambda frame: "Manual checks are due after" in frame and "[Start]" in frame,
+          "manual checks allow Start while still disclosing the later acceptance")
     escape(screen)
     screen.send("ORCHESTRATION_LONG_PLAN_FIXTURE\r")
     until(screen, lambda frame: "Проверить перенос длинного плана" in frame, "long proposal")
     assert "VISIBLE_END_OF_STEP" not in visible(screen)
     screen.send(b"\x1b[6~")
     until(screen, lambda frame: "VISIBLE_END_OF_STEP" in frame, "full step accessible before approval")
+    paint_quiet(screen)
+    word = "VISIBLE_END_OF_STEP"
+    row = next(row for row in range(screen.vt.rows) if word in screen.vt.line(row))
+    column = screen.vt.line(row).index(word)
+    before_copy = journals(root)
+    at = len(screen.raw)
+    mouse(screen, 0, column, row)
+    mouse(screen, 32, column + len(word) - 1, row)
+    mouse(screen, 0, column + len(word) - 1, row, release=True)
+    assert copied(screen, at) == word, "drag selects text in the plan and copies on release"
+    assert journals(root) == before_copy
     escape(screen)
     after_preview = records(root)
     assert len(journals(root)) == 1, "drafting a plan created a separate session"
@@ -1402,6 +1411,49 @@ def orchestration_candidate(screen, root, cwd):
     assert git("rev-parse", "ansa-result", path=checkout) == frozen
     assert check_marker.read_text() == "x", "recovery ran the completed command again"
     assert journals(root) == before_journals, "reconciliation executed a second tool or repeated the handoff"
+    escape(restarted)
+    if activity_open(restarted):
+        close_activity(restarted)
+    until(restarted, lambda _: "Tab mode" in restarted.vt.line(-2)
+          and "Ctrl+C stop" not in restarted.vt.line(-2), "composer ready for a manual-check plan")
+    local(restarted, "/orchestrate ORCHESTRATION_MANUAL_CHECKS_FIXTURE")
+    until(restarted, lambda frame: "[Start]" in frame and "Manual checks are due after" in frame,
+          "the manual-check plan is actionable")
+    restarted.send(b"\r")
+    until(restarted, lambda frame: "Рабочая копия ждёт ручной проверки" in frame,
+          "execution reaches a candidate with manual checks pending", timeout=15)
+    manual_run, = (path.parent for path in home.glob("*/*/manual-candidate.json"))
+    manual = json.loads((manual_run / "manual-candidate.json").read_text())
+    sha = manual["candidate"]
+    assert not (manual_run / "release.json").exists()
+    manual_checkout = manual_run / "checkout"
+    assert not git("branch", "--list", "ansa-result", path=manual_checkout).strip()
+    assert (manual_run / "verification-0/checkout/report.txt").read_text() == "after fixture\n"
+    assert check_marker.read_text() == "xx", "executable verification ran once for each candidate"
+    until(restarted, lambda _: "Tab mode" in restarted.vt.line(-2)
+          and "Ctrl+C stop" not in restarted.vt.line(-2), "foreground finished pending-candidate summary")
+    local(restarted, f"/accept {manual_run.name} {'0' * len(sha)}")
+    until(restarted, lambda frame: "manual_checks_candidate_mismatch" in frame, "reject another commit")
+    assert not (manual_run / "release.json").exists()
+    manual_report = manual_run / "verification-0/checkout/report.txt"
+    manual_report.write_text("different snapshot\n")
+    local(restarted, f"/accept {manual_run.name} {sha}")
+    until(restarted, lambda frame: "candidate_view_changed" in frame, "reject an altered verification snapshot")
+    assert not (manual_run / "release.json").exists()
+    manual_report.write_text("after fixture\n")
+    saved_view = manual_run / "saved-verification-0"
+    (manual_run / "verification-0").rename(saved_view)
+    local(restarted, f"/accept {manual_run.name} {sha}")
+    until(restarted, lambda frame: "candidate_view_missing" in frame, "reject a missing verification snapshot")
+    assert not (manual_run / "verification-0").exists()
+    saved_view.rename(manual_run / "verification-0")
+    local(restarted, f"/accept {manual_run.name} {sha}")
+    until(restarted, lambda frame: "Manual checks recorded" in frame
+          and (manual_run / "release.json").exists(), "explicit approval releases the exact reviewed commit")
+    assert json.loads((manual_run / "release.json").read_text())["candidate"] == sha
+    assert git("rev-parse", "ansa-result", path=manual_checkout).strip() == sha
+    assert report.read_text() == "before fixture\n"
+    assert check_marker.read_text() == "xx", "manual approval reused the check receipt"
     restarted.result = restarted.finish(signal.SIGTERM)
     assert restarted.result["exit"] == 143 and restarted.result["termios_restored"], restarted.result
     return "normal"

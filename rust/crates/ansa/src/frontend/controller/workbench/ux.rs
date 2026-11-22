@@ -9,6 +9,7 @@ pub(super) struct CandidateView {
     title: String,
     rows: Arc<Vec<crate::frontend::diff::Row>>,
     checks: Vec<Arc<carbon::OutputView>>,
+    manual: Option<Arc<carbon::OutputView>>,
 }
 
 impl CandidateView {
@@ -22,19 +23,41 @@ impl CandidateView {
             paths => format!("Files: {}", paths.len()),
         };
         let heading = format!("{changed} · +{added} −{removed}");
-        let title = format!("{heading} · project snapshot → ansa-result");
+        let (title, manual) = if candidate.manual_checks.is_empty() {
+            (format!("{heading} · project snapshot → ansa-result"), None)
+        } else {
+            let text = format!(
+                "Candidate {}\nCheckout {}\n\n{}\n\nAfter checking this candidate, run\n/accept {run} {}",
+                candidate.commit,
+                candidate.workspace.display(),
+                candidate.manual_checks.join("\n\n"),
+                candidate.commit,
+            );
+            (
+                format!("{heading} · Manual checks pending"),
+                Some(Arc::new(carbon::OutputView {
+                    title: "Manual checks pending".into(),
+                    text,
+                })),
+            )
+        };
         Self {
             run,
             heading,
             title,
             rows: Arc::new(rows),
             checks: candidate.checks.into_iter().map(Arc::new).collect(),
+            manual,
         }
     }
 
     pub(super) fn panel(&self) -> Panel {
         Panel::EditDiff {
-            title: format!("{} · Verified changes", self.title),
+            title: if self.manual.is_some() {
+                self.title.clone()
+            } else {
+                format!("{} · Verified changes", self.title)
+            },
             rows: self.rows.clone(),
             offset: 0,
             column: 0,
@@ -112,6 +135,13 @@ impl Workbench {
                         Some(view.clone()),
                     )
                 }));
+                if let Some(manual) = &review.manual {
+                    review_entries.push(result_entry(
+                        manual.title.clone(),
+                        Some(format!("output:manual:{}", review.run)),
+                        Some(manual.clone()),
+                    ));
+                }
                 entries.splice(index..index, review_entries);
             }
         }
@@ -258,11 +288,15 @@ impl Workbench {
         }
         if let Err(code) = plan.execution_ready() {
             sections.push(match code {
-                "orchestration_manual_checks_required" => "**A manual check is required before starting. Select Refine.**",
                 "orchestration_implementation_required" => "**Implementation requires a write step and an executable test. Select Refine.**",
                 "orchestration_investigation_only" => "**An investigation plan must contain only read steps. Select Refine.**",
                 _ => "**Select Refine to add a check for the changes.**",
             }.into());
+        }
+        if !plan.is_read_only() && !plan.manual_checks().is_empty() {
+            sections.push(
+                "**Manual checks are due after implementation and automated verification.**".into(),
+            );
         }
         if let Some(prompt) = prompt {
             sections.push(format!("## Original request\n\n{prompt}"));

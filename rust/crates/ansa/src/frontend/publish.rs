@@ -18,6 +18,23 @@ pub(super) fn record_release(
     worktree: &Worktree,
     candidate: &Frozen,
 ) -> Result<()> {
+    record_candidate(storage, worktree, candidate, "release.json")
+}
+
+pub(super) fn record_pending_manual(
+    storage: &Path,
+    worktree: &Worktree,
+    candidate: &Frozen,
+) -> Result<()> {
+    record_candidate(storage, worktree, candidate, "manual-candidate.json")
+}
+
+fn record_candidate(
+    storage: &Path,
+    worktree: &Worktree,
+    candidate: &Frozen,
+    name: &str,
+) -> Result<()> {
     let release = Release {
         candidate: candidate.commit().to_owned(),
         baseline: worktree.baseline().to_owned(),
@@ -25,12 +42,20 @@ pub(super) fn record_release(
     };
     let bytes = serde_json::to_vec(&release).map_err(|_| "draft_release")?;
     let directory = local_fs::private_directory(storage).map_err(|_| "draft_release")?;
-    local::publish_recovered(&directory, "release.json", &bytes).map_err(|_| "draft_release")
+    local::publish_recovered(&directory, name, &bytes).map_err(|_| "draft_release")
 }
 
 pub(super) fn released_candidate(storage: &Path, worktree: &Worktree) -> Result<String> {
+    read_candidate(storage, worktree, "release.json")
+}
+
+pub(super) fn pending_manual_candidate(storage: &Path, worktree: &Worktree) -> Result<String> {
+    read_candidate(storage, worktree, "manual-candidate.json")
+}
+
+fn read_candidate(storage: &Path, worktree: &Worktree, name: &str) -> Result<String> {
     let directory = local_fs::private_directory(storage).map_err(|_| "draft_release")?;
-    let bytes = local::read(&directory, "release.json", 4096)
+    let bytes = local::read(&directory, name, 4096)
         .map_err(|_| "draft_release")?
         .ok_or("draft_release_missing")?;
     let release: Release = serde_json::from_slice(&bytes).map_err(|_| "draft_release")?;

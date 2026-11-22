@@ -461,6 +461,9 @@ impl Worktree {
             fs::rename(&path, retained).map_err(|_| "candidate_view_incomplete")?;
         }
         let reopened = path.exists();
+        if referenced && !reopened {
+            return Err("candidate_view_missing");
+        }
         let dir = if reopened {
             local_fs::private_directory(&path)
         } else {

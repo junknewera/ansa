@@ -190,8 +190,8 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
                 {"id":"edit","task":"Синтетическая правка отчёта","access":"write","paths":["report.txt"],"depends_on":["read"],"acceptance":"Report contains after fixture"}
             ]
         }).to_string(),
-        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_BLOCKED_WRITE_FIXTURE") => serde_json::json!({
-            "schema_version": 1, "summary": "Обновить тестовый отчёт", "checks":[{"path":"report.txt","contains":"after fixture"}], "manual_checks": if user == "ORCHESTRATION_BLOCKED_WRITE_FIXTURE" { vec!["Подтвердить исходные данные"] } else { vec![] }, "steps": [
+        Some(FinalFormat::OrchestrationPlan | FinalFormat::OrchestrationPlanWithCommands | FinalFormat::OrchestrationPlanWithReadFolder | FinalFormat::OrchestrationPlanWithOutcome) if matches!(user, "ORCHESTRATION_WRITE_FIXTURE" | "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_MANUAL_CHECKS_FIXTURE") => serde_json::json!({
+            "schema_version": 1, "summary": "Обновить тестовый отчёт", "checks":[{"path":"report.txt","contains":"after fixture"}], "manual_checks": if user == "ORCHESTRATION_MANUAL_CHECKS_FIXTURE" { vec!["Подтвердить итоговый отчёт"] } else { vec![] }, "steps": [
                 {"id":"edit", "task":"Синтетическая правка отчёта", "access":"write", "paths":["report.txt"], "depends_on":[], "acceptance":"Тестовый отчёт содержит after fixture"}
             ]
         }).to_string(),
@@ -233,7 +233,9 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
             "Offline fixture edit complete.".to_owned()
         },
         None if request.epoch.exact_state.text_field("purpose") == Ok("orchestration_summary") => {
-            if user.contains("verified_candidate") {
+            if user.contains("pending_manual_candidate") {
+                "Рабочая копия ждёт ручной проверки.".to_owned()
+            } else if user.contains("verified_candidate") {
                 "Рабочая копия проверена. Ветка ansa-result готова.".to_owned()
             } else {
                 "Сводка готова. Оба помощника завершили проверку.".to_owned()
@@ -245,7 +247,9 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         .final_format()
         .is_some_and(FinalFormat::has_command_checks)
     {
-        let checks = if matches!(
+        let checks = if user == "ORCHESTRATION_MANUAL_CHECKS_FIXTURE" {
+            serde_json::json!([{"argv":["git","diff","--check"]},{"argv":["./check.sh"]}])
+        } else if matches!(
             user,
             "ORCHESTRATION_COMMAND_FIXTURE" | "ORCHESTRATION_REVIEW_RESUME_FIXTURE"
         ) {

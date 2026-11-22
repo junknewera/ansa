@@ -12,6 +12,7 @@ pub struct AgentSettings {
     pub tool_rounds: usize,
     pub tool_calls: usize,
     pub process_timeout_ms: usize,
+    pub(crate) orchestration_check_timeout_ms: usize,
     pub process_output_bytes: usize,
     pub exclude: Vec<String>,
 }
@@ -27,6 +28,7 @@ impl AgentSettings {
             tool_rounds: 32,
             tool_calls: 64,
             process_timeout_ms: 60000,
+            orchestration_check_timeout_ms: 600_000,
             process_output_bytes: 16384,
             exclude: [
                 ".git",
@@ -86,7 +88,11 @@ fn overlay(settings: &mut AgentSettings, path: &Path, project: bool) -> Result<(
             "compact_bytes" => settings.compact_bytes = json.usize_field(key)?,
             "tool_rounds" => settings.tool_rounds = json.usize_field(key)?,
             "tool_calls" => settings.tool_calls = json.usize_field(key)?,
-            "process_timeout_ms" => settings.process_timeout_ms = json.usize_field(key)?,
+            "process_timeout_ms" => {
+                let timeout = json.usize_field(key)?;
+                settings.process_timeout_ms = timeout;
+                settings.orchestration_check_timeout_ms = timeout;
+            }
             "process_output_bytes" => settings.process_output_bytes = json.usize_field(key)?,
             "exclude" => {
                 let entries = json.field(key)?.elements()?;

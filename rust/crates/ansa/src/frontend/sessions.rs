@@ -647,9 +647,9 @@ impl Factory {
             "The user must approve the plan before execution. "
         ));
         if format.has_command_checks() {
-            instructions.push_str("List repository test commands that are needed or explicitly requested in command_checks using argv arrays. Each command starts in a fresh copy of the frozen checkout, at its root. Put checks requiring human interaction in manual_checks.");
+            instructions.push_str("List targeted executable checks for the changed behavior in command_checks using argv arrays. Each command starts in its own fresh snapshot, without Git metadata or artifacts built by previous commands. Use the repository's configured toolchain and include each check's build prerequisites in that same command or script. ANSA checks the Git diff itself. Put human interaction needed after implementation in manual_checks.");
         } else {
-            instructions.push_str("Put required command-based or other unsupported checks in manual_checks. Those must be resolved before execution.");
+            instructions.push_str("Put verification requiring human interaction in manual_checks for the finished candidate.");
         }
         if format.has_read_folder() {
             instructions.push_str("\nFor a read-only investigation targeting a directory explicitly named in the request, set read_folder to the exact path spelling from the user message. Its resolved path will be shown before approval. Interpret all step paths relative to that folder and keep the steps about that folder. Use null for the current workspace or any plan involving writes. Do not infer or broaden the folder from other instructions. When revising a proposed plan, retain the user’s previously named folder if the latest clarification does not change it.");
@@ -664,6 +664,7 @@ impl Factory {
                 "An unrestricted workspace read helper can use git_snapshot for branch, HEAD, status and recent commits. ",
                 "Scoped readers only have file tools. Put executable tests in command_checks, not in read steps."
             ));
+            instructions.push_str(" Orchestrate+ runs approved steps sequentially and reviews the final candidate itself. Keep write scopes specific and include a separate review task only when explicitly requested.");
         }
         if read_only {
             instructions

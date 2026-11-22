@@ -2603,6 +2603,7 @@ pub struct Selection {
     focus: (usize, usize),
     moved: bool,
     chat: Option<ChatSelection>,
+    within_inspector: bool,
     pointer: (usize, usize),
     pub(super) scroll_pending: bool,
     pub(super) pending_range: Option<(usize, usize)>,
@@ -2739,10 +2740,20 @@ impl Selection {
             focus: (row, column),
             moved: false,
             chat: None,
+            within_inspector: false,
             pointer: (column, row),
             scroll_pending: false,
             pending_range: None,
         }
+    }
+    pub(super) fn inspector(frame: Frame, column: usize, row: usize) -> Option<Self> {
+        let (left, top, width, height) = frame.inspector_bounds()?;
+        if !(left..left + width).contains(&column) || !(top..top + height).contains(&row) {
+            return None;
+        }
+        let mut selection = Self::new(frame, column, row);
+        selection.within_inspector = true;
+        Some(selection)
     }
     pub(super) fn chat(frame: Frame, column: usize, row: usize) -> Option<Self> {
         let (top, bottom, _) = ChatSelection::bounds(&frame)?;
@@ -2873,7 +2884,16 @@ impl Selection {
             chat.focus = point;
             return;
         }
-        self.focus = (row.min(self.frozen.lines.len().saturating_sub(1)), column);
+        self.focus = if self.within_inspector {
+            let (left, top, width, height) =
+                self.frozen.inspector_bounds.expect("selection bounds");
+            (
+                row.clamp(top, top + height - 1),
+                column.clamp(left, left + width - 1),
+            )
+        } else {
+            (row.min(self.frozen.lines.len().saturating_sub(1)), column)
+        };
         self.moved |= self.focus != self.anchor;
     }
     pub fn frame(&self, color: bool) -> Frame {
