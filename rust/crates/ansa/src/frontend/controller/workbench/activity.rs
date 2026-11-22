@@ -16,6 +16,25 @@ pub(super) fn tabs() -> Vec<String> {
     vec!["Agents".into(), "Activity".into(), "Shell".into()]
 }
 
+fn agent_entry(
+    role: &str,
+    text: String,
+    agent: Option<&carbon::AgentLine>,
+    openable: bool,
+) -> Entry {
+    Entry {
+        role: role.into(),
+        text,
+        action: agent
+            .filter(|_| openable)
+            .map(|line| format!("agent:{}", line.id)),
+        status: None,
+        edit: None,
+        output: None,
+        agent: agent.map(|line| Arc::new(line.clone())),
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Navigation {
     scroll: usize,
@@ -89,19 +108,93 @@ impl Workbench {
         if !navigation.agents_only {
             return self.terminal_activity();
         }
-        self.agent_rows()
-            .into_iter()
-            .rev()
-            .map(|(id, agent)| Entry {
-                role: "agent_card".into(),
-                text: String::new(),
-                action: Some(format!("agent:{id}")),
-                status: None,
-                edit: None,
-                output: None,
-                agent: Some(Arc::new(agent)),
-            })
-            .collect()
+        let rows = self.agent_rows();
+        let view = self.orchestration_views.get(&self.conversation_root());
+        let mut entries = Vec::new();
+        let mut grouped = std::collections::BTreeSet::new();
+        for step in view.into_iter().flat_map(|view| view.plan.steps()) {
+            let agents: Vec<_> = rows
+                .iter()
+                .rev()
+                .map(|(_, agent)| agent)
+                .filter(|agent| agent.step.as_deref() == Some(step.id.as_str()))
+                .collect();
+            if agents.is_empty() {
+                continue;
+            }
+            grouped.insert(step.id.as_str());
+            if agents.len() == 1 {
+                entries.push(agent_entry(
+                    "agent_card",
+                    String::new(),
+                    Some(agents[0]),
+                    true,
+                ));
+                continue;
+            }
+            let title = step.task.lines().next().unwrap_or_default();
+            entries.push(agent_entry(
+                "agent_step",
+                format!("{} / {title}", step.id),
+                None,
+                false,
+            ));
+            let mut roles: Vec<Vec<&carbon::AgentLine>> = Vec::new();
+            for agent in agents {
+                if let Some(role) = roles
+                    .iter_mut()
+                    .find(|role| role[0].role == agent.role && role[0].model == agent.model)
+                {
+                    role.push(agent);
+                } else {
+                    roles.push(vec![agent]);
+                }
+            }
+            for role in roles {
+                let count = role.len();
+                if count == 1 {
+                    entries.push(agent_entry(
+                        "agent_role",
+                        String::new(),
+                        Some(role[0]),
+                        true,
+                    ));
+                    continue;
+                }
+                entries.push(agent_entry(
+                    "agent_role",
+                    format!("{count} attempts"),
+                    Some(role[0]),
+                    false,
+                ));
+                for (index, agent) in role.into_iter().enumerate() {
+                    let branch = if index + 1 == count {
+                        "└─"
+                    } else {
+                        "├─"
+                    };
+                    entries.push(agent_entry(
+                        "tool_agent_attempt",
+                        format!("{branch} {:02}", index + 1),
+                        Some(agent),
+                        true,
+                    ));
+                }
+            }
+        }
+        entries.extend(
+            rows.iter()
+                .rev()
+                .map(|(_, agent)| agent)
+                .filter(|agent| {
+                    !agent
+                        .step
+                        .as_deref()
+                        .is_some_and(|step| grouped.contains(step))
+                })
+                .map(|agent| agent_entry("agent_card", String::new(), Some(agent), true)),
+        );
+        entries
     }
 
     pub(super) fn return_to_activity(&mut self) {
@@ -136,11 +229,30 @@ impl Workbench {
         let page = slot.activity_timeline.as_ref();
         let entries = self.activity_entries(navigation);
         if navigation.agents_only {
+            let preview = navigation.selected.as_ref().and_then(|selected| {
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.action.as_ref() == Some(selected))?;
+                let agent = entry
+                    .agent
+                    .as_ref()
+                    .filter(|agent| !agent.activity.is_empty())?;
+                let title = entry
+                    .text
+                    .rsplit_once(' ')
+                    .filter(|_| entry.role == "tool_agent_attempt")
+                    .map_or_else(
+                        || agent.state.clone(),
+                        |(_, number)| format!("Attempt {number} · {}", agent.state),
+                    );
+                Some((title, agent.activity.clone()))
+            });
             return Inspector {
                 title: "Agents".into(),
                 tabs: tabs(),
                 lines: vec!["No agents in this conversation".into()],
                 footer: "Click to open · Tab focus · Esc close".into(),
+                preview,
                 kind: InspectorKind::Agents,
                 activity: Some(carbon::ActivityViewport {
                     entries,
@@ -338,6 +450,7 @@ impl Workbench {
         let Some(Panel::Activity(navigation)) = &mut self.panel else {
             return;
         };
+        let keep_selection = navigation.agents_only && navigation.selected.as_ref() == Some(&key);
         navigation.selected = Some(key.clone());
         if let Some(frame) = self
             .displayed
@@ -347,7 +460,7 @@ impl Workbench {
             navigation.scroll = frame.activity_scroll;
         }
         let mut previous = navigation.clone();
-        if previous.scroll == 0 && key.starts_with("agent:") {
+        if !keep_selection && previous.scroll == 0 && key.starts_with("agent:") {
             previous.selected = None;
         }
         let agents_only = previous.agents_only;

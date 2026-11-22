@@ -427,6 +427,10 @@ fn publish_progress(
                     } else {
                         action.into()
                     },
+                    step: Some(id.to_owned()),
+                    tool_calls: run
+                        .recorded_tool_evidence(id)
+                        .map(|evidence| evidence.dispatched),
                 },
             ))
         })
