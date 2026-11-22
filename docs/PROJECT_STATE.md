@@ -22,6 +22,9 @@ OpenRouter сохраняет отмену и продолжает генера�
 тестовых провайдерах. Сценарии проверяют порядок ответа ведущего,
 обновление журнала и два возобновления одного ревьюера.
 [Отчёт CI](https://github.com/junknewera/ansa/actions/runs/45075578148).
+На x13s (aarch64) прошли Nix build/check, `--self-check`, `--offline-demo`
+и 29 сценариев Carbon на установленном бинарнике. Отчёт помещён в
+`~/Workspace/pet/ansa-baselines/agent-chat-final-DJigvENP/`.
 
 ## Передача утверждённых шагов Orchestrate+
 

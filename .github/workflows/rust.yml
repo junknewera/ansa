@@ -57,6 +57,7 @@ jobs:
           python3 -B tests/carbon_workspace_pty.py \
             --binary rust/target/debug/ansa \
             --case mouse-history-send-child-escape \
+            --case slash-completion-help \
             --case session-agent-titles-restart \
             --case active-plan-clarification \
             --case orchestration-review-resume \
