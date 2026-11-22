@@ -170,7 +170,9 @@ def open_helper(screen, by_mouse=False):
     if by_mouse:
         paint_quiet(screen)
         row = next(row for row in range(screen.vt.rows) if helper_title(screen.vt.line(row)))
-        click(screen, screen.vt.line(row).index("─ ") + 2, row)
+        line = screen.vt.line(row)
+        title = next(title for title in ("Найти файлы", "Проверить, достаточно") if title in line)
+        click(screen, line.index(title), row)
     else:
         paint_quiet(screen)
         screen.send(b"\t\r")
