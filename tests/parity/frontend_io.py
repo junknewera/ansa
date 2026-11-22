@@ -136,12 +136,12 @@ def jsonl(binary,row,root,home,cwd):
     finally:stop(child)
 
 class Pty:
-    def __init__(self,binary,root,home,cwd,mode,plain=False,size=(80,24),argv=None,extra_env=None):
+    def __init__(self,binary,root,home,cwd,mode,plain=False,size=(80,24),argv=None,extra_env=None,base_env=None):
         self.master,self.slave=pty.openpty();self.original=termios.tcgetattr(self.slave);self.flags=fcntl.fcntl(self.slave,fcntl.F_GETFL);self.raw=b'';self.observations=[]
         self.resize(*size,notify=False);os.set_blocking(self.master,False)
         # This driver has no other threads. The child acquires this newly owned
         # PTY as its controlling terminal after Popen's setsid, before exec.
-        env=environment(home,root,plain)
+        env=environment(home,root,plain) if base_env is None else dict(base_env)
         if extra_env:env.update(extra_env)
         self.child=subprocess.Popen([binary,*(argv if argv is not None else ['--frontend-fixture',str(root),mode])],stdin=self.slave,stdout=self.slave,stderr=self.slave,cwd=cwd,env=env,start_new_session=True,preexec_fn=lambda:fcntl.ioctl(0,termios.TIOCSCTTY,0))
     def drain(self,timeout=.01):
