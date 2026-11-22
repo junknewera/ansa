@@ -1915,8 +1915,9 @@ def siwc_orchestration(screen, root, cwd):
                   and "ChatGPT did not confirm the strict plan format" in frame
                   and "Drafting a plan" not in frame, "resumed draft can pause again without hiding the error")
         local(screen, "/cancel")
-        until(screen, lambda _: any(row["kind"] == "cancel" and row["turn"] == draft["turn"]
-                                    for row in records(root)), "cancel paused unconfirmed draft")
+        until(screen, lambda _: "cancelled" in screen.vt.line(-2)
+              and any(row["kind"] == "cancel" and row["turn"] == draft["turn"]
+                      for row in records(root)), "cancel paused unconfirmed draft")
     screen.send(b"UNNAMED_READ_SCOPE\r")
     until(screen, lambda frame: "Name the read folder in your request" in frame
           and screen.vt.line(-4) == "  › UNNAMED_READ_SCOPE", "the model cannot select an unrelated folder")
@@ -1964,8 +1965,9 @@ def siwc_orchestration(screen, root, cwd):
     screen.send(b"\x03")
     until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear the composer before a local command")
     local(screen, "/cancel")
-    until(screen, lambda _: any(row["kind"] == "cancel" and row["turn"] == timeout_turn
-                                for row in records(root)), "discard the timed out plan explicitly")
+    until(screen, lambda _: "cancelled" in screen.vt.line(-2)
+          and any(row["kind"] == "cancel" and row["turn"] == timeout_turn
+                  for row in records(root)), "discard the timed out plan explicitly")
     local(screen, "/basic")
     until(screen, lambda _: "Orchestrate" not in screen.vt.line(-2), "switch to work after timeout")
     screen.send(b"AFTER_TIMEOUT\r")
