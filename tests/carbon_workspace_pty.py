@@ -245,15 +245,15 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     before = journals(root)
     screen.send("CHILD_DRAFT Ж")
     paint_quiet(screen)
-    assert screen.vt.line(-4) == "  ›" and "Agent transcript" in visible(screen)
+    assert screen.vt.line(-4) == "  › CHILD_DRAFT Ж" and "Agent transcript" in visible(screen)
     mouse(screen, 64, 2, 5)
     screen.send(b"\x1bg")
     for _ in range(8): screen.drain(.01)
     assert "Agent transcript" in visible(screen) and journals(root) == before
     escape(screen)
-    until(screen, lambda _: activity_open(screen) and ready(screen), "Esc restores Activity")
+    until(screen, lambda _: agents_open(screen) and ready(screen), "Esc restores the agent list")
     escape(screen)
-    until(screen, lambda _: not activity_open(screen) and ready(screen), "Esc restores parent input")
+    until(screen, lambda _: not agents_open(screen) and ready(screen), "Esc closes the agent list")
 
 
 def split_source_scroll(screen, root, cwd):
@@ -1244,12 +1244,12 @@ def session_agent_titles_restart(screen, root, cwd):
     open_helper(screen)
     escape(screen)
     until(screen, lambda frame: "PARENT_TITLE" in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
-    until(screen, lambda frame: activity_open(screen) and "Найти файлы" in frame
-          and "Проверить, достаточно" in frame, "Esc restored Activity with both completed helpers")
+    until(screen, lambda frame: agents_open(screen) and "Найти файлы" in frame
+          and "Проверить, достаточно" in frame, "Esc restores both completed helpers")
     assert not re.search(r"\bs_\d+_", screen.vt.line(1)), "agent breadcrumb displays an ID instead of a title"
     escape(screen)
-    until(screen, lambda _: not activity_open(screen) and not helper_title(screen.vt.line(1)),
-          "Activity closed before session command")
+    until(screen, lambda _: not agents_open(screen) and not helper_title(screen.vt.line(1)),
+          "Agent list closed before session command")
     local(screen, "/sessions")
     until(screen, lambda frame: "Project sessions" in frame and "Choose a conversation" in frame and "PARENT_TITLE" in frame, "human-readable root session picker")
     assert not helper_title(popup_text(screen)), "agents leaked into conversation picker"

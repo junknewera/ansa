@@ -4308,28 +4308,28 @@ impl Workbench {
         self.tool_press = None;
         self.slots[self.current].cancel_history_jump();
         if self.focus == Focus::Inspector {
-            if let Some(Panel::AgentTranscript(reader)) = &mut self.panel {
-                if reader.follow_agent {
-                    let (width, height) = self
-                        .displayed
-                        .as_ref()
-                        .and_then(|frame| frame.inspector_bounds())
-                        .map_or((80, 6), |(_, _, w, h)| (w, h));
-                    let document = reader.page.as_ref().map(|page| {
-                        if reader.tool_details {
-                            &page.details
-                        } else {
-                            &page.document
-                        }
-                    });
-                    reader.offset = document.map_or(0, |document| {
-                        document
-                            .viewport_rows(width.max(1))
-                            .len()
-                            .saturating_sub(height.max(1))
-                    });
-                    reader.follow_agent = false;
-                }
+            if let Some(Panel::AgentTranscript(reader)) = &mut self.panel
+                && reader.follow_agent
+            {
+                let (width, height) = self
+                    .displayed
+                    .as_ref()
+                    .and_then(|frame| frame.inspector_bounds())
+                    .map_or((80, 6), |(_, _, w, h)| (w, h));
+                let document = reader.page.as_ref().map(|page| {
+                    if reader.tool_details {
+                        &page.details
+                    } else {
+                        &page.document
+                    }
+                });
+                reader.offset = document.map_or(0, |document| {
+                    document
+                        .viewport_rows(width.max(1))
+                        .len()
+                        .saturating_sub(height.max(1))
+                });
+                reader.follow_agent = false;
             }
             let reading = match &mut self.panel {
                 Some(Panel::Orchestration { document, offset }) => Some((&*document, offset)),
