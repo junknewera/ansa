@@ -557,18 +557,58 @@ fn layout_impl(
     let mut outputs = std::collections::BTreeMap::new();
     let mut previous_tool = false;
     for entry in history {
-        let tool = entry.role.starts_with("tool");
+        let tool = entry.role.starts_with("tool") || entry.role == "agent_role";
         let separate_tool = tool
             && previous_tool
-            && entry.action.is_some()
-            && !entry.role.starts_with("tool_child_")
-            && !entry.role.starts_with("tool_diff_");
+            && (entry.role == "agent_role"
+                || entry.action.is_some()
+                    && !entry.role.starts_with("tool_child_")
+                    && !entry.role.starts_with("tool_diff_")
+                    && entry.role != "tool_agent_attempt");
         if !wrapped.is_empty() && (!(tool && previous_tool) || separate_tool) {
             wrapped.push(ChatRow::default());
         }
         previous_tool = tool;
+        if entry.role == "agent_step" {
+            wrapped.push(ChatRow {
+                text: styled(&clipped(&entry.text, cols), "\x1b[1m", color),
+                ..ChatRow::default()
+            });
+            continue;
+        }
         if let Some(agent) = &entry.agent {
-            for text in agent_card(agent, cols, color) {
+            let lines = match entry.role.as_str() {
+                "tool_agent_attempt" => {
+                    let mut prefix = String::new();
+                    if cols >= 25 {
+                        let (_, ink, avatar, _) = agent_art(agent.role);
+                        let row = entry
+                            .text
+                            .rsplit_once(' ')
+                            .and_then(|(_, number)| number.parse::<usize>().ok());
+                        let pixels = row
+                            .and_then(|index| avatar.get(index))
+                            .copied()
+                            .unwrap_or("     ");
+                        prefix.push_str(&styled(pixels, ink, color));
+                    }
+                    prefix.push_str(&styled(&format!("  {}  ", entry.text), MUTED, color));
+                    let calls = agent.tool_calls.map_or_else(
+                        || agent.activity.clone(),
+                        |calls| format!("{calls} {}", if calls == 1 { "call" } else { "calls" }),
+                    );
+                    let status = agent_status(
+                        &agent.state,
+                        &calls,
+                        cols.saturating_sub(cells(&prefix)),
+                        color,
+                    );
+                    vec![format!("{}{status}", clipped_painted(&prefix, cols))]
+                }
+                "agent_role" => agent_card(agent, cols, color, Some(&entry.text)),
+                _ => agent_card(agent, cols, color, None),
+            };
+            for text in lines {
                 if let Some(action) = &entry.action {
                     tool_actions.push((wrapped.len(), action.clone()));
                 }
@@ -967,6 +1007,7 @@ pub struct Inspector {
     pub offset: usize,
     pub follow_tail: bool,
     pub footer: String,
+    pub preview: Option<(String, String)>,
     pub kind: InspectorKind,
     pub activity: Option<ActivityViewport>,
     pub document: Option<super::markdown::Document>,
@@ -993,6 +1034,8 @@ pub struct AgentLine {
     pub role: AgentRole,
     pub model: String,
     pub activity: String,
+    pub step: Option<String>,
+    pub tool_calls: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1013,8 +1056,8 @@ impl AgentRole {
     }
 }
 
-fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
-    let (role, ink, avatar, badge) = match agent.role {
+fn agent_art(role: AgentRole) -> (&'static str, &'static str, [&'static str; 3], &'static str) {
+    match role {
         AgentRole::Research => ("Research", MINT, [" .-. ", "(   )", " '-'\\"], "(o)\\"),
         AgentRole::Implementation => (
             "Implementation",
@@ -1024,7 +1067,11 @@ fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
         ),
         AgentRole::Coordinator => ("Coordinator", SKY, ["  o  ", " /|\\ ", "o o o"], "-+-"),
         AgentRole::Review => ("Review", AMBER, ["+---+", "|+ -|", "+---+"], "[+-]"),
-    };
+    }
+}
+
+fn agent_card(agent: &AgentLine, width: usize, color: bool, group: Option<&str>) -> Vec<String> {
+    let (role, ink, avatar, badge) = agent_art(agent.role);
     let compact = width < 25;
     let content = width - if compact { 0 } else { 7 };
     let title = styled(&clipped(&agent.title, content), "\x1b[1m", color);
@@ -1039,31 +1086,57 @@ fn agent_card(agent: &AgentLine, width: usize, color: bool) -> Vec<String> {
         let model = clipped(&agent.model, remaining - 3);
         meta.push_str(&styled(&format!(" · {model}"), MUTED, color));
     }
-    let (status, status_ink) = match agent.state.as_str() {
-        "Completed" => ("· Done".into(), MUTED),
-        "Running" => ("· Running".into(), MUTED),
-        "Paused" => ("◷ Paused".into(), AMBER),
-        state => (format!("× {state}"), RED),
+    let lines = match group {
+        Some(attempts) if !attempts.is_empty() => {
+            let remaining = content.saturating_sub(cells(&meta));
+            if remaining > 3 {
+                meta.push_str(&styled(
+                    &format!(" · {}", clipped(attempts, remaining - 3)),
+                    MUTED,
+                    color,
+                ));
+            }
+            return vec![if compact {
+                meta
+            } else {
+                format!("{}  {meta}", styled(avatar[0], ink, color))
+            }];
+        }
+        Some(_) => [
+            meta,
+            agent_status(&agent.state, &agent.activity, content, color),
+            String::new(),
+        ],
+        None => [
+            title,
+            meta,
+            agent_status(&agent.state, &agent.activity, content, color),
+        ],
     };
-    let remaining = content.saturating_sub(cells(&status));
-    let mut status = styled(&clipped(&status, content), status_ink, color);
-    if !agent.activity.is_empty() && remaining > 3 {
-        status.push_str(" · ");
-        status.push_str(&styled(
-            &clipped(&agent.activity, remaining - 3),
-            MUTED,
-            color,
-        ));
-    }
-    let lines = [title, meta, status];
     if compact {
-        return lines.into_iter().collect();
+        return lines.into_iter().filter(|line| !line.is_empty()).collect();
     }
     avatar
         .into_iter()
         .zip(lines)
         .map(|(pixels, text)| format!("{}  {text}", styled(pixels, ink, color)))
         .collect()
+}
+
+fn agent_status(state: &str, detail: &str, width: usize, color: bool) -> String {
+    let (status, status_ink) = match state {
+        "Completed" => ("· Done".into(), MUTED),
+        "Running" => ("· Running".into(), MUTED),
+        "Paused" => ("◷ Paused".into(), AMBER),
+        state => (format!("× {state}"), RED),
+    };
+    let remaining = width.saturating_sub(cells(&status));
+    let mut status = styled(&clipped(&status, width), status_ink, color);
+    if !detail.is_empty() && remaining > 3 {
+        status.push_str(" · ");
+        status.push_str(&styled(&clipped(detail, remaining - 3), MUTED, color));
+    }
+    status
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Choice {
@@ -1436,6 +1509,7 @@ fn inspector_rows(
     color: bool,
     focused: bool,
     activity: Option<&Frame>,
+    preview: Vec<String>,
 ) -> Vec<String> {
     let mut rows = vec![styled(
         &clipped(&panel.title, width),
@@ -1472,7 +1546,7 @@ fn inspector_rows(
         rows.push(rule(width, color));
     }
     let footer = usize::from(!panel.footer.is_empty());
-    let available = height.saturating_sub(rows.len() + footer);
+    let available = height.saturating_sub(rows.len() + footer + preview.len());
     let document_rows = panel.document.as_ref().map(|doc| doc.viewport_rows(width));
     if let Some(activity) = activity {
         rows.extend(activity.lines.iter().skip(1).take(available).cloned());
@@ -1576,7 +1650,8 @@ fn inspector_rows(
             });
         }
     }
-    rows.resize(height.saturating_sub(footer), String::new());
+    rows.resize(height.saturating_sub(footer + preview.len()), String::new());
+    rows.extend(preview);
     if footer > 0 && height > 0 {
         rows.push(styled(&clipped(&panel.footer, width), MUTED, color));
     }
@@ -1854,8 +1929,22 @@ pub fn layout_workspace(
         let chrome = 1
             + usize::from(!panel.tabs.is_empty() && panel_height > 2)
             + usize::from(panel_height > 3);
-        let content_height =
-            panel_height.saturating_sub(chrome + usize::from(!panel.footer.is_empty()));
+        let mut preview = Vec::new();
+        if let Some((title, detail)) = &panel.preview
+            && panel_height >= 12
+        {
+            preview.push(rule(panel_width, color));
+            preview.push(styled(&clipped(title, panel_width), SKY, color));
+            let lines: Vec<_> = detail.lines().take(2).map(str::to_owned).collect();
+            preview.extend(
+                super::cells::wrap_lines(&lines, panel_width)
+                    .into_iter()
+                    .take(3)
+                    .map(|line| clipped(&line, panel_width)),
+            );
+        }
+        let content_height = panel_height
+            .saturating_sub(chrome + usize::from(!panel.footer.is_empty()) + preview.len());
         activity_frame = panel
             .activity
             .as_ref()
@@ -1897,6 +1986,7 @@ pub fn layout_workspace(
             color,
             ui.focus == Focus::Inspector,
             activity_frame.as_deref(),
+            preview,
         );
         inspector_bounds = Some((
             if side_by_side { chat_width + 3 } else { 0 },
@@ -3024,6 +3114,8 @@ mod tests {
                 role: AgentRole::Coordinator,
                 model: "gpt-6.1-sol".into(),
                 activity: "planning".into(),
+                step: None,
+                tool_calls: None,
             })),
         }];
         let ui = Workspace {

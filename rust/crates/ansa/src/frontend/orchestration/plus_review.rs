@@ -98,6 +98,7 @@ pub(super) async fn review_candidate_plus(
         source,
         stop,
         progress,
+        step: None,
     };
     let repair_phase = Phase {
         workspace: worktree.path(),

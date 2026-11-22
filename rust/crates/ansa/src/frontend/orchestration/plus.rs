@@ -38,6 +38,7 @@ pub(super) struct Phase<'a> {
     pub(super) source: &'a Request,
     pub(super) stop: &'a Cancel,
     pub(super) progress: &'a PhaseProgress<'a>,
+    pub(super) step: Option<&'a str>,
 }
 
 impl Phase<'_> {
@@ -75,6 +76,8 @@ impl Phase<'_> {
             role: agent_role,
             model: role.model.clone(),
             activity: stage.into(),
+            step: self.step.map(str::to_owned),
+            tool_calls: None,
         };
         let started_at = now()?;
         if started_at >= self.deadline {
@@ -139,6 +142,7 @@ impl Phase<'_> {
             let mut agent = card(&session.id);
             agent.state = child_status(result).into();
             agent.activity.clone_from(&result.summary);
+            agent.tool_calls = Some(tool_evidence.dispatched);
             self.publish(&agent);
             return Ok(PhaseResult {
                 result: result.clone(),
@@ -354,6 +358,7 @@ impl Phase<'_> {
             agent.activity = error.into();
         } else if let Ok(done) = &result {
             agent.activity.clone_from(&done.result.summary);
+            agent.tool_calls = Some(done.tool_evidence.dispatched);
         }
         self.publish(&agent);
         result
@@ -790,6 +795,7 @@ pub(super) async fn schedule(
                 source: &source,
                 stop,
                 progress: &phase_progress,
+                step: Some(&task.id),
             };
             let input = serde_json::json!({
                 "dependencies": task.depends_on.iter().filter_map(|id| {
@@ -850,6 +856,7 @@ pub(super) async fn schedule(
                 source: &source,
                 stop,
                 progress: &phase_progress,
+                step: None,
             };
             (None, review_report(&phase, &run, profile).await?)
         };

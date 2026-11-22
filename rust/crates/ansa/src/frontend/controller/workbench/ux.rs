@@ -724,6 +724,8 @@ impl Workbench {
                     role: carbon::AgentRole::Research,
                     model: String::new(),
                     activity,
+                    step: None,
+                    tool_calls: None,
                 },
             ));
         }

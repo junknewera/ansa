@@ -1826,6 +1826,23 @@ def siwc_orchestrate_plus(screen, root, cwd):
     local(screen, "/agents")
     until(screen, lambda frame: agents_open(screen) and "Review · gpt-6.2-sol" in frame,
           "Work opens the same completed agent cards")
+    screen.send(b"\tg")
+    until(screen, lambda _: "quick / Set report to after fixture" in activity_body(screen)
+          and "├─ 01" in activity_body(screen) and "0 calls" in activity_body(screen),
+          "worker attempts appear under one approved step")
+    assert activity_body(screen).count("Set report to after fixture") == 1
+    for _ in range(12):
+        screen.send(b"\x1b[B")
+        paint_quiet(screen)
+        if "Attempt 01" in visible(screen):
+            break
+    else:
+        raise AssertionError(("attempt preview", visible(screen)))
+    screen.send(b"\r")
+    until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
+          "the selected attempt opens its own transcript")
+    escape(screen)
+    until(screen, lambda _: agents_open(screen), "Esc returns to the grouped agents")
     escape(screen)
     until(screen, lambda _: not agents_open(screen), "close the agent list")
     followup = "PLUS_WORK_FOLLOWUP"
