@@ -51,13 +51,18 @@ impl ChildResult {
         })?;
         let mut result: Self = serde_json::from_str(text).map_err(|_| "child_result_schema")?;
         normalize_text(&mut result.summary);
-        if result.summary.trim().is_empty() {
-            result.summary = "No summary provided.".into();
-        }
         result.findings.retain_mut(|finding| {
             normalize_text(finding);
             !finding.trim().is_empty()
         });
+        if result.summary.trim().is_empty() {
+            if let Some(finding) = result.findings.first() {
+                result.summary.clone_from(finding);
+            } else {
+                result.status = ChildStatus::Blocked;
+                result.summary = "The agent returned an empty report.".into();
+            }
+        }
         Ok(result)
     }
 }
@@ -265,7 +270,7 @@ mod tests {
 
         let result = ChildResult::parse(&text).unwrap();
         assert_eq!(result.status, ChildStatus::Completed);
-        assert_eq!(result.summary, "No summary provided.");
+        assert_eq!(result.summary, "finding 1");
         assert_eq!(&result.findings[..12], expected.as_slice());
         assert_eq!(result.findings[12], "first second\n\tthird");
         assert_eq!(result.validate(), Ok(()));
@@ -274,6 +279,11 @@ mod tests {
             ChildResult::parse(r#"{"status":"completed","summary":"Done","findings":[""]}"#)
                 .unwrap();
         assert!(without_evidence.findings.is_empty());
+
+        let empty = ChildResult::parse(r#"{"status":"completed","summary":" ","findings":[" " ]}"#)
+            .unwrap();
+        assert_eq!(empty.status, ChildStatus::Blocked);
+        assert_eq!(empty.validate(), Ok(()));
     }
 
     #[test]
