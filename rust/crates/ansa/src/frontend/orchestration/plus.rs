@@ -288,6 +288,9 @@ impl Phase<'_> {
                         ..
                     }
                 ) {
+                    let reason = pause_reason(&proof);
+                    agent.activity = reason.clone();
+                    publish_pause(self.progress.sender, reason);
                     return Err("orchestration_paused");
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;

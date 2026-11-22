@@ -1497,10 +1497,15 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     assert not check_marker.exists()
     screen.send(b"\r")
     store = root / "home/.ansa/orchestration"
-    until(screen, lambda frame: "Agent paused" in frame and "resume with /sessions" in frame and any(
-        row["kind"] == "pause" and row.get("diagnostic") == "tool_round_limit"
-        for _, rows in reviewer_records() for row in rows),
-        "read-only reviewer paused at the tool round limit", timeout=15)
+    pause = "Orchestration paused · Tool budget reached (tool_round_limit) · /sessions for options"
+    until(screen, lambda _: pause in body(screen)
+          and "Ctrl+C stop" not in screen.vt.line(-2)
+          and any(row["kind"] == "pause" and row.get("diagnostic") == "tool_round_limit"
+                  for _, rows in reviewer_records() for row in rows),
+          "chat shows why the read-only reviewer stopped and how to resume", timeout=15)
+    open_activity(screen)
+    until(screen, lambda frame: pause in frame, "Activity also shows the paused run")
+    close_activity(screen)
     checkout, = store.glob("*/*/checkout")
     run = checkout.parent
     frozen = (run / "candidate-0").read_text()
@@ -1519,6 +1524,10 @@ def orchestration_review_resume(screen, root, cwd, exhausted=False):
     restarted = start(screen.child.args[0], root, root / "home", cwd,
                       argv_extra=["--session", run.parent.name])
     screen.additional_screens = [("restart", restarted)]
+    open_activity(restarted)
+    until(restarted, lambda frame: "Paused · Tool budget reached (tool_round_limit)" in frame,
+          "archived agent card shows the original cause after restart")
+    close_activity(restarted)
     local(restarted, "/sessions")
     until(restarted, lambda frame: "Resume orchestration" in frame, "saved run can resume")
     restarted.send(b"\r")

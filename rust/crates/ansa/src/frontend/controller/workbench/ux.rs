@@ -114,6 +114,13 @@ impl Workbench {
         ))
     }
 
+    pub(super) fn paused_orchestration_notice(&self) -> Option<String> {
+        let owner = &self.slots[self.current].id;
+        let reason = self.orchestration_views.get(owner)?.pause_reason.as_ref()?;
+        (!self.collecting_orchestration())
+            .then(|| format!("Orchestration paused · {reason} · /sessions for options"))
+    }
+
     pub(super) fn terminal_activity(&self) -> Vec<Entry> {
         let slot = &self.slots[self.current];
         let mut entries = slot.projected().unwrap_or_default();
@@ -229,6 +236,17 @@ impl Workbench {
                     agent: Some(Arc::new(agent)),
                 }),
         );
+        if let Some(text) = self.paused_orchestration_notice() {
+            entries.push(Entry {
+                role: "tool_warning".into(),
+                text,
+                action: None,
+                status: None,
+                edit: None,
+                output: None,
+                agent: None,
+            });
+        }
         if !collecting && let Some(view) = view.filter(|view| view.clarification_pending) {
             entries.push(Entry {
                 text: "Plan and saved clarification".into(),
@@ -646,8 +664,12 @@ impl Workbench {
                 continue;
             }
             let live = self.slots.iter().find(|slot| slot.id == *id);
-            let state = live
-                .and_then(|slot| slot.state.snapshot.as_ref())
+            let snapshot = live.and_then(|slot| slot.state.snapshot.as_ref());
+            let archived = self
+                .summaries
+                .iter()
+                .find(|summary| summary.entry.id == *id);
+            let state = snapshot
                 .map(|view| {
                     if view.worker_busy {
                         "Running"
@@ -660,14 +682,8 @@ impl Workbench {
                         }
                     }
                 })
-                .unwrap_or_else(|| {
-                    self.summaries
-                        .iter()
-                        .find(|s| s.entry.id == *id)
-                        .map_or("Unavailable", |s| s.status.label())
-                });
-            let generation = live
-                .and_then(|slot| slot.state.snapshot.as_ref())
+                .unwrap_or_else(|| archived.map_or("Unavailable", |s| s.status.label()));
+            let generation = snapshot
                 .map(|view| {
                     format!(
                         "{}{}",
@@ -680,12 +696,16 @@ impl Workbench {
                 })
                 .unwrap_or_default();
             let elapsed = live.and_then(|slot| slot.state.progress.elapsed());
-            let activity = if let Some(preview) = self
-                .summaries
-                .iter()
-                .find(|summary| summary.entry.id == *id)
-                .and_then(|summary| summary.preview.as_ref())
-            {
+            let pause_diagnostic = match snapshot {
+                Some(view) if state == "Paused" && !view.diagnostic.is_empty() => {
+                    Some(view.diagnostic.as_str())
+                }
+                Some(_) => None,
+                None => archived.and_then(|summary| summary.pause_diagnostic.as_deref()),
+            };
+            let activity = if let Some(code) = pause_diagnostic {
+                crate::frontend::diagnostics::error(code)
+            } else if let Some(preview) = archived.and_then(|summary| summary.preview.as_ref()) {
                 preview.clone()
             } else {
                 match (generation.is_empty(), elapsed) {

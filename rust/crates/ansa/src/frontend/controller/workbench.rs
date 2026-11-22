@@ -3535,6 +3535,14 @@ impl Workbench {
                     return;
                 }
                 self.orchestration_stop = None;
+                if let Some(view) = self.orchestration_views.get_mut(&owner) {
+                    if matches!(result, Err("orchestration_paused")) {
+                        view.pause_reason
+                            .get_or_insert_with(|| "Pause reason unavailable".into());
+                    } else {
+                        view.pause_reason = None;
+                    }
+                }
                 if result.is_err() && matches!(self.panel, Some(Panel::Activity(_))) {
                     self.refresh_agent_summaries();
                 }
@@ -3593,9 +3601,12 @@ impl Workbench {
                     Err("auth_cancelled" | "run_cancelled") => {
                         parent.state.report(io, "Plan stopped")
                     }
+                    Err("orchestration_paused") if self.orchestration_views.contains_key(&owner) => {
+                        parent.state.status.clear();
+                    }
                     Err("orchestration_paused") => parent
                         .state
-                        .report(io, "Agent paused · resume with /sessions"),
+                        .report(io, "Orchestration paused · /sessions for options"),
                     Err("orchestration_scope_confirmation") => parent.state.report(io,
                         "Plan stopped at the approved scope · submit the revised request to review a new plan"),
                     Err(code) => parent.state.report(io, &format!("Plan stopped ({code})")),
@@ -5476,7 +5487,8 @@ impl Workbench {
                     };
                     format!("Plan paused · {error}{actions}")
                 })
-        };
+        }
+        .or_else(|| self.paused_orchestration_notice());
         Workspace {
             breadcrumb: breadcrumb.join(" / "),
             model: if slot.kind == Kind::Console {

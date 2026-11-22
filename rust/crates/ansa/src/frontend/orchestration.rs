@@ -305,6 +305,7 @@ pub(super) struct RunView {
     pub completed_steps: BTreeSet<String>,
     pub reviewing: bool,
     pub clarification_pending: bool,
+    pub pause_reason: Option<String>,
     pub agents: Vec<(String, AgentLine)>,
 }
 
@@ -330,6 +331,24 @@ fn latest_action(receipt: &ChildAttempt) -> Option<String> {
         _ => name,
     };
     Some(target.map_or_else(|| label.into(), |path| format!("{label} {path}")))
+}
+
+fn pause_reason(receipt: &ChildAttempt) -> String {
+    receipt.pause_diagnostic().map_or_else(
+        || "Pause reason unavailable".into(),
+        super::diagnostics::error,
+    )
+}
+
+fn publish_pause(progress: &watch::Sender<Option<RunView>>, reason: String) {
+    progress.send_if_modified(|view| {
+        if let Some(view) = view {
+            view.pause_reason = Some(reason);
+            true
+        } else {
+            false
+        }
+    });
 }
 
 fn child_status(result: &ChildResult) -> &'static str {
@@ -418,6 +437,7 @@ fn publish_progress(
         completed_steps,
         reviewing,
         clarification_pending: !run.pending_clarifications().is_empty(),
+        pause_reason: None,
         agents,
     };
     progress.send_if_modified(|previous| {
@@ -612,6 +632,7 @@ async fn schedule(
                 return Err("orchestration_deadline");
             }
             let mut paused = 0;
+            let mut paused_reason = None;
             let previously_active = active.len();
             for index in (0..active.len()).rev() {
                 let receipt = active[index].receipt().await?;
@@ -639,12 +660,14 @@ async fn schedule(
                     active.swap_remove(index).runtime.shutdown().await?;
                 } else if observation.paused {
                     paused += 1;
+                    paused_reason.get_or_insert_with(|| pause_reason(&receipt));
                 }
             }
             accept_clarifications(&mut run, &mut inbox);
             publish_progress(&progress, &run, &source, &details, false);
-            if paused > 0 {
+            if let Some(reason) = paused_reason {
                 if paused == active.len() {
+                    publish_pause(&progress, reason);
                     return Err("orchestration_paused");
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
@@ -711,7 +734,7 @@ async fn schedule(
             }) {
                 return Err("orchestration_candidate_incomplete");
             }
-            Some(review_candidate(factory, &run, worktree, &source, stop).await?)
+            Some(review_candidate(factory, &run, worktree, &source, &progress, stop).await?)
         } else {
             None
         };
@@ -768,6 +791,7 @@ async fn review_candidate(
     run: &Run,
     worktree: &Worktree,
     source: &Request,
+    progress: &watch::Sender<Option<RunView>>,
     stop: &Cancel,
 ) -> Result<Candidate> {
     let scope = write_scope(run.plan());
@@ -816,6 +840,7 @@ async fn review_candidate(
             &review_path,
             source,
             reviewer,
+            progress,
             stop,
         )
         .await?;
@@ -843,6 +868,7 @@ async fn review_candidate(
             worktree.path(),
             source,
             repair,
+            progress,
             stop,
         )
         .await?
@@ -1032,6 +1058,7 @@ async fn run_candidate_phase(
     path: &Path,
     source: &Request,
     task: Step,
+    progress: &watch::Sender<Option<RunView>>,
     stop: &Cancel,
 ) -> Result<ChildResult> {
     let started_at = now()?;
@@ -1102,6 +1129,7 @@ async fn run_candidate_phase(
                     ..
                 }
             ) {
+                publish_pause(progress, pause_reason(&proof));
                 return Err("orchestration_paused");
             }
             tokio::time::sleep(Duration::from_millis(40)).await;

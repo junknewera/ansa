@@ -124,6 +124,7 @@ pub struct ChildAttempt {
     state: ChildAttemptState,
     latest_tool: Option<(String, Option<String>)>,
     tool_evidence: Option<ChildToolEvidence>,
+    pause_diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -181,6 +182,9 @@ impl ChildAttempt {
     }
     pub(crate) fn tool_evidence(&self) -> Option<&ChildToolEvidence> {
         self.tool_evidence.as_ref()
+    }
+    pub(crate) fn pause_diagnostic(&self) -> Option<&str> {
+        self.pause_diagnostic.as_deref()
     }
     pub fn into_state(self) -> ChildAttemptState {
         self.state
