@@ -1795,7 +1795,10 @@ def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol")
           and "Orchestrate+" not in screen.vt.line(-2), "return to Work")
     followup = "PLUS_BLOCKED_FOLLOWUP"
-    screen.send(followup + "\r")
+    screen.send(followup)
+    until(screen, lambda _: screen.vt.line(-4) == "  › " + followup
+          and "Ctrl+F Files" in screen.vt.line(-1), "the follow-up can be submitted after the summary")
+    screen.send(b"\r")
     until(screen, lambda frame: completed(root, followup) and "PLUS_BLOCKED_CONTEXT_RETAINED" in frame,
           "normal Work turn receives the authoritative stop evidence")
     rows = records(root)
@@ -1971,7 +1974,8 @@ def siwc_orchestration(screen, root, cwd):
     local(screen, "/basic")
     until(screen, lambda _: "Orchestrate" not in screen.vt.line(-2), "switch to work after timeout")
     screen.send(b"AFTER_TIMEOUT\r")
-    until(screen, lambda frame: completed(root, "AFTER_TIMEOUT") and "SIWC_CARBON_DONE" in frame,
+    until(screen, lambda frame: completed(root, "AFTER_TIMEOUT") and "SIWC_CARBON_DONE" in frame
+          and "Tab mode" in screen.vt.line(-2) and "Ctrl+C stop" not in screen.vt.line(-2),
           "the next request is sent successfully")
     local(screen, "/orchestrate")
     until(screen, lambda _: "Orchestrate" in screen.vt.line(-2) and "Tab mode" in screen.vt.line(-2),
@@ -1995,7 +1999,8 @@ def siwc_orchestration(screen, root, cwd):
 
         until(screen, lambda _: cancelled_draft(), "the exact pending draft was cancelled durably")
         screen.send(b"\x03")
-        until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear the pending draft")
+        until(screen, lambda _: screen.vt.line(-4) == "  ›" and "cancelled" in screen.vt.line(-2)
+              and "Ctrl+C stop" not in screen.vt.line(-2), "the cancelled draft has settled")
         before_login = journals(root)
         local(screen, "/login")
         until(screen, lambda _: "Continue in your browser" in popup_text(screen), "in-chat sign-in starts")
