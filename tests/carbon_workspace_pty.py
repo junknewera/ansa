@@ -1904,7 +1904,11 @@ def siwc_orchestrate_plus(screen, root, cwd):
     assert reviewers == [["plus-review-0", "plus-review-1"]], reviewers
     before = journals(root)
     archive = reopen_agents(screen, root, cwd, checkout.parent.parent.name)
-    archive.send(b"\tg")
+    paint_quiet(archive)
+    archive.send(b"\t")
+    until(archive, lambda _: "Tab → chat" in archive.vt.line(-2),
+          "keyboard focus moved to the archived Agents pane")
+    archive.send(b"g")
     until(archive, lambda _: "quick / Set report to after fixture" in activity_body(archive)
           and "3 attempts" in activity_body(archive)
           and "└─ 03" in activity_body(archive) and "0 calls" in activity_body(archive),
