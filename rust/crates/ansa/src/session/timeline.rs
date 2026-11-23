@@ -10,6 +10,56 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
+fn delegate_notice(
+    task: &str,
+    result: &crate::provider::replay::ToolResult,
+) -> (&'static str, String) {
+    use crate::provider::{
+        contracts::valid_id,
+        replay::{Effects, Execution},
+        structured::{ChildResult, ChildStatus},
+    };
+    let output = result.output();
+    if result.effects() == Effects::KnownResult
+        && result.execution() == Execution::Succeeded
+        && let Ok(report) = serde_json::from_str::<ChildResult>(output)
+    {
+        let status = match report.status {
+            ChildStatus::Completed => "done",
+            ChildStatus::Blocked => "blocked",
+            ChildStatus::ChangesRequested => "needs changes",
+        };
+        let summary = report.summary.trim().lines().next().unwrap_or_default();
+        return (
+            "delegate",
+            format!("Agent {status} · {task}\n{summary:.192}"),
+        );
+    }
+    let status = match (result.effects(), result.execution()) {
+        (Effects::Unknown, _) => "outcome unknown",
+        (_, Execution::Cancelled) => "cancelled",
+        (_, Execution::Failed) if output.starts_with("cancelled (session ") => "cancelled",
+        (_, Execution::Denied) => "denied",
+        (_, Execution::Failed) if output.contains(" (session ") => "paused",
+        _ => "error",
+    };
+    let parsed = Json::parse(output).ok();
+    let code = parsed
+        .as_ref()
+        .and_then(|value| value.text_field("error").ok())
+        .unwrap_or_else(|| {
+            output
+                .split_once(" (session ")
+                .map_or(output, |(code, _)| code)
+        });
+    let mut text = format!("Agent {status} · {task}");
+    if valid_id(code) && code != status {
+        text.push('\n');
+        text.push_str(code);
+    }
+    ("delegate_error", text)
+}
+
 impl ToolDetail {
     fn save(&self) -> Result<Json> {
         let (execution, effects) = match self.phase {
@@ -106,7 +156,8 @@ pub(crate) fn draft_material(row: &Entry) -> bool {
 }
 
 pub(crate) fn conversation_row(row: &Entry) -> bool {
-    matches!(row.role.as_str(), "user" | "assistant" | "reasoning")
+    (matches!(row.role.as_str(), "user" | "assistant" | "reasoning")
+        || (row.role == "notice" && matches!(row.state.as_str(), "delegate" | "delegate_error")))
         && !(row.role == "user" && row.turn.0.starts_with("draft-revise-"))
         && !draft_material(row)
 }
@@ -483,6 +534,14 @@ impl Timeline {
                         }
                     }
                 }
+                if !response.calls().is_empty()
+                    && !self.draft
+                    && response.request().final_format().is_none()
+                    && !self.final_text.trim().is_empty()
+                {
+                    let text = std::mem::take(&mut self.final_text);
+                    self.append("assistant", text, "confirmed");
+                }
             }
             "intent" => {
                 let invocation = codec_v1::Invocation::load(event.field("invocation")?)?;
@@ -524,6 +583,20 @@ impl Timeline {
                     }
                 }
                 let target: String = target.chars().take(480).collect();
+                let target = if invocation.name == crate::tools::delegation::NAME {
+                    invocation
+                        .arguments
+                        .text_field("task")
+                        .unwrap_or_default()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(96)
+                        .collect()
+                } else {
+                    target
+                };
                 let detail = ToolDetail {
                     operation: invocation.operation.clone(),
                     name: invocation.name,
@@ -571,6 +644,10 @@ impl Timeline {
                     effects: result.result.effects(),
                 };
                 detail.content_start = prefix.len();
+                if detail.name == crate::tools::delegation::NAME && result.dispatched {
+                    let (state, text) = delegate_notice(&detail.target, &result.result);
+                    self.append("notice", text, state);
+                }
                 self.append_tool(
                     "tool_result",
                     format!("{prefix}{}", result.result.output()),
@@ -612,6 +689,49 @@ mod tests {
         frontend::app,
         provider::request::{Epoch, Request},
     };
+    #[test]
+    fn delegate_errors_keep_effects_and_hide_raw_executor_output() {
+        use crate::provider::replay::{Effects, Execution, ToolResult};
+        for (execution, effects, output, expected) in [
+            (
+                Execution::Failed,
+                Effects::KnownResult,
+                "cancelled (session abc)",
+                "Agent cancelled · test",
+            ),
+            (
+                Execution::Failed,
+                Effects::Unknown,
+                r#"{"error":"executor_failure","detail":"private data"}"#,
+                "Agent outcome unknown · test\nexecutor_failure",
+            ),
+            (
+                Execution::Failed,
+                Effects::KnownResult,
+                "terminal_workspace_quarantined (session test-session)",
+                "Agent paused · test\nterminal_workspace_quarantined",
+            ),
+            (
+                Execution::Cancelled,
+                Effects::NotStarted,
+                "arbitrary output",
+                "Agent cancelled · test",
+            ),
+        ] {
+            let result = ToolResult::new(
+                "op".into(),
+                "call".into(),
+                output.into(),
+                execution,
+                effects,
+            );
+            assert_eq!(
+                delegate_notice("test", &result),
+                ("delegate_error", expected.into())
+            );
+        }
+    }
+
     #[test]
     fn command_target_uses_the_production_argv_and_cwd_contract() {
         let mut timeline = Timeline::default();

@@ -465,7 +465,11 @@ impl Slot {
             self.state.report(io, "No active step");
         }
     }
-    fn conversation(&self, show_activity: bool) -> Option<Vec<Entry>> {
+    fn conversation(
+        &self,
+        show_activity: bool,
+        delegate: Option<&crate::frontend::sessions::LiveDelegate>,
+    ) -> Option<Vec<Entry>> {
         let page = self.conversation_page.as_ref()?;
         let view = self.state.snapshot.as_ref()?;
         let mut entries = page
@@ -473,7 +477,13 @@ impl Slot {
             .iter()
             .map(|row| Entry {
                 role: row.role.clone(),
-                text: row.text.clone(),
+                text: if row.state == "delegate_error"
+                    && let Some((title, code)) = row.text.rsplit_once('\n')
+                {
+                    format!("{title}\n{} · /agents", diagnostics::error(code))
+                } else {
+                    row.text.clone()
+                },
                 action: None,
                 edit: None,
                 output: None,
@@ -523,19 +533,63 @@ impl Slot {
                     ),
                 });
             }
+            if diagnostics::needs_attention(view) {
+                let reason = if view.storage_failed {
+                    format!(
+                        "Session storage error · {}",
+                        diagnostics::error(&view.diagnostic)
+                    )
+                } else if view.recovery_operation.is_some() {
+                    "Tool outcome unknown · verify the operation before continuing".into()
+                } else if view.diagnostic == "tool_round_limit" {
+                    "Work paused · The next group of tool calls would exceed this segment’s allowance.".into()
+                } else {
+                    format!("Work paused · {}", diagnostics::error(&view.diagnostic))
+                };
+                let next = if view.storage_failed || view.recovery_operation.is_some() {
+                    "/sessions for details"
+                } else if matches!(
+                    view.diagnostic.as_str(),
+                    "tool_turn_limit"
+                        | "tool_batch_limit"
+                        | "tool_failed"
+                        | "task_path_scope"
+                        | "terminal_workspace_quarantined"
+                        | "terminal_workspace_busy"
+                ) {
+                    "/cancel this turn and send a new request"
+                } else if view.resume_available {
+                    "/retry to continue"
+                } else {
+                    "/sessions for details"
+                };
+                entries.push(Entry {
+                    role: "notice".into(),
+                    text: format!("{reason}\n{next}"),
+                    action: None,
+                    edit: None,
+                    output: None,
+                    agent: None,
+                    status: None,
+                });
+            }
             if show_activity
                 && !view
                     .submit
                     .as_ref()
                     .is_some_and(|id| id.0.starts_with("draft-"))
             {
-                entries.extend(self.live_activity(view));
+                entries.extend(self.live_activity(view, delegate));
             }
         }
         Some(entries)
     }
 
-    fn live_activity(&self, view: &Snapshot) -> Option<Entry> {
+    fn live_activity(
+        &self,
+        view: &Snapshot,
+        delegate: Option<&crate::frontend::sessions::LiveDelegate>,
+    ) -> Option<Entry> {
         if !view.worker_busy
             || view.request.is_none()
             || diagnostics::needs_attention(view)
@@ -546,11 +600,10 @@ impl Slot {
         let preview = self.state.preview.as_ref().is_some_and(|p| {
             p.state == "preview" && !p.text.is_empty() && self.state.preview_request == view.request
         });
-        let phase = Progress::phase(view, preview);
-        let text = self.state.progress.elapsed().map_or_else(
-            || phase.to_owned(),
-            |elapsed| format!("{phase} · {elapsed}"),
-        );
+        let text = self
+            .state
+            .progress
+            .live_label(view, preview, delegate, Instant::now());
         Some(Entry {
             role: "activity".into(),
             text,
@@ -605,7 +658,7 @@ impl Slot {
             );
         }
         if at_tail {
-            entries.extend(self.live_activity(view));
+            entries.extend(self.live_activity(view, None));
         }
         Some(entries)
     }
@@ -1027,6 +1080,8 @@ struct Workbench {
     orchestration_summary: BTreeMap<String, CommandId>,
     orchestration_mode: Option<OrchestrationMode>,
     live_delegates: tokio::sync::watch::Receiver<crate::frontend::sessions::LiveDelegates>,
+    agent_summaries_loading: bool,
+    agent_summaries_pending: bool,
     refinement: Option<(String, bool, Option<String>)>,
     plan_after_roles: Option<(String, Option<String>, bool)>,
     menu: Option<Menu>,
@@ -1123,6 +1178,8 @@ impl Workbench {
         let (sender, events) = mpsc::channel(64);
         let mut value = Self {
             live_delegates: factory.live_delegates.subscribe(),
+            agent_summaries_loading: true,
+            agent_summaries_pending: false,
             factory,
             files,
             theme_store,
@@ -1522,10 +1579,19 @@ impl Workbench {
     }
 
     fn refresh_agent_summaries(&mut self) {
-        if !self.input_closed
+        self.agent_summaries_pending = true;
+        self.start_agent_summaries();
+    }
+
+    fn start_agent_summaries(&mut self) {
+        if self.agent_summaries_pending
+            && !self.agent_summaries_loading
+            && !self.input_closed
             && !self.terminating
             && self.jobs.len() + self.pending_context.len() < MAX_JOBS
         {
+            self.agent_summaries_pending = false;
+            self.agent_summaries_loading = true;
             let factory = self.factory.clone();
             let stop = Cancel::linked(&self.stop);
             let parent = self.conversation_root();
@@ -1601,7 +1667,7 @@ impl Workbench {
         let Some(Panel::AgentTranscript(reader)) = &self.panel else {
             return;
         };
-        let live = self.live_delegates.borrow().contains_key(&reader.id)
+        let live = self.live_delegates.borrow().agents.contains_key(&reader.id)
             || self
                 .orchestration_views
                 .get(&reader.parent)
@@ -4259,6 +4325,7 @@ impl Workbench {
                 result,
                 agent_history,
             } => {
+                self.agent_summaries_loading = false;
                 if let Some((parent, views)) = agent_history
                     && parent == self.conversation_root()
                 {
@@ -4822,29 +4889,29 @@ impl Workbench {
                 ) => {}
                 Some(Panel::AgentTranscript(reader)) => {
                     if let Some(page) = &reader.page {
-                        let width = self
+                        let (width, height) = self
                             .displayed
                             .as_ref()
                             .and_then(|frame| frame.inspector_bounds())
-                            .map_or(72, |bounds| bounds.2);
+                            .map_or((72, 6), |(_, _, width, height)| (width, height));
                         let document = if reader.tool_details {
                             &page.details
                         } else {
                             &page.document
                         };
-                        if reader.follow_agent && older {
-                            let height = self
-                                .displayed
-                                .as_ref()
-                                .and_then(|frame| frame.inspector_bounds())
-                                .map_or(6, |bounds| bounds.3);
-                            reader.offset = document
-                                .viewport_rows(width)
-                                .len()
-                                .saturating_sub(height.max(1));
-                            reader.follow_agent = false;
+                        let last = document
+                            .viewport_rows(width)
+                            .len()
+                            .saturating_sub(height.max(1));
+                        if reader.follow_agent {
+                            reader.offset = last;
                         }
-                        delta(&mut reader.offset, document.viewport_rows(width).len());
+                        reader.offset = if older {
+                            reader.offset.saturating_sub(1)
+                        } else {
+                            reader.offset.saturating_add(1).min(last)
+                        };
+                        reader.follow_agent = !older && reader.offset == last;
                     }
                 }
                 Some(Panel::Orchestration { .. }) => {}
@@ -5263,7 +5330,7 @@ impl Workbench {
                         None
                     };
                     if in_chat && self.selection.is_some() {
-                        let reading = slot.conversation(false);
+                        let reading = slot.conversation(false, None);
                         slot.state.follow_tail = false;
                         slot.state.reading_total = slot
                             .state
@@ -5730,7 +5797,7 @@ impl Workbench {
                         .as_ref()
                         .filter(|page| page.begin > 0 || page.end < page.total)
                         .map_or("", |_| " · [/] pages");
-                    format!("Tab focus · t tool details{pages} · Esc back")
+                    format!("j/k scroll · t details{pages} · Tab focus · Esc back")
                 } else {
                     format!("{} · Esc back", reader.notice)
                 },
@@ -6408,6 +6475,7 @@ pub async fn run_attached(
     let mut escape_at = None;
     let mut dirty = true;
     let mut animated_frame = None;
+    let mut completed_delegates = work.live_delegates.borrow().completed;
     let mut deferred_input = std::collections::VecDeque::new();
     let mut failure: Option<&'static str> = None;
     let result: Result<()> = async {
@@ -6520,12 +6588,14 @@ pub async fn run_attached(
             let now = Instant::now();
             dirty |= work.update_orchestration_progress();
             if work.live_delegates.has_changed().unwrap_or(false) {
-                work.live_delegates.borrow_and_update();
-                if matches!(work.panel, Some(Panel::Activity(_) | Panel::AgentTranscript(_))) {
+                let completed = work.live_delegates.borrow_and_update().completed;
+                if completed != completed_delegates && matches!(work.panel, Some(Panel::Activity(_) | Panel::AgentTranscript(_))) {
                     work.refresh_agent_summaries();
                 }
+                completed_delegates = completed;
                 dirty = true;
             }
+            work.start_agent_summaries();
             dirty |= work.tick_drag(io, now);
             work.refresh_terminal_screen(now);
             work.refresh_agent_reader();
@@ -6641,7 +6711,7 @@ pub async fn run_attached(
                                     work.wide_diff = !work.wide_diff;
                                     continue;
                                 }
-                                if matches!(byte, b'j' | b'k') && !jumping && (work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Files(_) | Panel::EditDiff { .. } | Panel::Output { .. }))) { work.navigate(byte == b'k'); continue; }
+                                if matches!(byte, b'j' | b'k') && !jumping && (work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Files(_) | Panel::EditDiff { .. } | Panel::Output { .. } | Panel::AgentTranscript(_)))) { work.navigate(byte == b'k'); continue; }
                                 let file_visible = work.displayed.as_ref().map_or(1, |frame| frame.inspector_content_rows).max(1);
                                 let inspector_width = work.displayed.as_ref().and_then(|frame|frame.chat_bounds).map_or(io.size.0.saturating_sub(1),|(_,_,right)|io.size.0.saturating_sub(right+4));
                                 if work.focus == Focus::Inspector && matches!(work.panel, Some(Panel::Output { .. })) {

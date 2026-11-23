@@ -530,7 +530,7 @@ pub(crate) fn read(
             .as_ref()
             .and_then(|state| state.turn.as_ref())
             .filter(|turn| !turn.diagnostic.is_empty())
-            .map(|turn| turn.diagnostic.clone());
+            .map(|turn| turn.pause_diagnostic().to_owned());
     }
     Ok(summary)
 }

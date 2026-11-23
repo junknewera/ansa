@@ -164,7 +164,8 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
             ("arguments", s(&arguments.to_string())),
             ("status", s("completed")),
         ]);
-        return orchestration_response(request, &id, item).map(Some);
+        let note = orchestration_message(&id, "I will ask a helper to work on this task.")?;
+        return orchestration_response(request, &id, vec![note, item]).map(Some);
     }
     if request.final_format() == Some(FinalFormat::ChildResult)
         && (user.starts_with("Review first fixture file")
@@ -208,7 +209,7 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
                 ("arguments", s(&args.to_string())),
                 ("status", s("completed")),
             ]);
-            return orchestration_response(request, &id, item).map(Some);
+            return orchestration_response(request, &id, vec![item]).map(Some);
         }
     }
     let text = match request.final_format() {
@@ -340,7 +341,12 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
     } else {
         text
     };
-    let item = obj(vec![
+    let item = orchestration_message(&id, &text)?;
+    orchestration_response(request, &id, vec![item]).map(Some)
+}
+
+fn orchestration_message(id: &str, text: &str) -> Result<Json> {
+    Ok(obj(vec![
         ("type", s("message")),
         ("id", s(&format!("msg_{}", &id[..24]))),
         ("role", s("assistant")),
@@ -349,11 +355,10 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
             "content",
             Json::array(vec![obj(vec![
                 ("type", s("output_text")),
-                ("text", s(&text)),
+                ("text", s(text)),
             ])])?,
         ),
-    ]);
-    orchestration_response(request, &id, item).map(Some)
+    ]))
 }
 
 fn review_resume_probe(last: Option<&Json>) -> Result<Option<(&'static str, &'static str)>> {
@@ -384,12 +389,16 @@ fn review_resume_probe(last: Option<&Json>) -> Result<Option<(&'static str, &'st
     Ok(None)
 }
 
-fn orchestration_response(request: &Request, id: &str, item: Json) -> Result<AdmittedResponse> {
+fn orchestration_response(
+    request: &Request,
+    id: &str,
+    items: Vec<Json>,
+) -> Result<AdmittedResponse> {
     native::load(&obj(vec![
         ("request", request.save()?),
         ("id", s(&format!("response_{}", &id[..24]))),
         ("model", s(&request.binding.returned_model)),
-        ("items", Json::array(vec![item])?),
+        ("items", Json::array(items)?),
     ]))
 }
 

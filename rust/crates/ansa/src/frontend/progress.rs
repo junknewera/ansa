@@ -209,6 +209,63 @@ impl Progress {
             _ => "working",
         }
     }
+    pub fn live_label(
+        &self,
+        view: &Snapshot,
+        preview: bool,
+        delegate: Option<&super::sessions::LiveDelegate>,
+        now: Instant,
+    ) -> String {
+        if let Some(tool) = view.tools.iter().rev().find_map(|item| match item {
+            Activity::Started(tool) => Some(tool),
+            Activity::Finished(_) => None,
+        }) {
+            let elapsed = self
+                .tools
+                .get(&tool.operation.0)
+                .and_then(|clock| clock.started)
+                .map(|start| format!(" · {} s", now.saturating_duration_since(start).as_secs()))
+                .unwrap_or_default();
+            if tool.name == crate::tools::delegation::NAME {
+                return match delegate.filter(|agent| agent.operation == tool.operation.0) {
+                    Some(delegate) => {
+                        let agent = &delegate.line;
+                        let action = if agent.activity.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", agent.activity)
+                        };
+                        format!(
+                            "Agent {}{elapsed} · /agents · {}{action}",
+                            agent.model, agent.title
+                        )
+                    }
+                    None => format!("Delegating{elapsed} · /agents"),
+                };
+            }
+            return format!("Running {}{elapsed} · /terminals", tool.name);
+        }
+        let phase = if view.state == "executing" {
+            "Preparing tools"
+        } else {
+            Self::phase(view, preview)
+        };
+        self.clock.as_ref().map_or_else(
+            || phase.to_owned(),
+            |clock| {
+                format!(
+                    "{phase} · {} s {}",
+                    self.seconds,
+                    if clock.resumed {
+                        "since /resume"
+                    } else {
+                        "into turn"
+                    }
+                )
+            },
+        )
+    }
+
     pub fn entries(&self, view: &Snapshot, expanded: bool, now: Instant) -> Vec<Entry> {
         if self.pending.is_some() || self.request != view.request {
             return vec![];
@@ -432,6 +489,11 @@ mod tests {
             name: "read_file".into(),
         };
         progress.project(&mut v, Activity::Started(started.clone()), start);
+        v.state = "executing".into();
+        assert_eq!(
+            progress.live_label(&v, false, None, start + Duration::from_secs(3)),
+            "Running read_file · 3 s · /terminals"
+        );
         assert!(
             progress.entries(&v, false, start)[0]
                 .text

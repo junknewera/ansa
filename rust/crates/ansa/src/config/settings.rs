@@ -11,6 +11,8 @@ pub struct AgentSettings {
     pub compact_bytes: usize,
     pub tool_rounds: usize,
     pub tool_calls: usize,
+    pub(crate) lead_tool_rounds: usize,
+    pub(crate) lead_tool_calls: usize,
     pub process_timeout_ms: usize,
     pub(crate) orchestration_check_timeout_ms: usize,
     pub process_output_bytes: usize,
@@ -27,6 +29,8 @@ impl AgentSettings {
             compact_bytes: 256 * 1024,
             tool_rounds: 32,
             tool_calls: 64,
+            lead_tool_rounds: 64,
+            lead_tool_calls: 256,
             process_timeout_ms: 60000,
             orchestration_check_timeout_ms: 600_000,
             process_output_bytes: 16384,
@@ -86,8 +90,14 @@ fn overlay(settings: &mut AgentSettings, path: &Path, project: bool) -> Result<(
             }
             "returned_model" => settings.returned_model = json.text_field(key)?.into(),
             "compact_bytes" => settings.compact_bytes = json.usize_field(key)?,
-            "tool_rounds" => settings.tool_rounds = json.usize_field(key)?,
-            "tool_calls" => settings.tool_calls = json.usize_field(key)?,
+            "tool_rounds" => {
+                settings.tool_rounds = json.usize_field(key)?;
+                settings.lead_tool_rounds = settings.tool_rounds;
+            }
+            "tool_calls" => {
+                settings.tool_calls = json.usize_field(key)?;
+                settings.lead_tool_calls = settings.tool_calls;
+            }
             "process_timeout_ms" => {
                 let timeout = json.usize_field(key)?;
                 settings.process_timeout_ms = timeout;
@@ -152,4 +162,33 @@ pub fn load_agent_settings(cwd: &Path, home: &Path) -> Result<AgentSettings> {
         return Err("agent_config_limits");
     }
     Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_budgets_override_lead_defaults_independently() {
+        let root = std::env::temp_dir().join(format!("ansa-lead-settings-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("config.json");
+        let mut settings = AgentSettings::defaults(&root, &root);
+        assert_eq!(
+            (settings.lead_tool_rounds, settings.lead_tool_calls),
+            (64, 256)
+        );
+        std::fs::write(&file, r#"{"schema_version":1,"tool_calls":64}"#).unwrap();
+        overlay(&mut settings, &file, false).unwrap();
+        assert_eq!(
+            (settings.lead_tool_rounds, settings.lead_tool_calls),
+            (64, 64)
+        );
+        std::fs::write(&file, r#"{"schema_version":1,"tool_rounds":8}"#).unwrap();
+        overlay(&mut settings, &file, true).unwrap();
+        assert_eq!(
+            (settings.lead_tool_rounds, settings.lead_tool_calls),
+            (8, 64)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

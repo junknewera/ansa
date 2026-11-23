@@ -116,32 +116,58 @@ impl AgentArchive {
             .filter(|tool| matches!(tool.phase, ToolPhase::Finished { .. }))
             .map(|tool| tool.operation.as_str())
             .collect();
-        for entry in &page.entries {
+        let mut rows = page.entries.iter().peekable();
+        while let Some(entry) = rows.next() {
             if let Some(tool) = &entry.tool {
-                if !tool.continued {
-                    let state = tool_state(tool.phase);
-                    let target = tool_target(&tool.target);
-                    if !(tool.phase == ToolPhase::Prepared
-                        && settled.contains(tool.operation.as_str()))
-                    {
-                        let (action, show_target) = match tool.name.as_str() {
-                            "read_file" => ("Read", true),
-                            "list_directory" => ("List", true),
-                            "search_files" => ("Search", true),
-                            "edit_file" => ("Edit", true),
-                            "git_snapshot" => ("Git snapshot", false),
-                            "run_command" => ("Command", false),
-                            name => (name, false),
-                        };
-                        let shown = if show_target { target.as_str() } else { "" };
-                        sections.push(format!("**{}**{shown} · {state}", literal(action)));
-                    }
-                    details.push(format!("**{}**{target} · {state}", literal(&tool.name)));
+                let state = tool_state(tool.phase);
+                let target = tool_target(&tool.target);
+                if !(tool.phase == ToolPhase::Prepared && settled.contains(tool.operation.as_str()))
+                {
+                    let (action, show_target) = match tool.name.as_str() {
+                        "read_file" => ("Read", true),
+                        "list_directory" => ("List", true),
+                        "search_files" => ("Search", true),
+                        "edit_file" => ("Edit", true),
+                        "git_snapshot" => ("Git snapshot", false),
+                        "run_command" => ("Command", false),
+                        name => (name, false),
+                    };
+                    let shown = if show_target { target.as_str() } else { "" };
+                    sections.push(format!("**{}**{shown} · {state}", literal(action)));
                 }
-                let data = entry.text.get(tool.content_start..).unwrap_or_default();
-                if !data.is_empty() {
+                details.push(format!("**{}**{target} · {state}", literal(&tool.name)));
+                let mut data = entry
+                    .text
+                    .get(tool.content_start..)
+                    .unwrap_or_default()
+                    .to_owned();
+                let mut complete = tool.last_chunk;
+                while !complete
+                    && let Some(row) = rows.next_if(|row| {
+                        row.request == entry.request
+                            && row.tool.as_ref().is_some_and(|chunk| {
+                                chunk.continued
+                                    && chunk.operation == tool.operation
+                                    && chunk.phase == tool.phase
+                            })
+                    })
+                {
+                    let chunk = row.tool.as_ref().expect("matching tool chunk");
+                    data.push_str(row.text.get(chunk.content_start..).unwrap_or_default());
+                    complete = chunk.last_chunk;
+                }
+                let decoded = if tool.continued || !complete {
+                    format!(
+                        "Partial tool output on this page\n{}",
+                        crate::frontend::workspace::display_text(&data)
+                    )
+                } else {
+                    super::super::tool_ui::transcript_payload(&data)
+                };
+                if !decoded.is_empty() {
                     details.push(
-                        data.lines()
+                        decoded
+                            .lines()
                             .map(|line| format!("    {line}"))
                             .collect::<Vec<_>>()
                             .join("\n"),
@@ -245,4 +271,67 @@ fn literal(text: &str) -> String {
         });
     }
     literal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{protocol::json::Json, session::timeline::Timeline};
+
+    #[test]
+    fn detail_pages_decode_complete_payloads_and_only_include_their_own_chunks() {
+        let rows = [
+            (r#"{"content":"first\n"#, false, false),
+            (r#"second"}"#, true, true),
+        ]
+        .map(|(text, continued, last_chunk)| {
+            serde_json::json!({
+                "turn": "t", "request": "r", "mode": "basic", "state": "finished",
+                "role": "tool_result", "text": text, "tool": {
+                    "operation": "op", "call": "c", "name": "read_file", "purpose": "",
+                    "target": "file", "execution": 0, "effects": 1, "content_start": 0,
+                    "continued": continued, "last_chunk": last_chunk
+                }
+            })
+        });
+        let timeline =
+            Timeline::load(&Json::parse(&serde_json::to_string(&rows).unwrap()).unwrap()).unwrap();
+        let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let archive = AgentArchive {
+            tail: (
+                "test".into(),
+                ansa_linux::journal::ReadIdentity::capture(&file).unwrap(),
+            ),
+            timeline: Arc::new(timeline),
+            structured: false,
+        };
+        let details = |before, limit| {
+            archive
+                .page(GetTranscript {
+                    before,
+                    limit,
+                    forward: true,
+                })
+                .details
+                .rows(100)
+                .into_iter()
+                .map(|row| row.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let full = details(0, 2);
+        assert!(full.contains("first\n") && full.contains("second") && !full.contains(r"\n"));
+        let first = details(0, 1);
+        let second = details(1, 1);
+        assert!(
+            first.contains("Partial tool output")
+                && first.contains("first")
+                && !first.contains("second")
+        );
+        assert!(
+            second.contains("Partial tool output")
+                && second.contains("second")
+                && !second.contains("first")
+        );
+    }
 }

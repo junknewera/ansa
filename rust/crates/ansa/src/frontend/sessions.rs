@@ -23,7 +23,16 @@ use std::{
 };
 mod agent_transcript;
 mod delegate;
-pub(super) type LiveDelegates = BTreeMap<String, (String, super::carbon::AgentLine)>;
+pub(super) struct LiveDelegate {
+    pub parent: String,
+    pub operation: String,
+    pub line: super::carbon::AgentLine,
+}
+#[derive(Default)]
+pub(super) struct LiveDelegates {
+    pub agents: BTreeMap<String, LiveDelegate>,
+    pub completed: u64,
+}
 pub(super) use agent_transcript::AgentTranscript;
 mod role_preferences;
 mod siwc_lane;
@@ -104,7 +113,7 @@ impl Factory {
             stop: Cancel::default(),
             auth,
             siwc_lane: SiwcLane::default(),
-            live_delegates: tokio::sync::watch::channel(BTreeMap::new()).0,
+            live_delegates: tokio::sync::watch::channel(LiveDelegates::default()).0,
             editor: None,
             carbon_terminal: false,
             terminal_owners: Arc::default(),

@@ -178,7 +178,10 @@ fn explanation(code: &str) -> &'static str {
         "opaque_conflict" => "An encrypted response item changed while streaming",
         "terminal_item_count" => "Response items do not match",
         "terminal_workspace_busy" => "Workspace is in use by a terminal or another conversation",
-        "terminal_workspace_quarantined" => "Verify the terminal result first",
+        "terminal_workspace_quarantined" => {
+            "Workspace writes blocked after an unresolved terminal operation"
+        }
+        "task_path_scope" => "Path outside the assignment",
         "terminal_worker_lost" => "Lost connection to the terminal",
         "cli_output_stalled" => "Output stalled before the message was delivered",
         "cli_output_interrupted" => "Output interrupted",

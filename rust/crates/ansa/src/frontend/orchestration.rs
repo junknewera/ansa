@@ -322,7 +322,7 @@ fn accept_clarifications(run: &mut Run, inbox: &mut Clarifications) {
     }
 }
 
-fn latest_action(receipt: &ChildAttempt) -> Option<String> {
+pub(super) fn latest_action(receipt: &ChildAttempt) -> Option<String> {
     let (name, target) = receipt.latest_tool()?;
     let label = match name {
         "list_directory" => "List",

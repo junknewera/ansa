@@ -91,7 +91,12 @@ impl Workbench {
 
     pub(super) fn projected_slot(&self, slot: &Slot) -> Option<Vec<Entry>> {
         let activity_open = matches!(&self.panel, Some(Panel::Activity(nav)) if !nav.agents_only);
-        slot.conversation(!activity_open)
+        let delegates = self.live_delegates.borrow();
+        let delegate = delegates
+            .agents
+            .values()
+            .find(|agent| agent.parent == slot.id);
+        slot.conversation(!activity_open, delegate)
     }
 
     pub(super) fn orchestration_notice(&self) -> Option<String> {
@@ -612,11 +617,13 @@ impl Workbench {
             .flat_map(|view| &view.agents)
             .map(|(id, _)| (id.clone(), Some(root.clone()), String::from("agent")))
             .collect();
-        candidates.extend(
-            delegates
-                .iter()
-                .map(|(id, (owner, _))| (id.clone(), Some(owner.clone()), String::from("agent"))),
-        );
+        candidates.extend(delegates.agents.iter().map(|(id, agent)| {
+            (
+                id.clone(),
+                Some(agent.parent.clone()),
+                String::from("agent"),
+            )
+        }));
         for summary in &self.summaries {
             let entry = &summary.entry;
             if !candidates.iter().any(|(id, _, _)| id == &entry.id) {
@@ -675,8 +682,8 @@ impl Workbench {
             if kind != "agent" {
                 continue;
             }
-            if let Some((_, agent)) = delegates.get(id) {
-                let mut agent = agent.clone();
+            if let Some(delegate) = delegates.agents.get(id) {
+                let mut agent = delegate.line.clone();
                 agent.title = format!("{tree}{branch}{}", agent.title);
                 result.push((id.clone(), agent));
                 continue;
