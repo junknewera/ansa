@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from bench import load, main, run_trial, write
-from carbon import (TrialStopped, check_run_status, completed_draft, completed_turn,
+from carbon import (TrialStopped, check_run_status, completed_draft, completed_turn, effort_selected,
                     prepare_turn_images, verify_turn_images)
 
 
@@ -46,6 +46,19 @@ class PublicInputs(unittest.TestCase):
                 check_run_status("  " + status)
             self.assertEqual((stopped.exception.status, str(stopped.exception)), (expected, status))
         check_run_status("Ctrl+F Files")
+
+    def test_effort_setup_reports_carbon_connection_error_before_timeout(self):
+        footer = "ansa: Could not connect to the server (http_connect)"
+        with self.assertRaisesRegex(TrialStopped, "reasoning effort selection: http_connect") as stopped:
+            effort_selected([], "model", "xhigh", footer)
+        self.assertEqual(stopped.exception.status, "infra_error")
+        for code in ("reasoning_effort_not_supported", "openrouter_effort"):
+            with self.assertRaises(TrialStopped) as unsupported:
+                effort_selected([], "model", "xhigh", f"ansa: Unsupported effort ({code})")
+            self.assertEqual(unsupported.exception.status, "unsupported")
+        selection = [{"kind": "generation_selected", "model": "model", "effort": "xhigh"}]
+        self.assertTrue(effort_selected(selection, "model", "xhigh", footer))
+        self.assertFalse(effort_selected([], "model", "xhigh", "Ctrl+F Files"))
 
     def test_unsupported_image_is_visible_and_never_dispatched(self):
         image = self.root / "plot.png"

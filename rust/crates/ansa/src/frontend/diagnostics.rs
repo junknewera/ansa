@@ -198,7 +198,13 @@ pub(crate) fn pause_notice(view: &Snapshot, workspace: bool) -> String {
     }
     let code = safe_code(&view.diagnostic);
     if view.resume_available && view.request.is_some() {
-        let command = if workspace { "/sessions" } else { "/resume" };
+        let command = match (workspace, code) {
+            (false, _) => "/resume",
+            (true, "http_connect" | "http_handshake" | "http_transfer" | "http_timeout") => {
+                "/retry"
+            }
+            (true, _) => "/sessions",
+        };
         if code == "siwc_structured_format_unconfirmed" {
             format!("{} · {command} · Ctrl+C · {code}", explanation(code))
         } else {

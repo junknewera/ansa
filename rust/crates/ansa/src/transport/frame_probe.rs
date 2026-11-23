@@ -163,6 +163,7 @@ pub(super) struct Route {
     pub(super) proxy: Option<Intercept>,
     pub(super) tls: rustls::ClientConfig,
     pub(super) local_only: bool,
+    pub(super) tcp_timeout: Option<Duration>,
 }
 impl Service<Uri> for Route {
     type Response = Io;
@@ -175,10 +176,11 @@ impl Service<Uri> for Route {
         let proxy = self.proxy.clone();
         let tls = self.tls.clone();
         let local_only = self.local_only;
+        let tcp_timeout = self.tcp_timeout;
         Box::pin(async move {
             let mut tcp = HttpConnector::new();
             tcp.enforce_http(false);
-            tcp.set_connect_timeout(Some(Duration::from_secs(1)));
+            tcp.set_connect_timeout(tcp_timeout);
             let Some(proxy) = proxy else {
                 return Ok(Io(Box::new(tcp.call(uri).await?)));
             };
@@ -410,6 +412,7 @@ async fn exchange(
             proxy,
             tls,
             local_only: true,
+            tcp_timeout: Some(Duration::from_secs(1)),
         });
     let stream = connector.call(uri.clone()).await?;
     let h2 = stream.connected().is_negotiated_h2() || spec.h2_only;

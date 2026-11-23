@@ -118,10 +118,11 @@ def trace_metrics(path, traces):
     generations = {row["id"]: row for row in events if row["kind"] == "generation"}
     http = [row for row in events if row["kind"] == "http"]
     sent = [row for row in events if row["kind"] == "http_sent"]
+    reconnects = [row for row in events if row["kind"] == "connect_retry"]
     tools = [row for row in events if row["kind"] == "tool"]
     generation_rows = [row for row in events if row["kind"] == "generation"]
     require(len(generations) == len(generation_rows) and
-            all(row["id"] in generations for row in http + sent), "unmatched provider timing")
+            all(row["id"] in generations for row in http + sent + reconnects), "unmatched provider timing")
     require(all(math.isfinite(row["seconds"]) and row["seconds"] >= 0
                 for row in http + tools + generation_rows), "invalid timing duration")
     operations = {row["result"]["operation"]: session for session, rows in traces.items()
@@ -129,11 +130,12 @@ def trace_metrics(path, traces):
     def seconds(rows):
         return round(sum(row["seconds"] for row in rows), 3)
 
-    def requests(attempts, transmitted):
+    def requests(attempts, transmitted, redials):
         retries = Counter(row["id"] for row in attempts)
-        return {"http_attempts": len(attempts), "http_sent": len(transmitted),
-                "http_retries": sum(value - 1 for value in retries.values()),
-                "http_errors": sum(row["error"] is not None for row in attempts)}
+        return {"http_attempts": len(attempts) + len(redials), "http_sent": len(transmitted),
+                "http_retries": sum(value - 1 for value in retries.values()) + len(redials),
+                "http_errors": sum(row["error"] is not None for row in attempts) + len(redials),
+                "connect_retries": len(redials)}
 
     roles = defaultdict(list)
     for session, rows in traces.items():
@@ -163,12 +165,13 @@ def trace_metrics(path, traces):
                                                   if operations.get(row["operation"]) in sessions])}
         if http:
             by_role[role].update(requests([row for row in http if row["id"] in ids],
-                                          [row for row in sent if row["id"] in ids]))
+                                          [row for row in sent if row["id"] in ids],
+                                          [row for row in reconnects if row["id"] in ids]))
     result = {"provider_seconds": seconds(generation_rows), "tool_seconds": seconds(tools),
               "generation_errors": sum(row["error"] is not None for row in generation_rows),
               "by_role": by_role}
     if http:
-        result.update(requests(http, sent))
+        result.update(requests(http, sent, reconnects))
     return result
 
 
@@ -269,7 +272,7 @@ def report(spec, rows, arms, tasks):
                          "statuses": dict(Counter(r["status"] for r in runs))}
         totals = {}
         for name in ("wall_seconds", "admitted_responses", "dispatched_tools", "reported_tokens",
-                     "http_attempts", "http_sent", "http_retries", "http_errors",
+                     "http_attempts", "http_sent", "http_retries", "http_errors", "connect_retries",
                      "provider_seconds", "tool_seconds",
                      "first_visible_plan_seconds", "plan_seconds", "verifier_seconds"):
             values = [row.get(name, row.get("usage", {}).get(name))
