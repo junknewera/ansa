@@ -579,20 +579,7 @@ fn layout_impl(
         if let Some(agent) = &entry.agent {
             let lines = match entry.role.as_str() {
                 "tool_agent_attempt" => {
-                    let mut prefix = String::new();
-                    if cols >= AGENT_ICON_MIN_WIDTH {
-                        let (_, ink, avatar) = agent_art(agent.role);
-                        let row = entry
-                            .text
-                            .rsplit_once(' ')
-                            .and_then(|(_, number)| number.parse::<usize>().ok());
-                        let pixels = row
-                            .and_then(|index| avatar.get(index))
-                            .copied()
-                            .unwrap_or_default();
-                        prefix.push_str(&styled(&padded(pixels, AGENT_ICON_WIDTH), ink, color));
-                    }
-                    prefix.push_str(&styled(&format!("  {}  ", entry.text), MUTED, color));
+                    let prefix = format!("{}{}  ", " ".repeat(AGENT_ROLE_COLUMN), entry.text);
                     let calls = agent.tool_calls.map_or_else(
                         || agent.activity.clone(),
                         |calls| format!("{calls} {}", if calls == 1 { "call" } else { "calls" }),
@@ -603,7 +590,10 @@ fn layout_impl(
                         cols.saturating_sub(cells(&prefix)),
                         color,
                     );
-                    vec![format!("{}{status}", clipped_painted(&prefix, cols))]
+                    vec![format!(
+                        "{}{status}",
+                        styled(&clipped(&prefix, cols), MUTED, color)
+                    )]
                 }
                 "agent_role" => agent_card(agent, cols, color, Some(&entry.text)),
                 _ => agent_card(agent, cols, color, None),
@@ -1056,45 +1046,32 @@ impl AgentRole {
     }
 }
 
-const AGENT_ICON_WIDTH: usize = 11;
-const AGENT_ICON_INSET: usize = AGENT_ICON_WIDTH + 2;
-const AGENT_ICON_MIN_WIDTH: usize = AGENT_ICON_INSET + 36;
-
-fn agent_art(role: AgentRole) -> (&'static str, &'static str, [&'static str; 3]) {
-    match role {
-        AgentRole::Research => (
-            "Research",
-            MINT,
-            [" ▄█▀█ ██▀▄", "█▀▄██ █▄█▀█", " ▀█▄█ █▄█▀"],
-        ),
-        AgentRole::Implementation => (
-            "Implementation",
-            VIOLET,
-            ["  ▄▀   █ ▀▄", "█    █    █", " ▀▄ █    ▄▀"],
-        ),
-        AgentRole::Coordinator => ("Coordinator", SKY, ["    ▀█▀", " █▀▀▀█▀▀▀█", "███ ███ ███"]),
-        AgentRole::Review => (
-            "Review",
-            AMBER,
-            ["█▀▀█▀▀▀▀█▄", "█ ▀█▀   ▀▀█", "█▄▄▄▄███▄▄█"],
-        ),
-    }
-}
+const AGENT_ROLE_COLUMN: usize = 5;
+const AGENT_MODEL_COLUMN: usize = AGENT_ROLE_COLUMN + "Implementation".len() + 3;
 
 fn agent_card(agent: &AgentLine, width: usize, color: bool, group: Option<&str>) -> Vec<String> {
-    let (role, ink, avatar) = agent_art(agent.role);
-    let compact = width < AGENT_ICON_MIN_WIDTH;
-    let content = width - if compact { 0 } else { AGENT_ICON_INSET };
-    let title = styled(&clipped(&agent.title, content), "\x1b[1m", color);
-    let mut meta = styled(&clipped(role, content), ink, color);
-    let remaining = content.saturating_sub(cells(role));
-    if !agent.model.is_empty() && remaining > 3 {
-        let model = clipped(&agent.model, remaining - 3);
-        meta.push_str(&styled(&format!(" · {model}"), MUTED, color));
+    let (badge, role, ink) = match agent.role {
+        AgentRole::Research => (" ◉ ", "Research", MINT),
+        AgentRole::Implementation => ("</>", "Implementation", VIOLET),
+        AgentRole::Coordinator => (" ┬ ", "Coordinator", SKY),
+        AgentRole::Review => (" ± ", "Review", AMBER),
+    };
+    let label = format!("{badge}  {role}");
+    let mut meta = styled(&clipped(&label, width), ink, color);
+    let label_width = cells(&label);
+    let gap = if width > AGENT_MODEL_COLUMN {
+        AGENT_MODEL_COLUMN.saturating_sub(label_width).max(1)
+    } else {
+        1
+    };
+    let model_room = width.saturating_sub(label_width + gap);
+    if !agent.model.is_empty() && model_room > 0 {
+        meta.push_str(&" ".repeat(gap));
+        meta.push_str(&styled(&clipped(&agent.model, model_room), MUTED, color));
     }
-    let lines = match group {
+    match group {
         Some(attempts) if !attempts.is_empty() => {
-            let remaining = content.saturating_sub(cells(&meta));
+            let remaining = width.saturating_sub(cells(&meta));
             if remaining > 3 {
                 meta.push_str(&styled(
                     &format!(" · {}", clipped(attempts, remaining - 3)),
@@ -1102,39 +1079,18 @@ fn agent_card(agent: &AgentLine, width: usize, color: bool, group: Option<&str>)
                     color,
                 ));
             }
-            return vec![if compact {
-                meta
-            } else {
-                format!(
-                    "{}  {meta}",
-                    styled(&padded(avatar[0], AGENT_ICON_WIDTH), ink, color)
-                )
-            }];
+            vec![meta]
         }
-        Some(_) => [
+        Some(_) => vec![
             meta,
-            agent_status(&agent.state, &agent.activity, content, color),
-            String::new(),
+            agent_status(&agent.state, &agent.activity, width, color),
         ],
-        None => [
-            title,
+        None => vec![
+            styled(&clipped(&agent.title, width), "\x1b[1m", color),
             meta,
-            agent_status(&agent.state, &agent.activity, content, color),
+            agent_status(&agent.state, &agent.activity, width, color),
         ],
-    };
-    if compact {
-        return lines.into_iter().filter(|line| !line.is_empty()).collect();
     }
-    avatar
-        .into_iter()
-        .zip(lines)
-        .map(|(pixels, text)| {
-            format!(
-                "{}  {text}",
-                styled(&padded(pixels, AGENT_ICON_WIDTH), ink, color)
-            )
-        })
-        .collect()
 }
 
 fn agent_status(state: &str, detail: &str, width: usize, color: bool) -> String {
@@ -3158,7 +3114,7 @@ mod tests {
         let frame = layout_workspace(&[], b"", 0, "", 0, "", (110, 44), false, &ui).unwrap();
         for label in [
             "Coordinate the approved step",
-            "Coordinator · gpt-6.1-sol",
+            "┬   Coordinator      gpt-6.1-sol",
             "Running",
         ] {
             let (row, column) = frame

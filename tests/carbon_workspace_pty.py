@@ -1682,6 +1682,8 @@ def configure_plus_roles(screen, pending=False):
 
 
 def siwc_orchestrate_plus(screen, root, cwd):
+    implementation_label = "</>  Implementation   gpt-6.1-luna"
+    review_label = "±   Review           gpt-6.2-sol"
     def git(*args, path=cwd):
         return subprocess.check_output(["git", *args], cwd=path, text=True)
 
@@ -1750,21 +1752,20 @@ def siwc_orchestrate_plus(screen, root, cwd):
           row["turn"] == active_question(cancelled_chat)["turn"] for row in records(root)),
           "Ctrl+C cancels the waiting main turn without stopping the worker")
     assert all(label not in body(screen) for label in (
-        "PLUS_CARBON_PLAN", "Implementation · gpt-6.1-luna", "Conversation agents",
+        "PLUS_CARBON_PLAN", implementation_label, "Conversation agents",
     ))
     open_activity(screen)
     until(screen, lambda frame: all(label in frame for label in (
         "Proposed plan", "Approved plan", "0/2 steps done",
-        "Implementation · gpt-6.1-luna", "Running",
+        implementation_label, "Running",
     )),
           "worker active and historical plan links loaded before the first step")
-    assert "█    █    █" not in activity_body(screen), "compact panel reserves space for text"
     assert activity_body(screen).count("Proposed plan") == 1 and prompt not in activity_body(screen)
     assert prompt in body(screen) and "PLUS_CARBON_PLAN" not in body(screen)
     paint_quiet(screen)
     row = next(index for index, line in enumerate(visible(screen).splitlines())
-               if "Implementation · gpt-6.1-luna" in line)
-    click(screen, screen.vt.line(row).index("Implementation · gpt-6.1-luna"), row)
+               if implementation_label in line)
+    click(screen, screen.vt.line(row).index(implementation_label), row)
     until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
           "clicking the model row in Activity opens the worker's transcript")
     escape(screen)
@@ -1789,13 +1790,12 @@ def siwc_orchestrate_plus(screen, root, cwd):
     screen.wait(b"\x1b[H\x1b[2J", since=at)
     local(screen, "/agents")
     until(screen, lambda frame: agents_open(screen) and prompt in frame
-          and running_card("Implementation · gpt-6.1-luna", "Set report to after fixture")
-          and "█    █    █  Implementation" in frame,
+          and running_card(implementation_label, "Set report to after fixture"),
           "/agents shows running worker beside the main conversation")
     stages = [json.loads(line)["stage"] for line in (root / "plus-requests.jsonl").read_text().splitlines()]
     assert stages == [*before_approval, "worker-rejected"], stages
     paint_quiet(screen)
-    row = next(i for i in range(screen.vt.rows) if "Implementation · gpt-6.1-luna" in screen.vt.line(i))
+    row = next(i for i in range(screen.vt.rows) if implementation_label in screen.vt.line(i))
     click(screen, screen.vt.line(row).index("Implementation"), row)
     until(screen, lambda frame: "Agent transcript" in frame and "Assignment" in frame
           and "Verified dependencies" not in frame, "worker chat opens in the right panel")
@@ -1813,8 +1813,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     assert '"findings":' not in visible(screen)
     escape(screen)
     until(screen, lambda _: held("whole-review") and agents_open(screen)
-          and running_card("Review · gpt-6.2-sol", "PLUS_CARBON_PLAN")
-          and "█ ▀█▀   ▀▀█" in visible(screen),
+          and running_card(review_label, "PLUS_CARBON_PLAN"),
           "already-open Activity receives the running strong reviewer", timeout=35)
     escape(screen)
     if reading(screen):
@@ -1829,7 +1828,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
 
     until(screen, completed_plus_synthesis, "durable Plus synthesis and idle composer", timeout=45)
     assert all(label not in body(screen) for label in (
-        "Ctrl+T Agents", "Conversation agents", "Coordinator · gpt-6.1-sol",
+        "Ctrl+T Agents", "Conversation agents", "┬   Coordinator      gpt-6.1-sol",
     ))
 
     checkout, = ledgers.glob("*/*/checkout")
@@ -1845,7 +1844,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
           and all("Orchestrate+" not in screen.vt.line(row) for row in (0, -2)),
           "return to Work in the same conversation")
     local(screen, "/agents")
-    until(screen, lambda frame: agents_open(screen) and "Review · gpt-6.2-sol" in frame,
+    until(screen, lambda frame: agents_open(screen) and review_label in frame,
           "Work opens the same completed agent cards")
     screen.send(b"\tg")
     until(screen, lambda _: "quick / Set report to after fixture" in activity_body(screen)
@@ -2060,7 +2059,7 @@ def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
         before = journals(root)
         archive = reopen_agents(screen, root, cwd, run.parent.name)
         until(archive, lambda _: "status /" in activity_body(archive)
-              and "Coordinator · gpt-6.1-sol" in activity_body(archive)
+              and "┬   Coordinator      gpt-6.1-sol" in activity_body(archive)
               and activity_body(archive).count("× Blocked") == 2,
               "archive uses actual blocked verdicts and role models")
         assert journals(root) == before
