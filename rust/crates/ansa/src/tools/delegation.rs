@@ -8,8 +8,11 @@ use crate::{
 use std::sync::Arc;
 
 pub(crate) const NAME: &str = "delegate_task";
-pub(crate) type Delegate =
-    Arc<dyn Fn(&Request, Option<&RoleProfile>, &Json, &Cancel) -> Outcome + Send + Sync>;
+pub(crate) type Delegate = Arc<
+    dyn Fn(&Request, Option<&RoleProfile>, &super::invocation::Invocation, &Cancel) -> Outcome
+        + Send
+        + Sync,
+>;
 
 fn descriptor() -> Descriptor {
     Descriptor {

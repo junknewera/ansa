@@ -308,6 +308,16 @@ fn fallback(raw: &str, parsed: Option<&Json>, lines: &mut Vec<String>) {
         lines.extend(raw.lines().map(String::from));
     }
 }
+
+/// Decode one tool envelope. Backslashes in the actual file or command output remain literal.
+pub(super) fn transcript_payload(raw: &str) -> String {
+    let Ok(value) = Json::parse(raw) else {
+        return super::workspace::display_text(raw);
+    };
+    let mut lines = Vec::new();
+    readable(&value, 0, &mut lines);
+    super::workspace::display_text(&lines.join("\n"))
+}
 fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
     let mut lines = Vec::new();
     if !tool.arguments.is_empty() {
@@ -1037,6 +1047,18 @@ mod tests {
     use super::super::protocol_v1::{AgentMode, Finished, GenerationSelection, Started};
     use super::*;
     use std::sync::Arc;
+    #[test]
+    fn helper_tool_details_decode_the_envelope_once() {
+        let source = "fn example() {\n    let literal = r#\"\\n\"#;\n}";
+        let payload = serde_json::json!({"content":source,"instruction_token":"internal"});
+        assert_eq!(
+            transcript_payload(&payload.to_string()),
+            format!("content: {source}")
+        );
+        let command = serde_json::json!({"stdout":"первая\nвторая","stderr":r"C:\src"});
+        let display = transcript_payload(&command.to_string());
+        assert!(display.contains("первая\nвторая") && display.contains(r"C:\src"));
+    }
     fn view() -> Snapshot {
         Snapshot {
             timeline_size: 1,

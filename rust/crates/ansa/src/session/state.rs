@@ -282,6 +282,22 @@ pub struct SavedTurn {
     pub resume_operation: usize,
 }
 impl SavedTurn {
+    pub(crate) fn pause_diagnostic(&self) -> &str {
+        if self.diagnostic == "tool_failed"
+            && let Some(result) = self.results.last()
+            && result.result.effects() == Effects::NotStarted
+            && let Ok(value) = Json::parse(result.result.output())
+        {
+            match value.text_field("error") {
+                Ok("terminal_workspace_quarantined") => return "terminal_workspace_quarantined",
+                Ok("terminal_workspace_busy") => return "terminal_workspace_busy",
+                Ok("task_path_scope") => return "task_path_scope",
+                _ => {}
+            }
+        }
+        &self.diagnostic
+    }
+
     fn delegated_round(&self) -> bool {
         self.stage == "tools"
             && self.receipt.mode.leads()

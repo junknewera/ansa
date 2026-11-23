@@ -846,6 +846,8 @@ def retry_after_edit(binary, adapter, root, home, cwd, screens):
     screen.send('EDIT_AND_REPLY\r')
     until(screen, lambda _: 'http_transfer' in screen.vt.line(-1) and '/retry' in screen.vt.line(-1),
           'interrupted reply offers a retry in chat')
+    until(screen, lambda text: 'Work paused' in text and '/retry to continue' in text,
+          'the main conversation explains the pause above the composer')
     assert (cwd / 'edit-target.rs').read_text() == 'fn main() {\n    new();\n}\n'
     marker.unlink()
     local(screen, '/retry')

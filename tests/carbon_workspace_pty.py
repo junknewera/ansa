@@ -268,6 +268,10 @@ def mouse_history_send_and_child_escape(screen, root, cwd):
     approve_helpers(screen, "Запусти субагента: CHILD_HISTORY_TASK")
     open_helper(screen, by_mouse=True)
     before = journals(root)
+    screen.send(b"jk")
+    paint_quiet(screen)
+    assert screen.vt.line(-4).strip() == "›" and "Tab → chat" in screen.vt.line(-2)
+    screen.send(b"\t")
     screen.send("CHILD_DRAFT Ж")
     paint_quiet(screen)
     assert screen.vt.line(-4) == "  › CHILD_DRAFT Ж" and "Agent transcript" in visible(screen)
@@ -1331,18 +1335,21 @@ def orchestration_direct(screen, root, cwd):
     title = "Direct fixture report edit"
     report = cwd / "report.txt"
     report.write_text("before fixture\n")
-    local(screen, "/agents")
-    until(screen, lambda _: agents_open(screen), "Agents panel opened")
     local(screen, "/orchestrate " + message)
-    until(screen, lambda frame: title in frame and "Running" in frame,
-          "delegate progresses in the Agents panel")
+    note = "I will ask a helper to work on this task."
+    until(screen, lambda frame: note in frame and title in frame and "Agent gpt-" in frame and "/agents" in frame,
+          "lead commentary, active helper, assignment and details shortcut in the main chat")
+    assert not agents_open(screen)
     question = "DIRECT_SIDE_QUESTION"
     answer = "DIRECT_SIDE_ANSWER"
     screen.send(question + "\r")
-    until(screen, lambda frame: answer in frame and "Running" in frame,
+    until(screen, lambda frame: answer in frame and "Agent gpt-" in frame,
           "the lead answers a question while the same helper is running")
     until(screen, lambda frame: completed(root, message) and "DIRECT_LEAD_COMPLETED" in frame,
           "the lead continues from the helper result")
+    assert visible(screen).count(note) == 1 and "Agent done" in visible(screen)
+    local(screen, "/agents")
+    until(screen, lambda _: agents_open(screen), "Agents panel opened")
     until(screen, lambda frame: title in frame and "· Done" in frame and "Running" not in frame,
           "the Agents panel shows the archived helper as done")
     frame = visible(screen)
@@ -1352,6 +1359,7 @@ def orchestration_direct(screen, root, cwd):
     rows = records(root)
     accepted, = [row for row in rows if row["kind"] == "accepted" and row["text"] == message]
     assert accepted["mode"] == "basic" and accepted["orchestration_lead"] and not accepted.get("draft")
+    assert (int(accepted["round_limit"].lexeme), int(accepted["call_limit"].lexeme)) == (64, 256)
     intent, = [row["invocation"] for row in rows if row["kind"] == "intent"
                and row["invocation"]["name"] == "delegate_task"]
     outcome_index, outcome = next((index, row["result"]) for index, row in enumerate(rows)
@@ -1372,10 +1380,19 @@ def orchestration_direct(screen, root, cwd):
     assert assistant_text(native).count(answer) == 1
     assert len(list((root / "home/.ansa/sessions").iterdir())) == 2
     paint_quiet(screen)
-    row = next(row for row in range(screen.vt.rows) if title in screen.vt.line(row))
-    click(screen, screen.vt.line(row).index(title), row)
+    row = next(row for row in range(screen.vt.rows) if "Implementation" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).rindex("Implementation"), row)
     until(screen, lambda frame: "Agent transcript" in frame and "Синтетический результат" in frame,
           "archived helper opens the same transcript")
+    screen.send(b"t")
+    until(screen, lambda frame: "after fixture" in frame and "Tab → chat" in screen.vt.line(-2),
+          "click focuses the transcript and tool data is readable")
+    tail = body(screen)
+    screen.send(b"k")
+    until(screen, lambda _: body(screen) != tail, "k scrolls the transcript up")
+    screen.send(b"j")
+    until(screen, lambda _: body(screen) == tail, "j scrolls back without editing the draft")
+
     escape(screen)
     local(screen, "/exit")
     return "normal"
@@ -1987,6 +2004,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     until(archive, lambda frame: "Agent transcript" in frame and "Assignment" in frame,
           "selected archived attempt opens its original journal")
     assert journals(root) == before
+    archive.send(b"\t")
     local(archive, "/exit")
     archive.result = archive.finish()
     assert archive.result["exit"] == 0

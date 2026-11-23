@@ -757,7 +757,13 @@ impl State {
                 }
             }
             EventPayload::Preview(v) => {
-                if v.state != "committed" {
+                if v.state != "committed"
+                    || (self.preview_request == event.request
+                        && self
+                            .preview
+                            .as_ref()
+                            .is_some_and(|current| current.generation == v.generation))
+                {
                     self.preview = Some(v.clone());
                     self.preview_request = event.request.clone();
                 }

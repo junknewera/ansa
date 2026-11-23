@@ -461,11 +461,7 @@ impl Workbench {
         if !keep_selection && previous.scroll == 0 && key.starts_with("agent:") {
             previous.selected = None;
         }
-        let agents_only = previous.agents_only;
         self.activate_result(key, edit, output, io);
-        if agents_only && matches!(self.panel, Some(Panel::AgentTranscript(_))) {
-            self.focus = Focus::Chat;
-        }
         match &self.panel {
             Some(Panel::Activity(_) | Panel::Output { .. }) => {}
             Some(_) => self.activity_back = Some(previous),

@@ -18,9 +18,17 @@ const ARG_BYTES: usize = 16 * 1024;
 const OUTPUT_BYTES: usize = 120 * 1024;
 
 fn rejection(code: &str) -> Outcome {
+    // These preflight checks conclusively rejected the edit. Return the receipt
+    // to the model so it can report the blocker or choose another allowed task.
+    let effects = match code {
+        "terminal_workspace_quarantined" | "terminal_workspace_busy" | "task_path_scope" => {
+            Effects::KnownResult
+        }
+        _ => Effects::NotStarted,
+    };
     Outcome::from_bytes(
         Execution::Failed,
-        Effects::NotStarted,
+        effects,
         Json::object(vec![
             ("error", s(code).expect("error code")),
             ("applied", b(false)),
@@ -285,6 +293,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_quarantine_returns_a_known_refusal_without_writing() {
+        let root = Root::new();
+        let host = root.host();
+        std::fs::write(root.path(), "before").unwrap();
+        let mut writer = host.workspace_writer(&root.cwd()).unwrap();
+        writer.begin(&"a".repeat(64)).unwrap();
+        drop(writer);
+        let result = host.edit(
+            &root.args(&host, &root.path(), "before", "after"),
+            &Cancel::default(),
+        );
+        assert_eq!(
+            (result.execution(), result.effects()),
+            (Execution::Failed, Effects::KnownResult)
+        );
+        assert_eq!(
+            output(&result).text_field("error"),
+            Ok("terminal_workspace_quarantined")
+        );
+        assert_eq!(*output(&result).field("applied").unwrap(), b(false));
+        assert_eq!(std::fs::read_to_string(root.path()).unwrap(), "before");
+    }
+
+    #[test]
     fn task_scope_blocks_writes_outside_approval_and_filters_executors() {
         let root = Root::new();
         let mut host = root.host();
@@ -308,7 +340,10 @@ mod tests {
         let stop = Cancel::default();
         for denied in [&other, &outside] {
             let result = host.edit(&root.args(&host, denied, "before", "after"), &stop);
-            assert_eq!(result.effects(), Effects::NotStarted);
+            assert_eq!(result.execution(), Execution::Failed);
+            assert_eq!(result.effects(), Effects::KnownResult);
+            assert_eq!(output(&result).text_field("error"), Ok("task_path_scope"));
+            assert_eq!(*output(&result).field("applied").unwrap(), b(false));
             assert_eq!(std::fs::read_to_string(denied).unwrap(), "before");
         }
         let result = host.edit(&root.args(&host, &root.path(), "before", "after"), &stop);

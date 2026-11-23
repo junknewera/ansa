@@ -61,6 +61,8 @@ impl Default for Limits {
 #[derive(Clone)]
 pub struct Options {
     pub delegate: Option<crate::tools::delegation::Delegate>,
+    /// Optional segment allowance for a newly accepted direct orchestration turn.
+    pub lead_tool_budget: Option<(usize, usize)>,
     pub fork_seed: Option<crate::session::state::ForkSeed>,
     pub check_request: CheckRequest,
     pub select_generation: SelectGeneration,
@@ -82,6 +84,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             delegate: None,
+            lead_tool_budget: None,
             fork_seed: None,
             check_request: Arc::new(|_, _, _| Ok(())),
             select_generation: Arc::new(|_, _| Err("generation_selection_unavailable")),
@@ -237,6 +240,9 @@ pub(crate) fn valid_configuration(
         || limits.tool_rounds > 64
         || limits.tool_calls == 0
         || limits.tool_calls > 256
+        || options.lead_tool_budget.is_some_and(|(rounds, calls)| {
+            !(1..=64).contains(&rounds) || !(1..=256).contains(&calls)
+        })
     {
         return Err("runtime_configuration");
     }

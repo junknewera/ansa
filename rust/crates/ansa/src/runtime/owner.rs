@@ -434,7 +434,7 @@ impl Owner {
                     })
                     .ok_or("child_attempt_not_current")?;
                 if turn.paused && !turn.diagnostic.is_empty() {
-                    pause = Some((turn.diagnostic.clone(), turn.resumes.len()));
+                    pause = Some((turn.pause_diagnostic().to_owned(), turn.resumes.len()));
                 }
                 let quiescent = !self.busy()
                     && self.pending_outcome.is_none()
@@ -552,7 +552,8 @@ impl Owner {
     }
     fn finish_preview(&mut self, state: &str, final_text: bool) {
         if let Some(preview) = &mut self.preview
-            && preview.state == "preview"
+            && (preview.state == "preview"
+                || (state == "committed" && preview.state == "discarded"))
         {
             if final_text
                 && let Some(response) = self.state.turn.as_ref().and_then(|t| t.response.as_ref())
@@ -827,7 +828,7 @@ impl Owner {
             .with_effort(source.effort.clone())?;
             let roles = current.receipt.lead_profile.clone();
             self.tools.for_lead(Arc::new(move |invocation, stop| {
-                delegate(&request, roles.as_ref(), &invocation.arguments, stop)
+                delegate(&request, roles.as_ref(), invocation, stop)
             }))?
         } else if current.next.tools.revision == self.plan_tools.advertisement().revision {
             self.plan_tools.clone()
@@ -1371,7 +1372,12 @@ impl Owner {
         self.permit = None;
         self.owned_intent = false;
         self.pending_pause = None;
-        let limits = self.limits;
+        let standard_budget = (self.limits.tool_rounds, self.limits.tool_calls);
+        let (round_limit, call_limit) = if submitted.mode.leads() {
+            self.options.lead_tool_budget.unwrap_or(standard_budget)
+        } else {
+            standard_budget
+        };
         let can_compact = self.options.compact.is_some();
         let keep = self.options.keep_recent_turns;
         let model_window = self.options.model_window.clone();
@@ -1422,8 +1428,8 @@ impl Owner {
                         "compact",
                         Json::parse(if compact { "true" } else { "false" })?,
                     ),
-                    ("round_limit", number(limits.tool_rounds)?),
-                    ("call_limit", number(limits.tool_calls)?),
+                    ("round_limit", number(round_limit)?),
+                    ("call_limit", number(call_limit)?),
                 ];
                 if !receipt.image_sha256.is_empty() {
                     fields.push((
@@ -2033,8 +2039,8 @@ impl Owner {
                     .turn
                     .as_ref()
                     .ok_or("runtime_turn")?
-                    .diagnostic
-                    .clone();
+                    .pause_diagnostic()
+                    .to_owned();
                 self.emit(EventPayload::RuntimeError {
                     command: self
                         .pending_receipt
@@ -2074,6 +2080,15 @@ impl Owner {
                         request: self.request(),
                     });
                 }
+            }
+            Kind::Response
+                if self
+                    .state
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.stage == "tools") =>
+            {
+                self.finish_preview("committed", false);
             }
             Kind::Response | Kind::Continued | Kind::Compacted => {}
         }
@@ -2566,7 +2581,7 @@ impl Owner {
                                 .state
                                 .turn
                                 .as_ref()
-                                .map(|turn| turn.diagnostic.as_str())
+                                .map(|turn| turn.pause_diagnostic())
                                 .filter(|code| crate::provider::contracts::valid_id(code))
                                 .unwrap_or("session_interrupted")
                                 .to_owned();
