@@ -107,15 +107,7 @@ impl Progress {
         for activity in &view.tools {
             match activity {
                 Activity::Started(tool) => {
-                    if self.tools.len() < 256 {
-                        self.tools
-                            .entry(tool.operation.0.clone())
-                            .or_insert_with(|| ToolClock {
-                                name: tool.name.clone(),
-                                started: None,
-                                stopped: None,
-                            });
-                    }
+                    self.tool_clock(tool);
                 }
                 Activity::Finished(tool) => self.finished(tool, now),
             }
@@ -123,17 +115,26 @@ impl Progress {
         self.tick(now);
     }
     pub fn started(&mut self, tool: &Started, now: Instant) {
-        if self.tools.len() < 256 {
-            let clock = self
+        self.tool_clock(tool).started.get_or_insert(now);
+    }
+    fn tool_clock(&mut self, tool: &Started) -> &mut ToolClock {
+        if self.tools.len() >= RECENT_TOOL_ACTIVITY
+            && !self.tools.contains_key(&tool.operation.0)
+            && let Some(old) = self
                 .tools
-                .entry(tool.operation.0.clone())
-                .or_insert_with(|| ToolClock {
-                    name: tool.name.clone(),
-                    started: None,
-                    stopped: None,
-                });
-            clock.started.get_or_insert(now);
+                .iter()
+                .min_by_key(|(_, clock)| (clock.stopped.is_none(), clock.stopped, clock.started))
+                .map(|(id, _)| id.clone())
+        {
+            self.tools.remove(&old);
         }
+        self.tools
+            .entry(tool.operation.0.clone())
+            .or_insert_with(|| ToolClock {
+                name: tool.name.clone(),
+                started: None,
+                stopped: None,
+            })
     }
     pub fn finished(&mut self, tool: &Finished, now: Instant) {
         if let Some(clock) = self.tools.get_mut(&tool.operation.0) {
@@ -141,32 +142,13 @@ impl Progress {
         }
     }
     pub fn project(&mut self, view: &mut Snapshot, activity: Activity, now: Instant) {
-        if let Some(index) = view
-            .tools
-            .iter()
-            .position(|old| old.operation() == activity.operation())
-        {
-            if matches!(
-                (&view.tools[index], &activity),
-                (Activity::Finished(_), Activity::Started(_))
-            ) {
-                return;
-            }
-            view.tools[index] = activity.clone();
-        } else if view.tools.len() < 256 {
-            view.tools.push(activity.clone());
-        } else {
+        if !activity.record(&mut view.tools, &mut view.completed_tools) {
             return;
         }
         match activity {
             Activity::Started(tool) => self.started(&tool, now),
             Activity::Finished(tool) => self.finished(&tool, now),
         }
-        view.completed_tools = view
-            .tools
-            .iter()
-            .filter(|tool| matches!(tool, Activity::Finished(result) if result.effects == Effects::KnownResult))
-            .count();
     }
     pub fn tick(&mut self, now: Instant) -> bool {
         let seconds = self.clock.as_ref().map_or(0, |c| {
@@ -476,6 +458,39 @@ mod tests {
         assert!(!reopened.entries(&v, false, start)[0].text.contains(" ms"));
         v.recovery_operation = Some("operation".into());
         assert_eq!(Progress::phase(&v, false), "effect_unknown");
+    }
+    #[test]
+    fn long_turn_displays_the_newest_active_tool_and_retains_the_total() {
+        let now = Instant::now();
+        let mut progress = Progress::default();
+        let mut view = view();
+        view.state = "executing".into();
+        for n in 0..=RECENT_TOOL_ACTIVITY {
+            let operation = OperationId(format!("op{n}"));
+            let started = Started {
+                operation: operation.clone(),
+                call_id: "c".into(),
+                name: "read_file".into(),
+            };
+            progress.project(&mut view, Activity::Started(started), now);
+            if n < RECENT_TOOL_ACTIVITY {
+                let done = Finished {
+                    operation,
+                    call_id: "c".into(),
+                    execution: Execution::Succeeded,
+                    effects: Effects::KnownResult,
+                    output: Arc::default(),
+                };
+                progress.project(&mut view, Activity::Finished(done), now);
+            }
+        }
+        assert_eq!(view.tools.len(), RECENT_TOOL_ACTIVITY);
+        assert_eq!(view.completed_tools, RECENT_TOOL_ACTIVITY);
+        assert!(
+            progress
+                .live_label(&view, false, None, now + Duration::from_secs(3))
+                .contains("Running read_file · 3 s")
+        );
     }
     #[test]
     fn live_tools_render_before_the_next_snapshot_without_duplicates() {

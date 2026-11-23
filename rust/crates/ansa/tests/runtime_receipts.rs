@@ -320,11 +320,11 @@ async fn cancelling_delegation_dismisses_steers_reserved_behind_a_journal_write(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn nonrenewable_tool_budgets_have_distinct_diagnostics() {
-    for (batch, call_limit, expected, executed) in [
-        (2, 1, "tool_batch_limit", 0),
-        (1, 256, "tool_turn_limit", 64),
-        (16, 256, "tool_turn_limit", 256),
+async fn only_explicit_tool_budgets_pause_new_turns() {
+    for (batch, rounds, calls, expected, executed) in [
+        (2, 0, 1, "tool_batch_limit", 0),
+        (1, 2, 0, "tool_round_limit", 2),
+        (2, 0, 3, "tool_round_limit", 2),
     ] {
         let count = Arc::new(AtomicUsize::new(0));
         let offset = count.clone();
@@ -340,8 +340,8 @@ async fn nonrenewable_tool_budgets_have_distinct_diagnostics() {
                 ))
             }),
             Limits {
-                tool_rounds: 64,
-                tool_calls: call_limit,
+                tool_rounds: rounds,
+                tool_calls: calls,
                 ..Limits::default()
             },
             Options::default(),
@@ -353,6 +353,155 @@ async fn nonrenewable_tool_budgets_have_distinct_diagnostics() {
         assert_eq!(count.load(Ordering::SeqCst), executed);
         f::finish(&mut runtime).await;
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn default_turn_finishes_after_65_rounds_and_276_tools() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let executed = count.clone();
+    let mut runtime = f::setup(
+        count.clone(),
+        None,
+        Arc::new(move |request, _, _| {
+            let offset = executed.load(Ordering::SeqCst);
+            if offset == 276 {
+                return native::load(&f::saved_response(request, Some("ALL_DONE"), 0));
+            }
+            native::load(&f::response_with_offset(
+                request,
+                None,
+                if offset == 0 { 20 } else { 4 },
+                offset,
+            ))
+        }),
+        Limits::default(),
+        Options::default(),
+    )
+    .await;
+    let handle = runtime.handle();
+    f::submit(&handle, "assignment", "Long fixture", "task").await;
+    let terminal = f::until(&handle, |p| {
+        matches!(p, EventPayload::Done | EventPayload::RuntimeError { .. })
+    })
+    .await;
+    assert!(
+        matches!(terminal.payload, EventPayload::Done),
+        "{:?}",
+        terminal.payload
+    );
+    let snapshot = f::snapshot(&handle, "done").await;
+    assert_eq!(count.load(Ordering::SeqCst), 276);
+    assert_eq!(snapshot.completed_tools, 276);
+    assert_eq!(snapshot.tools.len(), 256);
+    assert_eq!(snapshot.text, "ALL_DONE");
+    f::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retry_of_legacy_budget_pause_applies_current_settings_without_replaying_tools() {
+    use ansa::session::journal_v1::Journal;
+
+    let source = f::Root::new();
+    let restored = f::Root::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    let generate = |counter: Arc<AtomicUsize>| -> Generate {
+        Arc::new(move |request, _, _| {
+            let offset = counter.load(Ordering::SeqCst);
+            if offset >= 3 {
+                return native::load(&f::saved_response(request, Some("RESUMED"), 0));
+            }
+            native::load(&f::response_with_offset(
+                request,
+                None,
+                if offset == 0 { 1 } else { 2 },
+                offset,
+            ))
+        })
+    };
+    let options = |root: &f::Root| Options {
+        directory: Some(root.journal()),
+        ..Options::default()
+    };
+    let mut runtime = f::setup(
+        count.clone(),
+        None,
+        generate(count.clone()),
+        Limits {
+            tool_calls: 1,
+            tool_rounds: 1,
+            ..Limits::default()
+        },
+        options(&source),
+    )
+    .await;
+    let handle = runtime.handle();
+    let target = f::submit(&handle, "assignment", "Legacy fixture", "task").await;
+    f::until(&handle, |p| matches!(p, EventPayload::RuntimeError { diagnostic, .. } if diagnostic == "tool_batch_limit")).await;
+    f::finish(&mut runtime).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    // Reproduce the accepted record written by a prior release in a second store.
+    let mut journal = Journal::open(&restored.journal(), |_| Ok(()), None).unwrap();
+    let old = Journal::open(
+        &source.journal(),
+        |row| {
+            if row.text_field("kind")? == "accepted" {
+                journal.append(&row.without("tool_budget_version")?)
+            } else {
+                journal.append(row)
+            }
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(old.diagnostic(), "");
+    drop(journal);
+    let mut runtime = f::setup(
+        count.clone(),
+        None,
+        generate(count.clone()),
+        Limits::default(),
+        options(&restored),
+    )
+    .await;
+    let handle = runtime.handle();
+    assert_eq!(
+        f::snapshot(&handle, "before-retry").await.diagnostic,
+        "tool_batch_limit"
+    );
+    f::post(
+        &handle,
+        "retry",
+        CommandPayload::Resume(target),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    let terminal = f::until(&handle, |p| {
+        matches!(p, EventPayload::Done | EventPayload::RuntimeError { .. })
+    })
+    .await;
+    assert!(
+        matches!(terminal.payload, EventPayload::Done),
+        "{:?}",
+        terminal.payload
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    f::finish(&mut runtime).await;
+    let mut runtime = f::setup(
+        count.clone(),
+        None,
+        generate(count.clone()),
+        Limits::default(),
+        options(&restored),
+    )
+    .await;
+    assert_eq!(
+        f::snapshot(&runtime.handle(), "after-reopen").await.text,
+        "RESUMED"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    f::finish(&mut runtime).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

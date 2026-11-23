@@ -1032,7 +1032,9 @@ impl Factory {
         settings.cwd = PathBuf::from(saved_settings.text_field("cwd")?);
         settings.model = saved_settings.text_field("model")?.into();
         settings.returned_model = saved_settings.text_field("returned_model")?.into();
-        if settings.effective()? != *saved_settings {
+        if settings_without_tool_budget(&settings.effective()?)?
+            != settings_without_tool_budget(saved_settings)?
+        {
             return Err("session_configuration_mismatch");
         }
         let mut scope = TaskScope::new(&settings.cwd, &writes)?;
@@ -1561,6 +1563,25 @@ fn display_models(models: &Json) -> Result<Json> {
     }
     Json::object(vec![("models", Json::array(models)?)])
 }
+// The runtime journals tool budgets separately. Reopening uses the original
+// provider epoch even when the user changes the budget for subsequent work.
+fn settings_without_tool_budget(settings: &Json) -> Result<Json> {
+    settings.usize_field("tool_rounds")?;
+    settings.usize_field("tool_calls")?;
+    settings.without("tool_rounds")?.without("tool_calls")
+}
+
+#[cfg(test)]
+#[test]
+fn comparing_saved_settings_requires_numeric_budget_fields() {
+    for raw in [
+        r#"{"tool_calls":0}"#,
+        r#"{"tool_rounds":32,"tool_calls":"64"}"#,
+    ] {
+        assert!(settings_without_tool_budget(&Json::parse(raw).unwrap()).is_err());
+    }
+}
+
 fn base_state(value: &Json) -> Result<Json> {
     let mut value = value;
     for _ in 0..16 {
@@ -1583,8 +1604,7 @@ fn base_state(value: &Json) -> Result<Json> {
                 value = value.without("local_console_parent")?;
             }
             if value.has("settings") {
-                let settings = value
-                    .field("settings")?
+                let settings = settings_without_tool_budget(value.field("settings")?)?
                     .without("model")?
                     .without("returned_model")?;
                 value = value.with("settings", settings)?;

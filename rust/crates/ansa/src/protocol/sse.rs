@@ -14,7 +14,7 @@ pub struct Limits {
     pub events: usize,
     pub arguments: usize,
     pub items: usize,
-    pub calls: usize,
+    pub calls: Option<usize>,
     pub json_depth: usize,
     pub json_nodes: usize,
 }
@@ -27,7 +27,7 @@ impl Default for Limits {
             events: 65536,
             arguments: 256 * 1024,
             items: 64,
-            calls: 16,
+            calls: None,
             json_depth: 64,
             json_nodes: 131072,
         }

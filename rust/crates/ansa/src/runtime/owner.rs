@@ -104,6 +104,7 @@ pub(crate) struct Owner {
     preview_sequence: u64,
     preview: Option<Preview>,
     activity: Vec<Activity>,
+    completed_tools: usize,
     turn_stop: Cancel,
     storing: Option<PendingStore>,
     provider: Option<Identity>,
@@ -120,6 +121,16 @@ pub(crate) struct Owner {
     pending_pause: Option<&'static str>,
     shutting_down: bool,
 }
+impl Limits {
+    fn tool_budget_fields(self) -> Result<[(&'static str, Json); 3]> {
+        Ok([
+            ("tool_budget_version", number(2)?),
+            ("round_limit", number(self.tool_rounds)?),
+            ("call_limit", number(self.tool_calls)?),
+        ])
+    }
+}
+
 fn number(n: usize) -> Result<Json> {
     Json::parse(&n.to_string())
 }
@@ -188,6 +199,7 @@ impl Owner {
             preview_sequence: 0,
             preview: None,
             activity: vec![],
+            completed_tools: 0,
             turn_stop: Cancel::default(),
             storing: None,
             provider: None,
@@ -312,11 +324,7 @@ impl Owner {
             state: self.phase.clone(),
             request: self.request(),
             worker_busy: self.busy(),
-            completed_tools: self
-                .activity
-                .iter()
-                .filter(|v| matches!(v,Activity::Finished(f) if f.effects==Effects::KnownResult))
-                .count(),
+            completed_tools: self.completed_tools,
             text,
             diagnostic: self.diagnostic.clone(),
             recovery_operation: self.recovery.clone(),
@@ -434,7 +442,7 @@ impl Owner {
                     })
                     .ok_or("child_attempt_not_current")?;
                 if turn.paused && !turn.diagnostic.is_empty() {
-                    pause = Some((turn.pause_diagnostic().to_owned(), turn.resumes.len()));
+                    pause = Some(turn.pause_diagnostic().to_owned());
                 }
                 let quiescent = !self.busy()
                     && self.pending_outcome.is_none()
@@ -576,15 +584,7 @@ impl Owner {
             effects: result.result.effects(),
             output: Arc::new(result.result.output().into()),
         };
-        if let Some(index) = self
-            .activity
-            .iter()
-            .position(|a| a.operation() == &finished.operation)
-        {
-            self.activity[index] = Activity::Finished(finished.clone());
-        } else {
-            self.activity.push(Activity::Finished(finished.clone()));
-        }
+        Activity::Finished(finished.clone()).record(&mut self.activity, &mut self.completed_tools);
         self.emit(EventPayload::ToolFinished(finished.clone()));
         if finished.effects == Effects::Unknown {
             self.recovery = Some(finished.operation.clone());
@@ -1361,6 +1361,7 @@ impl Owner {
         self.pending_receipt = Some(receipt.clone());
         let receipt = receipt.clone();
         self.activity.clear();
+        self.completed_tools = 0;
         self.preview = None;
         self.diagnostic.clear();
         self.recovered_pause = false;
@@ -1372,12 +1373,7 @@ impl Owner {
         self.permit = None;
         self.owned_intent = false;
         self.pending_pause = None;
-        let standard_budget = (self.limits.tool_rounds, self.limits.tool_calls);
-        let (round_limit, call_limit) = if submitted.mode.leads() {
-            self.options.lead_tool_budget.unwrap_or(standard_budget)
-        } else {
-            standard_budget
-        };
+        let limits = self.limits;
         let can_compact = self.options.compact.is_some();
         let keep = self.options.keep_recent_turns;
         let model_window = self.options.model_window.clone();
@@ -1428,9 +1424,8 @@ impl Owner {
                         "compact",
                         Json::parse(if compact { "true" } else { "false" })?,
                     ),
-                    ("round_limit", number(round_limit)?),
-                    ("call_limit", number(call_limit)?),
                 ];
+                fields.extend(limits.tool_budget_fields()?);
                 if !receipt.image_sha256.is_empty() {
                     fields.push((
                         "image_sha256",
@@ -1677,13 +1672,17 @@ impl Owner {
                 self.plan_admission_pending = true;
                 return Ok(());
             }
+            let mut fields = vec![("command", Json::string(&command.0)?)];
+            if self
+                .state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.renew_tool_budget_on_resume())
+            {
+                fields.extend(self.limits.tool_budget_fields()?);
+            }
             self.resuming = Some(command.clone());
-            return self.record(
-                workers,
-                Kind::Resume,
-                "resume",
-                vec![("command", Json::string(&command.0)?)],
-            );
+            return self.record(workers, Kind::Resume, "resume", fields);
         }
         if let Some(code) = self.pending_pause.take()
             && self.phase != "cancelled"
@@ -2452,18 +2451,27 @@ impl Owner {
         {
             self.starting = false;
             self.activity.clear();
+            self.completed_tools = 0;
             if let Some(turn) = &self.state.turn {
-                for result in turn.previous_results.iter().chain(&turn.results) {
-                    if result.dispatched {
-                        self.activity.push(Activity::Finished(Finished {
-                            operation: OperationId(result.result.operation_id().into()),
-                            call_id: result.result.call_id().into(),
-                            execution: result.result.execution(),
-                            effects: result.result.effects(),
-                            output: Arc::new(result.result.output().into()),
-                        }));
-                    }
+                let dispatched = turn
+                    .previous_results
+                    .iter()
+                    .chain(&turn.results)
+                    .filter(|result| result.dispatched);
+                self.completed_tools = dispatched
+                    .clone()
+                    .filter(|result| result.result.effects() == Effects::KnownResult)
+                    .count();
+                for result in dispatched.rev().take(RECENT_TOOL_ACTIVITY) {
+                    self.activity.push(Activity::Finished(Finished {
+                        operation: OperationId(result.result.operation_id().into()),
+                        call_id: result.result.call_id().into(),
+                        execution: result.result.execution(),
+                        effects: result.result.effects(),
+                        output: Arc::new(result.result.output().into()),
+                    }));
                 }
+                self.activity.reverse();
             }
             self.recovery = self
                 .state
@@ -2479,7 +2487,7 @@ impl Owner {
             .as_ref()
             .is_some_and(|(active, task)| active == &identity && *task == ToolTask::Execute)
         {
-            self.activity.push(Activity::Started(value.clone()));
+            Activity::Started(value.clone()).record(&mut self.activity, &mut self.completed_tools);
             self.emit(EventPayload::ToolStarted(value));
         }
     }

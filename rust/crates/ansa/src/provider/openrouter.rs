@@ -591,7 +591,7 @@ pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResp
         let calls = message["tool_calls"]
             .as_array()
             .ok_or("openrouter_tool_calls")?;
-        if calls.is_empty() || calls.len() > 16 {
+        if calls.is_empty() || calls.len() > crate::protocol::sse::Limits::default().items {
             return Err("openrouter_tool_calls");
         }
         for (index, call) in calls.iter().enumerate() {
@@ -665,6 +665,24 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn accepts_twenty_calls_in_one_response_and_replays_them() {
+        let router = OpenRouter::new(
+            Secret::new("synthetic-fixture-key-0123456789".into()),
+            Arc::new(|_, _| unreachable!()),
+        )
+        .unwrap();
+        let calls: Vec<_> = (0..20).map(|n| json!({"id":format!("call{n}"),"type":"function","function":{"name":"get_test_value","arguments":"{}"}})).collect();
+        let response = json!({"id":"batch","model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":calls}}]});
+        let batch = decode(&request(&router), &response).unwrap();
+        assert_eq!(batch.calls().len(), 20);
+        assert_eq!(
+            native::load(&native::save(&batch).unwrap())
+                .unwrap()
+                .calls(),
+            batch.calls()
+        );
+    }
     #[test]
     fn route_without_catalog_window_keeps_admitted_estimate() {
         let calls = Arc::new(AtomicUsize::new(0));

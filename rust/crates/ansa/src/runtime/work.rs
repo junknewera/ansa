@@ -497,7 +497,9 @@ impl Workers {
                                     {
                                         return Err("provider_request_mismatch");
                                     }
-                                    if value.calls().len() > 16 || value.items().len() > 64 {
+                                    if value.items().len()
+                                        > crate::protocol::sse::Limits::default().items
+                                    {
                                         return Err("runtime_response_limit");
                                     }
                                     if matches!(&job.task, ProviderTask::SideReply(_))

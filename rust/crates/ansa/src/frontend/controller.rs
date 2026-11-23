@@ -983,11 +983,7 @@ impl State {
             status.push_str(&format!("  {elapsed}"));
         }
         if ui.is_none() && !view.tools.is_empty() {
-            status.push_str(&format!(
-                "  tools {}/{}  Ctrl+O",
-                view.completed_tools,
-                view.tools.len()
-            ));
+            status.push_str(&format!("  tools {} done  Ctrl+O", view.completed_tools));
         }
         let queued = view
             .followups

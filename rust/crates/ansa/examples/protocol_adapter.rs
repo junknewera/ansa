@@ -53,7 +53,7 @@ fn row_limits(row: &Json) -> sse::Limits {
         limits.events = set("events", limits.events);
         limits.arguments = set("arguments", limits.arguments);
         limits.items = set("items", limits.items);
-        limits.calls = set("calls", limits.calls);
+        limits.calls = value.usize_field("calls").ok();
         limits.json_depth = set("json_depth", limits.json_depth);
         limits.json_nodes = set("json_nodes", limits.json_nodes);
     }

@@ -1359,7 +1359,9 @@ def orchestration_direct(screen, root, cwd):
     rows = records(root)
     accepted, = [row for row in rows if row["kind"] == "accepted" and row["text"] == message]
     assert accepted["mode"] == "basic" and accepted["orchestration_lead"] and not accepted.get("draft")
-    assert (int(accepted["round_limit"].lexeme), int(accepted["call_limit"].lexeme)) == (64, 256)
+    for turn in (row for row in rows if row["kind"] == "accepted"):
+        assert int(turn["tool_budget_version"].lexeme) == 2
+        assert (int(turn["round_limit"].lexeme), int(turn["call_limit"].lexeme)) == (0, 0)
     intent, = [row["invocation"] for row in rows if row["kind"] == "intent"
                and row["invocation"]["name"] == "delegate_task"]
     outcome_index, outcome = next((index, row["result"]) for index, row in enumerate(rows)
@@ -2011,7 +2013,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
     return "normal"
 
 
-def siwc_orchestrate_plus_budget(screen, root, cwd):
+def siwc_orchestrate_plus_budget(screen, root, cwd, *, capped=False):
     (root / "orchestration-plus-budget").touch()
     report = cwd / "report.txt"
     original = "ORIGINAL\n" + "abcdefghijklmnopqrstuvwxyz" * 3 + "\n"
@@ -2024,15 +2026,24 @@ def siwc_orchestrate_plus_budget(screen, root, cwd):
     local(screen, "/propose+ Read and update report.txt")
     until(screen, lambda frame: "Budget regression" in frame and "Start" in frame, "approved budget test plan")
     screen.send(b"\r")
-    until(screen, lambda frame: "BUDGET_WORK_COMPLETE" in frame, "automatic worker continuation", timeout=35)
+    if capped:
+        until(screen, lambda frame: "Orchestration paused" in frame and "tool_round_limit" in frame,
+              "worker honours the configured budget", timeout=35)
+        rows = records(root)
+        intents = [row["invocation"]["name"] for row in rows if row["kind"] == "intent"]
+        assert intents == ["read_file"] * 32
+        assert not any(row["kind"] == "resume" for row in rows)
+        assert report.read_text() == original
+        local(screen, "/exit")
+        return "normal"
+    until(screen, lambda frame: "BUDGET_WORK_COMPLETE" in frame, "worker completed 66 calls without a budget pause", timeout=35)
     rows = records(root)
     intents = [row["invocation"] for row in rows if row["kind"] == "intent"]
     assert [v["name"] for v in intents] == ["read_file"] * 65 + ["edit_file"]
     assert [int(v["arguments"]["offset"].lexeme) for v in intents[:-1]] == list(range(65))
     contents = [json.loads(row["result"]["output"]) for row in rows if row["kind"] == "outcome"]
     assert [v["content"] for v in contents[:-1]] == list(original[:65]) and contents[-1]["applied"]
-    assert sum(row["kind"] == "pause" and row["diagnostic"] == "tool_round_limit" for row in rows) == 1
-    assert sum(row["kind"] == "resume" for row in rows) == 1
+    assert not any(row["kind"] in ("pause", "resume") for row in rows)
     checkout, = (root / "home/.ansa/orchestration").glob("*/*/checkout")
     actual = subprocess.check_output(["git", "show", "ansa-result:report.txt"], cwd=checkout, text=True)
     assert actual == original.replace("ORIGINAL", "UPDATED") and report.read_text() == original
@@ -2458,6 +2469,7 @@ def main():
              ("siwc-orchestration-direct", siwc_orchestration_direct),
              ("siwc-orchestrate-plus", siwc_orchestrate_plus),
              ("siwc-orchestrate-plus-budget", siwc_orchestrate_plus_budget),
+             ("siwc-orchestrate-plus-budget-configured", lambda screen, root, cwd: siwc_orchestrate_plus_budget(screen, root, cwd, capped=True)),
              ("siwc-orchestrate-plus-implement", siwc_orchestrate_plus_implement),
              ("siwc-orchestrate-plus-plan-only", siwc_orchestrate_plus_plan_only),
              ("siwc-orchestrate-plus-blocked", siwc_orchestrate_plus_blocked),
@@ -2500,6 +2512,12 @@ def main():
                     (nested / "AGENTS.md").write_text("Follow the fixture instructions.\n" * 600 + "END_NESTED_INSTRUCTIONS\n")
                 if name.startswith("siwc-orchestrate-plus"):
                     (root / "orchestration-plus").touch()
+                if name == "siwc-orchestrate-plus-budget-configured":
+                    directory = home / ".ansa"
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    config = directory / "config.json"
+                    config.write_text(json.dumps({"schema_version": 1, "tool_calls": 32}))
+                    config.chmod(0o600)
                 adapter = "openrouter-carbon" if name.startswith("openrouter-") else "siwc-carbon"
                 size = (110, 44) if name.startswith("siwc-orchestrate-plus") else (100, 32)
                 screen = Pty(str(args.binary.resolve()), root, home, cwd, "", True, size=size,
