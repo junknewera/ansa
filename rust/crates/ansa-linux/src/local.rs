@@ -10,6 +10,9 @@ pub type ReadFlags = OFlags;
 pub fn read_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NONBLOCK
 }
+pub fn append_flags() -> OFlags {
+    OFlags::WRONLY | OFlags::APPEND | OFlags::NONBLOCK
+}
 pub fn read(directory: &File, name: &str, limit: usize) -> io::Result<Option<Vec<u8>>> {
     read_impl(directory, name, limit, true)
 }

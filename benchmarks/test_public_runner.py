@@ -13,7 +13,8 @@ import unittest
 from unittest.mock import patch
 
 from bench import load, main, run_trial, write
-from carbon import TrialStopped, check_run_status, completed_turn, prepare_turn_images, verify_turn_images
+from carbon import (TrialStopped, check_run_status, completed_draft, completed_turn,
+                    prepare_turn_images, verify_turn_images)
 
 
 class PublicInputs(unittest.TestCase):
@@ -66,6 +67,14 @@ class PublicInputs(unittest.TestCase):
             with self.subTest(reason=reason), self.assertRaises(TrialStopped) as stopped:
                 completed_turn(events, lambda _: True)
             self.assertEqual(stopped.exception.status, status)
+
+    def test_draft_pause_without_a_visible_plan_reports_its_diagnostic(self):
+        events = [{"kind": "accepted", "draft": True, "turn": "first"},
+                  {"kind": "pause", "diagnostic": "plan_check_scope"}]
+        self.assertIsNone(completed_draft(events, "first"))
+        with self.assertRaisesRegex(TrialStopped, "plan_check_scope") as stopped:
+            completed_draft(events, None)
+        self.assertEqual(stopped.exception.status, "failed")
 
     def test_image_schedule_binds_capability_to_each_arm(self):
         f = self.root / "plot.png"
@@ -128,7 +137,7 @@ class PublicInputs(unittest.TestCase):
         config.write_text('{"servers":[]}\n')
         self.task.update(git_setup="seed.sh", mcp_config="mcp.json")
         arms, tasks, budget = self.freeze()
-        def inspect(binary, root, home, workspace, env, arm, turns, deadline, git, head, fixture_args, attachments=()):
+        def inspect(binary, root, home, workspace, env, arm, turns, deadline, git, head, fixture_args, **options):
             self.assertEqual(git(workspace, "rev-parse", "recovered").strip(), head)
             self.assertEqual((home / ".ansa/mcp.json").read_bytes(), config.read_bytes())
             raise TrialStopped("pass", "fixture inspected")

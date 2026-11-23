@@ -94,7 +94,7 @@ Path(answer).write_text(json.dumps({"answers": ["42" if expected == "pass" else 
         self.assertEqual(result["split"], "holdout")
         self.assertEqual(result["comparison"]["by_category"], {"example": {"right_only": 1}})
         self.assertEqual(result["comparison"]["metrics"]["b"]["reported_tokens"],
-                         {"sum": None, "trials_reporting": 0})
+                         {"sum": None, "trials_reporting": 0, "per_solved_task": None})
         self.assertEqual(result["comparison"]["coverage"]["a"]["scheduled_tasks"], ["two"])
 
     def test_frozen_plan_refuses_mutated_asset(self):
@@ -109,6 +109,48 @@ Path(answer).write_text(json.dumps({"answers": ["42" if expected == "pass" else 
                                          "--output", str(self.root / "runs")]), 2)
             trial.assert_not_called()
             self.assertFalse((self.root / "runs").exists())
+
+    def test_mode_comparison_locks_plus_roles(self):
+        spec = self.spec
+        spec["comparison"]["factor"] = "mode"
+        same = {"model": "fixture", "effort": "xhigh"}
+        a, b = spec["arms"]
+        b.pop("guidance")
+        a.update(same, mode="orchestrate")
+        b.update(same, mode="orchestrate+", roles={k: same.copy() for k in ("strong", "medium", "weak")})
+        for task in spec["tasks"]:
+            task["modes"] = ["orchestrate", "orchestrate+"]
+        self.assertEqual(len(bench.load(self.manifest(spec))[3]), 4)
+        b["roles"]["weak"]["effort"] = "high"
+        with self.assertRaisesRegex(ValueError, "roles must match"):
+            bench.load(self.manifest(spec))
+
+    def test_trace_counts_failed_connect_and_retry_separately_from_sent(self):
+        path = self.root / "trace.jsonl"
+        data = [{"kind": "http", "id": "g", "seconds": .1, "error": "http_connect"},
+                {"kind": "http_sent", "id": "g"},
+                {"kind": "http", "id": "g", "seconds": .2, "error": None},
+                {"kind": "generation", "id": "g", "session": "s", "seconds": .4, "error": None},
+                {"kind": "tool", "operation": "op", "seconds": .1}]
+        path.write_text("".join(json.dumps(row) + "\n" for row in data))
+        traces = {"s": [{"kind": "init"}, {"kind": "outcome",
+                       "result": {"operation": "op", "dispatched": True}}]}
+        outcome = comparison.trace_metrics(path, traces)
+        self.assertEqual([outcome[k] for k in ("http_attempts", "http_sent", "http_retries", "http_errors")],
+                         [2, 1, 1, 1])
+        self.assertEqual(outcome["by_role"]["lead"]["tool_seconds"], .1)
+
+    def test_plan_grading_checks_scope_and_user_approval(self):
+        plan = {"steps": [{"access": "write", "paths": ["./answer.txt"]}],
+                "command_checks": [{"argv": ["./test.sh"]}]}
+        requirements = {"paths": ["answer.txt"], "check": "test.sh"}
+        self.assertEqual(comparison.grade_plan(plan, requirements, True)["status"], "pass")
+        echoed = plan | {"command_checks": [{"argv": ["echo", "test.sh"]}]}
+        self.assertFalse(comparison.grade_plan(echoed, requirements, True)["criteria"]["expected_check"])
+        plan["steps"][0]["paths"].append("extra.txt")
+        failed = comparison.grade_plan(plan, requirements, True)
+        self.assertEqual(failed["status"], "fail")
+        self.assertFalse(failed["criteria"]["expected_write_paths"])
 
     def test_frozen_plan_refuses_changed_pty_helper(self):
         manifest = self.manifest(self.spec)

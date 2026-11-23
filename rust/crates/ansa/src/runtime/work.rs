@@ -455,7 +455,11 @@ impl Workers {
                                         }
                                         Ok(())
                                     });
-                                    let value = generate(&request, &job.stop, update)?;
+                                    let value = crate::benchmark_trace::generation(
+                                        &job.state.session.0,
+                                        "generate",
+                                        || generate(&request, &job.stop, update),
+                                    )?;
                                     let value = if value.context_budget().is_none() {
                                         value
                                             .with_context_window(estimate.map(|(_, window)| window))
@@ -487,11 +491,14 @@ impl Workers {
                                             )?
                                         }
                                     };
-                                    let value = provider_options
+                                    let compact = provider_options
                                         .compact
                                         .as_ref()
-                                        .ok_or("compaction_unavailable")?(
-                                        &request, prefix, &job.stop,
+                                        .ok_or("compaction_unavailable")?;
+                                    let value = crate::benchmark_trace::generation(
+                                        &job.state.session.0,
+                                        "compact",
+                                        || compact(&request, prefix, &job.stop),
                                     )?;
                                     if value.request().save()? != request.save()? {
                                         return Err("compaction_request_mismatch");
@@ -594,21 +601,28 @@ impl Workers {
                                     };
                                     if tool_gate.begin(&identity, Some((&started, value))) {
                                         let combined = Cancel::combined(&stop, &lease_stop);
-                                        let returned = catch_unwind(AssertUnwindSafe(|| {
-                                            let definition = tools
-                                                .definition(&invocation.name)
-                                                .ok_or("unknown_tool")?;
-                                            let policy = tools
-                                                .policy(&invocation.name)
-                                                .ok_or("unknown_tool")?;
-                                            Ok::<_, &'static str>(
-                                                if let Some(invoke) = &policy.invoke {
-                                                    invoke(&invocation, &combined)
-                                                } else {
-                                                    (definition.executor)(&invocation.arguments)
-                                                },
-                                            )
-                                        }));
+                                        let returned = crate::benchmark_trace::tool(
+                                            &invocation.operation,
+                                            || {
+                                                catch_unwind(AssertUnwindSafe(|| {
+                                                    let definition = tools
+                                                        .definition(&invocation.name)
+                                                        .ok_or("unknown_tool")?;
+                                                    let policy = tools
+                                                        .policy(&invocation.name)
+                                                        .ok_or("unknown_tool")?;
+                                                    Ok::<_, &'static str>(
+                                                        if let Some(invoke) = &policy.invoke {
+                                                            invoke(&invocation, &combined)
+                                                        } else {
+                                                            (definition.executor)(
+                                                                &invocation.arguments,
+                                                            )
+                                                        },
+                                                    )
+                                                }))
+                                            },
+                                        );
                                         saved = match returned {
                                             Ok(Ok(value)) => outcome(&invocation, value),
                                             _ => outcome(
