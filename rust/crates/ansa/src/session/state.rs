@@ -261,6 +261,7 @@ pub struct SavedTurn {
     pub operation_run: String,
     pub next: Request,
     start_item: usize,
+    archived_images: bool,
     pub response: Option<Arc<AdmittedResponse>>,
     pub tools_response: Option<Arc<AdmittedResponse>>,
     pub results: Vec<SavedResult>,
@@ -380,6 +381,21 @@ impl State {
             .get(index)
             .copied()
             .filter(|prefix| *prefix > 0)
+    }
+    pub(crate) fn compaction_request(&self) -> Result<Request> {
+        let turn = self.turn.as_ref().ok_or("session_compaction_stage")?;
+        let input = if turn.archived_images {
+            turn.next.input[..turn.start_item].to_vec()
+        } else {
+            self.history.clone()
+        };
+        Request::new(
+            turn.next.binding.clone(),
+            turn.next.epoch.clone(),
+            self.configuration.tools.clone(),
+            input,
+        )?
+        .with_effort(turn.next.effort.clone())
     }
     pub(crate) fn completed_context_turns(&self) -> usize {
         self.completed_starts.len()
@@ -1163,6 +1179,10 @@ impl State {
                 None
             };
             let next = Request::load(event.field("next")?)?;
+            need(
+                !event.has("image_originals") || event.has("image_sha256"),
+                "image_submit_identity",
+            )?;
             let (image_sha256, image_content) = if event.has("image_sha256") {
                 let content = next
                     .input
@@ -1175,13 +1195,12 @@ impl State {
             } else {
                 (Vec::new(), None)
             };
-            need(
-                next.save()?
-                    == self
-                        .request_for_input(text, mode, internal, draft.as_ref(), image_content)?
-                        .save()?,
-                "session_request_conflict",
-            )?;
+            let mut expected =
+                self.request_for_input(text, mode, internal, draft.as_ref(), image_content)?;
+            if event.has("archived_images") {
+                expected.replay_archived_images(event.field("archived_images")?.elements()?)?;
+            }
+            need(next.save()? == expected.save()?, "session_request_conflict")?;
             let stage = if *event.field("compact")? == Json::parse("true")? {
                 "compacting"
             } else {
@@ -1234,6 +1253,7 @@ impl State {
                 receipt: receipt.clone(),
                 operation_run: run.into(),
                 start_item: next.input.len() - 1,
+                archived_images: event.has("archived_images"),
                 next,
                 response: None,
                 tools_response: None,
@@ -1274,14 +1294,7 @@ impl State {
                 Request::load(value.field("request")?)?,
                 value.field("native")?.clone(),
             )?;
-            let current = self.turn.as_ref().ok_or("session_compaction_stage")?;
-            let expected = Request::new(
-                current.next.binding.clone(),
-                current.next.epoch.clone(),
-                self.configuration.tools.clone(),
-                self.history.clone(),
-            )?
-            .with_effort(current.next.effort.clone())?;
+            let expected = self.compaction_request()?;
             need(
                 compacted.request().save()? == expected.save()?,
                 "session_compaction_request",

@@ -3563,10 +3563,24 @@ impl Workbench {
                     slot.state.image_loading = false;
                     match result {
                         Ok(image) => {
+                            let reduced = image.original_byte_len() > image.byte_len();
                             slot.state.images.push(image);
                             let count = slot.state.images.len();
-                            slot.state.report(io, &format!("Image attached ({count})"));
+                            let notice = if reduced {
+                                " · smaller copy for model"
+                            } else {
+                                ""
+                            };
+                            slot.state
+                                .report(io, &format!("Image attached ({count}){notice}"));
                         }
+                        Err("image_original_bytes") if slot.state.images.is_empty() => slot
+                            .state
+                            .report(io, "Image exceeds 8 MiB. Attach a smaller copy."),
+                        Err("image_original_bytes" | "image_batch_bytes") => slot.state.report(
+                            io,
+                            "Send the current attachments first, then add this image.",
+                        ),
                         Err(code) => slot
                             .state
                             .report(io, &format!("Could not attach image ({code})")),

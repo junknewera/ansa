@@ -61,6 +61,9 @@ impl Json {
     pub(crate) fn quoted_size(text: &str) -> usize {
         quoted_bytes(text)
     }
+    pub(crate) fn encoded_bytes(&self) -> usize {
+        self.0.bytes
+    }
 
     fn owned(value: Value) -> Self {
         let (bytes, nodes, depth) = match &value {

@@ -7,12 +7,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import tempfile
 import time
+import zlib
 
 from bench import environment, write
 from carbon import TrialStopped, capture
-from carbon_workspace_pty import Pty, Terminal, completed, ready, roots, seed_siwc, until
+from carbon_workspace_pty import Pty, Terminal, completed, ready, records, roots, seed_siwc, until
 from public_images import TASK_IDS
 
 MODELS = {"siwc": "gpt-6.2-sol", "openrouter": "deepseek/deepseek-v4.1-flash-1017"}
@@ -131,13 +133,25 @@ def check_composer(binary):
             command("/attach file with spaces.png", "Image attached (1)")
             command("/attach --clear", "Image attachments cleared")
             turn("Answer without an attachment.")
+            content = b"Description\0" + b"x" * (3 * 1024 * 1024)
+            chunk = b"tEXt" + content
+            original = PNG[:-12] + struct.pack(">I", len(content)) + chunk + struct.pack(">I", zlib.crc32(chunk)) + PNG[-12:]
+            image.write_bytes(original)
+            command("/attach file with spaces.png", "smaller copy for model")
+            image.unlink()
+            turn("Describe the compressed attachment.")
             submit("/exit")
             result = screen.finish()
             assert result["exit"] == 0 and result["termios_restored"]
-            first, second = [json.loads(line) for line in wire.read_text().splitlines()]
+            first, second, third = [json.loads(line) for line in wire.read_text().splitlines()]
             url = "data:image/png;base64," + base64.b64encode(PNG).decode()
             assert first[-1]["content"][1] == {"type": "input_image", "image_url": url}
             assert second[-1]["content"] == "Answer without an attachment."
+            sent = third[-1]["content"][1]["image_url"]
+            assert len(base64.b64decode(sent.split(",", 1)[1])) <= 2 * 1024 * 1024
+            accepted, = [event for event in records(root) if event.get("text") == "Describe the compressed attachment." and event["kind"] == "accepted"]
+            saved, = accepted["image_originals"]
+            assert base64.b64decode(saved["url"].split(",", 1)[1]) == original
         finally:
             if screen.child.poll() is None:
                 screen.child.terminate()

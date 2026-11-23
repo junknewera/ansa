@@ -162,6 +162,9 @@ fn explanation(code: &str) -> &'static str {
         "siwc_structured_format_unconfirmed" => "ChatGPT did not confirm the strict plan format",
         "model_context_limit" => "The request exceeds the model's context window",
         "request_frame_limit" => "The request cannot be stored in a journal record",
+        "image_request_frame_limit" => {
+            "The message and attachments exceed the request size. Try a smaller batch."
+        }
         "followup_frame_limit" => {
             "Clarifications exceed the request frame and were kept in history"
         }

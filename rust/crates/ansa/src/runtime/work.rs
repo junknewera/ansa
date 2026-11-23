@@ -478,13 +478,7 @@ impl Workers {
                                     )))
                                 }
                                 ProviderTask::Compact => {
-                                    let request = Request::new(
-                                        current.next.binding.clone(),
-                                        current.next.epoch.clone(),
-                                        job.state.configuration.tools.clone(),
-                                        job.state.history.clone(),
-                                    )?
-                                    .with_effort(current.next.effort.clone())?;
+                                    let request = job.state.compaction_request()?;
                                     let prefix = match job.state.compaction_prefix() {
                                         Some(prefix) => prefix,
                                         None => {

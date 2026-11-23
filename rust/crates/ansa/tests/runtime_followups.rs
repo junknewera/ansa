@@ -5,13 +5,14 @@ mod support {
 use ansa::{
     protocol::json::Json,
     provider::{
+        contracts::{ImageInput, MAX_IMAGE_BYTES},
         native,
         replay::{Effects, Execution},
         request::Request,
     },
     runtime::*,
     session::{
-        journal_v1::{Journal, Point},
+        journal_v1::{Journal, Point, inspect_read_only},
         state::State,
     },
     tools::registry::{Outcome, Policy, Registry},
@@ -41,6 +42,124 @@ async fn steer(handle: &Handle, id: &str, target: &RequestId, text: &str) {
         PostStatus::Accepted,
     )
     .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn large_image_history_stays_sendable_and_reopens() {
+    let root = fixture::Root::new();
+    let mut png = Vec::new();
+    let (width, height) = (1024, 682);
+    let mut encoder = png::Encoder::new(&mut png, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_compression(png::Compression::NoCompression);
+    encoder
+        .write_header()
+        .unwrap()
+        .write_image_data(&vec![0; (width * height * 3) as usize])
+        .unwrap();
+    assert!(png.len() <= MAX_IMAGE_BYTES && png.len() > MAX_IMAGE_BYTES - 4096);
+    let image = ImageInput::from_bytes(&png).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let provider: Generate = Arc::new(move |request, _, _| {
+        let sent = seen.fetch_add(1, Ordering::SeqCst);
+        let body = request.json()?;
+        assert!(body.dump().len() < Json::FRAME_BYTES);
+        let newest = request.input.last().unwrap().field("content")?;
+        if sent < 7 {
+            let parts = newest.elements()?;
+            assert_eq!(parts[0].text_field("text")?, format!("Screenshot {sent}"));
+            assert_eq!(parts[1].text_field("type")?, "input_image");
+        } else {
+            assert_eq!(newest.text()?, "Follow-up after restart");
+            let captions: Vec<_> = request
+                .input
+                .iter()
+                .filter(|item| item.text_field("role") == Ok("user"))
+                .map(|item| item.field("content").unwrap())
+                .collect();
+            assert_eq!(captions.len(), 8);
+            assert!(captions[0].text()?.starts_with("Screenshot 0\n["));
+            assert_eq!(
+                captions[6].elements()?[1].text_field("type")?,
+                "input_image"
+            );
+        }
+        native::load(&fixture::saved_response(request, Some("done"), 0))
+    });
+    let options = Options {
+        directory: Some(root.journal()),
+        ..Options::default()
+    };
+    let mut runtime = fixture::setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider.clone(),
+        Limits::default(),
+        options.clone(),
+    )
+    .await;
+    let handle = runtime.handle();
+    for index in 0..7 {
+        let id = format!("image_{index}");
+        fixture::post(
+            &handle,
+            &id,
+            CommandPayload::SubmitImages(
+                Submit {
+                    text: format!("Screenshot {index}"),
+                    mode: AgentMode::Basic,
+                },
+                vec![image.clone()],
+            ),
+            &id,
+            PostStatus::Accepted,
+        )
+        .await;
+        fixture::until(&handle, |event| matches!(event, EventPayload::Done)).await;
+    }
+    fixture::finish(&mut runtime).await;
+
+    let mut first_preserved = false;
+    let mut archived = false;
+    inspect_read_only(
+        &root.journal(),
+        &mut (256 * 1024 * 1024),
+        || Ok(()),
+        |event| {
+            if event.text_field("kind")? == "accepted" {
+                archived |= event.has("archived_images");
+                if event.text_field("command")? == "image_0" {
+                    let saved = Request::load(event.field("next")?)?;
+                    let url =
+                        saved.input[0].field("content")?.elements()?[1].text_field("image_url")?;
+                    first_preserved = ImageInput::from_data_url(url)?.sha256() == image.sha256();
+                }
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(first_preserved && archived);
+
+    let mut reopened = fixture::setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider,
+        Limits::default(),
+        options,
+    )
+    .await;
+    assert!(
+        !fixture::snapshot(&reopened.handle(), "after_restart")
+            .await
+            .storage_failed
+    );
+    let handle = reopened.handle();
+    fixture::submit(&handle, "follow_up", "Follow-up after restart", "follow_up").await;
+    fixture::until(&handle, |event| matches!(event, EventPayload::Done)).await;
+    fixture::finish(&mut reopened).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
 }
 
 #[tokio::test(flavor = "current_thread")]

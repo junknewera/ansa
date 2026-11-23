@@ -71,6 +71,7 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 vt100.workspace = true
 png = "0.18.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 tokio-rustls.workspace = true

@@ -25,6 +25,16 @@ import comparison
 
 MAX_TRIALS = 128
 LIVE_ROUTES = ("siwc", "openrouter")
+CARBON_HELPERS = (
+    "tests/carbon_workspace_pty.py",
+    "tests/cli_progress_pty.py",
+    "tests/native_eval.py",
+    "tests/parity/frontend_io.py",
+    "tests/parity/protocol.py",
+    "tests/parity/protocol_network.py",
+    "tests/parity/run.py",
+    "tests/parity/session_cases.py",
+)
 
 
 def utc():
@@ -403,15 +413,20 @@ def main(argv=None, fixture_launch=None):
             rows = [row for row in rows if tasks[row["task"]]["split"] == split]
         plan = {"manifest_sha256": manifest_hash, "driver_sha256": digest(Path(__file__)),
                 "carbon_sha256": digest(Path(__file__).with_name("carbon.py")),
+                "comparison_sha256": digest(Path(comparison.__file__)),
+                "helper_sha256": {path: digest(PROJECT / path) for path in CARBON_HELPERS},
                 "arms": {key: {field: str(value) if isinstance(value, Path) else value
                                for field, value in arm.items() if field != "auth_dir"}
                          for key, arm in arms.items()},
                 "tasks": tasks, "budget": budget, "schedule": rows}
         if experiment:
-            plan.update(comparison=experiment, split=split,
-                        comparison_sha256=digest(Path(comparison.__file__)))
+            plan.update(comparison=experiment, split=split)
         if args.frozen_plan:
             frozen = decode(no_dotenv(args.frozen_plan.resolve(strict=True)).read_bytes())
+            saved_helpers = frozen.get("helper_sha256") if isinstance(frozen, dict) else None
+            require(isinstance(saved_helpers, dict), "frozen plan lacks Carbon helper hashes; regenerate it")
+            for path, sha in plan["helper_sha256"].items():
+                require(saved_helpers.get(path) == sha, f"Carbon helper differs from the frozen plan: {path}")
             require(frozen == json.loads(json.dumps(plan, default=str)),
                     "current manifest, programs, inputs or schedule differ from the frozen plan")
         if args.output is None:

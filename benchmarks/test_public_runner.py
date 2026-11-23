@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import time
 import unittest
@@ -22,9 +23,11 @@ class PublicInputs(unittest.TestCase):
         self.root = Path(temp.name)
         self.manifest = self.root / "manifest.json"
         (self.root / "inputs").mkdir()
-        self.task = {"id": "case", "turns": ["hello"], "verifier": "/bin/true",
+        executable = shutil.which("true")
+        self.assertIsNotNone(executable)
+        self.task = {"id": "case", "turns": ["hello"], "verifier": executable,
                      "workspace": "inputs", "modes": ["work"]}
-        self.arm = {"id": "base", "model": "fixture", "binary": "/bin/true",
+        self.arm = {"id": "base", "model": "fixture", "binary": executable,
                     "route": "offline", "mode": "work"}
         self.spec = {"version": 1, "seed": "demo", "repetitions": 1, "arms": [self.arm],
                      "tasks": [self.task], "budget": {"tool_calls": 2, "tool_rounds": 1,

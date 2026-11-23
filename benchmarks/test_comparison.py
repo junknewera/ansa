@@ -5,6 +5,7 @@ import copy
 import io
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -107,6 +108,28 @@ Path(answer).write_text(json.dumps({"answers": ["42" if expected == "pass" else 
             self.assertEqual(bench.main([str(manifest), "--frozen-plan", str(plan),
                                          "--output", str(self.root / "runs")]), 2)
             trial.assert_not_called()
+            self.assertFalse((self.root / "runs").exists())
+
+    def test_frozen_plan_refuses_changed_pty_helper(self):
+        manifest = self.manifest(self.spec)
+        plan = self.root / "plan.json"
+        checkout = self.root / "checkout"
+        for path in bench.CARBON_HELPERS:
+            target = checkout / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(bench.PROJECT / path, target)
+        with patch("bench.PROJECT", checkout):
+            with plan.open("w") as stream, contextlib.redirect_stdout(stream):
+                self.assertEqual(bench.main([str(manifest)]), 0)
+            helper = checkout / "tests/parity/frontend_io.py"
+            source = helper.read_text()
+            self.assertTrue("'xterm'" in source)
+            helper.write_text(source.replace("'xterm'", "'xterm-color'", 1))
+            args = [str(manifest), "--frozen-plan", str(plan), "--output", str(self.root / "runs")]
+            with contextlib.redirect_stderr(io.StringIO()) as errors, patch("bench.run_trial") as trial:
+                self.assertEqual(bench.main(args), 2)
+                trial.assert_not_called()
+            self.assertIn("tests/parity/frontend_io.py", errors.getvalue())
             self.assertFalse((self.root / "runs").exists())
 
     def test_broken_oracle_prevents_dispatch(self):

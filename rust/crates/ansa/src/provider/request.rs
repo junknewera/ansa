@@ -201,7 +201,66 @@ impl Request {
             Ok(value)
         }
     }
-    pub(crate) fn fingerprint(&self) -> Result<String, &'static str> {
+    // Keep the newest user item intact and leave room for another attachment
+    // batch and continuation metadata. Prior captions and native outputs stay
+    // in place so replay and the completed-turn offsets remain meaningful.
+    pub(crate) fn archive_history_images(&mut self) -> Result<Vec<usize>, &'static str> {
+        use super::contracts::image::{MAX_IMAGE_BYTES, without_archived_images};
+        let mut bytes = self
+            .input
+            .iter()
+            .fold(2 + self.input.len().saturating_sub(1), |bytes, item| {
+                bytes.saturating_add(item.encoded_bytes())
+            });
+        let headroom = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+        let ceiling = Json::FRAME_BYTES - headroom;
+        if !self.has_image_input() {
+            return Ok(Vec::new());
+        }
+        let metadata = self.clone().with_input(Vec::new())?;
+        let overhead = metadata
+            .identity_value()?
+            .encoded_bytes()
+            .max(metadata.save()?.encoded_bytes())
+            - 2;
+        let limit = ceiling.saturating_sub(overhead);
+        let end = self.input.len().saturating_sub(1);
+        let mut archived = Vec::new();
+        for (index, item) in self.input[..end].iter_mut().enumerate() {
+            if bytes <= limit {
+                break;
+            }
+            if let Some(text) = without_archived_images(item)?
+                && text.encoded_bytes() < item.encoded_bytes()
+            {
+                bytes -= item.encoded_bytes() - text.encoded_bytes();
+                *item = text;
+                archived.push(index);
+            }
+        }
+        Ok(archived)
+    }
+
+    pub(crate) fn replay_archived_images(&mut self, indexes: &[Json]) -> Result<(), &'static str> {
+        use super::contracts::image::without_archived_images;
+        if indexes.is_empty() {
+            return Err("session_archived_images");
+        }
+        let end = self.input.len().saturating_sub(1);
+        let mut previous = None;
+        for entry in indexes {
+            let index = entry.index()?;
+            if index >= end || previous.is_some_and(|previous| index <= previous) {
+                return Err("session_archived_images");
+            }
+            let item = &mut self.input[index];
+            *item = without_archived_images(item)?.ok_or("session_archived_images")?;
+            previous = Some(index);
+        }
+        Ok(())
+    }
+
+    fn identity_value(&self) -> Result<Json, &'static str> {
         let descriptors = self
             .tools
             .descriptors
@@ -215,7 +274,7 @@ impl Request {
                 ])
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let identity = Json::object(vec![
+        Json::object(vec![
             ("provider", Json::string(&self.binding.provider)?),
             ("account", Json::string(&self.binding.account)?),
             (
@@ -232,9 +291,11 @@ impl Request {
             ("tools_revision", Json::string(&self.tools.revision)?),
             ("descriptors", Json::array(descriptors)?),
             ("request", self.json()?),
-        ])?;
+        ])
+    }
+    pub(crate) fn fingerprint(&self) -> Result<String, &'static str> {
         Ok(crate::protocol::legacy_json_v1::sha256(
-            identity.dump().as_bytes(),
+            self.identity_value()?.dump().as_bytes(),
         ))
     }
     pub fn save(&self) -> Result<Json, &'static str> {

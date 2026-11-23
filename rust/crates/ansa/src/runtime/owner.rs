@@ -1337,13 +1337,14 @@ impl Owner {
                 let image_content = (!images.is_empty())
                     .then(|| crate::provider::contracts::image::content(&submitted.text, &images))
                     .transpose()?;
-                let next = state.request_for_input(
+                let mut next = state.request_for_input(
                     &submitted.text,
                     submitted.mode,
                     internal,
                     receipt.draft.as_ref(),
                     image_content.as_ref(),
                 )?;
+                let archived_images = next.archive_history_images()?;
                 let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;
                 let compact = can_compact
                     && !inherited_incomplete_turn
@@ -1388,6 +1389,20 @@ impl Owner {
                                 .iter()
                                 .map(|hash| Json::string(hash))
                                 .collect::<Result<Vec<_>>>()?,
+                        )?,
+                    ));
+                }
+                if let Some(originals) = crate::provider::contracts::image::originals(&images)? {
+                    fields.push(("image_originals", originals));
+                }
+                if !archived_images.is_empty() {
+                    fields.push((
+                        "archived_images",
+                        Json::array(
+                            archived_images
+                                .into_iter()
+                                .map(number)
+                                .collect::<Result<_>>()?,
                         )?,
                     ));
                 }
@@ -1736,7 +1751,12 @@ impl Owner {
             self.emit_at(
                 EventPayload::RuntimeError {
                     command: Some(submitted.command),
-                    diagnostic: "request_frame_limit".into(),
+                    diagnostic: if submitted.image_sha256.is_empty() {
+                        "request_frame_limit"
+                    } else {
+                        "image_request_frame_limit"
+                    }
+                    .into(),
                 },
                 submitted.turn.clone(),
                 None,
