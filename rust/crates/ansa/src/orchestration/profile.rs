@@ -12,7 +12,7 @@ pub struct RoleProfile {
 }
 
 impl RoleProfile {
-    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), &'static str> {
         for selection in [&self.strong, &self.medium, &self.weak] {
             if selection.model.is_empty()
                 || selection.model.len() > 256
