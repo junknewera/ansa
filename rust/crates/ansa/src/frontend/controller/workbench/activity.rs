@@ -35,9 +35,61 @@ fn agent_entry(
     }
 }
 
+fn delegated_entries(mut rows: Vec<ux::ConversationAgent>) -> Vec<Entry> {
+    // A delegate call starts a new session, even when the lead reuses a model.
+    // Keep each assignment addressable inside its parent's role/model group.
+    rows.sort_by_key(|row| row.line.state != "Running");
+    let mut groups: Vec<Vec<ux::ConversationAgent>> = Vec::new();
+    for row in rows {
+        let group = groups.iter_mut().find(|group| {
+            let first = &group[0];
+            !row.line.model.is_empty()
+                && first.parent == row.parent
+                && first.line.role == row.line.role
+                && first.line.model == row.line.model
+        });
+        if let Some(group) = group {
+            group.push(row);
+        } else {
+            groups.push(vec![row]);
+        }
+    }
+    let mut entries = Vec::new();
+    for mut group in groups {
+        if group.len() > 1 {
+            entries.push(agent_entry(
+                "agent_role",
+                format!("{} runs", group.len()),
+                Some(&group[0].line),
+                false,
+            ));
+            group.sort_by(|a, b| a.line.id.cmp(&b.line.id));
+            let mut numbered: Vec<_> = group.into_iter().enumerate().rev().collect();
+            numbered.sort_by_key(|(_, row)| row.line.state != "Running");
+            for (index, row) in numbered {
+                entries.push(agent_entry(
+                    "tool_agent_run",
+                    format!("{:02}", index + 1),
+                    Some(&row.line),
+                    true,
+                ));
+            }
+        } else if let Some(row) = group.pop() {
+            entries.push(agent_entry(
+                "agent_direct",
+                String::new(),
+                Some(&row.into_tree_line()),
+                true,
+            ));
+        }
+    }
+    entries
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Navigation {
     scroll: usize,
+    initial_agents_position: bool,
     selected: Option<String>,
     pub(super) agents_only: bool,
 }
@@ -98,6 +150,7 @@ impl Workbench {
         self.activity_back = None;
         self.panel = Some(Panel::Activity(Navigation {
             agents_only: true,
+            initial_agents_position: true,
             ..Navigation::default()
         }));
         self.focus = Focus::Chat;
@@ -185,14 +238,31 @@ impl Workbench {
                 }
             }
         }
-        entries.extend(
-            rows.iter()
-                .rev()
-                .map(|(_, agent)| agent)
-                .filter(|agent| !grouped.contains(agent.id.as_str()))
-                .map(|agent| agent_entry("agent_card", String::new(), Some(agent), true)),
-        );
-        entries
+        let root = self.conversation_root();
+        let planned: std::collections::BTreeSet<_> = self
+            .agent_views(&root)
+            .flat_map(|view| view.agents.iter().map(|(id, _)| id.as_str()))
+            .collect();
+        let mut direct = Vec::new();
+        for row in rows
+            .into_iter()
+            .rev()
+            .filter(|r| !grouped.contains(r.line.id.as_str()))
+        {
+            if planned.contains(row.line.id.as_str()) {
+                entries.push(agent_entry(
+                    "agent_card",
+                    String::new(),
+                    Some(&row.into_tree_line()),
+                    true,
+                ));
+            } else {
+                direct.push(row);
+            }
+        }
+        let mut runs = delegated_entries(direct);
+        runs.extend(entries);
+        runs
     }
 
     pub(super) fn return_to_activity(&mut self) {
@@ -227,6 +297,14 @@ impl Workbench {
         let page = slot.activity_timeline.as_ref();
         let entries = self.activity_entries(navigation);
         if navigation.agents_only {
+            let has_delegates = entries
+                .iter()
+                .any(|e| matches!(e.role.as_str(), "agent_direct" | "tool_agent_run"));
+            let scroll = if navigation.initial_agents_position && has_delegates {
+                usize::MAX
+            } else {
+                navigation.scroll
+            };
             let preview = navigation.selected.as_ref().and_then(|selected| {
                 let entry = entries
                     .iter()
@@ -254,7 +332,7 @@ impl Workbench {
                 kind: InspectorKind::Agents,
                 activity: Some(carbon::ActivityViewport {
                     entries,
-                    scroll: navigation.scroll,
+                    scroll,
                     selected: navigation.selected.clone(),
                 }),
                 ..Inspector::default()
@@ -304,6 +382,7 @@ impl Workbench {
             .and_then(|frame| frame.activity.as_ref())
             .map_or((0, 0), |frame| (frame.scroll_limit, frame.activity_scroll));
         if navigation.agents_only {
+            navigation.initial_agents_position = false;
             navigation.scroll = if older {
                 scroll.saturating_add(step).min(limit)
             } else {
@@ -373,6 +452,7 @@ impl Workbench {
             self.scroll_activity(older, 1);
             return;
         }
+        navigation.initial_agents_position = false;
         let index = navigation
             .selected
             .as_ref()
@@ -399,21 +479,27 @@ impl Workbench {
             .as_ref()
             .and_then(|frame| frame.activity.as_ref())
             .and_then(|frame| {
-                frame
-                    .tool_actions
-                    .iter()
-                    .rev()
-                    .find(|(_, key)| selected(key))
-                    .map(|(_, key)| (key.clone(), frame.edit_view(key), frame.output_view(key)))
+                let mut matches = frame.tool_actions.iter().filter(|(_, key)| selected(key));
+                (if navigation.agents_only {
+                    matches.next()
+                } else {
+                    matches.next_back()
+                })
+                .map(|(_, key)| (key.clone(), frame.edit_view(key), frame.output_view(key)))
             })
             .or_else(|| {
-                self.activity_entries(navigation)
-                    .into_iter()
-                    .rev()
-                    .find_map(|entry| {
-                        let key = entry.action.filter(selected)?;
-                        Some((key, entry.edit, entry.output))
-                    })
+                let mut matches =
+                    self.activity_entries(navigation)
+                        .into_iter()
+                        .filter_map(|entry| {
+                            let key = entry.action.filter(selected)?;
+                            Some((key, entry.edit, entry.output))
+                        });
+                if navigation.agents_only {
+                    matches.next()
+                } else {
+                    matches.next_back()
+                }
             });
         if let Some((key, edit, output)) = action {
             self.activate_activity(key, edit, output, io);
@@ -449,6 +535,7 @@ impl Workbench {
             return;
         };
         let keep_selection = navigation.agents_only && navigation.selected.as_ref() == Some(&key);
+        navigation.initial_agents_position = false;
         navigation.selected = Some(key.clone());
         if let Some(frame) = self
             .displayed
@@ -485,6 +572,7 @@ impl Workbench {
                     return false;
                 };
                 navigation.selected = None;
+                navigation.initial_agents_position = false;
                 navigation.scroll = if byte == b'g' { usize::MAX } else { 0 };
                 if byte == b'G' && !navigation.agents_only {
                     self.slots[self.current].activity_query = latest();
@@ -493,5 +581,49 @@ impl Workbench {
             _ => return false,
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_runs_share_headers_only_for_the_same_parent_role_and_model() {
+        use carbon::AgentRole::{Implementation, Research};
+        let row = |id: &str, parent: &str, role, model: &str, state: &str| ux::ConversationAgent {
+            parent: parent.into(),
+            branch: String::new(),
+            line: carbon::AgentLine {
+                id: id.into(),
+                title: format!("Assignment {id}"),
+                state: state.into(),
+                role,
+                model: model.into(),
+                activity: String::new(),
+                step: None,
+                tool_calls: None,
+            },
+        };
+        let entries = delegated_entries(vec![
+            row("other", "fork", Implementation, "sol", "Paused"),
+            row("one", "main", Implementation, "sol", "Blocked"),
+            row("research", "main", Research, "sol", "Completed"),
+            row("two", "main", Implementation, "sol", "Running"),
+            row("third-model", "main", Implementation, "astra", "Completed"),
+        ]);
+        assert_eq!(entries[0].text, "2 runs");
+        assert!(entries[0].action.is_none());
+        assert_eq!(entries[1].action.as_deref(), Some("agent:two"));
+        assert_eq!(entries[2].action.as_deref(), Some("agent:one"));
+        assert_eq!(entries[2].agent.as_ref().unwrap().title, "Assignment one");
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[1].text, "02");
+        assert_eq!(entries[2].text, "01");
+        assert!(
+            entries[3..]
+                .iter()
+                .all(|entry| entry.role == "agent_direct")
+        );
     }
 }

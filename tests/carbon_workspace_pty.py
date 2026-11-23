@@ -1340,6 +1340,9 @@ def orchestration_direct(screen, root, cwd):
     until(screen, lambda frame: note in frame and title in frame and "Agent gpt-" in frame and "/agents" in frame,
           "lead commentary, active helper, assignment and details shortcut in the main chat")
     assert not agents_open(screen)
+    local(screen, "/retry")
+    until(screen, lambda _: "This request is running" in screen.vt.line(-1),
+          "retry identifies the running lead")
     question = "DIRECT_SIDE_QUESTION"
     answer = "DIRECT_SIDE_ANSWER"
     screen.send(question + "\r")
@@ -1396,7 +1399,28 @@ def orchestration_direct(screen, root, cwd):
     until(screen, lambda _: body(screen) == tail, "j scrolls back without editing the draft")
 
     escape(screen)
+    until(screen, lambda _: agents_open(screen), "return to agent list")
+    escape(screen)
+    until(screen, lambda _: not agents_open(screen), "return to lead")
+    report.write_text("before fixture\n")
+    local(screen, "/orchestrate " + message)
+    until(screen, lambda _: len(list((root / "home/.ansa/sessions").iterdir())) == 3,
+          "the second delegation has its own session")
+    local(screen, "/agents")
+    until(screen, lambda _: "2 runs" in activity_body(screen) and "Running" in activity_body(screen),
+          "running and saved assignments share one role and model")
+    until(screen, lambda _: activity_body(screen).count("· Done") == 2 and "2 runs" in activity_body(screen),
+          "both assignments remain visible when the second one finishes")
     local(screen, "/exit")
+    assert screen.finish()["exit"] == 0
+    restored = start(screen.child.args[0], root, root / "home", cwd, argv_extra=["--continue"])
+    screen.additional_screens = [("restored-agents", restored)]
+    local(restored, "/agents")
+    until(restored, lambda _: "2 runs" in activity_body(restored)
+          and all(f"{number}  · Done" in activity_body(restored) for number in ("01", "02")),
+          "restored sessions keep separate numbered runs in one group")
+    local(restored, "/exit")
+    assert restored.finish()["exit"] == 0
     return "normal"
 
 
