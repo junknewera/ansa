@@ -421,6 +421,8 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
                 result.get("start_available", False))
         elif result.get("clarification_verified") is False:
             result["plan_grade"] = {"status": "fail", "criteria": {"clarification": False}}
+        elif "plan_failure" in result:
+            result["plan_grade"] = {"status": "fail", "criteria": {"draft_admitted": False}}
     result["wall_seconds"] = round(time.monotonic() - started, 3)
     return result
 

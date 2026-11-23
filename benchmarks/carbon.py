@@ -137,6 +137,14 @@ def completed_turn(events, match):
     return None
 
 
+def completed_draft(events, previous):
+    latest = next((i for i in range(len(events) - 1, -1, -1)
+                   if events[i]["kind"] == "accepted" and events[i].get("draft")), None)
+    if latest is None:
+        return None
+    return completed_turn(events[latest:], lambda event: event["turn"] != previous)
+
+
 def check_run_status(footer):
     status = footer.strip()
     if status.startswith(("Plan stopped", "Orchestration paused")):
@@ -290,14 +298,16 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
             previous = None
 
             def drafted(frame):
-                if not proposal(frame):
+                offered = proposal(frame)
+                if not offered and "Plan paused" not in frame:
                     return None
-                events = parent_events()
-                latest = next((i for i in range(len(events) - 1, -1, -1)
-                               if events[i]["kind"] == "accepted" and events[i].get("draft")), None)
-                if latest is None:
-                    return None
-                return completed_turn(events[latest:], lambda event: event["turn"] != previous)
+                try:
+                    result = completed_draft(parent_events(), previous)
+                except TrialStopped as error:
+                    if error.status == "failed":
+                        observations["plan_failure"] = str(error)
+                    raise
+                return result if offered else None
 
             turn, response = wait(drafted, "plan confirmation")
             observations["first_visible_plan_seconds"] = round(time.monotonic() - requested_at, 3)
