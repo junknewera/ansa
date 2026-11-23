@@ -850,6 +850,7 @@ impl AuthManager {
                 Limits::default(),
                 preview,
                 Some(Box::new(move || stopped.cancelled())),
+                crate::benchmark_trace::unknown_response_event,
             );
             streaming(
                 &request.json()?,
@@ -896,6 +897,7 @@ impl AuthManager {
             Limits::default(),
             preview,
             Some(Box::new(move || stopped.cancelled())),
+            crate::benchmark_trace::unknown_response_event,
         );
         stream.feed(reply.body.as_bytes())?;
         stream.finish()

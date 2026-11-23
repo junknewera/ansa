@@ -972,12 +972,145 @@ fn streaming_preview_emits_ordered_utf8_and_cancels_before_next_event() {
 }
 
 #[test]
+fn reasoning_text_events_leave_final_items_calls_and_preview_intact() {
+    use provider::responses::ResponseStream;
+    let decode = |events: &[Json], preview: bool| {
+        let callback: Option<provider::responses::TextPreview> = preview.then(|| {
+            Box::new(|text: &str| assert_eq!(text, "Final answer"))
+                as provider::responses::TextPreview
+        });
+        let mut stream =
+            ResponseStream::for_siwc(request(), Limits::default(), callback, None, |_| {
+                panic!("unexpected event")
+            });
+        for chunk in wire(events).chunks(17) {
+            stream.feed(chunk)?;
+        }
+        stream.finish()
+    };
+
+    let wrapped = fixture_events("reasoning-text.sse");
+    let output = wrapped
+        .last()
+        .unwrap()
+        .field("response")
+        .unwrap()
+        .field("output")
+        .unwrap()
+        .elements()
+        .unwrap();
+    for preview in [false, true] {
+        let admitted = decode(&wrapped, preview).unwrap();
+        assert!(admitted.calls().is_empty());
+        assert_eq!(
+            admitted
+                .items()
+                .iter()
+                .map(|item| item.value())
+                .collect::<Vec<_>>(),
+            output.iter().collect::<Vec<_>>()
+        );
+        assert!(decode(&wrapped[..wrapped.len() - 1], preview).is_err());
+    }
+    for extra in [
+        wrapped[4].clone(),
+        wrapped[6].clone(),
+        with(&wrapped[7], "item_id", Json::string("other").unwrap()),
+    ] {
+        let mut invalid = wrapped.clone();
+        invalid.insert(7, extra);
+        assert!(decode(&invalid, true).is_err());
+    }
+    let mut incomplete = wrapped.clone();
+    incomplete.remove(7); // content_part.done
+    assert!(decode(&incomplete, true).is_err());
+
+    // A provider may return only encrypted_content in its final reasoning item.
+    let mut bare = fixture_events("round1.sse");
+    let canonical = decode(&bare, false).unwrap();
+    for (index, event) in [wrapped[4].clone(), wrapped[6].clone()]
+        .into_iter()
+        .enumerate()
+    {
+        bare.insert(
+            2 + index,
+            with(&event, "item_id", Json::string("rs_a").unwrap()),
+        );
+    }
+    let result = decode(&bare, false).unwrap();
+    assert_eq!(result.items(), canonical.items());
+    assert_eq!(result.calls(), canonical.calls());
+    let mut invalid_type = wrapped.clone();
+    invalid_type.retain(|e| {
+        e.text_field("type") != Ok("response.content_part.added")
+            && e.text_field("type") != Ok("response.content_part.done")
+    });
+    for e in &mut invalid_type {
+        // Keep the final native item and terminal output identical.
+        *e = Json::parse(
+            &e.dump()
+                .replace(r#""type":"reasoning_text""#, r#""type":"output_text""#),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        decode(&invalid_type, false).unwrap_err(),
+        "reasoning_content_type"
+    );
+    bare.remove(3); // raw delta without its matching done
+    assert_eq!(
+        decode(&bare, false).unwrap_err(),
+        "reasoning_text_incomplete"
+    );
+}
+
+#[test]
+fn unsuccessful_terminals_and_unrecognized_events_never_admit_pending_calls() {
+    use provider::responses::ResponseStream;
+
+    static REPORTED: AtomicUsize = AtomicUsize::new(0);
+    for (event, code) in [
+        (r#"{"type":"response.failed"}"#, "response_failed"),
+        (
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            "response_output_token_limit",
+        ),
+        (
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+            "response_content_filter",
+        ),
+        (r#"{"type":"response.incomplete"}"#, "response_incomplete"),
+        (r#"{"type":"error"}"#, "response_stream_error"),
+        (
+            r#"{"type":"response.unknown_execution.delta"}"#,
+            "unknown_response_event",
+        ),
+    ] {
+        let mut events = fixture_events("round1.sse");
+        *events.last_mut().unwrap() = Json::parse(event).unwrap();
+        let mut stream = ResponseStream::for_siwc(request(), Limits::default(), None, None, |ty| {
+            assert_eq!(ty, "response.unknown_execution.delta");
+            REPORTED.fetch_add(1, Ordering::Relaxed);
+        });
+        stream.feed(&wire(&events)).unwrap();
+        assert_eq!(stream.finish().unwrap_err(), code);
+    }
+    assert_eq!(REPORTED.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn siwc_empty_terminal_output_requires_completed_text_without_calls() {
     use provider::responses::ResponseStream;
 
     let decode = |events: &[Json], siwc: bool| {
         let mut stream = if siwc {
-            ResponseStream::for_siwc(request(), Limits::default(), Some(Box::new(|_| {})), None)
+            ResponseStream::for_siwc(
+                request(),
+                Limits::default(),
+                Some(Box::new(|_| {})),
+                None,
+                |_| {},
+            )
         } else {
             ResponseStream::new(request(), Limits::default())
         };

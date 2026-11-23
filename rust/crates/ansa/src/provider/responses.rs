@@ -127,6 +127,7 @@ pub(crate) struct Reducer {
     preview: Option<TextPreview>,
     preview_text: String,
     siwc: bool,
+    on_unknown_event: Option<fn(&str)>,
 }
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
 impl Reducer {
@@ -145,6 +146,7 @@ impl Reducer {
             preview,
             preview_text: String::new(),
             siwc: false,
+            on_unknown_event: None,
         }
     }
     pub(crate) fn event(&mut self, event: Event) -> Result<(), &'static str> {
@@ -377,10 +379,10 @@ impl Reducer {
         let mut ids = HashSet::new();
         let mut calls = Vec::new();
         let mut progress = false;
-        let mut parts: BTreeMap<(usize, usize), Json> = BTreeMap::new();
-        let mut part_done: BTreeMap<(usize, usize), Json> = BTreeMap::new();
-        let mut text_delta: BTreeMap<(usize, usize), String> = BTreeMap::new();
-        let mut text_final: BTreeMap<(usize, usize), String> = BTreeMap::new();
+        let mut parts: BTreeMap<(usize, &'static str, usize), Json> = BTreeMap::new();
+        let mut part_done: BTreeMap<(usize, &'static str, usize), Json> = BTreeMap::new();
+        let mut text_delta: BTreeMap<(usize, &'static str, usize), String> = BTreeMap::new();
+        let mut text_final: BTreeMap<(usize, &'static str, usize), String> = BTreeMap::new();
         for event in &self.events {
             let value = Json::parse_with_limits(
                 &event.data,
@@ -397,6 +399,9 @@ impl Reducer {
                 return Err("sequence_mismatch");
             };
             seq += 1;
+            if ty == "error" && terminal.is_none() {
+                return Err("response_stream_error");
+            }
             if ty != "response.created" && response_id.is_empty() {
                 return Err("response_created_order");
             }
@@ -547,25 +552,50 @@ impl Reducer {
                             return Err("call_count_limit");
                         };
                     } else {
-                        let key = if item.text_field("type")? == "reasoning" {
-                            "summary"
+                        let reasoning = item.text_field("type")? == "reasoning";
+                        let fields: &[&str] = if reasoning {
+                            &["summary", "content"]
                         } else {
-                            "content"
+                            &["content"]
                         };
-                        let finals = item.field(key)?.elements()?;
-                        let initial = prior.field(key)?.elements()?;
-                        if !initial.is_empty() && initial != finals {
-                            return Err("added_content_conflict");
-                        };
-                        let part_count = parts.keys().filter(|(index, _)| *index == i).count();
-                        if part_count != 0 && part_count != finals.len() {
-                            return Err("content_part_count");
-                        }
-                        for (j, part) in finals.iter().enumerate() {
-                            if parts.keys().any(|(index, _)| *index == i)
-                                && (part_done.get(&(i, j)) != Some(part))
-                            {
-                                return Err("content_part_final_conflict");
+                        for &field in fields {
+                            let optional = reasoning && field == "content";
+                            let initial = item_parts(prior, field, optional)?;
+                            let finals = item_parts(&item, field, optional)?;
+                            if initial.is_some_and(|p| !p.is_empty() && Some(p) != finals) {
+                                return Err("added_content_conflict");
+                            }
+                            let range = (i, field, 0)..=(i, field, usize::MAX);
+                            let observed = parts.range(range.clone());
+                            let count = observed.clone().count();
+                            if count != 0 && finals.is_some_and(|p| p.len() != count) {
+                                return Err("content_part_count");
+                            }
+                            for (key, _) in observed {
+                                let closed =
+                                    part_done.get(key).ok_or("content_part_final_conflict")?;
+                                if finals.is_some_and(|p| p.get(key.2) != Some(closed)) {
+                                    return Err("content_part_final_conflict");
+                                }
+                            }
+                            if optional {
+                                if text_delta
+                                    .range(range.clone())
+                                    .any(|(key, _)| !text_final.contains_key(key))
+                                {
+                                    return Err("reasoning_text_incomplete");
+                                }
+                                if let Some(finals) = finals {
+                                    for (&(_, _, j), text) in text_final.range(range) {
+                                        if finals
+                                            .get(j)
+                                            .and_then(|part| part.text_field("text").ok())
+                                            != Some(text.as_str())
+                                        {
+                                            return Err("content_part_final_conflict");
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -582,6 +612,8 @@ impl Reducer {
                 | "response.content_part.done"
                 | "response.output_text.delta"
                 | "response.output_text.done"
+                | "response.reasoning_text.delta"
+                | "response.reasoning_text.done"
                 | "response.refusal.delta"
                 | "response.refusal.done"
                 | "response.reasoning_summary_part.added"
@@ -591,7 +623,14 @@ impl Reducer {
                     let i = value.usize_field("output_index")?;
                     let prior = added.get(&i).ok_or("orphan_content_event")?;
                     let summary = ty.starts_with("response.reasoning_summary_");
-                    let expected = if summary { "reasoning" } else { "message" };
+                    let raw_text = ty.starts_with("response.reasoning_text.")
+                        || ty.starts_with("response.content_part.")
+                            && value.field("part")?.text_field("type")? == "reasoning_text";
+                    let expected = if summary || raw_text {
+                        "reasoning"
+                    } else {
+                        "message"
+                    };
                     if prior.text_field("type")? != expected
                         || prior.text_field("id")? != value.text_field("item_id")?
                     {
@@ -602,18 +641,25 @@ impl Reducer {
                     } else {
                         "content_index"
                     })?;
-                    let key = (i, j);
+                    if j >= self.limits.items {
+                        return Err("content_part_order");
+                    }
+                    // A reasoning item can have both summary[0] and content[0].
+                    let group = if summary { "summary" } else { "content" };
+                    let key = (i, group, j);
                     let is_part = ty.contains("part.");
                     if is_part && ty.ends_with(".added") {
-                        if j >= self.limits.items
-                            || j != parts.keys().filter(|(idx, _)| *idx == i).count()
+                        if j != parts.range((i, group, 0)..=(i, group, usize::MAX)).count()
+                            || text_delta.contains_key(&key)
+                            || text_final.contains_key(&key)
                         {
                             return Err("content_part_order");
                         }
                         let p = value.field("part")?.clone();
                         let kind = p.text_field("type")?;
                         if (summary && kind != "summary_text")
-                            || !["summary_text", "output_text", "refusal"].contains(&kind)
+                            || !["summary_text", "output_text", "refusal", "reasoning_text"]
+                                .contains(&kind)
                             || !p
                                 .text_field(if kind == "refusal" { "refusal" } else { "text" })?
                                 .is_empty()
@@ -622,8 +668,12 @@ impl Reducer {
                             return Err("content_part_added");
                         }
                     } else {
-                        let old = parts.get(&key).ok_or("orphan_content_part")?;
-                        let kind = old.text_field("type")?;
+                        let kind = match parts.get(&key) {
+                            Some(part) => part.text_field("type")?,
+                            // Reasoning text can stream without optional content-part envelopes.
+                            None if raw_text && !is_part => "reasoning_text",
+                            None => return Err("orphan_content_part"),
+                        };
                         let field = if kind == "refusal" { "refusal" } else { "text" };
                         if is_part {
                             let p = value.field("part")?.clone();
@@ -641,6 +691,8 @@ impl Reducer {
                             };
                             let wanted = if ty.starts_with("response.refusal.") {
                                 "refusal"
+                            } else if raw_text {
+                                "reasoning_text"
                             } else if summary {
                                 "summary_text"
                             } else {
@@ -667,10 +719,23 @@ impl Reducer {
                     }
                 }
                 "response.completed" => terminal = Some(value.field("response")?.clone()),
-                "response.failed" | "response.incomplete" | "error" => {
-                    return Err("response_unsuccessful");
+                "response.failed" => return Err("response_failed"),
+                "response.incomplete" => {
+                    let details = value
+                        .field("response")
+                        .and_then(|r| r.field("incomplete_details"));
+                    return Err(match details.and_then(|d| d.text_field("reason")) {
+                        Ok("max_output_tokens") => "response_output_token_limit",
+                        Ok("content_filter") => "response_content_filter",
+                        _ => "response_incomplete",
+                    });
                 }
-                _ => return Err("unknown_response_event"),
+                _ => {
+                    if let Some(report) = self.on_unknown_event {
+                        report(ty);
+                    }
+                    return Err("unknown_response_event");
+                }
             }
         }
         let mut call_ids = HashSet::new();
@@ -794,6 +859,17 @@ fn has_final_text(item: &Json) -> bool {
 }
 
 #[cfg_attr(not(feature = "protocol-test-adapter"), allow(dead_code))]
+fn item_parts<'a>(
+    item: &'a Json,
+    field: &str,
+    optional: bool,
+) -> Result<Option<&'a [Json]>, &'static str> {
+    if optional && (!item.has(field) || item.field(field)?.is_null()) {
+        return Ok(None);
+    }
+    item.field(field)?.elements().map(Some)
+}
+
 fn compatible_added(added: &Json, final_item: &Json) -> Result<(), &'static str> {
     for key in added.keys()? {
         if [
@@ -878,6 +954,14 @@ fn validate_item(
             {
                 item.text_field("encrypted_content")?;
             }
+            if let Some(content) = item_parts(item, "content", true)? {
+                for part in content {
+                    if part.text_field("type")? != "reasoning_text" {
+                        return Err("reasoning_content_type");
+                    }
+                    part.text_field("text")?;
+                }
+            }
             for p in item.field("summary")?.elements()? {
                 if p.text_field("type")? != "summary_text" {
                     return Err("reasoning_summary_type");
@@ -944,9 +1028,11 @@ impl ResponseStream {
         limits: Limits,
         preview: Option<TextPreview>,
         cancelled: Option<Box<dyn Fn() -> bool>>,
+        on_unknown_event: fn(&str),
     ) -> Self {
         let mut stream = Self::new_with_callbacks(request, limits, preview, cancelled);
         stream.reducer.siwc = true;
+        stream.reducer.on_unknown_event = Some(on_unknown_event);
         stream
     }
     #[cfg(feature = "protocol-test-adapter")]

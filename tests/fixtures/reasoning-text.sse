@@ -1,0 +1,28 @@
+data: {"type":"response.created","response":{"id":"r1","model":"gpt-6.1-sol","status":"in_progress","output":[]},"sequence_number":0}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"r","type":"reasoning","summary":[]},"sequence_number":1}
+
+data: {"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"r","summary_index":0,"part":{"type":"summary_text","text":""},"sequence_number":2}
+
+data: {"type":"response.content_part.added","output_index":0,"item_id":"r","content_index":0,"part":{"type":"reasoning_text","text":""},"sequence_number":3}
+
+data: {"type":"response.reasoning_text.delta","output_index":0,"item_id":"r","content_index":0,"delta":"synthetic private text","sequence_number":4}
+
+data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"r","summary_index":0,"delta":"public summary","sequence_number":5}
+
+data: {"type":"response.reasoning_text.done","output_index":0,"item_id":"r","content_index":0,"text":"synthetic private text","sequence_number":6}
+
+data: {"type":"response.content_part.done","output_index":0,"item_id":"r","content_index":0,"part":{"type":"reasoning_text","text":"synthetic private text"},"sequence_number":7}
+
+data: {"type":"response.reasoning_summary_text.done","output_index":0,"item_id":"r","summary_index":0,"text":"public summary","sequence_number":8}
+
+data: {"type":"response.reasoning_summary_part.done","output_index":0,"item_id":"r","summary_index":0,"part":{"type":"summary_text","text":"public summary"},"sequence_number":9}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"r","type":"reasoning","summary":[{"type":"summary_text","text":"public summary"}],"content":[{"type":"reasoning_text","text":"synthetic private text"}],"encrypted_content":"synthetic-opaque"},"sequence_number":10}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"m","role":"assistant","type":"message","status":"in_progress","content":[]},"sequence_number":11}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"m","role":"assistant","type":"message","status":"completed","content":[{"type":"output_text","text":"Final answer"}]},"sequence_number":12}
+
+data: {"type":"response.completed","response":{"id":"r1","model":"gpt-6.1-sol","status":"completed","output":[{"id":"r","type":"reasoning","summary":[{"type":"summary_text","text":"public summary"}],"content":[{"type":"reasoning_text","text":"synthetic private text"}],"encrypted_content":"synthetic-opaque"},{"id":"m","role":"assistant","type":"message","status":"completed","content":[{"type":"output_text","text":"Final answer"}]}]},"sequence_number":13}
+
