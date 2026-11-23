@@ -97,6 +97,10 @@ const COMMANDS: &[Command] = &[
         description: "Configure role models or draft a plan for a task",
     },
     Command {
+        name: "/attach",
+        description: "Attach a PNG or JPEG to the next Work or Plan message",
+    },
+    Command {
         name: "/terminals",
         description: "View activity and the agent shell",
     },
@@ -184,7 +188,7 @@ impl Completion {
         }
         if matches!(
             text[..begin].split_whitespace().next(),
-            Some("/orchestrate" | "/orchestrate+")
+            Some("/orchestrate" | "/orchestrate+" | "/attach")
         ) {
             return None;
         }

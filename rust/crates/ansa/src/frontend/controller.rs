@@ -12,6 +12,7 @@ use super::{
     terminal::{Drain, Io},
 };
 use crate::{
+    provider::contracts::ImageInput,
     runtime::{Handle, PostStatus, Runtime},
     session::transcript,
 };
@@ -54,6 +55,9 @@ pub struct State {
     pub scroll_limit: usize,
     pub status: String,
     pub pending: Option<CommandId>,
+    images: Vec<ImageInput>,
+    image_loading: bool,
+    image_submission: Option<CommandId>,
     pub deferred_cancel: bool,
     pub cancelled: bool,
     pub exit: i32,
@@ -100,6 +104,9 @@ impl State {
             scroll_limit: 0,
             status: String::new(),
             pending: None,
+            images: vec![],
+            image_loading: false,
+            image_submission: None,
             deferred_cancel: false,
             cancelled: false,
             exit: 0,
@@ -234,12 +241,14 @@ impl State {
         let new_turn = matches!(
             command.payload,
             CommandPayload::Submit(_)
+                | CommandPayload::SubmitImages(_, _)
                 | CommandPayload::Handoff(_)
                 | CommandPayload::DraftPlan(_, _)
         );
         let submit = matches!(
             command.payload,
             CommandPayload::Submit(_)
+                | CommandPayload::SubmitImages(_, _)
                 | CommandPayload::Handoff(_)
                 | CommandPayload::DraftPlan(_, _)
                 | CommandPayload::Steer(_)
@@ -521,7 +530,15 @@ impl State {
             self.exit = 1;
             return (false, false);
         }
+        if self.image_loading || self.image_submission.is_some() {
+            self.report(io, "Wait for the image attachment or submission");
+            return (false, false);
+        }
         if !self.available() {
+            if !self.images.is_empty() {
+                self.report(io, "Wait for the current turn before sending images");
+                return (false, false);
+            }
             if let Some(target) = self
                 .snapshot
                 .as_ref()
@@ -567,15 +584,24 @@ impl State {
         replies: &mut Replies,
     ) -> bool {
         self.turn = TurnId(format!("t_{}_{}", self.prefix, self.sequence + 1));
-        let posted = self.post(
-            handle,
-            CommandPayload::Submit(Submit {
-                text: text.into(),
-                mode,
-            }),
-            replies,
-        );
+        let submit = Submit {
+            text: text.into(),
+            mode,
+        };
+        let payload = if self.images.is_empty() {
+            CommandPayload::Submit(submit)
+        } else {
+            if !matches!(mode, AgentMode::Basic | AgentMode::Plan) {
+                self.report(io, "Image attachments require Work or Plan");
+                return false;
+            }
+            CommandPayload::SubmitImages(submit, self.images.clone())
+        };
+        let posted = self.post(handle, payload, replies);
         if posted {
+            if !self.images.is_empty() {
+                self.image_submission = self.pending.clone();
+            }
             self.progress
                 .submitted(self.pending.clone().expect("posted Submit"), Instant::now());
             self.tools_expanded = false;
@@ -593,9 +619,23 @@ impl State {
         }
         posted
     }
+    fn accept_images(&mut self, command: &CommandId) {
+        if self.image_submission.as_ref() == Some(command) {
+            self.images.clear();
+            self.image_submission = None;
+            self.status.clear();
+        }
+    }
+
     pub fn apply(&mut self, event: &RuntimeEvent, io: &Io) {
         match &event.payload {
             EventPayload::FrontendSnapshot(v) => {
+                if v.durable
+                    && !v.storage_failed
+                    && let Some(command) = v.submit.as_ref()
+                {
+                    self.accept_images(command);
+                }
                 self.delivery_snapshot(v);
                 self.progress.observe(v, Instant::now());
                 if diagnostics::needs_attention(v)
@@ -731,6 +771,12 @@ impl State {
                     ),
                 );
             }
+            EventPayload::CommandAccepted { command, .. }
+            | EventPayload::CommandReplayed { command, .. }
+                if event.request.is_some() =>
+            {
+                self.accept_images(command);
+            }
             EventPayload::RuntimeError {
                 command,
                 diagnostic,
@@ -739,6 +785,9 @@ impl State {
                     if event.request.is_none() && self.pending.as_ref() == Some(command) {
                         self.pending = None;
                         self.exit = 1;
+                    }
+                    if event.request.is_none() && self.image_submission.as_ref() == Some(command) {
+                        self.image_submission = None;
                     }
                     self.progress.rejected(command);
                     self.copy.rejected(command);
@@ -931,6 +980,8 @@ impl State {
             } else {
                 "/resume unavailable · /cancel to cancel the request".into()
             }
+        } else if self.status.is_empty() && !self.images.is_empty() {
+            format!("Image attached ({}) · /attach --clear", self.images.len())
         } else {
             self.status.trim().to_owned()
         };

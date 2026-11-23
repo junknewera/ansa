@@ -21,9 +21,20 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "tests"))
 from native_eval import decode, label, require
 from carbon import MODES, TrialStopped, capture, journals
+import comparison
 
 MAX_TRIALS = 128
 LIVE_ROUTES = ("siwc", "openrouter")
+CARBON_HELPERS = (
+    "tests/carbon_workspace_pty.py",
+    "tests/cli_progress_pty.py",
+    "tests/native_eval.py",
+    "tests/parity/frontend_io.py",
+    "tests/parity/protocol.py",
+    "tests/parity/protocol_network.py",
+    "tests/parity/run.py",
+    "tests/parity/session_cases.py",
+)
 
 
 def utc():
@@ -73,9 +84,13 @@ def tree(root):
 
 
 def load(path):
+    return load_experiment(path)[:5]
+
+
+def load_experiment(path):
     raw = path.read_bytes()
     spec = decode(raw)
-    check_fields(spec, ("version", "repetitions", "seed", "arms", "tasks", "budget"))
+    check_fields(spec, ("version", "repetitions", "seed", "arms", "tasks", "budget"), ("comparison",))
     bounded(spec["version"], 1, 1)
     bounded(spec["repetitions"], 1, 16)
     require(label(spec["seed"]), "invalid seed")
@@ -93,10 +108,11 @@ def load(path):
     require(isinstance(spec["arms"], list) and spec["arms"], "expected arms")
     for arm in spec["arms"]:
         check_fields(arm, ("id", "binary", "mode", "route", "model"),
-                     ("effort", "roles", "guidance", "auth_dir", "mcp_config"))
+                     ("effort", "roles", "guidance", "auth_dir", "mcp_config", "image_input"))
         key = arm["id"]
         require(label(key) and key not in arms, "invalid or duplicate arm")
         require(arm["mode"] in MODES and arm["route"] in ("offline", *LIVE_ROUTES), "invalid mode or route")
+        require(type(arm.get("image_input", False)) is bool, "image_input must be a boolean")
         validate_selection(arm["model"], arm.get("effort"))
         require("auth_dir" in arm if arm["route"] in LIVE_ROUTES else "auth_dir" not in arm,
                 "live arms require a dedicated auth_dir")
@@ -121,7 +137,8 @@ def load(path):
     require(isinstance(spec["tasks"], list) and spec["tasks"], "expected tasks")
     for task in spec["tasks"]:
         check_fields(task, ("id", "turns", "workspace", "verifier", "modes"),
-                     ("source", "verifier_inputs"))
+                     ("source", "verifier_inputs", "mcp_config", "git_setup", "attachments",
+                      "category", "family", "split", "oracle_fixture"))
         key = task["id"]
         require(label(key) and key not in tasks, "invalid or duplicate task")
         require(isinstance(task["turns"], list) and 0 < len(task["turns"]) <= 32,
@@ -141,6 +158,23 @@ def load(path):
         require(task["verifier"].is_file() and os.access(task["verifier"], os.X_OK)
                 and not task["verifier"].is_relative_to(task["workspace"]),
                 "verifier must be an executable outside the input workspace")
+        for field in ("mcp_config", "git_setup", "oracle_fixture"):
+            if field in task:
+                file = path_for(task[field])
+                require(file.is_file() and not file.is_relative_to(task["workspace"]),
+                        f"{field} must be a file outside the input workspace")
+                if field in ("git_setup", "oracle_fixture"):
+                    require(os.access(file, os.X_OK), f"{field} must be executable")
+                task[field] = file
+                task[field + "_sha256"] = digest(file)
+        if "attachments" in task:
+            require(isinstance(task["attachments"], list) and task["attachments"], "empty attachments")
+            for attachment in task["attachments"]:
+                check_fields(attachment, ("turn", "path"))
+                bounded(attachment["turn"], 0, len(task["turns"]) - 1)
+                file = path_for(attachment["path"])
+                require(file.is_file(), "attachment must be a file")
+                attachment.update(path=str(file), sha256=digest(file))
         dependencies = task.pop("verifier_inputs", [])
         require(isinstance(dependencies, list), "invalid verifier inputs")
         dependencies = [path_for(value) for value in dependencies]
@@ -151,12 +185,29 @@ def load(path):
 
     rows = [{"id": f"{task}.{repeat}.{arm}", "task": task, "repeat": repeat, "arm": arm}
             for task, repeat, arm in itertools.product(tasks, range(1, spec["repetitions"] + 1), arms)
-            if arms[arm]["mode"] in tasks[task]["modes"]]
+            if arms[arm]["mode"] in tasks[task]["modes"] or tasks[task].get("attachments")]
+    for row in rows:
+        arm = arms[row["arm"]]
+        task = tasks[row["task"]]
+        require("mcp_config" not in arm or "mcp_config" not in task,
+                "choose either task or arm MCP configuration")
+        if task.get("attachments"):
+            row.update(mode=arm["mode"], model=arm["model"], route=arm["route"])
+            if arm["mode"] not in task["modes"]:
+                row["unsupported"] = "this task does not support the selected mode"
+            elif arm["mode"] not in ("work", "plan"):
+                row["unsupported"] = "Carbon accepts images in Work and Plan"
+            elif arm["route"] not in LIVE_ROUTES:
+                row["unsupported"] = "the offline model has no image transport"
+            elif not arm.get("image_input"):
+                row["unsupported"] = "image input was not declared for this binary, route and model"
     require(0 < len(rows) <= MAX_TRIALS
             and {row["arm"] for row in rows} == arms.keys()
             and {row["task"] for row in rows} == tasks.keys(), "empty or oversized matrix")
     rows.sort(key=lambda row: hashlib.sha256(f'{spec["seed"]}/{row["id"]}'.encode()).digest())
-    return arms, tasks, budget, rows, hashlib.sha256(raw).hexdigest()
+    if "comparison" in spec:
+        comparison.validate(spec["comparison"], arms, tasks, rows)
+    return arms, tasks, budget, rows, hashlib.sha256(raw).hexdigest(), spec.get("comparison")
 
 
 def validate_selection(model, effort):
@@ -193,7 +244,7 @@ def usage(traces):
         "sessions": sorted(traces), "admitted_responses": len(responses),
         "dispatched_tools": sum(record["kind"] == "outcome" and record["result"]["dispatched"]
                                 for record in records),
-        "compactions": len(compactions),
+        "compactions": len(compactions), "stages": comparison.stages(traces),
         "reported_tokens": sum(t["input_tokens"] + t["output_tokens"] for t in tokens)
         if responses and all(tokens) else None,
         "observed_generations": [{"requested": a, "returned": b, "effort": e or None}
@@ -245,6 +296,10 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
         git(workspace, "add", "-f", "--", ".")
         git(workspace, "-c", "user.name=ANSA Benchmark", "-c", "user.email=fixture@localhost",
             "commit", "--allow-empty", "-qm", "Benchmark inputs")
+        if "git_setup" in task:
+            require(digest(task["git_setup"]) == task["git_setup_sha256"], "git_setup changed")
+            subprocess.run([str(task["git_setup"])], cwd=workspace, env=env,
+                           capture_output=True, check=True, timeout=60)
         result["input_commit"] = git(workspace, "rev-parse", "HEAD").strip()
 
         config = home / ".ansa"
@@ -252,9 +307,10 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
         write(config / "config.json", {"schema_version": 1, "tool_calls": budget["tool_calls"],
                                       "tool_rounds": budget["tool_rounds"]})
         for key, target in (("guidance", "AGENTS.md"), ("mcp_config", ".ansa/mcp.json")):
-            if key in arm:
-                data = arm[key].read_bytes()
-                require(hashlib.sha256(data).hexdigest() == arm[f"{key}_sha256"], f"{key} changed")
+            owner = task if key in task else arm
+            if key in owner:
+                data = owner[key].read_bytes()
+                require(hashlib.sha256(data).hexdigest() == owner[f"{key}_sha256"], f"{key} changed")
                 (home / target).write_bytes(data)
                 (home / target).chmod(0o600)
         if arm["route"] == "siwc":
@@ -265,14 +321,16 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
                     "benchmark account needs a qualifying ChatGPT sign-in")
         fixture_args = fixture_launch(root, home, arm) if fixture_launch else None
         if fixture_args is not None:
-            result["transport"] = "synthetic-siwc"
+            result["transport"] = "synthetic-openrouter" if arm["route"] == "openrouter" else "synthetic-siwc"
         deadline = min(end, time.monotonic() + budget["trial_seconds"])
         if deadline <= time.monotonic():
             raise TrialStopped("not_run", "experiment time budget")
         agent_started = time.monotonic()
         grading_workspace, answer = capture(arm["binary"], root, home, workspace, env, arm,
                                              task["turns"], deadline, git, result["input_commit"],
-                                             fixture_args)
+                                             fixture_args, attachments=task.get("attachments", ()))
+        if "image_inputs" in answer:
+            result["image_inputs"] = answer["image_inputs"]
         result["agent_wall_seconds"] = round(time.monotonic() - agent_started, 3)
         result["candidate"] = answer["candidate"]
         write(root / "answer.json", answer)
@@ -343,16 +401,34 @@ def main(argv=None, fixture_launch=None):
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh evidence directory; omit to print the frozen plan")
     parser.add_argument("--live", action="store_true", help="authorize model requests")
+    parser.add_argument("--split", choices=("development", "holdout"), help="strict A/B split (default: development)")
+    parser.add_argument("--frozen-plan", type=Path, help="require the exact configuration and input hashes saved in an earlier plan")
     args = parser.parse_args(argv)
     try:
         manifest = no_dotenv(no_dotenv(args.manifest).resolve())
-        arms, tasks, budget, rows, manifest_hash = load(manifest)
+        arms, tasks, budget, rows, manifest_hash, experiment = load_experiment(manifest)
+        require(experiment or args.split is None, "--split requires a comparison")
+        split = args.split or "development"
+        if experiment:
+            rows = [row for row in rows if tasks[row["task"]]["split"] == split]
         plan = {"manifest_sha256": manifest_hash, "driver_sha256": digest(Path(__file__)),
                 "carbon_sha256": digest(Path(__file__).with_name("carbon.py")),
+                "comparison_sha256": digest(Path(comparison.__file__)),
+                "helper_sha256": {path: digest(PROJECT / path) for path in CARBON_HELPERS},
                 "arms": {key: {field: str(value) if isinstance(value, Path) else value
                                for field, value in arm.items() if field != "auth_dir"}
                          for key, arm in arms.items()},
                 "tasks": tasks, "budget": budget, "schedule": rows}
+        if experiment:
+            plan.update(comparison=experiment, split=split)
+        if args.frozen_plan:
+            frozen = decode(no_dotenv(args.frozen_plan.resolve(strict=True)).read_bytes())
+            saved_helpers = frozen.get("helper_sha256") if isinstance(frozen, dict) else None
+            require(isinstance(saved_helpers, dict), "frozen plan lacks Carbon helper hashes; regenerate it")
+            for path, sha in plan["helper_sha256"].items():
+                require(saved_helpers.get(path) == sha, f"Carbon helper differs from the frozen plan: {path}")
+            require(frozen == json.loads(json.dumps(plan, default=str)),
+                    "current manifest, programs, inputs or schedule differ from the frozen plan")
         if args.output is None:
             print(json.dumps(plan, ensure_ascii=False, indent=2, default=str))
             return 0
@@ -372,11 +448,21 @@ def main(argv=None, fixture_launch=None):
         write(output / "plan.json", plan)
         end = time.monotonic() + budget["total_seconds"]
         began = utc()
+        if experiment:
+            controls = output / "controls"
+            controls.mkdir()
+            for task_id in sorted({row["task"] for row in rows if "unsupported" not in row}):
+                receipt = comparison.calibrate(tasks[task_id], controls / task_id, budget, end, digest, environment)
+                write(controls / task_id / "receipt.json", receipt)
         trials = []
         for row in rows:
             timestamp = utc()
             archive = output / row["id"]
-            if time.monotonic() < end:
+            if "unsupported" in row:
+                archive.mkdir(mode=0o700)
+                result = {"status": "unsupported", "reason": row["unsupported"],
+                          "mode": arms[row["arm"]]["mode"], "model": arms[row["arm"]]["model"]}
+            elif time.monotonic() < end:
                 prefix = "ansa-m4-" if fixture_launch else "ansa-bench-"
                 root = Path(tempfile.mkdtemp(prefix=prefix, dir="/tmp"))
                 try:
@@ -391,10 +477,20 @@ def main(argv=None, fixture_launch=None):
             trials.append(trial)
             print(f'{row["id"]} {trial["status"]}', flush=True)
         counts, pairs = summarize(trials, arms)
-        write(output / "report.json", {"started_at": began, "finished_at": utc(),
-                                      "summary": counts, "paired": pairs, "trials": trials})
-        return int(any(row["status"] in ("infra_error", "not_run") for row in trials))
-    except (KeyError, TypeError, ValueError, OSError) as error:
+        report = {"started_at": began, "finished_at": utc(), "summary": counts, "paired": pairs,
+                  "trials": trials}
+        invalid_stage = False
+        if experiment:
+            details = comparison.report(experiment, trials, arms, tasks)
+            report.update(comparison=details, split=split)
+            # Keep the legacy summary consistent with stage-qualified outcomes.
+            report["paired"] = {f"{experiment['left']}:{experiment['right']}":
+                                dict(Counter(pair["outcome"] for pair in details["pairs"]))}
+            invalid_stage = any(pair["outcome"] == "stage_missing" for pair in details["pairs"])
+        write(output / "report.json", report)
+        return int(invalid_stage or all(row["status"] == "unsupported" for row in trials)
+                   or any(row["status"] in ("infra_error", "not_run") for row in trials))
+    except (KeyError, TypeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
         print(str(error), file=sys.stderr)
         return 2
 

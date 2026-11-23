@@ -359,6 +359,7 @@ impl Owner {
                         .is_some_and(|r| r.state == state),
                 state,
                 mode: Some(receipt.mode),
+                image_sha256: receipt.image_sha256.clone(),
                 text_sha256: crate::protocol::legacy_json_v1::sha256(receipt.text.as_bytes()),
                 admission_durable,
             });
@@ -377,6 +378,7 @@ impl Owner {
                 request: Some(message.target.clone()),
                 state: message.state.clone(),
                 mode: source.map(|r| r.mode),
+                image_sha256: Vec::new(),
                 text_sha256: crate::protocol::legacy_json_v1::sha256(message.text.as_bytes()),
                 admission_durable: self.options.directory.is_some() && !self.storage_failed,
                 state_durable: self.options.directory.is_some() && !self.storage_failed,
@@ -397,6 +399,7 @@ impl Owner {
                     .find(|r| r.request == message.target)
                     .map(|r| r.mode),
                 admission_durable: false,
+                image_sha256: Vec::new(),
                 text_sha256: crate::protocol::legacy_json_v1::sha256(message.text.as_bytes()),
                 state_durable: false,
             });
@@ -534,6 +537,7 @@ impl Owner {
     fn match_child_submit(receipt: &SubmitReceipt, lookup: &ChildLookup) -> Result<()> {
         if receipt.internal
             || receipt.draft.is_some()
+            || !receipt.image_sha256.is_empty()
             || receipt.turn != lookup.turn
             || receipt.mode != lookup.submit.mode
             || *receipt.text != lookup.submit.text
@@ -1106,9 +1110,17 @@ impl Owner {
                 });
             }
             CommandPayload::Submit(submitted)
+            | CommandPayload::SubmitImages(submitted, _)
             | CommandPayload::Handoff(submitted)
             | CommandPayload::DraftPlan(submitted, _) => {
                 let internal = matches!(command.payload, CommandPayload::Handoff(_));
+                let image_sha256 = match &command.payload {
+                    CommandPayload::SubmitImages(_, images) => images
+                        .iter()
+                        .map(|image| image.sha256().to_owned())
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let draft = match &command.payload {
                     CommandPayload::DraftPlan(_, draft) => Some(draft.as_ref()),
                     _ => None,
@@ -1132,6 +1144,7 @@ impl Owner {
                 }
                 if let Some(receipt) = self.receipts.get(&command.command.0) {
                     if *receipt.text != submitted.text
+                        || receipt.image_sha256 != image_sha256
                         || receipt.turn != command.turn
                         || receipt.mode != submitted.mode
                         || receipt.internal != internal
@@ -1177,6 +1190,7 @@ impl Owner {
                         turn: command.turn.clone(),
                         request: RequestId(String::new()),
                         text: Arc::new(submitted.text.clone()),
+                        image_sha256,
                         state: "queued".into(),
                         mode: submitted.mode,
                         internal,
@@ -1269,7 +1283,7 @@ impl Owner {
             );
             return Ok(());
         }
-        if matches!(&command.payload, CommandPayload::Submit(submitted) | CommandPayload::Handoff(submitted) if submitted.mode == AgentMode::Plan)
+        if matches!(&command.payload, CommandPayload::Submit(submitted) | CommandPayload::SubmitImages(submitted, _) | CommandPayload::Handoff(submitted) if submitted.mode == AgentMode::Plan)
             && !self.tools.plan_ready()
         {
             self.reject_plan(&command, "terminal_workspace_busy");
@@ -1281,11 +1295,12 @@ impl Owner {
             self.reject(&command, "orchestration_generation_changed");
             return Ok(());
         }
-        let (submitted, internal) = match command.payload {
+        let (submitted, internal, images) = match command.payload {
             CommandPayload::Submit(submitted) | CommandPayload::DraftPlan(submitted, _) => {
-                (submitted, false)
+                (submitted, false, Vec::new())
             }
-            CommandPayload::Handoff(submitted) => (submitted, true),
+            CommandPayload::SubmitImages(submitted, images) => (submitted, false, images),
+            CommandPayload::Handoff(submitted) => (submitted, true, Vec::new()),
             _ => return Err("submit_contract"),
         };
         self.tools.begin_turn();
@@ -1319,12 +1334,17 @@ impl Owner {
             workers,
             Kind::Accepted,
             Box::new(move |state| {
-                let next = state.request_for_input(
+                let image_content = (!images.is_empty())
+                    .then(|| crate::provider::contracts::image::content(&submitted.text, &images))
+                    .transpose()?;
+                let mut next = state.request_for_input(
                     &submitted.text,
                     submitted.mode,
                     internal,
                     receipt.draft.as_ref(),
+                    image_content.as_ref(),
                 )?;
+                let archived_images = next.archive_history_images()?;
                 let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;
                 let compact = can_compact
                     && !inherited_incomplete_turn
@@ -1360,6 +1380,32 @@ impl Owner {
                     ("round_limit", number(limits.tool_rounds)?),
                     ("call_limit", number(limits.tool_calls)?),
                 ];
+                if !receipt.image_sha256.is_empty() {
+                    fields.push((
+                        "image_sha256",
+                        Json::array(
+                            receipt
+                                .image_sha256
+                                .iter()
+                                .map(|hash| Json::string(hash))
+                                .collect::<Result<Vec<_>>>()?,
+                        )?,
+                    ));
+                }
+                if let Some(originals) = crate::provider::contracts::image::originals(&images)? {
+                    fields.push(("image_originals", originals));
+                }
+                if !archived_images.is_empty() {
+                    fields.push((
+                        "archived_images",
+                        Json::array(
+                            archived_images
+                                .into_iter()
+                                .map(number)
+                                .collect::<Result<_>>()?,
+                        )?,
+                    ));
+                }
                 if internal {
                     fields.push(("handoff", Json::parse("true")?));
                 }
@@ -1602,7 +1648,7 @@ impl Owner {
             && self.closing.mode.load(Ordering::Acquire) != 2
             && let Some(command) = self.queued.pop_front()
         {
-            if matches!(&command.payload, CommandPayload::Submit(value) | CommandPayload::Handoff(value) if value.mode == AgentMode::Plan)
+            if matches!(&command.payload, CommandPayload::Submit(value) | CommandPayload::SubmitImages(value, _) | CommandPayload::Handoff(value) if value.mode == AgentMode::Plan)
                 && let Some(plan) = &workers.plan
             {
                 plan.try_send(PlanTarget::Submit(command))
@@ -1705,7 +1751,12 @@ impl Owner {
             self.emit_at(
                 EventPayload::RuntimeError {
                     command: Some(submitted.command),
-                    diagnostic: "request_frame_limit".into(),
+                    diagnostic: if submitted.image_sha256.is_empty() {
+                        "request_frame_limit"
+                    } else {
+                        "image_request_frame_limit"
+                    }
+                    .into(),
                 },
                 submitted.turn.clone(),
                 None,

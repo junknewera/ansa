@@ -81,6 +81,12 @@ fn estimate_item_tokens(item: &Json) -> usize {
         parts
             .iter()
             .map(|part| {
+                // Image tokens depend on the provider, resolution and detail level.
+                // Reserve a vision budget per image. Base64 length measures transfer
+                // bytes and can differ dramatically for the same pixels.
+                if part.text_field("type") == Ok("input_image") {
+                    return 1536;
+                }
                 part.text_field("text")
                     .or_else(|_| part.text_field("refusal"))
                     .map_or_else(|_| value(part), estimate_text_tokens)
@@ -101,5 +107,36 @@ fn estimate_item_tokens(item: &Json) -> usize {
             .map_or(0, parts),
         Ok("compaction") => field("text"),
         _ => value(item),
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn estimate_reserves_tokens_per_image_independent_of_compression() {
+        let estimate = |payload: &str, count| {
+            let text = Json::parse(r#"{"type":"input_text","text":"look"}"#).unwrap();
+            let image = Json::object(vec![
+                ("type", Json::string("input_image").unwrap()),
+                ("image_url", Json::string(payload).unwrap()),
+            ])
+            .unwrap();
+            let parts = std::iter::once(text)
+                .chain(std::iter::repeat_n(image, count))
+                .collect();
+            let item = Json::object(vec![
+                ("role", Json::string("user").unwrap()),
+                ("content", Json::array(parts).unwrap()),
+            ])
+            .unwrap();
+            estimate_item_tokens(&item)
+        };
+        let text_only = estimate("", 0);
+        let one = estimate("small", 1);
+        assert!(one > text_only);
+        assert_eq!(one, estimate(&"A".repeat(64 * 1024), 1));
+        assert_eq!(estimate("small", 2) - one, one - text_only);
     }
 }

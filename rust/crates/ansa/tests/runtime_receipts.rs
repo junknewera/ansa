@@ -1093,3 +1093,62 @@ async fn cancellation_before_sync_does_not_claim_a_durable_cancelled_state() {
     assert_eq!(executed.load(Ordering::SeqCst), 0);
     f::finish(&mut runtime).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn image_receipt_survives_reopen_and_conflicts_with_text_only_retry() {
+    use ansa::provider::contracts::ImageInput;
+    let url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==";
+    let root = f::Root::new();
+    let options = Options {
+        directory: Some(root.journal()),
+        ..Options::default()
+    };
+    let generate: Generate = Arc::new(move |request, _, _| {
+        let item = request.input.first().ok_or("missing_image_turn")?;
+        let parts = item.field("content")?.elements()?;
+        assert_eq!(parts[0].text_field("text")?, "inspect");
+        assert_eq!(parts[1].text_field("image_url")?, url);
+        native::load(&f::saved_response(request, Some("inspected"), 0))
+    });
+    let setup = || {
+        f::setup(
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            generate.clone(),
+            Limits::default(),
+            options.clone(),
+        )
+    };
+    let mut runtime = setup().await;
+    let submit = Submit {
+        text: "inspect".into(),
+        mode: AgentMode::Basic,
+    };
+    let image = CommandPayload::SubmitImages(
+        submit.clone(),
+        vec![ImageInput::from_data_url(url).unwrap()],
+    );
+    let handle = runtime.handle();
+    f::post(&handle, "image", image.clone(), "one", PostStatus::Accepted).await;
+    f::until(&handle, |payload| matches!(payload, EventPayload::Done)).await;
+    f::finish(&mut runtime).await;
+    let mut reopened = setup().await;
+    let handle = reopened.handle();
+    let message = receipt(lookup(&handle, "lookup-image", "image").await);
+    assert_eq!(
+        message.image_sha256,
+        [ImageInput::from_data_url(url).unwrap().sha256()]
+    );
+    f::post(
+        &handle,
+        "image",
+        CommandPayload::Submit(submit),
+        "one",
+        PostStatus::CommandConflict,
+    )
+    .await;
+    f::post(&handle, "image", image, "one", PostStatus::Duplicate).await;
+    f::submit(&handle, "second", "refer to the image", "two").await;
+    f::until(&handle, |payload| matches!(payload, EventPayload::Done)).await;
+    f::finish(&mut reopened).await;
+}

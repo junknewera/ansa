@@ -1,0 +1,39 @@
+name: Public benchmark acceptance
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/chartjs-oracle.yml'
+      - 'benchmarks/**'
+      - 'rust/**'
+      - 'tests/carbon_workspace_pty.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  public-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PYTHON: /usr/bin/python3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Verify eight public tasks and native image transport
+        run: ./benchmarks/check_public.sh "$RUNNER_TEMP/public-check"
+      - name: Save control and transport results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: public-benchmark
+          path: |
+            ${{ runner.temp }}/public-check/controls/**/results.json
+            ${{ runner.temp }}/public-check/controls/*/*.log
+            ${{ runner.temp }}/public-check/controls/swebench-chartjs-8567/**/run_instance.log
+            ${{ runner.temp }}/public-check/controls/**/report.json
+            ${{ runner.temp }}/public-check/controls/**/test_output.txt
+            ${{ runner.temp }}/public-check/wire/
+          if-no-files-found: warn

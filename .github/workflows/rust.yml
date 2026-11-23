@@ -23,6 +23,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends python3-matplotlib python3-pil zsh
+      - name: Check offline benchmark controls and reporting
+        run: python3 -B -m unittest discover -s benchmarks -p 'test_*.py'
       - name: Install the repository toolchain
         working-directory: rust
         run: rustup show active-toolchain
@@ -41,7 +43,12 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
       - name: Build Carbon test adapter
         working-directory: rust
-        run: cargo build --locked --features frontend-test-adapter --example frontend_adapter
+        run: cargo build --locked -p ansa --bin ansa --example frontend_adapter --features frontend-test-adapter
+      - name: Exercise five benchmark modes through Carbon
+        run: |
+          python3 -B benchmarks/smoke.py --binary rust/target/debug/ansa \
+            --frontend-adapter rust/target/debug/examples/frontend_adapter \
+            --output "${RUNNER_TEMP}/benchmark-smoke"
       - name: Exercise Orchestrate+ through Carbon
         run: |
           python3 -B tests/carbon_workspace_pty.py \

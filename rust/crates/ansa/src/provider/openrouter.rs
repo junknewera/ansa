@@ -66,6 +66,7 @@ struct Route {
     window: Option<usize>,
     strict_verified: bool,
     accepts_effort: bool,
+    accepts_images: bool,
 }
 
 impl OpenRouter {
@@ -192,6 +193,7 @@ impl OpenRouter {
             &request.binding.requested_model,
             request.effort.as_deref(),
             RouteCheck::RequireStrict,
+            request.has_image_input(),
             stop,
         )
         .map(|_| ())
@@ -209,6 +211,7 @@ impl OpenRouter {
             &selection.model,
             selection.effort.as_deref(),
             RouteCheck::RequireCatalog,
+            false,
             stop,
         )
         .map(|_| ())
@@ -219,9 +222,10 @@ impl OpenRouter {
         model: &str,
         effort: Option<&str>,
         check: RouteCheck,
+        needs_images: bool,
         stop: &Cancel,
     ) -> Result<Option<usize>> {
-        let require_catalog = check != RouteCheck::BestEffortCatalog;
+        let require_catalog = needs_images || check != RouteCheck::BestEffortCatalog;
         let mut routes = loop {
             stop.check()?;
             match self.route.try_lock() {
@@ -250,6 +254,9 @@ impl OpenRouter {
                 .send("GET", &url, None, Some(timeout), stop)
                 .and_then(|response| {
                     let endpoint = catalog_endpoint(&response, model)?;
+                    route.accepts_images = response["data"]["architecture"]["input_modalities"]
+                        .as_array()
+                        .is_some_and(|modes| modes.iter().any(|mode| mode == "image"));
                     route.accepts_effort = endpoint["supported_parameters"]
                         .as_array()
                         .is_some_and(|v| v.iter().any(|p| p == "reasoning_effort"));
@@ -271,6 +278,9 @@ impl OpenRouter {
                     }
                 }
             }
+        }
+        if needs_images && !route.accepts_images {
+            return Err("openrouter_image_unsupported");
         }
         if effort.is_some_and(|v| !route.accepts_effort || !matches!(v, "low" | "medium" | "high"))
         {
@@ -299,7 +309,13 @@ impl OpenRouter {
         } else {
             RouteCheck::BestEffortCatalog
         };
-        let window = self.prepare_route(model, request.effort.as_deref(), check, stop)?;
+        let window = self.prepare_route(
+            model,
+            request.effort.as_deref(),
+            check,
+            request.has_image_input(),
+            stop,
+        )?;
         let tokens = request
             .estimated_tokens()
             .unwrap_or_else(|| crate::context::estimate_request_tokens(request));
@@ -471,6 +487,29 @@ pub(crate) fn base_body(request: &Request, instructions: &str) -> Result<Value> 
             && value["content"].is_string()
         {
             messages.push(json!({"role":value["role"],"content":value["content"]}));
+        } else if value["role"] == "user" && value["content"].is_array() {
+            let parts = value["content"].as_array().ok_or("openrouter_input")?;
+            let (text, images) = parts.split_first().ok_or("openrouter_input")?;
+            if text["type"] != "input_text"
+                || images.is_empty()
+                || images.len() > crate::provider::contracts::MAX_IMAGES
+            {
+                return Err("openrouter_input");
+            }
+            let mut content = vec![
+                json!({"type":"text","text":text["text"].as_str().ok_or("openrouter_input")?}),
+            ];
+            for image in images {
+                let url = image["image_url"].as_str().ok_or("openrouter_input")?;
+                if image["type"] != "input_image"
+                    || !(url.starts_with("data:image/png;base64,")
+                        || url.starts_with("data:image/jpeg;base64,"))
+                {
+                    return Err("openrouter_input");
+                }
+                content.push(json!({"type":"image_url","image_url":{"url":url}}));
+            }
+            messages.push(json!({"role":"user","content":content}));
         } else if value["type"] == "message" && value["role"] == "assistant" {
             let parts = value["content"].as_array().ok_or("openrouter_input")?;
             if parts.len() != 1 || parts[0]["type"] != "output_text" {
@@ -848,6 +887,100 @@ mod tests {
             verify_probe(&response(r#"{"value":"wrong","value":"schema-enforced"}"#)),
             Err("openrouter_probe")
         );
+    }
+
+    #[test]
+    fn native_image_bytes_survive_both_wires_and_following_turn() {
+        const WHITE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC";
+        const BLACK: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+        let http = Arc::new(AtomicUsize::new(0));
+        let observed = http.clone();
+        let exchange = Arc::new(move |req: &HttpRequest, _: &Cancel| {
+            if req.url == CATALOG {
+                return Ok(reply(
+                    json!({"data":{"id":MODEL, "architecture":{"input_modalities":["text","image"]},
+                    "endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,
+                    "supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}}),
+                ));
+            }
+            let wire: Value = serde_json::from_str(req.body.expose()).unwrap();
+            let messages = wire["messages"].as_array().unwrap();
+            assert_eq!(
+                messages[1],
+                json!({"role":"user","content":[
+                    {"type":"text","text":"describe"}, {"type":"image_url","image_url":{"url":WHITE}},
+                    {"type":"image_url","image_url":{"url":BLACK}}
+                ]})
+            );
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert_eq!(messages.len(), 2);
+            } else {
+                assert_eq!(messages.len(), 4);
+                assert_eq!(
+                    messages[2],
+                    json!({"role":"assistant","content":"first answer"})
+                );
+                assert_eq!(messages[3], json!({"role":"user","content":"follow up"}));
+            }
+            Ok(reply(response("first answer")))
+        });
+        let route = OpenRouter::new(
+            Secret::new("synthetic-fixture-key-0123456789".into()),
+            exchange,
+        )
+        .unwrap();
+        let image = json!({"role":"user","content":[
+            {"type":"input_text","text":"describe"}, {"type":"input_image","image_url":WHITE},
+            {"type":"input_image","image_url":BLACK}
+        ]});
+        let image_inputs = [WHITE, BLACK]
+            .map(|url| crate::provider::contracts::ImageInput::from_data_url(url).unwrap());
+        let user = Json::object(vec![
+            ("role", Json::string("user").unwrap()),
+            (
+                "content",
+                crate::provider::contracts::image::content("describe", &image_inputs).unwrap(),
+            ),
+        ])
+        .unwrap();
+        let mut req = request(&route).with_input(vec![user]).unwrap();
+        for followup in [false, true] {
+            let mut siwc = req.clone();
+            siwc.binding.provider = "openai-siwc".into();
+            let wire: Value = serde_json::from_str(&siwc.json().unwrap().dump()).unwrap();
+            assert_eq!(wire["input"][0], image);
+            assert_eq!(
+                wire["input"].as_array().unwrap().len(),
+                if followup { 3 } else { 1 }
+            );
+            if followup {
+                assert_eq!(wire["input"][1]["content"][0]["text"], "first answer");
+                assert_eq!(wire["input"][2]["content"], "follow up");
+            }
+            let admitted = route.generate(&req, &Cancel::default()).unwrap();
+            if !followup {
+                let mut next = req.input.clone();
+                next.push(admitted.items()[0].value().clone());
+                next.push(Json::parse(r#"{"role":"user","content":"follow up"}"#).unwrap());
+                req = Request::load(&req.with_input(next).unwrap().save().unwrap()).unwrap();
+            }
+        }
+        assert_eq!(http.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn image_request_stops_before_post_on_text_only_route() {
+        let route = OpenRouter::new(Secret::new("synthetic-fixture-key-0123456789".into()), Arc::new(|req, _| {
+            assert_eq!(req.url, CATALOG);
+            Ok(reply(json!({"data":{"id":MODEL,"architecture":{"input_modalities":["text"]},
+                "endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,
+                "supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}})))
+        })).unwrap();
+        let req = request(&route).with_input(vec![Json::parse(r#"{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}"#).unwrap()]).unwrap();
+        assert!(matches!(
+            route.generate(&req, &Cancel::default()),
+            Err("openrouter_image_unsupported")
+        ));
     }
 
     #[test]

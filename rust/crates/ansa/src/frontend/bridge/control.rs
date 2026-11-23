@@ -60,7 +60,7 @@ fn reply_error(id: &str, code: &str) -> Arc<String> {
     .unwrap()
 }
 fn info_json(receipt: &MessageReceiptInfo) -> Json {
-    obj(vec![
+    let mut fields = vec![
         (
             "kind",
             s(match receipt.kind {
@@ -85,7 +85,9 @@ fn info_json(receipt: &MessageReceiptInfo) -> Json {
         ("admission_durable", flag(receipt.admission_durable)),
         ("text_sha256", s(&receipt.text_sha256).unwrap()),
         ("state_durable", flag(receipt.state_durable)),
-    ])
+    ];
+    receipt.add_image_hashes(&mut fields);
+    obj(fields)
 }
 impl Control {
     pub fn new(

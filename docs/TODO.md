@@ -155,26 +155,26 @@
 
 Расширить [стенд сессий](../benchmarks/README.md) публичными задачами из
 повседневного рабочего цикла. Уже подключён `log-summary-date-ranges`.
-Для остальных задач нужны следующие адаптеры.
+Адаптеры и команды описаны в [плане реализации и приёмки](../benchmarks/ALL_AROUND.md).
 
-- [ ] Linux и отладка. Подключить InterCode-Bash `nl2bash_fs_1.json[48]`
+- [x] Linux и отладка. Подключить InterCode-Bash `nl2bash_fs_1.json[48]`
   для короткого запроса о пяти крупнейших файлах и Terminal-Bench `fix-git`
   для восстановления потерянных изменений. Для InterCode сохранять исходный
   reward, для `fix-git` воспроизводить исходную историю Git и проверять
   итоговое слияние авторским verifier.
   [InterCode](https://github.com/princeton-nlp/intercode/blob/c3e46d827cfc9d4c704ec078f7abf9f41e3191d8/data/nl2bash/nl2bash_fs_1.json),
   [Terminal-Bench](https://github.com/harbor-framework/terminal-bench-2/tree/2fd12b88aafdd04a52c298e3940bcb189f9766d6/fix-git)
-- [ ] ML/NLP. Подключить `count-dataset-tokens` и `mteb-retrieve`.
+- [x] ML/NLP. Подключить `count-dataset-tokens` и `mteb-retrieve`.
   Закрепить ревизии датасета, токенизатора и энкодера. Проверять точное
   число токенов и пятый документ по cosine similarity авторскими тестами.
   [Подсчёт токенов](https://github.com/harbor-framework/terminal-bench-2/tree/2fd12b88aafdd04a52c298e3940bcb189f9766d6/count-dataset-tokens),
   [Поиск по эмбеддингам](https://github.com/harbor-framework/terminal-bench-2/tree/2fd12b88aafdd04a52c298e3940bcb189f9766d6/mteb-retrieve)
-- [ ] Многоходовый диалог. Подключить BFCL V4 `multi_turn_miss_param_1`.
+- [x] Многоходовый диалог. Подключить BFCL V4 `multi_turn_miss_param_1`.
   Передать исходные реплики в одну сессию по порядку. Проверить вызовы
   функций и состояние виртуальной среды на каждом ходе, включая уточнение
   числа строк. Оставить родственные варианты одного сюжета в одной выборке.
   [Данные BFCL](https://github.com/ShishirPatil/gorilla/blob/6ea57973c7a6097fd7c5915698c54c17c5b1b6c8/berkeley-function-call-leaderboard/bfcl_eval/data/BFCL_v4_multi_turn_miss_param.json)
-- [ ] Вложения в чате. Подключить CharXiv Reasoning `val/figure_id=0` для
+- [x] Вложения в чате. Подключены CharXiv Reasoning `val/figure_id=0` для
   объяснения графика и SWE-bench Multimodal `chartjs__Chart.js-8567` для
   правки проекта по скриншоту. Передавать оригинальное изображение в
   пользовательском сообщении. Проверять ответ по эталону CharXiv и патч
@@ -182,12 +182,12 @@
   моделью в отчёте.
   [CharXiv](https://github.com/princeton-nlp/CharXiv/blob/7ebe88f78dee387691551f071abcb2b9e1a8025b/data/reasoning_val.json),
   [SWE-bench Multimodal](https://huggingface.co/datasets/SWE-bench/SWE-bench_Multimodal/tree/4e6662d51c48e475f7f346e4fa09a6f8b31fcaa5)
-- [ ] Декомпиляция через MCP. Подготовить бинарник для HumanEval-Decompile
+- [x] Декомпиляция через MCP. Подготовить бинарник для HumanEval-Decompile
   `task_id=12`, `O2`. Закрепить архитектуру, компилятор и SHA-256
   бинарника. По журналу подтверждать вызов MCP. Компилировать восстановленную
   функцию обработки строк и проверять её поведение авторскими `c_test`.
   [Протокол HumanEval-Decompile](https://github.com/albertan017/LLM4Decompile/blob/85b364bf093eb2ee4f3687cfe38a203fca89f23e/legacy-test/README.md)
-- [ ] Сравнение A/B. Перед прогоном закрепить задачи, отдельную контрольную
+- [x] Сравнение A/B. Перед прогоном закрепить задачи, отдельную контрольную
   выборку, исходные данные, модели и бюджеты. Сверить оценщик на верном и
   ошибочном результате. Для каждой пары менять один фактор. Для правки
   planner, ревьюера или свёртки подтвердить по журналу, что нужная стадия

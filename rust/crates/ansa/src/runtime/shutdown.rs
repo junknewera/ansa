@@ -119,6 +119,7 @@ impl Handle {
             | CommandPayload::GetMessageReceipt(_)
             | CommandPayload::GetContext => &self.transcript,
             CommandPayload::Submit(_)
+            | CommandPayload::SubmitImages(_, _)
             | CommandPayload::Handoff(_)
             | CommandPayload::DraftPlan(_, _)
             | CommandPayload::Steer(_)

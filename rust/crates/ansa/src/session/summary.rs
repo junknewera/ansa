@@ -200,11 +200,6 @@ pub(crate) fn read(
                 )?;
                 let text = event.text_field("text")?;
                 let internal = event.has("handoff");
-                let content = if internal {
-                    super::state::handoff_content(text)
-                } else {
-                    text.to_owned()
-                };
                 need(
                     !text.is_empty()
                         && valid_id(event.text_field("command")?)
@@ -223,20 +218,14 @@ pub(crate) fn read(
                         "session_mode",
                     )?;
                 }
-                let next = Request::load(event.field("next")?)?;
+                // State::apply already checked the exact turn, image hashes and request.
+                let next = canonical
+                    .as_ref()
+                    .and_then(|state| state.turn.as_ref())
+                    .ok_or("session_request_conflict")?
+                    .next
+                    .clone();
                 let saved = configuration.as_ref().ok_or("session_missing_init")?;
-                need(
-                    next.binding.provider == saved.binding.provider
-                        && next.binding.account == saved.binding.account,
-                    "session_request_conflict",
-                )?;
-                need(
-                    next.input.last().is_some_and(|item| {
-                        item.text_field("role") == Ok("user")
-                            && item.text_field("content") == Ok(content.as_str())
-                    }),
-                    "session_request_conflict",
-                )?;
                 stage = if event.field("compact")?.boolean()? {
                     Stage::Compacting
                 } else {

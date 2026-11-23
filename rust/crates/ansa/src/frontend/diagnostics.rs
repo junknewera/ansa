@@ -152,12 +152,19 @@ fn explanation(code: &str) -> &'static str {
         "auth_required" => "Sign in again",
         "provider_policy_denied" => "Provider denied the request",
         "provider_usage_limit" => "Provider usage limit reached",
+        "siwc_image_unsupported" => "The selected ChatGPT model does not accept image inputs",
+        "openrouter_image_unsupported" => {
+            "The selected OpenRouter route does not advertise image inputs"
+        }
         "tool_turn_limit" => "Tool limit for the entire turn reached",
         "tool_batch_limit" => "Tool batch exceeds the configured per-segment allowance",
         "tool_round_limit" => "Tool budget reached",
         "siwc_structured_format_unconfirmed" => "ChatGPT did not confirm the strict plan format",
         "model_context_limit" => "The request exceeds the model's context window",
         "request_frame_limit" => "The request cannot be stored in a journal record",
+        "image_request_frame_limit" => {
+            "The message and attachments exceed the request size. Try a smaller batch."
+        }
         "followup_frame_limit" => {
             "Clarifications exceed the request frame and were kept in history"
         }

@@ -7,6 +7,9 @@
 //! ```
 use crate::{protocol::json::Json, provider::replay::Effects};
 
+pub(crate) mod image;
+pub use image::{ImageInput, MAX_IMAGE_BYTES, MAX_IMAGES};
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,10 +84,27 @@ pub struct MessageReceiptInfo {
     pub mode: Option<AgentMode>,
     /// Binds a reconnect lookup to the exact user message without exporting it.
     pub text_sha256: String,
+    /// Ordered attachment hashes, omitted from legacy text-only receipt frames.
+    pub image_sha256: Vec<String>,
     /// The message admission is confirmed by the canonical journal.
     pub admission_durable: bool,
     /// The reported state also matches an acknowledged journal state.
     pub state_durable: bool,
+}
+impl MessageReceiptInfo {
+    pub(crate) fn add_image_hashes(&self, fields: &mut Vec<(&'static str, Json)>) {
+        if !self.image_sha256.is_empty() {
+            let hashes = self
+                .image_sha256
+                .iter()
+                .map(|value| Json::string(value).expect("sha256 hex"))
+                .collect();
+            fields.push((
+                "image_sha256",
+                Json::array(hashes).expect("bounded image count"),
+            ));
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanDraft {
@@ -139,6 +159,7 @@ impl PlanDraft {
 pub enum CommandPayload {
     SetAutocompact(u8),
     Submit(Submit),
+    SubmitImages(Submit, Vec<ImageInput>),
     /// Native-only synthesis input from the coordinator. Frontend wire
     /// decoders accept ordinary Submit and never construct this variant.
     Handoff(Submit),
@@ -262,10 +283,14 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         }
         CommandPayload::GetMessageReceipt(id) if !valid_id(&id.0) => Err("command_id"),
         CommandPayload::Submit(submit)
+        | CommandPayload::SubmitImages(submit, _)
         | CommandPayload::Handoff(submit)
         | CommandPayload::DraftPlan(submit, _) => {
             if submit.text.is_empty() || !Json::text_fits_frame(&submit.text) {
                 return Err("submit_size");
+            }
+            if let CommandPayload::SubmitImages(_, images) = &command.payload {
+                image::validate_images(images)?;
             }
             if submit.mode == AgentMode::OrchestrationChat
                 && !matches!(command.payload, CommandPayload::Submit(_))
