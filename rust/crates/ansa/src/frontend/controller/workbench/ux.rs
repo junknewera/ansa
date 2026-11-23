@@ -3,6 +3,19 @@ use super::*;
 use crate::frontend::terminal_input::TerminalEvent;
 use std::sync::Arc;
 
+pub(super) struct ConversationAgent {
+    pub parent: String,
+    pub branch: String,
+    pub line: carbon::AgentLine,
+}
+
+impl ConversationAgent {
+    pub fn into_tree_line(mut self) -> carbon::AgentLine {
+        self.line.title.insert_str(0, &self.branch);
+        self.line
+    }
+}
+
 pub(super) struct CandidateView {
     run: String,
     heading: String,
@@ -232,10 +245,11 @@ impl Workbench {
             self.agent_rows()
                 .into_iter()
                 .rev()
-                .map(|(id, agent)| Entry {
+                .map(ConversationAgent::into_tree_line)
+                .map(|agent| Entry {
                     role: "agent_card".into(),
                     text: String::new(),
-                    action: Some(format!("agent:{id}")),
+                    action: Some(format!("agent:{}", agent.id)),
                     status: None,
                     edit: None,
                     output: None,
@@ -607,7 +621,7 @@ impl Workbench {
             .chain(live)
     }
 
-    pub(super) fn agent_rows(&self) -> Vec<(String, carbon::AgentLine)> {
+    pub(super) fn agent_rows(&self) -> Vec<ConversationAgent> {
         let root = self.conversation_root();
         let delegates = self.live_delegates.borrow();
         let progress: Vec<_> = self.agent_views(&root).collect();
@@ -676,27 +690,32 @@ impl Workbench {
             if parent == root {
                 continue;
             }
-            let Some((id, _, kind)) = candidates.iter().find(|(id, _, _)| *id == parent) else {
+            let Some((id, Some(owner), kind)) = candidates.iter().find(|(id, _, _)| *id == parent)
+            else {
                 continue;
             };
             if kind != "agent" {
                 continue;
             }
-            if let Some(delegate) = delegates.agents.get(id) {
-                let mut agent = delegate.line.clone();
-                agent.title = format!("{tree}{branch}{}", agent.title);
-                result.push((id.clone(), agent));
-                continue;
-            }
-            if let Some(mut agent) = progress
-                .iter()
-                .rev()
-                .flat_map(|view| &view.agents)
-                .find(|(agent, _)| agent == id)
-                .map(|(_, agent)| agent.clone())
+            let row = |line| ConversationAgent {
+                parent: owner.clone(),
+                branch: format!("{tree}{branch}"),
+                line,
+            };
+            if let Some(agent) = delegates
+                .agents
+                .get(id)
+                .map(|delegate| &delegate.line)
+                .or_else(|| {
+                    progress
+                        .iter()
+                        .rev()
+                        .flat_map(|view| &view.agents)
+                        .find(|(agent, _)| agent == id)
+                        .map(|(_, agent)| agent)
+                })
             {
-                agent.title = format!("{tree}{branch}{}", agent.title);
-                result.push((id.clone(), agent));
+                result.push(row(agent.clone()));
                 continue;
             }
             let live = self.slots.iter().find(|slot| slot.id == *id);
@@ -760,28 +779,25 @@ impl Workbench {
                     (true, None) => String::new(),
                 }
             };
-            result.push((
-                id.clone(),
-                carbon::AgentLine {
-                    id: id.clone(),
-                    title: format!("{tree}{branch}{}", self.title(id)),
-                    state: state.into(),
-                    role: if archived
-                        .and_then(|s| s.agent.as_ref())
-                        .is_some_and(|a| a.writable)
-                    {
-                        carbon::AgentRole::Implementation
-                    } else {
-                        carbon::AgentRole::Research
-                    },
-                    model: archived
-                        .and_then(|s| s.agent.as_ref())
-                        .map_or_else(String::new, |a| a.model.clone()),
-                    activity,
-                    step: None,
-                    tool_calls: None,
+            result.push(row(carbon::AgentLine {
+                id: id.clone(),
+                title: self.title(id),
+                state: state.into(),
+                role: if archived
+                    .and_then(|s| s.agent.as_ref())
+                    .is_some_and(|a| a.writable)
+                {
+                    carbon::AgentRole::Implementation
+                } else {
+                    carbon::AgentRole::Research
                 },
-            ));
+                model: archived
+                    .and_then(|s| s.agent.as_ref())
+                    .map_or_else(String::new, |a| a.model.clone()),
+                activity,
+                step: None,
+                tool_calls: None,
+            }));
         }
         result
     }

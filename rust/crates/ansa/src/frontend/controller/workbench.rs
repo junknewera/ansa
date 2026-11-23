@@ -1621,8 +1621,8 @@ impl Workbench {
             .or_else(|| {
                 self.agent_rows()
                     .into_iter()
-                    .find(|(key, _)| key == id)
-                    .map(|(_, line)| line.title)
+                    .find(|row| row.line.id == id)
+                    .map(|row| row.line.title)
             });
         let Some(title) = title else {
             return;
@@ -3056,8 +3056,13 @@ impl Workbench {
                     self.report(io, "Use /retry to continue the paused request");
                 } else if let Some(target) = self.resume_target() {
                     self.resume_request(target);
+                } else if self.slots[self.current].active() {
+                    self.report(io, "This request is running · /agents shows delegated runs");
                 } else {
-                    self.report(io, "No paused request to retry");
+                    self.report(
+                        io,
+                        "No request to resume in this chat · /agents shows delegated runs",
+                    );
                 }
                 (true, false)
             }

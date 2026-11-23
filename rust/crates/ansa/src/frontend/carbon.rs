@@ -564,7 +564,7 @@ fn layout_impl(
                 || entry.action.is_some()
                     && !entry.role.starts_with("tool_child_")
                     && !entry.role.starts_with("tool_diff_")
-                    && entry.role != "tool_agent_attempt");
+                    && !matches!(entry.role.as_str(), "tool_agent_attempt" | "tool_agent_run"));
         if !wrapped.is_empty() && (!(tool && previous_tool) || separate_tool) {
             wrapped.push(ChatRow::default());
         }
@@ -578,6 +578,19 @@ fn layout_impl(
         }
         if let Some(agent) = &entry.agent {
             let lines = match entry.role.as_str() {
+                "tool_agent_run" => {
+                    let prefix = format!("{}  ", entry.text);
+                    vec![format!(
+                        "{}{}",
+                        styled(&clipped(&prefix, cols), MUTED, color),
+                        agent_status(
+                            &agent.state,
+                            &agent.title,
+                            cols.saturating_sub(cells(&prefix)),
+                            color
+                        )
+                    )]
+                }
                 "tool_agent_attempt" => {
                     let prefix = format!("{}{}  ", " ".repeat(AGENT_ROLE_COLUMN), entry.text);
                     let calls = agent.tool_calls.map_or_else(
@@ -1070,15 +1083,11 @@ fn agent_card(agent: &AgentLine, width: usize, color: bool, group: Option<&str>)
         meta.push_str(&styled(&clipped(&agent.model, model_room), MUTED, color));
     }
     match group {
-        Some(attempts) if !attempts.is_empty() => {
-            let remaining = width.saturating_sub(cells(&meta));
-            if remaining > 3 {
-                meta.push_str(&styled(
-                    &format!(" · {}", clipped(attempts, remaining - 3)),
-                    MUTED,
-                    color,
-                ));
+        Some(count) if !count.is_empty() => {
+            if cells(&meta) + 3 + cells(count) > width {
+                return vec![meta, styled(&clipped(count, width), MUTED, color)];
             }
+            meta.push_str(&styled(&format!(" · {count}"), MUTED, color));
             vec![meta]
         }
         Some(_) => vec![
