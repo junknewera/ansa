@@ -1042,7 +1042,7 @@ def completion_and_help(screen, root, cwd):
                     if (match := re.match(r"^[\s─]*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
-                "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
+                "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact", "/retry",
                 "/orchestrate", "/orchestrate+", "/propose", "/propose+", "/terminals", "/accept", "/clarify", "/attach"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"

@@ -83,10 +83,18 @@ pub(crate) fn http<T>(run: impl FnOnce() -> Result<T, &'static str>) -> Result<T
 }
 
 pub(crate) fn http_sent() {
+    http_event("http_sent");
+}
+
+pub(crate) fn connect_retry() {
+    http_event("connect_retry");
+}
+
+fn http_event(kind: &'static str) {
     if path().is_some() {
         GENERATION.with(|id| {
             if id.borrow().is_some() {
-                record(serde_json::json!({"kind":"http_sent","id":*id.borrow()}));
+                record(serde_json::json!({"kind":kind,"id":*id.borrow()}));
             }
         });
     }

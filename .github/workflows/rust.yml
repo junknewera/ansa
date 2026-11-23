@@ -49,6 +49,11 @@ jobs:
           python3 -B benchmarks/smoke.py --binary rust/target/debug/ansa \
             --frontend-adapter rust/target/debug/examples/frontend_adapter \
             --output "${RUNNER_TEMP}/benchmark-smoke"
+      - name: Resume an interrupted reply after a saved edit
+        run: |
+          python3 -B tests/carbon_visual_pty.py --binary rust/target/debug/ansa \
+            --fixture-binary rust/target/debug/examples/frontend_adapter \
+            --case retry-after-saved-edit --output "${RUNNER_TEMP}/carbon-retry"
       - name: Exercise Orchestrate+ through Carbon
         run: |
           python3 -B tests/carbon_workspace_pty.py \

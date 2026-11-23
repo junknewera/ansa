@@ -223,7 +223,8 @@ def click_text(screen, text):
 
 def open_activity(screen):
     screen.send(b'\x14')
-    until(screen, lambda text: 'Activity' in text, 'Terminals Activity opened')
+    until(screen, lambda text: 'Activity' in text, 'Agents panel opened')
+    click_text(screen, 'Activity')
 
 
 def close_activity(screen):
@@ -835,10 +836,31 @@ def dataset_chart(binary, adapter, root, home, cwd, screens):
     return {'canonical_png_sha256': digest, 'bytes': path.stat().st_size}
 
 
+def retry_after_edit(binary, adapter, root, home, cwd, screens):
+    marker = root / 'fail-edit-reply'
+    marker.touch()
+    screen = start(adapter, root, home, cwd, screens, 'retry', adapter=True)
+    screen.send('EDIT_AND_REPLY\r')
+    until(screen, lambda _: 'http_transfer' in screen.vt.line(-1) and '/retry' in screen.vt.line(-1),
+          'interrupted reply offers a retry in chat')
+    assert (cwd / 'edit-target.rs').read_text() == 'fn main() {\n    new();\n}\n'
+    marker.unlink()
+    local(screen, '/retry')
+    until(screen, lambda text: completed(root, 'EDIT_AND_REPLY') and 'EDIT_DONE' in text,
+          'retry delivers the reply after the saved edit')
+    rows = records(root)
+    assert sum(row['kind'] == 'accepted' for row in rows) == 1
+    assert sum(row['kind'] == 'intent' for row in rows) == 1
+    assert sum(row['kind'] == 'outcome' for row in rows) == 1
+    finish(screen)
+    return {'accepted_turns': 1, 'edit_outcomes': 1}
+
+
 def main():
     inventory = [('color-tool-selection-resize', colored_lifecycle),
                  ('theme-preview-persistence-dms', theme_preferences),
                  ('acknowledged-inline-edit-diff', inline_edit),
+                 ('retry-after-saved-edit', retry_after_edit),
                  ('native-carbon-chart', native_chart),
                  ('native-carbon-dataset', dataset_chart)]
     parser = argparse.ArgumentParser()
@@ -858,7 +880,7 @@ def main():
             continue
         began = time.monotonic()
         screens = []
-        uses_fixture = case in (inline_edit, native_chart, dataset_chart)
+        uses_fixture = case in (inline_edit, retry_after_edit, native_chart, dataset_chart)
         record = {'case': name, 'passed': False,
                   'executed_binary': str(adapter if uses_fixture else binary),
                   'executed_binary_sha256': adapter_hash if uses_fixture else binary_hash,

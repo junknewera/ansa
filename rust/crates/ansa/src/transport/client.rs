@@ -23,6 +23,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tower_service::Service;
 type Sink<'a> = dyn FnMut(&[u8]) -> Result<()> + 'a;
 #[derive(Clone, Copy)]
 enum StreamAdmission<'a> {
@@ -93,6 +94,39 @@ fn tls_bytes(raw: &str) -> Result<rustls::ClientConfig> {
 async fn cancelled(stop: &Cancel) {
     while !stop.cancelled() {
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// Only dial the endpoint here. The HTTP request and its body stay with the
+// caller until a connection is ready, including TLS and proxy negotiation.
+async fn connect<C: Service<Uri>>(
+    connector: &mut C,
+    uri: &Uri,
+    stop: &Cancel,
+    retry: bool,
+    trace_responses: bool,
+) -> Result<C::Response> {
+    if !retry {
+        return connector
+            .call(uri.clone())
+            .await
+            .map_err(|_| "http_connect");
+    }
+    let mut delays = [Duration::from_millis(250), Duration::from_secs(1)].into_iter();
+    loop {
+        stop.check()?;
+        let dial = tokio::time::timeout(Duration::from_secs(10), connector.call(uri.clone()));
+        if let Ok(Ok(stream)) = dial.await {
+            return Ok(stream);
+        }
+        let Some(delay) = delays.next() else {
+            return Err("http_connect");
+        };
+        tokio::time::sleep(delay).await;
+        stop.check()?;
+        if trace_responses {
+            crate::benchmark_trace::connect_retry();
+        }
     }
 }
 fn head(headers: &hyper::HeaderMap, status: u16) -> Result<Head> {
@@ -174,7 +208,13 @@ fn perform_route(
     if let StreamAdmission::SiwcResponses(value) = policy.admission {
         super::http::validate_request_profile(request.url, request.method, value)?;
     }
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+    let retry = policy.mcp.is_none()
+        && (request.method == "GET"
+            || matches!(
+                request.url,
+                super::http::RESPONSES_ENDPOINT | crate::openrouter::API
+            ));
+    let mut connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls.clone())
         .https_or_http()
         .enable_http1()
@@ -183,6 +223,7 @@ fn perform_route(
             proxy,
             tls,
             local_only: policy.local_only,
+            tcp_timeout: (!retry).then_some(Duration::from_secs(1)),
         });
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -192,8 +233,9 @@ fn perform_route(
         let deadline = request.timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         let mut driver:Option<tokio::task::JoinHandle<()>>=None;
         let transfer=async {
-            use tower_service::Service;
-            let mut connector=connector;let stream=connector.call(uri.clone()).await.map_err(|_|"http_connect")?;
+            let trace_responses = matches!(policy.admission, StreamAdmission::SiwcResponses(_));
+            let stream = connect(&mut connector, &uri, stop, retry, trace_responses).await?;
+            stop.check()?;
             let h2=stream.connected().is_negotiated_h2();let wire=Arc::new(AtomicUsize::new(0));
             let stream=hyper_util::rt::TokioIo::new(Counted {inner:hyper_util::rt::TokioIo::new(stream),bytes:wire.clone(),limit:if h2 {usize::MAX}else{request.body_limit+64*1024}});
             let budget=Arc::new(Mutex::new(HeaderBudget::default()));let (failure,mut failed)=tokio::sync::watch::channel(false);let _failure_lifetime=failure.clone();

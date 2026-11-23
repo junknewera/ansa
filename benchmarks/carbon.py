@@ -141,6 +141,18 @@ def completed_turn(events, match):
     return None
 
 
+def effort_selected(events, model, effort, footer):
+    if any(event["kind"] == "generation_selected" and event.get("model") == model
+           and event.get("effort") == effort for event in events):
+        return True
+    diagnostic = re.fullmatch(r"ansa: .+ \(([a-z][a-z0-9_]*)\)", footer.strip())
+    if diagnostic:
+        code = diagnostic[1]
+        status = "unsupported" if code in ("reasoning_effort_not_supported", "openrouter_effort") else "infra_error"
+        raise TrialStopped(status, f"reasoning effort selection: {code}")
+    return False
+
+
 def completed_draft(events, previous):
     latest = next((i for i in range(len(events) - 1, -1, -1)
                    if events[i]["kind"] == "accepted" and events[i].get("draft")), None)
@@ -248,10 +260,10 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
             route = arm["route"] if fixture_args is None else "siwc"
             install_roles(home, route, binding["account"], arm["roles"])
         if arm["effort"] is not None:
+            before = len(parent_events())
             screen.send(f'/effort {arm["effort"]}\r')
-            wait(lambda _: ready() and any(event["kind"] == "generation_selected"
-                 and event.get("model") == model and event.get("effort") == arm["effort"]
-                 for event in parent_events()), "reasoning effort selection")
+            wait(lambda _: ready() and effort_selected(parent_events()[before:], model, arm["effort"],
+                                                       screen.vt.line(-1)), "reasoning effort selection")
 
         if mode not in PROPOSAL_MODES:
             target = ("Work", "Plan", "Orchestrate", "Orchestrate+").index(MODES[mode])

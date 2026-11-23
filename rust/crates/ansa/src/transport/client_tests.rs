@@ -140,11 +140,14 @@ fn h1_peer(listener: TcpListener, case: &str, body: &[u8]) {
 fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let after_response = (case == "truncated").then(|| listener.try_clone().unwrap());
+    let stop = Cancel::default();
     let body = std::fs::read(protocol_fixture("round1.sse")).unwrap();
     let body_length = body.len();
     let server = if h2 {
         listener.set_nonblocking(true).unwrap();
         let fixture = transport_fixtures();
+        let server_stop = stop.clone();
         let case = case.to_owned();
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -153,6 +156,21 @@ fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
                 .unwrap();
             runtime.block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                if case.starts_with("h2-connect-reset") {
+                    let first = tokio::time::timeout(Duration::from_secs(4), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    drop(first);
+                    if case == "h2-connect-reset-cancel" {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        server_stop.cancel();
+                        return;
+                    }
+                    if case == "h2-connect-reset-deadline" {
+                        return;
+                    }
+                }
                 let _ = tokio::time::timeout(
                     Duration::from_secs(4),
                     frame_server::serve_body(listener, &fixture, &case, Bytes::from(body)),
@@ -193,7 +211,10 @@ fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
     let mut request = responses_request(&value, &Secret::new("synthetic-only".into()));
     match case {
         "delayed-complete" | "unbounded-cancel" => assert!(request.timeout_ms.is_none()),
-        "delayed-complete-bounded" | "missing-stall" | "h2-missing-timeout" => {
+        "delayed-complete-bounded"
+        | "missing-stall"
+        | "h2-missing-timeout"
+        | "h2-connect-reset-deadline" => {
             request.timeout_ms = Some(200);
         }
         _ => request.timeout_ms = Some(2000),
@@ -205,7 +226,6 @@ fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
         None,
     );
     let mut received = 0;
-    let stop = Cancel::default();
     let result = perform_route(
         &request,
         &stop,
@@ -243,6 +263,14 @@ fn exercise(case: &str, h2: bool, siwc: bool) -> (Result<()>, usize, usize) {
         Ok(())
     });
     server.join().unwrap();
+    if let Some(listener) = after_response {
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the client reconnected after sending a POST"
+        );
+    }
     (result, received, count.load(Ordering::SeqCst))
 }
 #[test]
@@ -258,6 +286,24 @@ fn siwc_missing_mime_admits_complete_http2_response() {
     assert_eq!(result, Ok(()));
     assert!(received > 0);
     assert_eq!(executors, 1);
+}
+#[test]
+fn reconnects_after_tls_disconnect_and_dispatches_the_tool_once() {
+    let (result, received, executors) = exercise("h2-connect-reset", true, true);
+    assert_eq!(result, Ok(()));
+    assert!(received > 0);
+    assert_eq!(executors, 1);
+}
+#[test]
+fn reconnect_backoff_respects_cancellation_and_request_deadline() {
+    assert_eq!(
+        exercise("h2-connect-reset-cancel", true, true),
+        (Err("auth_cancelled"), 0, 0)
+    );
+    assert_eq!(
+        exercise("h2-connect-reset-deadline", true, true),
+        (Err("http_timeout"), 0, 0)
+    );
 }
 #[test]
 fn unbounded_siwc_waits_for_eof_and_still_cancels() {

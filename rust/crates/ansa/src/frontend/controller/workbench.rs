@@ -2138,6 +2138,38 @@ impl Workbench {
             .filter(|view| view.resume_available)
             .and_then(|view| view.request.clone())
     }
+    fn resume_request(&mut self, target: RequestId) {
+        let slot = &mut self.slots[self.current];
+        let draft = slot
+            .state
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.submit.as_ref())
+            .filter(|submit| submit.0.starts_with("draft-"))
+            .cloned();
+        let resume = slot
+            .state
+            .command(&slot.handle, CommandPayload::Resume(target));
+        let resume_id = resume.command.clone();
+        if slot
+            .state
+            .post_command(&slot.handle, resume, &mut slot.replies, false)
+            && let Some(submit) = draft
+        {
+            self.planning_context = Some(PlanningContext {
+                profile: None,
+                pending_draft: None,
+                resume: Some(resume_id),
+                awaiting_context: false,
+                command: submit.clone(),
+                turn: TurnId(submit.0.clone()),
+                submit,
+                owner: slot.id.clone(),
+                token: self.modal_token,
+            });
+            self.menu = Some(Menu::DraftingPlan);
+        }
+    }
     fn open_models(&mut self, effort: bool, io: &Io) {
         if self.slots[self.current].kind == Kind::Console {
             self.report(io, "The command panel has no model");
@@ -2931,6 +2963,16 @@ impl Workbench {
             }
             "/agents" => {
                 self.open_agents();
+                (true, false)
+            }
+            "/retry" => {
+                if !argument.is_empty() {
+                    self.report(io, "Use /retry to continue the paused request");
+                } else if let Some(target) = self.resume_target() {
+                    self.resume_request(target);
+                } else {
+                    self.report(io, "No paused request to retry");
+                }
                 (true, false)
             }
             "/sessions" if argument == "search" => {
@@ -4888,38 +4930,7 @@ impl Workbench {
                     let archived = usize::from(clarification.is_some());
                     if let Some(target) = resume_target.as_ref().filter(|_| selected == 0) {
                         if self.resume_target().as_ref() == Some(target) {
-                            let slot = &mut self.slots[self.current];
-                            let draft = slot
-                                .state
-                                .snapshot
-                                .as_ref()
-                                .and_then(|snapshot| snapshot.submit.as_ref())
-                                .filter(|submit| submit.0.starts_with("draft-"))
-                                .cloned();
-                            let resume = slot
-                                .state
-                                .command(&slot.handle, CommandPayload::Resume(target.clone()));
-                            let resume_id = resume.command.clone();
-                            if slot.state.post_command(
-                                &slot.handle,
-                                resume,
-                                &mut slot.replies,
-                                false,
-                            ) && let Some(submit) = draft
-                            {
-                                self.planning_context = Some(PlanningContext {
-                                    profile: None,
-                                    pending_draft: None,
-                                    resume: Some(resume_id),
-                                    awaiting_context: false,
-                                    command: submit.clone(),
-                                    turn: TurnId(submit.0.clone()),
-                                    submit,
-                                    owner: slot.id.clone(),
-                                    token: self.modal_token,
-                                });
-                                self.menu = Some(Menu::DraftingPlan);
-                            }
+                            self.resume_request(target.clone());
                         }
                     } else if let Some((id, _)) = continuation.filter(|_| selected == native) {
                         self.resume_orchestration(id, io);

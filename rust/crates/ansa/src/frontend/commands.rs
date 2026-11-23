@@ -49,6 +49,10 @@ const COMMANDS: &[Command] = &[
         description: "Open a saved conversation, or search with /sessions search QUERY",
     },
     Command {
+        name: "/retry",
+        description: "Continue the paused request in this chat",
+    },
+    Command {
         name: "/new",
         description: "Start a new conversation",
     },

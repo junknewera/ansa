@@ -142,6 +142,12 @@ Path(answer).write_text(json.dumps({"answers": ["42" if expected == "pass" else 
         self.assertEqual([outcome[k] for k in ("http_attempts", "http_sent", "http_retries", "http_errors")],
                          [2, 1, 1, 1])
         self.assertEqual(outcome["by_role"]["lead"]["tool_seconds"], .1)
+        data.insert(0, {"kind": "connect_retry", "id": "g"})
+        path.write_text("".join(json.dumps(row) + "\n" for row in data))
+        outcome = comparison.trace_metrics(path, traces)
+        for counts in (outcome, outcome["by_role"]["lead"]):
+            self.assertEqual([counts[k] for k in ("http_attempts", "http_sent", "http_retries",
+                                                   "http_errors", "connect_retries")], [3, 1, 2, 2, 1])
 
     def test_plan_grading_checks_scope_and_user_approval(self):
         plan = {"steps": [{"access": "write", "paths": ["./answer.txt"]}],

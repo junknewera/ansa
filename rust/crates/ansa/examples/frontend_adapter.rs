@@ -517,6 +517,9 @@ fn workspace_edit(root: &Path) -> Result<i32> {
                 if !output.field("applied")?.boolean()? {
                     return Err("fixture_edit_not_applied");
                 }
+                if root_path.join("fail-edit-reply").exists() {
+                    return Err("http_transfer");
+                }
                 return final_response(request, "EDIT_DONE");
             }
             let (name, arguments) = if dataset {
