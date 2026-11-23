@@ -548,7 +548,7 @@ impl Reducer {
                             arguments: args.to_owned(),
                             output_index: i,
                         });
-                        if calls.len() > self.limits.calls {
+                        if self.limits.calls.is_some_and(|max| calls.len() > max) {
                             return Err("call_count_limit");
                         };
                     } else {
@@ -742,7 +742,7 @@ impl Reducer {
         for item in added.values() {
             if item.text_field("type")? == "function_call"
                 && (!call_ids.insert(item.text_field("call_id")?)
-                    || call_ids.len() > self.limits.calls)
+                    || self.limits.calls.is_some_and(|max| call_ids.len() > max))
             {
                 return Err("duplicate_call_id");
             }

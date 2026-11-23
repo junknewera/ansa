@@ -11,8 +11,6 @@ pub struct AgentSettings {
     pub compact_bytes: usize,
     pub tool_rounds: usize,
     pub tool_calls: usize,
-    pub(crate) lead_tool_rounds: usize,
-    pub(crate) lead_tool_calls: usize,
     pub process_timeout_ms: usize,
     pub(crate) orchestration_check_timeout_ms: usize,
     pub process_output_bytes: usize,
@@ -27,10 +25,8 @@ impl AgentSettings {
             model: "gpt-6.1-sol".into(),
             returned_model: "gpt-6.1-sol".into(),
             compact_bytes: 256 * 1024,
-            tool_rounds: 32,
-            tool_calls: 64,
-            lead_tool_rounds: 64,
-            lead_tool_calls: 256,
+            tool_rounds: 0,
+            tool_calls: 0,
             process_timeout_ms: 60000,
             orchestration_check_timeout_ms: 600_000,
             process_output_bytes: 16384,
@@ -90,14 +86,8 @@ fn overlay(settings: &mut AgentSettings, path: &Path, project: bool) -> Result<(
             }
             "returned_model" => settings.returned_model = json.text_field(key)?.into(),
             "compact_bytes" => settings.compact_bytes = json.usize_field(key)?,
-            "tool_rounds" => {
-                settings.tool_rounds = json.usize_field(key)?;
-                settings.lead_tool_rounds = settings.tool_rounds;
-            }
-            "tool_calls" => {
-                settings.tool_calls = json.usize_field(key)?;
-                settings.lead_tool_calls = settings.tool_calls;
-            }
+            "tool_rounds" => settings.tool_rounds = json.usize_field(key)?,
+            "tool_calls" => settings.tool_calls = json.usize_field(key)?,
             "process_timeout_ms" => {
                 let timeout = json.usize_field(key)?;
                 settings.process_timeout_ms = timeout;
@@ -154,8 +144,6 @@ pub fn load_agent_settings(cwd: &Path, home: &Path) -> Result<AgentSettings> {
         || settings.returned_model.is_empty()
         || settings.returned_model.len() > 256
         || !(256..=4 * 1024 * 1024).contains(&settings.compact_bytes)
-        || !(1..=64).contains(&settings.tool_rounds)
-        || !(1..=256).contains(&settings.tool_calls)
         || !(1..=600000).contains(&settings.process_timeout_ms)
         || !(1..=16384).contains(&settings.process_output_bytes)
     {
@@ -168,27 +156,18 @@ pub fn load_agent_settings(cwd: &Path, home: &Path) -> Result<AgentSettings> {
 mod tests {
     use super::*;
     #[test]
-    fn explicit_budgets_override_lead_defaults_independently() {
+    fn tool_budgets_are_opt_in_and_independent() {
         let root = std::env::temp_dir().join(format!("ansa-lead-settings-{}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         let file = root.join("config.json");
         let mut settings = AgentSettings::defaults(&root, &root);
-        assert_eq!(
-            (settings.lead_tool_rounds, settings.lead_tool_calls),
-            (64, 256)
-        );
-        std::fs::write(&file, r#"{"schema_version":1,"tool_calls":64}"#).unwrap();
+        assert_eq!((settings.tool_rounds, settings.tool_calls), (0, 0));
+        std::fs::write(&file, r#"{"schema_version":1,"tool_calls":900}"#).unwrap();
         overlay(&mut settings, &file, false).unwrap();
-        assert_eq!(
-            (settings.lead_tool_rounds, settings.lead_tool_calls),
-            (64, 64)
-        );
+        assert_eq!((settings.tool_rounds, settings.tool_calls), (0, 900));
         std::fs::write(&file, r#"{"schema_version":1,"tool_rounds":8}"#).unwrap();
         overlay(&mut settings, &file, true).unwrap();
-        assert_eq!(
-            (settings.lead_tool_rounds, settings.lead_tool_calls),
-            (8, 64)
-        );
+        assert_eq!((settings.tool_rounds, settings.tool_calls), (8, 900));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

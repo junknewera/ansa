@@ -62,6 +62,7 @@ jobs:
             --case siwc-orchestration-direct \
             --case siwc-orchestrate-plus \
             --case siwc-orchestrate-plus-budget \
+            --case siwc-orchestrate-plus-budget-configured \
             --case siwc-orchestrate-plus-plan-only \
             --case siwc-orchestrate-plus-blocked \
             --case siwc-orchestrate-plus-implement \

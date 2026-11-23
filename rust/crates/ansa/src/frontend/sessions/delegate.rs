@@ -8,10 +8,6 @@ use crate::{
 impl Factory {
     pub(in crate::frontend) fn enable_delegation(&self, options: &mut Options, parent: &str) {
         if self.orchestration_route().is_ok() {
-            options.lead_tool_budget = Some((
-                self.settings.lead_tool_rounds,
-                self.settings.lead_tool_calls,
-            ));
             let factory = self.clone();
             let parent = parent.to_owned();
             options.delegate = Some(Arc::new(move |source, roles, invocation, stop| {

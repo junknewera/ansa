@@ -26,12 +26,37 @@ pub enum Activity {
     Started(Started),
     Finished(Finished),
 }
+pub(crate) const RECENT_TOOL_ACTIVITY: usize = 256;
 impl Activity {
     pub(crate) fn operation(&self) -> &OperationId {
         match self {
             Self::Started(v) => &v.operation,
             Self::Finished(v) => &v.operation,
         }
+    }
+
+    /// Keep only recent output in live snapshots. The journal holds the full history.
+    pub(crate) fn record(&self, recent: &mut Vec<Self>, completed: &mut usize) -> bool {
+        let known = |activity: &Self| {
+            usize::from(matches!(activity, Self::Finished(f) if f.effects == Effects::KnownResult))
+        };
+        if let Some(previous) = recent
+            .iter_mut()
+            .find(|old| old.operation() == self.operation())
+        {
+            if matches!((&*previous, self), (Self::Finished(_), Self::Started(_))) {
+                return false;
+            }
+            *completed -= known(previous);
+            *previous = self.clone();
+        } else {
+            if recent.len() == RECENT_TOOL_ACTIVITY {
+                recent.remove(0);
+            }
+            recent.push(self.clone());
+        }
+        *completed += known(self);
+        true
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]

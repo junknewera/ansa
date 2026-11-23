@@ -548,11 +548,11 @@ impl Slot {
                 };
                 let next = if view.storage_failed || view.recovery_operation.is_some() {
                     "/sessions for details"
+                } else if view.diagnostic == "tool_batch_limit" && view.resume_available {
+                    "Increase or remove tool_calls in config, reopen ANSA, then /retry"
                 } else if matches!(
                     view.diagnostic.as_str(),
-                    "tool_turn_limit"
-                        | "tool_batch_limit"
-                        | "tool_failed"
+                    "tool_failed"
                         | "task_path_scope"
                         | "terminal_workspace_quarantined"
                         | "terminal_workspace_busy"

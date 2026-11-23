@@ -287,9 +287,12 @@ async fn pre_edit_catalog_resumes_and_forks_without_upgrading_saved_tools_or_con
         .unwrap()
         .create_kind("main", None)
         .unwrap();
-    let epoch = agent_epoch(&factory.settings).unwrap();
+    let mut legacy_settings = factory.settings.clone();
+    legacy_settings.tool_rounds = 32;
+    legacy_settings.tool_calls = 64;
+    let epoch = agent_epoch(&legacy_settings).unwrap();
     let current = local_tools(
-        factory.settings.clone(),
+        legacy_settings.clone(),
         epoch.clone(),
         &selected.directory,
         &factory.auth_path,
@@ -341,7 +344,8 @@ async fn pre_edit_catalog_resumes_and_forks_without_upgrading_saved_tools_or_con
         legacy,
         Arc::new(|request, stop, _| offline::generate(request, stop)),
         Limits {
-            tool_rounds: factory.settings.tool_rounds,
+            tool_rounds: legacy_settings.tool_rounds,
+            tool_calls: legacy_settings.tool_calls,
             ..Limits::default()
         },
         Options {

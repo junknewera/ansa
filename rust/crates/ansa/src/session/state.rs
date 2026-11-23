@@ -276,6 +276,7 @@ pub struct SavedTurn {
     pub resumes: BTreeSet<String>,
     pub rounds: usize,
     pub operation_offset: usize,
+    legacy_tool_limits: bool,
     pub round_limit: usize,
     pub call_limit: usize,
     pub resume_round: usize,
@@ -307,24 +308,45 @@ impl SavedTurn {
                     .any(|call| call.name == crate::tools::delegation::NAME)
             })
     }
-    /// A segment pause can admit this entire batch after Resume. The other bounds cannot.
+    pub(crate) fn renew_tool_budget_on_resume(&self) -> bool {
+        self.legacy_tool_limits
+            || (self.paused
+                && matches!(
+                    self.diagnostic.as_str(),
+                    "tool_round_limit" | "tool_turn_limit" | "tool_batch_limit"
+                ))
+    }
+
     pub(crate) fn tool_budget_pause(&self, batch: usize) -> Option<&'static str> {
         if batch == 0 {
             return None;
         }
         let completed = self.operation_offset + self.results.len();
-        if self.rounds >= 64 || completed + batch > 256 {
+        if self.legacy_tool_limits && (self.rounds >= 64 || completed + batch > 256) {
             Some("tool_turn_limit")
-        } else if batch > self.call_limit {
+        } else if self.call_limit != 0 && batch > self.call_limit {
             Some("tool_batch_limit")
-        } else if self.rounds.saturating_sub(self.resume_round) >= self.round_limit
-            || completed.saturating_sub(self.resume_operation) + batch > self.call_limit
+        } else if (self.round_limit != 0
+            && self.rounds.saturating_sub(self.resume_round) >= self.round_limit)
+            || (self.call_limit != 0
+                && completed.saturating_sub(self.resume_operation) + batch > self.call_limit)
         {
             Some("tool_round_limit")
         } else {
             None
         }
     }
+}
+
+fn configured_tool_budget(event: &Json) -> Result<(usize, usize)> {
+    need(
+        event.usize_field("tool_budget_version")? == 2,
+        "session_tool_budget_version",
+    )?;
+    Ok((
+        event.usize_field("round_limit")?,
+        event.usize_field("call_limit")?,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -1242,7 +1264,10 @@ impl State {
                 .map_or(0, |response| response.calls().len());
             current.previous_results.append(&mut current.results);
             current.operation_offset += consumed;
-            need(current.operation_offset <= 256, "session_turn_limits")?;
+            need(
+                !current.legacy_tool_limits || current.operation_offset <= 256,
+                "session_turn_limits",
+            )?;
             current.next = expected;
             current.response = None;
             current.tools_response = None;
@@ -1405,20 +1430,26 @@ impl State {
             };
             let run = event.text_field("operation_run")?;
             OperationIds::new(run, 0)?;
-            let round_limit = if event.has("round_limit") {
-                event.usize_field("round_limit")?
+            let legacy_tool_limits = !event.has("tool_budget_version");
+            let (round_limit, call_limit) = if legacy_tool_limits {
+                let rounds = if event.has("round_limit") {
+                    event.usize_field("round_limit")?
+                } else {
+                    1
+                };
+                let calls = if event.has("call_limit") {
+                    event.usize_field("call_limit")?
+                } else {
+                    16
+                };
+                need(
+                    (1..=64).contains(&rounds) && (1..=256).contains(&calls),
+                    "session_turn_limits",
+                )?;
+                (rounds, calls)
             } else {
-                1
+                configured_tool_budget(event)?
             };
-            let call_limit = if event.has("call_limit") {
-                event.usize_field("call_limit")?
-            } else {
-                16
-            };
-            need(
-                round_limit > 0 && round_limit <= 64 && call_limit > 0 && call_limit <= 256,
-                "session_turn_limits",
-            )?;
             let displayed = if internal {
                 displayed_handoff_question(text)
             } else {
@@ -1453,6 +1484,7 @@ impl State {
                 resumes: BTreeSet::new(),
                 rounds: 0,
                 operation_offset: 0,
+                legacy_tool_limits,
                 round_limit,
                 call_limit,
                 resume_round: 0,
@@ -1545,6 +1577,10 @@ impl State {
                 "response" => {
                     need(current.stage == "generating", "session_response_stage")?;
                     let response = load_response(event.field("response")?)?;
+                    need(
+                        !current.legacy_tool_limits || response.calls().len() <= 16,
+                        "session_turn_limits",
+                    )?;
                     let expected = if let Some(previous) = &current.tools_response {
                         if !previous.calls().is_empty() {
                             need(
@@ -1773,6 +1809,14 @@ impl State {
                             && current.resumes.len() < 4096,
                         "session_resume",
                     )?;
+                    if event.has("tool_budget_version") {
+                        need(
+                            current.renew_tool_budget_on_resume(),
+                            "session_tool_budget_resume",
+                        )?;
+                        (current.round_limit, current.call_limit) = configured_tool_budget(event)?;
+                        current.legacy_tool_limits = false;
+                    }
                     current.resumes.insert(id.into());
                     current.resume_round = current.rounds;
                     while current

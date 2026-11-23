@@ -121,6 +121,47 @@ fn cpp_golden_journals() {
     }
 }
 #[test]
+fn legacy_replay_preserves_the_original_per_response_call_bound() {
+    let events = events("completed");
+    let accepted = events[1]
+        .with("call_limit", Json::parse("64").unwrap())
+        .unwrap();
+    let response = events[2].field("response").unwrap();
+    let call = &response.field("items").unwrap().elements().unwrap()[1];
+    let calls = (0..17)
+        .map(|n| {
+            call.with("id", Json::string(&format!("item{n}")).unwrap())
+                .unwrap()
+                .with("call_id", Json::string(&format!("call{n}")).unwrap())
+                .unwrap()
+        })
+        .collect();
+    let large = events[2]
+        .with(
+            "response",
+            response.with("items", Json::array(calls).unwrap()).unwrap(),
+        )
+        .unwrap();
+    for legacy in [true, false] {
+        let mut state = state();
+        state.apply(&events[0]).unwrap();
+        let turn = if legacy {
+            accepted.clone()
+        } else {
+            accepted
+                .with("tool_budget_version", Json::parse("2").unwrap())
+                .unwrap()
+        };
+        state.apply(&turn).unwrap();
+        if legacy {
+            assert_eq!(state.apply(&large), Err("session_turn_limits"));
+        } else {
+            state.apply(&large).unwrap();
+        }
+    }
+}
+
+#[test]
 fn exact_cpp_frame_and_chain() {
     let root = Root::new();
     let mut journal = Journal::open(&root.journal(), |_| Ok(()), None).unwrap();

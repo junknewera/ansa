@@ -44,6 +44,7 @@ pub struct Limits {
     pub commands: usize,
     pub events: usize,
     pub submit_ids: usize,
+    /// Per-segment budgets. Zero leaves the corresponding count unlimited.
     pub tool_rounds: usize,
     pub tool_calls: usize,
 }
@@ -53,16 +54,14 @@ impl Default for Limits {
             commands: 16,
             events: 64,
             submit_ids: 4096,
-            tool_rounds: 1,
-            tool_calls: 16,
+            tool_rounds: 0,
+            tool_calls: 0,
         }
     }
 }
 #[derive(Clone)]
 pub struct Options {
     pub delegate: Option<crate::tools::delegation::Delegate>,
-    /// Optional segment allowance for a newly accepted direct orchestration turn.
-    pub lead_tool_budget: Option<(usize, usize)>,
     pub fork_seed: Option<crate::session::state::ForkSeed>,
     pub check_request: CheckRequest,
     pub select_generation: SelectGeneration,
@@ -84,7 +83,6 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             delegate: None,
-            lead_tool_budget: None,
             fork_seed: None,
             check_request: Arc::new(|_, _, _| Ok(())),
             select_generation: Arc::new(|_, _| Err("generation_selection_unavailable")),
@@ -129,7 +127,7 @@ pub struct ChildAttempt {
     state: ChildAttemptState,
     latest_tool: Option<(String, Option<String>)>,
     tool_evidence: Option<ChildToolEvidence>,
-    pause: Option<(String, usize)>,
+    pause: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -189,14 +187,7 @@ impl ChildAttempt {
         self.tool_evidence.as_ref()
     }
     pub(crate) fn pause_diagnostic(&self) -> Option<&str> {
-        self.pause
-            .as_ref()
-            .map(|(diagnostic, _)| diagnostic.as_str())
-    }
-    pub(crate) fn budget_pause_generation(&self) -> Option<usize> {
-        self.pause.as_ref().and_then(|(diagnostic, generation)| {
-            (diagnostic == "tool_round_limit").then_some(*generation)
-        })
+        self.pause.as_deref()
     }
     pub fn into_state(self) -> ChildAttemptState {
         self.state
@@ -236,13 +227,6 @@ pub(crate) fn valid_configuration(
         || limits.events > 256
         || limits.submit_ids == 0
         || limits.submit_ids > 65536
-        || limits.tool_rounds == 0
-        || limits.tool_rounds > 64
-        || limits.tool_calls == 0
-        || limits.tool_calls > 256
-        || options.lead_tool_budget.is_some_and(|(rounds, calls)| {
-            !(1..=64).contains(&rounds) || !(1..=256).contains(&calls)
-        })
     {
         return Err("runtime_configuration");
     }
