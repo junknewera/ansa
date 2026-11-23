@@ -54,23 +54,26 @@ pub struct TaskScope {
 }
 
 impl TaskScope {
-    pub fn new(root: &Path, writes: &[String]) -> Result<Self> {
-        let directory = ansa_linux::fs::open_nofollow(root, ansa_linux::local::read_flags())
-            .map_err(|_| "task_workspace")?;
-        if !directory.metadata().map_err(|_| "task_workspace")?.is_dir() || writes.len() > 32 {
-            return Err("task_workspace");
-        }
-        let root = ansa_linux::fs::normalize(root);
-        let mut paths = Vec::with_capacity(writes.len());
-        for path in writes {
+    pub(crate) fn validate_paths(paths: &[String]) -> Result<()> {
+        for path in paths {
             let path = Path::new(path);
-            if path.as_os_str().is_empty() || path.components().any(|component| {
+            if path.as_os_str().is_empty() || path.as_os_str().as_encoded_bytes().contains(&0) || path.components().any(|component| {
                 !matches!(component, std::path::Component::Normal(value) if value != ".git")
             }) || ansa_linux::fs::protected_path(path) {
                 return Err("task_write_scope");
             }
-            paths.push(root.join(path));
         }
+        Ok(())
+    }
+    pub fn new(root: &Path, writes: &[String]) -> Result<Self> {
+        Self::validate_paths(writes)?;
+        let directory = ansa_linux::fs::open_nofollow(root, ansa_linux::local::read_flags())
+            .map_err(|_| "task_workspace")?;
+        if !directory.metadata().map_err(|_| "task_workspace")?.is_dir() {
+            return Err("task_workspace");
+        }
+        let root = ansa_linux::fs::normalize(root);
+        let paths = writes.iter().map(|path| root.join(path)).collect();
         Ok(Self {
             root,
             reads: Vec::new(),

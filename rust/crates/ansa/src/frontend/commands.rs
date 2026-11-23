@@ -90,11 +90,19 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/orchestrate",
-        description: "Open Orchestrate or draft a plan for a task",
+        description: "Work with a lead agent that can delegate tasks",
     },
     Command {
         name: "/orchestrate+",
-        description: "Configure role models or draft a plan for a task",
+        description: "Configure role models or give the lead a task",
+    },
+    Command {
+        name: "/propose",
+        description: "Prepare a plan with explicit approval before execution",
+    },
+    Command {
+        name: "/propose+",
+        description: "Prepare an approval-based plan with configured role models",
     },
     Command {
         name: "/attach",
@@ -188,7 +196,7 @@ impl Completion {
         }
         if matches!(
             text[..begin].split_whitespace().next(),
-            Some("/orchestrate" | "/orchestrate+" | "/attach")
+            Some("/orchestrate" | "/orchestrate+" | "/propose" | "/propose+" | "/attach")
         ) {
             return None;
         }

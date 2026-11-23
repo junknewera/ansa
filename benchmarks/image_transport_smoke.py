@@ -126,8 +126,11 @@ def check_composer(binary):
             command("/attach link", "image_open")
             command("/attach file with spaces.png", "Image attached (1)")
             image.unlink()
-            command("/orchestrate", "Send or clear attached images")
+            command("/propose Verify the fixture", "Send or clear attached images")
             screen.send(b"\x15")  # Rejected command stays editable.
+            submit("/orchestrate")
+            until(screen, lambda _: screen.vt.line(-2).strip().startswith("Orchestrate ·"),
+                  "switch to Orchestrate with a pending image")
             turn("Describe the attached image.")
             image.write_bytes(PNG)
             command("/attach file with spaces.png", "Image attached (1)")
@@ -150,6 +153,7 @@ def check_composer(binary):
             sent = third[-1]["content"][1]["image_url"]
             assert len(base64.b64decode(sent.split(",", 1)[1])) <= 2 * 1024 * 1024
             accepted, = [event for event in records(root) if event.get("text") == "Describe the compressed attachment." and event["kind"] == "accepted"]
+            assert accepted["orchestration_lead"] and accepted["mode"] == "basic"
             saved, = accepted["image_originals"]
             assert base64.b64decode(saved["url"].split(",", 1)[1]) == original
         finally:

@@ -603,6 +603,7 @@ impl Workbench {
 
     pub(super) fn agent_rows(&self) -> Vec<(String, carbon::AgentLine)> {
         let root = self.conversation_root();
+        let delegates = self.live_delegates.borrow();
         let progress: Vec<_> = self.agent_views(&root).collect();
         let mut candidates: Vec<_> = progress
             .iter()
@@ -610,6 +611,11 @@ impl Workbench {
             .flat_map(|view| &view.agents)
             .map(|(id, _)| (id.clone(), Some(root.clone()), String::from("agent")))
             .collect();
+        candidates.extend(
+            delegates
+                .iter()
+                .map(|(id, (owner, _))| (id.clone(), Some(owner.clone()), String::from("agent"))),
+        );
         for summary in &self.summaries {
             let entry = &summary.entry;
             if !candidates.iter().any(|(id, _, _)| id == &entry.id) {
@@ -668,6 +674,12 @@ impl Workbench {
             if kind != "agent" {
                 continue;
             }
+            if let Some((_, agent)) = delegates.get(id) {
+                let mut agent = agent.clone();
+                agent.title = format!("{tree}{branch}{}", agent.title);
+                result.push((id.clone(), agent));
+                continue;
+            }
             if let Some(mut agent) = progress
                 .iter()
                 .rev()
@@ -699,6 +711,15 @@ impl Workbench {
                     }
                 })
                 .unwrap_or_else(|| archived.map_or("Unavailable", |s| s.status.label()));
+            let state = archived
+                .and_then(|s| s.agent.as_ref())
+                .and_then(|a| a.outcome)
+                .filter(|_| snapshot.is_none() && state == "Completed")
+                .map_or(state, |outcome| match outcome {
+                    crate::provider::structured::ChildStatus::Completed => "Completed",
+                    crate::provider::structured::ChildStatus::ChangesRequested => "Needs changes",
+                    crate::provider::structured::ChildStatus::Blocked => "Blocked",
+                });
             let generation = snapshot
                 .map(|view| {
                     format!(
@@ -737,8 +758,17 @@ impl Workbench {
                     id: id.clone(),
                     title: format!("{tree}{branch}{}", self.title(id)),
                     state: state.into(),
-                    role: carbon::AgentRole::Research,
-                    model: String::new(),
+                    role: if archived
+                        .and_then(|s| s.agent.as_ref())
+                        .is_some_and(|a| a.writable)
+                    {
+                        carbon::AgentRole::Implementation
+                    } else {
+                        carbon::AgentRole::Research
+                    },
+                    model: archived
+                        .and_then(|s| s.agent.as_ref())
+                        .map_or_else(String::new, |a| a.model.clone()),
                     activity,
                     step: None,
                     tool_calls: None,

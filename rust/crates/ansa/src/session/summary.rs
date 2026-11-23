@@ -44,7 +44,14 @@ impl SummaryStatus {
     }
 }
 #[derive(Clone, Debug)]
+pub struct AgentSummary {
+    pub model: String,
+    pub writable: bool,
+    pub outcome: Option<crate::provider::structured::ChildStatus>,
+}
+#[derive(Clone, Debug)]
 pub struct SessionSummary {
+    pub agent: Option<AgentSummary>,
     pub entry: CatalogEntry,
     pub title: Option<String>,
     pub preview: Option<String>,
@@ -54,6 +61,7 @@ pub struct SessionSummary {
 impl SessionSummary {
     fn unavailable(entry: CatalogEntry) -> Self {
         Self {
+            agent: None,
             entry,
             title: None,
             preview: None,
@@ -89,6 +97,7 @@ pub(crate) fn read(
     compiled: Option<&crate::tools::registry::Snapshot>,
 ) -> Result<SessionSummary> {
     let mut summary = SessionSummary {
+        agent: None,
         entry: entry.clone(),
         title: None,
         preview: None,
@@ -159,6 +168,16 @@ pub(crate) fn read(
                         "session_fork_source",
                     )?;
                     summary.entry.parent = Some(source.into());
+                    summary.agent = Some(AgentSummary {
+                        model: saved.binding.requested_model.clone(),
+                        writable: saved
+                            .epoch
+                            .exact_state
+                            .field("orchestration_writes")
+                            .and_then(Json::elements)
+                            .is_ok_and(|paths| !paths.is_empty()),
+                        outcome: None,
+                    });
                 }
                 configuration = Some(saved);
                 initialized = true;
@@ -268,6 +287,7 @@ pub(crate) fn read(
                 "session_turn_identity",
             )?;
             match kind {
+                "side_reply" => {} // The canonical reducer checked this answer above.
                 "response" => {
                     need(
                         stage == Stage::Generating && !paused && outstanding.is_none(),
@@ -304,6 +324,12 @@ pub(crate) fn read(
                         "session_done_stage",
                     )?;
                     let text = final_text.take().ok_or("session_done_stage")?;
+                    if let Some(agent) = &mut summary.agent {
+                        agent.outcome = response
+                            .as_ref()
+                            .and_then(|r| r.child_result().ok())
+                            .map(|report| report.status);
+                    }
                     summary.preview = Some(excerpt(&text, 192));
                     summary.status = if unknown_effect {
                         SummaryStatus::Unknown
@@ -314,6 +340,9 @@ pub(crate) fn read(
                 }
                 "cancel" => {
                     need(stage != Stage::Completed, "session_cancel_completed")?;
+                    if event.has("dismissed") {
+                        queued.clear();
+                    }
                     stage = Stage::Cancelled;
                     paused = false;
                     final_text = None;
@@ -436,15 +465,11 @@ pub(crate) fn read(
                             && next.input.len() >= queued.len(),
                         "session_followup_context",
                     )?;
-                    let start = next.input.len() - queued.len();
                     need(
-                        next.input[start..]
-                            .iter()
-                            .zip(&queued)
-                            .all(|(item, (_, text))| {
-                                item.text_field("role") == Ok("user")
-                                    && item.text_field("content") == Ok(text.as_str())
-                            }),
+                        canonical
+                            .as_ref()
+                            .and_then(|state| state.turn.as_ref())
+                            .is_some_and(|turn| turn.next.input == next.input),
                         "session_followup_context",
                     )?;
                     expected = Some(next);

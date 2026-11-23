@@ -20,7 +20,7 @@ import time
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "tests"))
 from native_eval import decode, label, require
-from carbon import MODES, TrialStopped, capture, journals
+from carbon import MODES, PLUS_MODES, PROPOSAL_MODES, TrialStopped, capture, journals
 import comparison
 
 MAX_TRIALS = 128
@@ -116,8 +116,8 @@ def load_experiment(path):
         validate_selection(arm["model"], arm.get("effort"))
         require("auth_dir" in arm if arm["route"] in LIVE_ROUTES else "auth_dir" not in arm,
                 "live arms require a dedicated auth_dir")
-        require(("roles" in arm) == (arm["mode"] == "orchestrate+"),
-                "Orchestrate+ requires strong, medium and weak roles")
+        require(("roles" in arm) == (arm["mode"] in PLUS_MODES),
+                "orchestrate+ and propose+ require strong, medium and weak roles")
         if "roles" in arm:
             check_fields(arm["roles"], ("strong", "medium", "weak"))
             for value in arm["roles"].values():
@@ -150,8 +150,8 @@ def load_experiment(path):
         modes = task["modes"]
         require(isinstance(modes, list) and modes and all(mode in MODES for mode in modes)
                 and len(set(modes)) == len(modes), "invalid task modes")
-        require(len(task["turns"]) == 1 or set(modes) <= {"work", "plan"},
-                "multiple user turns require Work or Plan")
+        require(len(task["turns"]) == 1 or not set(modes).intersection(PROPOSAL_MODES),
+                "a proposal accepts one user turn")
         if "plan_requirements" in task:
             requirements = task["plan_requirements"]
             check_fields(requirements, ("paths",), ("check",))
@@ -163,8 +163,8 @@ def load_experiment(path):
             require("check" not in requirements or isinstance(check, str)
                     and 0 < len(check) <= 128 and all(c.isascii() and (c.isalnum() or c in "._-") for c in check),
                     "invalid expected plan check")
-            require(set(modes) <= {"planner", "orchestrate", "orchestrate+"},
-                    "plan requirements need an orchestration mode")
+            require(set(modes) <= set(PROPOSAL_MODES),
+                    "plan requirements need a proposal mode")
         if "clarification" in task:
             clarification = task["clarification"]
             check_fields(clarification, ("question", "answer"))
@@ -216,8 +216,8 @@ def load_experiment(path):
             row.update(mode=arm["mode"], model=arm["model"], route=arm["route"])
             if arm["mode"] not in task["modes"]:
                 row["unsupported"] = "this task does not support the selected mode"
-            elif arm["mode"] not in ("work", "plan"):
-                row["unsupported"] = "Carbon accepts images in Work and Plan"
+            elif arm["mode"] in PROPOSAL_MODES:
+                row["unsupported"] = "the proposal workflow accepts text only"
             elif arm["route"] not in LIVE_ROUTES:
                 row["unsupported"] = "the offline model has no image transport"
             elif not arm.get("image_input"):
@@ -254,7 +254,8 @@ def environment(root, home):
 
 def usage(traces):
     records = [record for rows in traces.values() for record in rows]
-    responses = [record["response"] for record in records if record["kind"] == "response"]
+    responses = [record["response"] for record in records
+                 if record["kind"] in ("response", "side_reply")]
     compactions = [record["compaction"]["native"] for record in records if record["kind"] == "compacted"]
     responses += [native["summary_response"] for native in compactions if "summary_response" in native]
     generations = sorted({(response["request"]["binding"]["requested_model"],

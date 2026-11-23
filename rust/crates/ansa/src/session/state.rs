@@ -10,6 +10,7 @@ use crate::{
         epoch::compact_epoch, estimate_input_tokens, estimate_request_tokens,
         legacy_compact::CompactedContext, prompt_policy::PromptPolicy,
     },
+    orchestration::profile::RoleProfile,
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::{
         contracts::{
@@ -254,6 +255,7 @@ pub struct Receipt {
     pub mode: AgentMode,
     pub internal: bool,
     pub draft: Option<PlanDraft>,
+    pub(crate) lead_profile: Option<RoleProfile>,
 }
 #[derive(Clone, Debug)]
 pub struct SavedTurn {
@@ -267,6 +269,7 @@ pub struct SavedTurn {
     pub results: Vec<SavedResult>,
     pub previous_results: Vec<SavedResult>,
     pub intent: Option<Invocation>,
+    side_replies: BTreeMap<String, Arc<Vec<Json>>>,
     pub stage: String,
     pub diagnostic: String,
     pub paused: bool,
@@ -279,6 +282,15 @@ pub struct SavedTurn {
     pub resume_operation: usize,
 }
 impl SavedTurn {
+    fn delegated_round(&self) -> bool {
+        self.stage == "tools"
+            && self.receipt.mode.leads()
+            && self.tools_response.as_ref().is_some_and(|r| {
+                r.calls()
+                    .iter()
+                    .any(|call| call.name == crate::tools::delegation::NAME)
+            })
+    }
     /// A segment pause can admit this entire batch after Resume. The other bounds cannot.
     pub(crate) fn tool_budget_pause(&self, batch: usize) -> Option<&'static str> {
         if batch == 0 {
@@ -460,7 +472,7 @@ impl State {
             self.configuration.final_format().is_none(),
             "structured_session_fork_seed",
         )?;
-        let request = if let Some(turn) = &self.turn
+        let mut request = if let Some(turn) = &self.turn
             && !(turn.receipt.draft.is_some() && turn.stage == "completed")
         {
             // An in-flight operation is not a completed result. Fork from the
@@ -479,6 +491,24 @@ impl State {
             self.request_for("fork", AgentMode::Basic)?
                 .with_input(self.history.clone())?
         };
+        // A fork inherits the settled native input, but starts choosing its own
+        // turn mode. The parent's temporary delegate executor cannot be forked.
+        if self
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.receipt.mode.leads())
+        {
+            let turn = self.turn.as_ref().expect("lead turn");
+            for message in self.followups.iter().filter(|m| {
+                m.target == turn.receipt.request
+                    && matches!(m.state.as_str(), "answered" | "side_closed")
+            }) {
+                Self::append_followup(&mut request, message, turn)?;
+            }
+            request = request.with_input_bounds()?;
+            request.epoch = self.epoch.clone();
+            request.tools = self.configuration.tools.clone();
+        }
         let budget = self.context_budget_for(&request).map(|mut budget| {
             if budget.tokens.is_some() && request.input != self.history {
                 budget.tokens = None;
@@ -525,7 +555,50 @@ impl State {
         self.followups
             .iter()
             .map(Arc::as_ref)
-            .filter(|m| m.state == "queued")
+            .filter(|m| matches!(m.state.as_str(), "queued" | "answered"))
+    }
+    /// An inline question branches from the input before the outstanding tool
+    /// call. No fabricated result or outstanding call reaches this request.
+    pub(crate) fn side_request(&self, command: &CommandId) -> Result<Request> {
+        let turn = self.turn.as_ref().ok_or("session_turn_identity")?;
+        need(turn.receipt.mode.leads(), "session_side_reply")?;
+        let mut request = turn.next.clone();
+        let provenance = Json::object(vec![
+            ("base_epoch", Json::string(&request.epoch.id)?),
+            ("base_state", request.epoch.exact_state.clone()),
+            ("purpose", Json::string("orchestration_chat")?),
+        ])?;
+        request.epoch = Epoch {
+            id: sha256(provenance.dump().as_bytes()),
+            exact_state: provenance,
+            instructions: format!(
+                "{}\nA helper is working. Answer the user's follow-up in chat using the available context. The parent will receive this exchange and the helper result. Do not claim that an action has been performed without evidence.",
+                request.epoch.instructions
+            ),
+        };
+        request.tools = crate::tools::registry::Registry::new()
+            .snapshot()
+            .advertisement()
+            .clone();
+        for message in self.pending_followups() {
+            need(message.target == turn.receipt.request, "session_side_reply")?;
+            Self::append_followup(&mut request, message, turn)?;
+            if message.command == *command {
+                need(message.state == "queued", "session_side_reply")?;
+                return request.with_input_bounds();
+            }
+        }
+        Err("session_side_reply")
+    }
+    fn append_followup(request: &mut Request, message: &Followup, turn: &SavedTurn) -> Result<()> {
+        request.input.push(Json::object(vec![
+            ("role", Json::string("user")?),
+            ("content", Json::string(&message.text)?),
+        ])?);
+        if let Some(items) = turn.side_replies.get(&message.command.0) {
+            request.input.extend(items.iter().cloned());
+        }
+        Ok(())
     }
     /// Preserve admitted items and known results. Calls not dispatched at this
     /// user-requested boundary receive explicit not-started outputs, never an
@@ -569,10 +642,7 @@ impl State {
             current.next.clone()
         };
         for message in messages {
-            next.input.push(Json::object(vec![
-                ("role", Json::string("user")?),
-                ("content", Json::string(&message.text)?),
-            ])?);
+            Self::append_followup(&mut next, message, current)?;
         }
         next.with_input_bounds()
     }
@@ -691,6 +761,25 @@ impl State {
                 },
                 empty.advertisement().clone(),
             )
+        } else if mode.leads() {
+            let tools = crate::tools::delegation::advertise(&self.configuration.tools)?;
+            let provenance = Json::object(vec![
+                ("base_epoch", Json::string(&self.epoch.id)?),
+                ("base_state", self.epoch.exact_state.clone()),
+                ("purpose", Json::string("orchestration_lead")?),
+                ("tools_revision", Json::string(&tools.revision)?),
+            ])?;
+            (
+                Epoch {
+                    id: sha256(provenance.dump().as_bytes()),
+                    instructions: format!(
+                        "{}\nYou lead this task. Answer questions directly. If the user only asks for a plan, give the plan in chat. For implementation requests, explain your plan briefly when useful, then edit and test in this turn. Ask the user when a material choice is unresolved. Use delegate_task for independent work when useful. Its report is evidence for your next decision. Report blockers promptly.",
+                        self.epoch.instructions
+                    ),
+                    exact_state: provenance,
+                },
+                tools,
+            )
         } else if mode == AgentMode::Basic {
             (self.epoch.clone(), self.configuration.tools.clone())
         } else {
@@ -715,14 +804,20 @@ impl State {
                 self.plan_tools.clone(),
             )
         };
-        let mut input = if self.turn.as_ref().is_some_and(|turn| {
+        let mut input = if let Some(turn) = self.turn.as_ref().filter(|turn| {
             turn.stage == "cancelled"
-                && self
-                    .followups
-                    .iter()
-                    .any(|m| m.target == turn.receipt.request && m.state == "delivered")
+                && self.followups.iter().any(|m| {
+                    m.target == turn.receipt.request
+                        && matches!(m.state.as_str(), "delivered" | "side_closed")
+                })
         }) {
-            self.followup_request(&[])?.input
+            let closed = self
+                .followups
+                .iter()
+                .filter(|m| m.target == turn.receipt.request && m.state == "side_closed")
+                .map(|m| (**m).clone())
+                .collect::<Vec<_>>();
+            self.followup_request(&closed)?.input
         } else {
             self.history.clone()
         };
@@ -1027,6 +1122,51 @@ impl State {
             }));
             return Ok(None);
         }
+        if kind == "side_reply" {
+            let command = CommandId(event.text_field("command")?.to_owned());
+            let response = load_response(event.field("response")?)?;
+            let expected = self.side_request(&command)?;
+            let text = response_text(&response)?;
+            let turn = self.turn.as_mut().ok_or("session_turn_identity")?;
+            need(
+                turn.receipt.turn.0 == event.text_field("turn")?
+                    && turn.delegated_round()
+                    && !turn.paused
+                    && response.request().save()? == expected.save()?
+                    && response.returned_model() == expected.binding.returned_model
+                    && response.calls().is_empty()
+                    && !text.is_empty(),
+                "session_side_reply",
+            )?;
+            let message = self
+                .followups
+                .iter_mut()
+                .find(|m| m.command == command)
+                .ok_or("session_side_reply")?;
+            Arc::make_mut(message).state = "answered".into();
+            for (role, text) in [("user", message.text.clone()), ("assistant", text)] {
+                Arc::make_mut(&mut self.transcript).append(Entry {
+                    tool: None,
+                    turn: turn.receipt.turn.clone(),
+                    request: turn.receipt.request.clone(),
+                    role: role.into(),
+                    text,
+                    state: "delivered".into(),
+                    mode: turn.receipt.mode,
+                });
+            }
+            turn.side_replies.insert(
+                command.0,
+                Arc::new(
+                    response
+                        .items()
+                        .iter()
+                        .map(|item| item.value().clone())
+                        .collect(),
+                ),
+            );
+            return Ok(None);
+        }
         if matches!(kind, "steered" | "steer_rejected") {
             let messages = self.pending_followups().cloned().collect::<Vec<_>>();
             need(!messages.is_empty(), "session_followup_empty")?;
@@ -1056,7 +1196,7 @@ impl State {
                     ),
                     "session_followup_context",
                 )?;
-                for message in &messages {
+                for message in messages.iter().filter(|m| m.state == "queued") {
                     Arc::make_mut(&mut self.transcript).append(Entry {
                         tool: None,
                         turn: current.receipt.turn.clone(),
@@ -1068,7 +1208,7 @@ impl State {
                     });
                 }
                 for message in &mut self.followups {
-                    if message.state == "queued" {
+                    if matches!(message.state.as_str(), "queued" | "answered") {
                         Arc::make_mut(message).state = "rejected".into();
                     }
                 }
@@ -1094,7 +1234,7 @@ impl State {
             current.paused = false;
             current.diagnostic.clear();
             current.receipt.state = "generating".into();
-            for message in &messages {
+            for message in messages.iter().filter(|m| m.state == "queued") {
                 Arc::make_mut(&mut self.transcript).append(Entry {
                     tool: None,
                     turn: current.receipt.turn.clone(),
@@ -1106,10 +1246,11 @@ impl State {
                 });
             }
             for message in &mut self.followups {
-                if message.state == "queued" {
+                if matches!(message.state.as_str(), "queued" | "answered") {
                     Arc::make_mut(message).state = "delivered".into();
                 }
             }
+            current.side_replies.clear();
             return Ok(Some(current.receipt.clone()));
         }
         if kind == "accepted" {
@@ -1147,6 +1288,34 @@ impl State {
                 _ => return Err("session_mode"),
             };
             let internal = event.has("handoff");
+            if event.has("orchestration_lead") {
+                need(
+                    event.field("orchestration_lead")?.boolean()?
+                        && mode == AgentMode::Basic
+                        && !internal
+                        && !event.has("draft")
+                        && !event.has("orchestration_chat")
+                        && self.configuration.final_format().is_none(),
+                    "session_lead_mode",
+                )?;
+                mode = if event.has("orchestration_plus")
+                    && event.field("orchestration_plus")?.boolean()?
+                {
+                    AgentMode::LeadPlus
+                } else {
+                    AgentMode::Lead
+                };
+            }
+            let lead_profile = if event.has("orchestration_roles") {
+                let roles = RoleProfile::decode(event.field("orchestration_roles")?)?;
+                need(
+                    mode == AgentMode::LeadPlus && roles.strong == self.generation,
+                    "session_lead_profile",
+                )?;
+                Some(roles)
+            } else {
+                None
+            };
             if event.has("orchestration_chat") {
                 need(
                     event.field("orchestration_chat")?.boolean()?
@@ -1216,6 +1385,7 @@ impl State {
                 mode,
                 internal,
                 draft,
+                lead_profile,
             };
             let run = event.text_field("operation_run")?;
             OperationIds::new(run, 0)?;
@@ -1260,6 +1430,7 @@ impl State {
                 results: vec![],
                 previous_results: vec![],
                 intent: None,
+                side_replies: BTreeMap::new(),
                 stage: stage.into(),
                 diagnostic: String::new(),
                 paused: false,
@@ -1516,6 +1687,37 @@ impl State {
                 }
                 "cancel" => {
                     need(current.stage != "completed", "session_cancel_completed")?;
+                    if event.has("dismissed") {
+                        need(current.receipt.mode.leads(), "session_side_reply")?;
+                        let ids = event.field("dismissed")?.elements()?;
+                        let pending = self
+                            .followups
+                            .iter_mut()
+                            .filter(|m| {
+                                m.target == current.receipt.request
+                                    && matches!(m.state.as_str(), "answered" | "queued")
+                            })
+                            .collect::<Vec<_>>();
+                        need(ids.len() == pending.len(), "session_side_reply")?;
+                        for (id, message) in ids.iter().zip(pending) {
+                            need(id.text()? == message.command.0, "session_side_reply")?;
+                            let state = if message.state == "answered" {
+                                "side_closed"
+                            } else {
+                                Arc::make_mut(&mut self.transcript).append(Entry {
+                                    tool: None,
+                                    turn: current.receipt.turn.clone(),
+                                    request: current.receipt.request.clone(),
+                                    role: "user".into(),
+                                    text: message.text.clone(),
+                                    state: "cancelled".into(),
+                                    mode: current.receipt.mode,
+                                });
+                                "cancelled"
+                            };
+                            Arc::make_mut(message).state = state.into();
+                        }
+                    }
                     if current.stage != "cancelled"
                         && current.receipt.internal
                         && stopped_handoff(&current.receipt.text)
@@ -1591,6 +1793,71 @@ impl State {
 
 #[cfg(test)]
 #[test]
+fn cancelling_a_delegation_keeps_an_answer_and_rejects_a_late_reply() {
+    use crate::{
+        auth::Cancel,
+        frontend::{app, offline},
+        session::codec_v1::save_response,
+    };
+    let tools = app::pure_tools().unwrap();
+    let base = Request::new(
+        app::binding(),
+        Epoch {
+            id: "side-test".into(),
+            instructions: "Test context".into(),
+            exact_state: Json::parse("{}").unwrap(),
+        },
+        tools.advertisement().clone(),
+        vec![],
+    )
+    .unwrap();
+    let mut state = State::new(
+        "side-test".into(),
+        base,
+        tools.read_only().advertisement().clone(),
+    );
+    state.apply(&state.initialization().unwrap()).unwrap();
+    let request = state
+        .request_for("ORCHESTRATION_DIRECT_FIXTURE", AgentMode::Lead)
+        .unwrap();
+    let accepted = Json::parse(r#"{"kind":"accepted","command":"c","turn":"t","request":"request_1","request_number":1,"text":"ORCHESTRATION_DIRECT_FIXTURE","mode":"basic","orchestration_lead":true,"operation_run":"run","compact":false}"#).unwrap()
+        .with("next", request.save().unwrap()).unwrap();
+    state.apply(&accepted).unwrap();
+    let response = offline::generate(&request, &Cancel::default()).unwrap();
+    state
+        .apply(
+            &Json::parse(r#"{"kind":"response","turn":"t"}"#)
+                .unwrap()
+                .with("response", save_response(&response).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    state.apply(&Json::parse(r#"{"kind":"queued","turn":"t","target":"request_1","command":"q","text":"DIRECT_SIDE_QUESTION"}"#).unwrap()).unwrap();
+    let ask = state.side_request(&"q".into()).unwrap();
+    assert!(ask.tools.descriptors.is_empty());
+    assert_eq!(ask.binding, request.binding);
+    assert_eq!(ask.effort, request.effort);
+    let answer = offline::generate(&ask, &Cancel::default()).unwrap();
+    let reply = Json::parse(r#"{"kind":"side_reply","turn":"t","command":"q"}"#)
+        .unwrap()
+        .with("response", save_response(&answer).unwrap())
+        .unwrap();
+    let cancel = Json::parse(r#"{"kind":"cancel","turn":"t","dismissed":["q"]}"#).unwrap();
+    let mut interrupted = state.clone();
+    interrupted.apply(&cancel).unwrap();
+    assert!(interrupted.apply(&reply).is_err());
+    assert_eq!(interrupted.pending_followups().count(), 0);
+    state.apply(&reply).unwrap();
+    state.apply(&cancel).unwrap();
+    assert_eq!(state.pending_followups().count(), 0);
+    let next = state
+        .request_for("Continue separately", AgentMode::Basic)
+        .unwrap();
+    assert_eq!(next.input[next.input.len() - 2], *answer.items()[0].value());
+}
+
+#[cfg(test)]
+#[test]
 fn orchestration_chat_replays_exact_context_without_changing_mode() {
     let tools = crate::frontend::app::pure_tools().unwrap();
     let configuration = Request::new(
@@ -1649,4 +1916,65 @@ fn orchestration_chat_replays_exact_context_without_changing_mode() {
         Ok(text)
     );
     assert_eq!(turn.next.save().unwrap(), request.save().unwrap());
+}
+
+#[cfg(test)]
+#[test]
+fn lead_replays_on_an_existing_journal_without_exporting_delegate_to_forks() {
+    let tools = crate::frontend::app::pure_tools().unwrap();
+    let base = Request::new(
+        crate::frontend::app::binding(),
+        Epoch {
+            id: "lead-test".into(),
+            instructions: "Original instructions".into(),
+            exact_state: Json::parse("{}").unwrap(),
+        },
+        tools.advertisement().clone(),
+        vec![],
+    )
+    .unwrap();
+    let existing = State::new(
+        "existing".into(),
+        base.clone(),
+        tools.read_only().advertisement().clone(),
+    );
+    let initialization = existing.initialization().unwrap();
+    for mode in [AgentMode::Lead, AgentMode::LeadPlus] {
+        let mut state = existing.clone();
+        state.apply(&initialization).unwrap();
+        let request = state.request_for("Implement the change", mode).unwrap();
+        assert_eq!(request.final_format(), None);
+        assert_eq!(
+            request.tools.descriptors.last().unwrap().name,
+            "delegate_task"
+        );
+        let mut accepted = Json::object(vec![
+            ("kind", Json::string("accepted").unwrap()),
+            ("command", Json::string("lead-submit").unwrap()),
+            ("turn", Json::string("lead-turn").unwrap()),
+            ("request", Json::string("request_1").unwrap()),
+            ("request_number", num(1).unwrap()),
+            ("text", Json::string("Implement the change").unwrap()),
+            ("mode", Json::string("basic").unwrap()),
+            ("orchestration_lead", Json::parse("true").unwrap()),
+            ("operation_run", Json::string("run").unwrap()),
+            ("next", request.save().unwrap()),
+            ("compact", Json::parse("false").unwrap()),
+        ])
+        .unwrap();
+        if mode == AgentMode::LeadPlus {
+            accepted = accepted
+                .with("orchestration_plus", Json::parse("true").unwrap())
+                .unwrap();
+        }
+        state.apply(&accepted).unwrap();
+        assert_eq!(state.turn.as_ref().unwrap().receipt.mode, mode);
+        let fork = state.fork_seed().unwrap().request().unwrap();
+        assert_eq!(fork.tools, base.tools);
+        assert_eq!(fork.epoch, base.epoch);
+        assert_eq!(
+            fork.input.last().unwrap().text_field("content"),
+            Ok("Implement the change")
+        );
+    }
 }

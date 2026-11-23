@@ -118,7 +118,7 @@ pub(super) fn submit_digest(submit: &Submit) -> Result<String> {
     let mode = match submit.mode {
         AgentMode::Basic => "basic",
         AgentMode::Plan => "plan",
-        AgentMode::OrchestrationChat => return Err("orchestration_child_submit_mode"),
+        _ => return Err("orchestration_child_submit_mode"),
     };
     Ok(sha256(&encode(&(mode, &submit.text))?))
 }

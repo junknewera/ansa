@@ -59,6 +59,267 @@ fn parts(root: &f::Root) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn direct_plus_resumes_with_the_roles_accepted_before_restart() {
+    use ansa::{
+        orchestration::profile::RoleProfile,
+        tools::registry::{Outcome, Registry},
+    };
+    let root = f::Root::new();
+    let selection = |model: &str| GenerationSelection {
+        model: model.into(),
+        effort: None,
+    };
+    let roles = RoleProfile {
+        strong: selection("gpt-6.1-sol"),
+        medium: selection("medium-model"),
+        weak: selection("research-model"),
+    };
+    let submit = |roles| {
+        CommandPayload::SubmitWithRoles(
+            Submit {
+                text: "Inspect project".into(),
+                mode: AgentMode::LeadPlus,
+            },
+            vec![],
+            Box::new(roles),
+        )
+    };
+    let expected = roles.clone();
+    let options = Options {
+        directory: Some(root.journal()),
+        delegate: Some(Arc::new(move |_, saved, _, _| {
+            assert_eq!(saved, Some(&expected));
+            Outcome::succeeded("observed saved roles".into())
+        })),
+        ..Options::default()
+    };
+    let fixture = f::tools(Arc::new(AtomicUsize::new(0)), None, false);
+    let mut registry = Registry::new();
+    for name in ["list_directory", "read_file", "search_files"] {
+        let mut tool = fixture.definition("get_test_value").unwrap().clone();
+        tool.descriptor.name = name.into();
+        registry.register(tool).unwrap();
+    }
+    let tools = registry.snapshot();
+    let open = |provider: Generate| {
+        Runtime::new(
+            "lead".into(),
+            f::configuration(&tools),
+            tools.clone(),
+            provider,
+            Limits::default(),
+            options.clone(),
+        )
+        .unwrap()
+    };
+    let mut runtime = open(Arc::new(|_, _, _| Err("fixture_pause")));
+    runtime.ready().await.unwrap();
+    let handle = runtime.handle();
+    f::post(
+        &handle,
+        "lead",
+        submit(roles.clone()),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    let paused = f::until(&handle, |event| {
+        matches!(event, EventPayload::RuntimeError { diagnostic, .. } if diagnostic == "fixture_pause")
+    }).await;
+    f::finish(&mut runtime).await;
+
+    let provider: Generate = Arc::new(|request, _, _| {
+        if request
+            .input
+            .last()
+            .is_some_and(|item| item.text_field("output") == Ok("observed saved roles"))
+        {
+            return native::load(&f::saved_response(request, Some("done"), 0));
+        }
+        let response = f::saved_response(request, None, 1);
+        let call = response.field("items")?.elements()?[0]
+            .with("name", Json::string("delegate_task")?)?
+            .with(
+                "arguments",
+                Json::string(r#"{"task":"Inspect project","paths":[]}"#)?,
+            )?;
+        native::load(&response.with("items", Json::array(vec![call])?)?)
+    });
+    let mut restored = open(provider);
+    restored.ready().await.unwrap();
+    let handle = restored.handle();
+    let mut changed = roles.clone();
+    changed.weak = selection("new-research-model");
+    f::post(
+        &handle,
+        "lead",
+        submit(changed),
+        "task",
+        PostStatus::CommandConflict,
+    )
+    .await;
+    f::post(
+        &handle,
+        "lead",
+        submit(roles),
+        "task",
+        PostStatus::Duplicate,
+    )
+    .await;
+    f::post(
+        &handle,
+        "resume",
+        CommandPayload::Resume(paused.request.unwrap()),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    f::until(&handle, |event| matches!(event, EventPayload::Done)).await;
+    f::finish(&mut restored).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_delegation_dismisses_steers_reserved_behind_a_journal_write() {
+    use ansa::{
+        auth::Cancel,
+        tools::registry::{Outcome, Registry},
+    };
+    let root = f::Root::new();
+    let store = Arc::new(f::Gate::default());
+    let helper = Arc::new(f::Gate::default());
+    let options = Options {
+        directory: Some(root.journal()),
+        journal: Some(Arc::new({
+            let store = store.clone();
+            move |point, kind| {
+                if point == Point::BeforeSync && kind == "queued" {
+                    store.hold(&Cancel::default());
+                }
+                Ok(())
+            }
+        })),
+        delegate: Some(Arc::new({
+            let helper = helper.clone();
+            move |_, _, _, stop| {
+                helper.hold(stop);
+                Outcome::succeeded("finished".into())
+            }
+        })),
+        ..Options::default()
+    };
+    let fixture = f::tools(Arc::new(AtomicUsize::new(0)), None, false);
+    let mut registry = Registry::new();
+    for name in ["list_directory", "read_file", "search_files", "edit_file"] {
+        let mut definition = fixture.definition("get_test_value").unwrap().clone();
+        definition.descriptor.name = name.into();
+        registry.register(definition).unwrap();
+    }
+    let tools = registry.snapshot();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut runtime = Runtime::new(
+        "side-cancel".into(),
+        f::configuration(&tools),
+        tools,
+        Arc::new(move |request, stop, _| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            ansa::frontend::offline::generate(request, stop)
+        }),
+        Limits::default(),
+        options,
+    )
+    .unwrap();
+    let _release_store = Release(store.clone());
+    let _release_helper = Release(helper.clone());
+    runtime.ready().await.unwrap();
+    let handle = runtime.handle();
+    f::post(
+        &handle,
+        "lead",
+        CommandPayload::Submit(Submit {
+            text: "ORCHESTRATION_DIRECT_FIXTURE".into(),
+            mode: AgentMode::Lead,
+        }),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    let request = f::until(&handle, |event| {
+        matches!(event, EventPayload::ToolStarted(_))
+    })
+    .await
+    .request
+    .unwrap();
+    let post = |id: &'static str| {
+        let handle = handle.clone();
+        let target = request.clone();
+        tokio::spawn(async move {
+            f::post(
+                &handle,
+                id,
+                CommandPayload::Steer(Steer {
+                    target,
+                    text: id.into(),
+                }),
+                "task",
+                PostStatus::Accepted,
+            )
+            .await;
+        })
+    };
+    let first = post("first");
+    tokio::task::spawn_blocking({
+        let store = store.clone();
+        move || store.wait()
+    })
+    .await
+    .unwrap();
+    let second = post("second");
+    loop {
+        if matches!(lookup(&handle, "probe", "second").await.payload,
+            EventPayload::MessageReceipt { receipt: Some(info), .. } if !info.admission_durable)
+        {
+            break;
+        }
+    }
+    f::post(
+        &handle,
+        "stop",
+        CommandPayload::Cancel(request.clone()),
+        "task",
+        PostStatus::Accepted,
+    )
+    .await;
+    store.release();
+    first.await.unwrap();
+    second.await.unwrap();
+    f::until(&handle, |event| {
+        matches!(event, EventPayload::Cancelled { .. })
+    })
+    .await;
+    helper.release();
+    for command in ["first", "second"] {
+        assert_eq!(
+            receipt(lookup(&handle, "lookup", command).await).state,
+            "cancelled"
+        );
+    }
+    f::post(
+        &handle,
+        "late",
+        CommandPayload::Steer(Steer {
+            target: request,
+            text: "stale".into(),
+        }),
+        "task",
+        PostStatus::StaleTarget,
+    )
+    .await;
+    f::finish(&mut runtime).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn nonrenewable_tool_budgets_have_distinct_diagnostics() {
     for (batch, call_limit, expected, executed) in [
         (2, 1, "tool_batch_limit", 0),

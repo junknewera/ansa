@@ -41,6 +41,7 @@ impl Identity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     Queued,
+    SideReply,
     Steered,
     GenerationSelected,
     AutocompactSelected,
@@ -99,6 +100,7 @@ pub(crate) struct Ready {
 }
 pub(crate) enum ProviderTask {
     Generate,
+    SideReply(CommandId),
     Compact,
 }
 pub(crate) struct ProviderJob {
@@ -148,6 +150,7 @@ pub(crate) enum AuthTask {
     Compact,
     BeforeIntent,
     ToolLease,
+    ChildDispatch,
 }
 pub(crate) struct AuthJob {
     pub selection: Option<GenerationSelection>,
@@ -340,7 +343,10 @@ impl Workers {
                                 let event = (job.build)(&state)?;
                                 if matches!(
                                     job.kind,
-                                    Kind::Accepted | Kind::Response | Kind::Compacted
+                                    Kind::Accepted
+                                        | Kind::Response
+                                        | Kind::Compacted
+                                        | Kind::SideReply
                                 ) {
                                     crate::session::journal_v1::check_record_frame(&event)?;
                                 }
@@ -366,7 +372,7 @@ impl Workers {
                         let rejected_frame = !poisoned
                             && matches!(
                                 job.kind,
-                                Kind::Accepted | Kind::Response | Kind::Compacted
+                                Kind::Accepted | Kind::Response | Kind::Compacted | Kind::SideReply
                             )
                             && !built
                             && matches!(
@@ -409,10 +415,26 @@ impl Workers {
                                 return Err("generation_cancelled");
                             }
                             let current = job.state.turn.as_ref().ok_or("runtime_turn")?;
-                            match job.task {
-                                ProviderTask::Generate => {
+                            match &job.task {
+                                ProviderTask::Generate | ProviderTask::SideReply(_) => {
                                     let mut request =
-                                        if let Some(response) = &current.tools_response {
+                                        if let ProviderTask::SideReply(command) = &job.task {
+                                            let request = job.state.side_request(command)?;
+                                            (provider_options.check_dispatch)(
+                                                job.identity.resume_epoch,
+                                                &job.stop,
+                                            )?;
+                                            (provider_options.check_request)(
+                                                &request,
+                                                job.identity.resume_epoch,
+                                                &job.stop,
+                                            )?;
+                                            job.stop.check()?;
+                                            if !provider_gate.active(&job.identity) {
+                                                return Err("generation_cancelled");
+                                            }
+                                            request
+                                        } else if let Some(response) = &current.tools_response {
                                             next_request(response, &current.results)?
                                         } else {
                                             current.next.clone()
@@ -440,11 +462,15 @@ impl Workers {
                                         job.identity.clone(),
                                         job.preview_generation,
                                     );
+                                    let inline = matches!(&job.task, ProviderTask::SideReply(_));
                                     let update: PreviewSink = Arc::new(move |text: &str| {
                                         if text.len() > 64 * 1024 {
                                             return Err("preview_text_limit");
                                         }
-                                        if !sink_stop.cancelled() && sink_gate.active(&sink_id) {
+                                        if !inline
+                                            && !sink_stop.cancelled()
+                                            && sink_gate.active(&sink_id)
+                                        {
                                             sink_preview.send_replace(Some(Arc::new(
                                                 PreviewUpdate {
                                                     identity: sink_id.clone(),
@@ -473,6 +499,12 @@ impl Workers {
                                     }
                                     if value.calls().len() > 16 || value.items().len() > 64 {
                                         return Err("runtime_response_limit");
+                                    }
+                                    if matches!(&job.task, ProviderTask::SideReply(_))
+                                        && (!value.calls().is_empty()
+                                            || response_text(&value)?.is_empty())
+                                    {
+                                        return Err("session_side_reply");
                                     }
                                     if value.calls().is_empty() || provider_options.streaming {
                                         response_text(&value)?;

@@ -608,6 +608,7 @@ fn text_with_providers(
     let configuration =
         Request::new(bound, epoch, tools.advertisement().clone(), vec![])?.with_effort(effort)?;
     options.directory = Some(selected.directory.clone());
+    factory.enable_delegation(&mut options, &selected.id);
     if !parsed.resume && parsed.session.is_empty() {
         options.autocompact_percent = factory.saved_autocompact();
     }
@@ -912,7 +913,24 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                             content.starts_with("Inspect nested project instructions")
                         })
                     });
-                    let item = if call {
+                    let direct = input
+                        .iter()
+                        .any(|item| item["content"] == "DIRECT_SIWC_FIXTURE");
+                    let item = if name.is_none() && direct && last["type"] != "function_call_output"
+                    {
+                        if !request["tools"][0]["tools"]
+                            .as_array()
+                            .is_some_and(|tools| {
+                                tools.iter().any(|tool| tool["name"] == "delegate_task")
+                            })
+                        {
+                            return Err("fixture_delegate_tool");
+                        }
+                        let arguments =
+                            json!({"task":"Inspect the synthetic SIWC workspace","paths":[]})
+                                .to_string();
+                        json!({"type":"function_call","id":"fixture-direct-item","call_id":"fixture-direct-call","namespace":"omh","name":"delegate_task","arguments":arguments,"status":"completed"})
+                    } else if call {
                         if !request["tools"].to_string().contains("list_directory") {
                             return Err("fixture_tools");
                         }
@@ -950,6 +968,13 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                             }}).to_string(),
                         Some("ansa_child_result_v1") if output["entries"].is_array() =>
                             r#"{"status":"completed","summary":"SIWC_HELPER_DONE","findings":[]}"#.into(),
+                        None if direct => {
+                            if last["call_id"] != "fixture-direct-call" || output["status"] != "completed"
+                                || output["summary"] != "SIWC_HELPER_DONE" {
+                                return Err("fixture_delegate_result");
+                            }
+                            "DIRECT_SIWC_DONE".into()
+                        }
                         None => "SIWC_CARBON_DONE".into(),
                         _ => return Err("fixture_format"),
                     };
@@ -957,7 +982,7 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                     };
                     let mut added = item.clone();
                     added["status"] = json!("in_progress");
-                    if call {
+                    if item["type"] == "function_call" {
                         added["arguments"] = json!("");
                     }
                     let mut completed = json!({"id":"fixture-response","model":MODEL,"status":"completed","output":[item]});

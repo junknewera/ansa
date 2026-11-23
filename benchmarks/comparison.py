@@ -33,8 +33,8 @@ def validate(comparison, arms, tasks, rows):
     differences = {key for key in (*fields, "route", "auth_dir")
                    if identity(arms[left], key) != identity(arms[right], key)}
     if factor == "mode" and differences == {"mode", "roles"}:
-        plus = next((arm for arm in arms.values() if arm["mode"] == "orchestrate+"), None)
-        if plus and any(arm["mode"] == "orchestrate" for arm in arms.values()):
+        plus = next((arm for arm in arms.values() if arm["mode"] in ("orchestrate+", "propose+")), None)
+        if plus and any(arm["mode"] + "+" == plus["mode"] for arm in arms.values()):
             require(all(role == {"model": plus["model"], "effort": plus["effort"]}
                         for role in plus["roles"].values()),
                     "Orchestrate+ roles must match the shared model and effort")
@@ -151,7 +151,7 @@ def trace_metrics(path, traces):
     for role, sessions in sorted(roles.items()):
         ids = {row["id"] for row in generation_rows if row["session"] in sessions}
         usage = [row["response"].get("reported_usage_v1") for session in sessions
-                 for row in traces[session] if row["kind"] == "response"]
+                 for row in traces[session] if row["kind"] in ("response", "side_reply")]
         usage += [native["summary_response"].get("reported_usage_v1")
                   for session in sessions for row in traces[session] if row["kind"] == "compacted"
                   for native in (row["compaction"]["native"],) if "summary_response" in native]

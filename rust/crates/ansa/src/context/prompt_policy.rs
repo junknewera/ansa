@@ -81,6 +81,7 @@ impl PromptPolicy {
                             Ok("orchestration_summary"
                                 | "orchestration_plan"
                                 | "orchestration_chat"
+                                | "orchestration_lead"
                                 | "readonly_child")
                         )
                         || state.text_field("previous_epoch").is_ok())

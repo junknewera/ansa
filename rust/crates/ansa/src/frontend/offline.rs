@@ -114,8 +114,16 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         && std::env::var("ANSA_OFFLINE_EVAL_ARM").as_deref() == Ok("N0");
     #[cfg(not(feature = "frontend-test-adapter"))]
     let single = false;
+    let lead = request.epoch.exact_state.text_field("purpose") == Ok("orchestration_lead");
+    let inline = request.epoch.exact_state.text_field("purpose") == Ok("orchestration_chat")
+        && request
+            .input
+            .last()
+            .is_some_and(|item| item.text_field("content") == Ok("DIRECT_SIDE_QUESTION"));
     if request.final_format().is_none()
         && !single
+        && !lead
+        && !inline
         && request.epoch.exact_state.text_field("purpose") != Ok("orchestration_summary")
     {
         return Ok(None);
@@ -129,14 +137,45 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
         })
         .unwrap_or_default();
     let id = sha256(request.save()?.dump().as_bytes());
+    const BLOCKED: &str = "A person needs to be present.";
+    if lead
+        && matches!(
+            user,
+            "ORCHESTRATION_DIRECT_FIXTURE" | "ORCHESTRATION_DIRECT_BLOCKED_FIXTURE"
+        )
+    {
+        let (arguments, call) = if user == "ORCHESTRATION_DIRECT_FIXTURE" {
+            (
+                serde_json::json!({"task":"Direct fixture report edit","paths":["report.txt"]}),
+                "edit",
+            )
+        } else {
+            (
+                serde_json::json!({"task":"Direct fixture physical task","paths":[]}),
+                "blocked",
+            )
+        };
+        let item = obj(vec![
+            ("type", s("function_call")),
+            ("id", s(&format!("item_{}", &id[..24]))),
+            ("call_id", s(&format!("orch_delegate_{call}_{}", &id[..24]))),
+            ("namespace", s("omh")),
+            ("name", s("delegate_task")),
+            ("arguments", s(&arguments.to_string())),
+            ("status", s("completed")),
+        ]);
+        return orchestration_response(request, &id, item).map(Some);
+    }
     if request.final_format() == Some(FinalFormat::ChildResult)
-        && user.starts_with("Review first fixture file")
+        && (user.starts_with("Review first fixture file")
+            || user.contains("Direct fixture report edit"))
     {
         stop.wait(std::time::Duration::from_millis(950));
         stop.check()?;
     }
     if request.final_format() == Some(FinalFormat::ChildResult) || single {
         let operation = if user.starts_with("Синтетическая правка отчёта")
+            || user.contains("Direct fixture report edit")
             || (single && user == "ORCHESTRATION_COMMAND_FIXTURE")
         {
             Some(("edit_file", "report.txt", "orch_edit_file_"))
@@ -205,6 +244,9 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
                 {"id":"check","task":"Проверить, достаточно ли данных для ответа","access":"read","paths":[],"depends_on":[],"acceptance":"Указать оставшиеся вопросы"}
             ]
         }).to_string(),
+        Some(FinalFormat::ChildResult) if user == "Direct fixture physical task" => {
+            serde_json::json!({"status":"blocked", "summary":BLOCKED, "findings":[]}).to_string()
+        }
         Some(FinalFormat::ChildResult) => {
             let mut success = true;
             if let Some(last) = last.filter(|item| item.text_field("type") == Ok("function_call_output")) {
@@ -231,6 +273,20 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
                 return Err("offline_eval_edit");
             }
             "Offline fixture edit complete.".to_owned()
+        },
+        None if inline => "DIRECT_SIDE_ANSWER".to_owned(),
+        None if lead && let Some(outcome) = request.input.iter().rev().find(|item| {
+            item.text_field("type") == Ok("function_call_output")
+                && item.text_field("call_id").is_ok_and(|call| call.starts_with("orch_delegate_"))
+        }) => {
+            let blocked = outcome.text_field("call_id")?.starts_with("orch_delegate_blocked_");
+            let report = Json::parse(outcome.text_field("output")?)?;
+            let status = if blocked { "blocked" } else { "completed" };
+            let summary = if blocked { BLOCKED } else { "Синтетический результат проверки" };
+            if report.text_field("status") != Ok(status) || report.text_field("summary") != Ok(summary) {
+                return Err("offline_eval_delegate");
+            }
+            if blocked { format!("DIRECT_LEAD_BLOCKED: {summary}") } else { "DIRECT_LEAD_COMPLETED".to_owned() }
         },
         None if request.epoch.exact_state.text_field("purpose") == Ok("orchestration_summary") => {
             if user.contains("pending_manual_candidate") {

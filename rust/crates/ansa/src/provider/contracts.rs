@@ -5,7 +5,7 @@
 //! use ansa::provider::contracts::{SessionId, TurnId};
 //! fn wrong_identity(session: SessionId) -> TurnId { session }
 //! ```
-use crate::{protocol::json::Json, provider::replay::Effects};
+use crate::{orchestration::profile::RoleProfile, protocol::json::Json, provider::replay::Effects};
 
 pub(crate) mod image;
 pub use image::{ImageInput, MAX_IMAGE_BYTES, MAX_IMAGES};
@@ -34,10 +34,15 @@ pub enum AgentMode {
     Basic,
     Plan,
     OrchestrationChat,
+    Lead,
+    LeadPlus,
 }
 impl AgentMode {
     pub(crate) fn read_only(self) -> bool {
-        self != Self::Basic
+        matches!(self, Self::Plan | Self::OrchestrationChat)
+    }
+    pub(crate) fn leads(self) -> bool {
+        matches!(self, Self::Lead | Self::LeadPlus)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +165,7 @@ pub enum CommandPayload {
     SetAutocompact(u8),
     Submit(Submit),
     SubmitImages(Submit, Vec<ImageInput>),
+    SubmitWithRoles(Submit, Vec<ImageInput>, Box<RoleProfile>),
     /// Native-only synthesis input from the coordinator. Frontend wire
     /// decoders accept ordinary Submit and never construct this variant.
     Handoff(Submit),
@@ -284,6 +290,7 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
         CommandPayload::GetMessageReceipt(id) if !valid_id(&id.0) => Err("command_id"),
         CommandPayload::Submit(submit)
         | CommandPayload::SubmitImages(submit, _)
+        | CommandPayload::SubmitWithRoles(submit, _, _)
         | CommandPayload::Handoff(submit)
         | CommandPayload::DraftPlan(submit, _) => {
             if submit.text.is_empty() || !Json::text_fits_frame(&submit.text) {
@@ -292,8 +299,27 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
             if let CommandPayload::SubmitImages(_, images) = &command.payload {
                 image::validate_images(images)?;
             }
+            if let CommandPayload::SubmitWithRoles(_, images, profile) = &command.payload {
+                if submit.mode != AgentMode::LeadPlus {
+                    return Err("submit_mode");
+                }
+                if !images.is_empty() {
+                    image::validate_images(images)?;
+                }
+                profile.validate()?;
+            }
             if submit.mode == AgentMode::OrchestrationChat
                 && !matches!(command.payload, CommandPayload::Submit(_))
+            {
+                return Err("submit_mode");
+            }
+            if submit.mode.leads()
+                && !matches!(
+                    command.payload,
+                    CommandPayload::Submit(_)
+                        | CommandPayload::SubmitImages(..)
+                        | CommandPayload::SubmitWithRoles(..)
+                )
             {
                 return Err("submit_mode");
             }
