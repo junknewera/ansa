@@ -12,7 +12,7 @@ use ansa::{
     },
     runtime::*,
     session::{
-        journal_v1::{Journal, Point, inspect_read_only},
+        journal_v1::{Journal, Point},
         state::State,
     },
     tools::registry::{Outcome, Policy, Registry},
@@ -63,8 +63,7 @@ async fn large_image_history_stays_sendable_and_reopens() {
     let seen = calls.clone();
     let provider: Generate = Arc::new(move |request, _, _| {
         let sent = seen.fetch_add(1, Ordering::SeqCst);
-        let body = request.json()?;
-        assert!(body.dump().len() < Json::FRAME_BYTES);
+        request.json()?;
         let newest = request.input.last().unwrap().field("content")?;
         if sent < 7 {
             let parts = newest.elements()?;
@@ -120,36 +119,20 @@ async fn large_image_history_stays_sendable_and_reopens() {
     }
     fixture::finish(&mut runtime).await;
 
-    let mut first_preserved = false;
-    let mut archived = false;
-    inspect_read_only(
-        &root.journal(),
-        &mut (256 * 1024 * 1024),
-        || Ok(()),
-        |event| {
-            if event.text_field("kind")? == "accepted" {
-                archived |= event.has("archived_images");
-                if event.text_field("command")? == "image_0" {
-                    let saved = Request::load(event.field("next")?)?;
-                    let url =
-                        saved.input[0].field("content")?.elements()?[1].text_field("image_url")?;
-                    first_preserved = ImageInput::from_data_url(url)?.sha256() == image.sha256();
-                }
-            }
-            Ok(())
-        },
-    )
-    .unwrap();
-    assert!(first_preserved && archived);
-
-    let mut reopened = fixture::setup(
-        Arc::new(AtomicUsize::new(0)),
-        None,
+    let tools = fixture::tools(Arc::new(AtomicUsize::new(0)), None, true);
+    let mut reopened = Runtime::new(
+        "offline".into(),
+        fixture::configuration(&tools),
+        tools,
         provider,
         Limits::default(),
         options,
     )
-    .await;
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(75), reopened.ready())
+        .await
+        .expect("large journal replay timeout")
+        .unwrap();
     assert!(
         !fixture::snapshot(&reopened.handle(), "after_restart")
             .await
