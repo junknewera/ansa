@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod benchmark_trace;
 pub mod config;
 pub mod context;
 pub mod frontend;

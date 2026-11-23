@@ -128,7 +128,7 @@ class PublicInputs(unittest.TestCase):
         config.write_text('{"servers":[]}\n')
         self.task.update(git_setup="seed.sh", mcp_config="mcp.json")
         arms, tasks, budget = self.freeze()
-        def inspect(binary, root, home, workspace, env, arm, turns, deadline, git, head, fixture_args, attachments=()):
+        def inspect(binary, root, home, workspace, env, arm, turns, deadline, git, head, fixture_args, **options):
             self.assertEqual(git(workspace, "rev-parse", "recovered").strip(), head)
             self.assertEqual((home / ".ansa/mcp.json").read_bytes(), config.read_bytes())
             raise TrialStopped("pass", "fixture inspected")

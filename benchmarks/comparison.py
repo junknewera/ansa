@@ -2,6 +2,8 @@
 
 from collections import Counter, defaultdict
 import os
+import json
+import math
 from pathlib import Path
 import re
 import signal
@@ -30,6 +32,13 @@ def validate(comparison, arms, tasks, rows):
 
     differences = {key for key in (*fields, "route", "auth_dir")
                    if identity(arms[left], key) != identity(arms[right], key)}
+    if factor == "mode" and differences == {"mode", "roles"}:
+        plus = next((arm for arm in arms.values() if arm["mode"] == "orchestrate+"), None)
+        if plus and any(arm["mode"] == "orchestrate" for arm in arms.values()):
+            require(all(role == {"model": plus["model"], "effort": plus["effort"]}
+                        for role in plus["roles"].values()),
+                    "Orchestrate+ roles must match the shared model and effort")
+            differences.remove("roles")
     require(differences == {factor}, f"expected {factor} alone to differ; got {sorted(differences)}")
 
     if factor not in ("binary", "model"):
@@ -82,6 +91,100 @@ def stages(traces):
     return dict(evidence)
 
 
+def grade_plan(plan, requirements, start_available):
+    paths = {path.removeprefix("./").rstrip("/") for step in plan["steps"]
+             if step["access"] == "write" for path in step["paths"]}
+    required = set(requirements["paths"])
+    checks = [check["argv"] for check in plan.get("command_checks", [])]
+    command = requirements.get("check")
+    def runs_check(argv):
+        if command is None:
+            return bool(argv)
+        executable = argv[0].removeprefix("./") if argv else ""
+        return executable == command or (
+            Path(executable).name in ("sh", "bash") and len(argv) > 1
+            and argv[1].removeprefix("./") == command)
+
+    checks_ok = any(runs_check(argv) for argv in checks)
+    criteria = {"expected_write_paths": paths == required,
+                "expected_check" if command else "command_check_present": checks_ok,
+                "start_available": start_available}
+    return {"status": "pass" if all(criteria.values()) else "fail", "criteria": criteria}
+
+
+def trace_metrics(path, traces):
+    require(path.stat().st_size <= 4 * 1024 * 1024, "benchmark timing evidence exceeds limit")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    generations = {row["id"]: row for row in events if row["kind"] == "generation"}
+    http = [row for row in events if row["kind"] == "http"]
+    sent = [row for row in events if row["kind"] == "http_sent"]
+    tools = [row for row in events if row["kind"] == "tool"]
+    generation_rows = [row for row in events if row["kind"] == "generation"]
+    require(len(generations) == len(generation_rows) and
+            all(row["id"] in generations for row in http + sent), "unmatched provider timing")
+    require(all(math.isfinite(row["seconds"]) and row["seconds"] >= 0
+                for row in http + tools + generation_rows), "invalid timing duration")
+    operations = {row["result"]["operation"]: session for session, rows in traces.items()
+                  for row in rows if row["kind"] == "outcome" and row["result"]["dispatched"]}
+    def seconds(rows):
+        return round(sum(row["seconds"] for row in rows), 3)
+
+    def requests(attempts, transmitted):
+        retries = Counter(row["id"] for row in attempts)
+        return {"http_attempts": len(attempts), "http_sent": len(transmitted),
+                "http_retries": sum(value - 1 for value in retries.values()),
+                "http_errors": sum(row["error"] is not None for row in attempts)}
+
+    roles = defaultdict(list)
+    for session, rows in traces.items():
+        state = rows[0].get("configuration", {}).get("epoch", {}).get("exact_state", {})
+        accepted = next((row for row in rows if row["kind"] == "accepted"), {})
+        assignment = accepted.get("text", "").rsplit("\n\nШаг ", 1)
+        if state.get("orchestration_parent") and len(assignment) == 2 and assignment[-1].startswith("plus-"):
+            roles[plus_role(assignment[-1].split("\n", 1)[0])].append(session)
+        elif state.get("orchestration_parent"):
+            roles["worker"].append(session)
+        else:
+            roles["lead"].append(session)
+
+    by_role = {}
+    for role, sessions in sorted(roles.items()):
+        ids = {row["id"] for row in generation_rows if row["session"] in sessions}
+        usage = [row["response"].get("reported_usage_v1") for session in sessions
+                 for row in traces[session] if row["kind"] == "response"]
+        usage += [native["summary_response"].get("reported_usage_v1")
+                  for session in sessions for row in traces[session] if row["kind"] == "compacted"
+                  for native in (row["compaction"]["native"],) if "summary_response" in native]
+        by_role[role] = {"sessions": len(sessions), "admitted_responses": len(usage),
+                         "reported_tokens": sum(u["input_tokens"] + u["output_tokens"] for u in usage)
+                         if usage and all(usage) else None,
+                         "provider_seconds": seconds([generations[id] for id in ids]),
+                         "tool_seconds": seconds([row for row in tools
+                                                  if operations.get(row["operation"]) in sessions])}
+        if http:
+            by_role[role].update(requests([row for row in http if row["id"] in ids],
+                                          [row for row in sent if row["id"] in ids]))
+    result = {"provider_seconds": seconds(generation_rows), "tool_seconds": seconds(tools),
+              "generation_errors": sum(row["error"] is not None for row in generation_rows),
+              "by_role": by_role}
+    if http:
+        result.update(requests(http, sent))
+    return result
+
+
+def plus_role(step):
+    if step.startswith("plus-review-"):
+        if step == "plus-review-report-repair" or re.search(r"-repair-\d+$", step):
+            return "worker"
+        if re.search(r"-coordinate-\d+$", step):
+            return "coordinator"
+        return "review"
+    match = re.search(r"-(draft-replan|draft|work|check|escalate|fix|verify)-\d+-\d+$", step)
+    return {"draft": "coordinator", "draft-replan": "coordinator", "check": "coordinator",
+            "verify": "coordinator", "work": "worker", "fix": "worker",
+            "escalate": "review"}.get(match[1], "other") if match else "other"
+
+
 def run_control_command(argv, cwd, env, deadline, log):
     remaining = deadline - time.monotonic()
     require(remaining > 0, "oracle control budget exhausted")
@@ -130,6 +233,7 @@ def report(spec, rows, arms, tasks):
     by_id = {(row["task"], row["repeat"], row["arm"]): row for row in rows}
     pairs = []
     groups = defaultdict(Counter)
+    plan_groups = defaultdict(Counter)
     coverage = {}
     metrics = {}
     stage = spec.get("stage")
@@ -148,18 +252,36 @@ def report(spec, rows, arms, tasks):
                            a["status"] == "pass", b["status"] == "pass"]
         category = tasks[task]["category"]
         groups[category][outcome] += 1
-        pairs.append({"task": task, "repeat": repeat, "outcome": outcome})
+        pair = {"task": task, "repeat": repeat, "outcome": outcome}
+        plans = [row.get("plan_grade") if row else None for row in (a, b)]
+        if "plan_requirements" in tasks[task] or any(grade is not None for grade in plans):
+            plan_outcome = ({"pass pass": "both_pass", "pass fail": "left_only",
+                             "fail pass": "right_only", "fail fail": "both_fail"}
+                            .get(" ".join(grade["status"] if grade else "ungraded" for grade in plans),
+                                 "ungraded"))
+            pair["plan_outcome"] = plan_outcome
+            plan_groups[category][plan_outcome] += 1
+        pairs.append(pair)
     for arm in (left, right):
         runs = [row for row in rows if row["arm"] == arm]
         coverage[arm] = {"mode": arms[arm]["mode"], "model": arms[arm]["model"],
                          "scheduled_tasks": sorted({r["task"] for r in runs}),
                          "statuses": dict(Counter(r["status"] for r in runs))}
         totals = {}
-        for name in ("wall_seconds", "admitted_responses", "dispatched_tools", "reported_tokens"):
-            values = [row.get(name) if name == "wall_seconds" else row.get("usage", {}).get(name)
+        for name in ("wall_seconds", "admitted_responses", "dispatched_tools", "reported_tokens",
+                     "http_attempts", "http_sent", "http_retries", "http_errors",
+                     "provider_seconds", "tool_seconds",
+                     "first_visible_plan_seconds", "plan_seconds", "verifier_seconds"):
+            values = [row.get(name, row.get("usage", {}).get(name))
                       for row in runs]
             present = [value for value in values if value is not None]
             totals[name] = {"sum": round(sum(present), 3) if present else None,
                             "trials_reporting": len(present)}
+            if name in ("reported_tokens", "http_attempts", "http_sent", "http_retries", "http_errors"):
+                solves = coverage[arm]["statuses"].get("pass", 0)
+                totals[name]["per_solved_task"] = (
+                    round(sum(present) / solves, 3) if solves and len(present) == len(runs) else None
+                )
         metrics[arm] = totals
-    return {"by_category": groups, "pairs": pairs, "coverage": coverage, "metrics": metrics}
+    return {"by_category": groups, "plan_by_category": plan_groups,
+            "pairs": pairs, "coverage": coverage, "metrics": metrics}

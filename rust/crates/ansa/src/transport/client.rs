@@ -218,10 +218,16 @@ fn perform_route(
             let mut reply=if h2 {
                 let (mut sender,connection)=hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new()).max_header_list_size(64*1024).handshake(stream).await.map_err(|_|"http_handshake")?;
                 driver=Some(tokio::spawn(async move{let _=connection.await;}));
+                if matches!(policy.admission, StreamAdmission::SiwcResponses(_)) {
+                    crate::benchmark_trace::http_sent();
+                }
                 tokio::select!{reply=sender.send_request(req)=>reply.map_err(|_|"http_transfer")?,_=failed.changed()=>return Err("informational_header_limit")}
             }else{
                 let (mut sender,connection)=hyper::client::conn::http1::Builder::new().max_headers(256).max_buf_size(64*1024).handshake(stream).await.map_err(|_|"http_handshake")?;
                 driver=Some(tokio::spawn(async move{let _=connection.await;}));
+                if matches!(policy.admission, StreamAdmission::SiwcResponses(_)) {
+                    crate::benchmark_trace::http_sent();
+                }
                 tokio::select!{reply=sender.send_request(req)=>reply.map_err(|_|"http_transfer")?,_=failed.changed()=>return Err("informational_header_limit")}
             };
             if !budget.lock().map_err(|_|"http_budget")?.observe(reply.headers(),true){return Err("http_header_limit");}
@@ -508,13 +514,15 @@ pub fn stream(
     sink: &mut dyn FnMut(&[u8]) -> Result<()>,
     stop: &Cancel,
 ) -> Result<()> {
-    perform(
-        &responses_request(value, bearer),
-        stop,
-        Some(sink),
-        StreamAdmission::SiwcResponses(value),
-    )
-    .map(|_| ())
+    crate::benchmark_trace::http(|| {
+        perform(
+            &responses_request(value, bearer),
+            stop,
+            Some(sink),
+            StreamAdmission::SiwcResponses(value),
+        )
+        .map(|_| ())
+    })
 }
 
 #[cfg(test)]

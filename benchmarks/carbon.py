@@ -177,7 +177,8 @@ def install_roles(home, route, account, roles):
 
 
 def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input_commit,
-            fixture_args=None, attachments=()):
+            fixture_args=None, attachments=(), clarification=None, observations=None):
+    observations = observations if observations is not None else {}
     turn_images = prepare_turn_images(root, attachments, turns)
     argv = ["--cwd", str(workspace), "--model", arm["model"]]
     if arm["route"] == "offline":
@@ -283,7 +284,10 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
                 wait(lambda _: screen.vt.line(-4) == "  ›", "chat editor clear")
         else:
             message, = turns
+            requested_at = time.monotonic()
             submit(message)
+
+            previous = None
 
             def drafted(frame):
                 if not proposal(frame):
@@ -291,16 +295,38 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
                 events = parent_events()
                 latest = next((i for i in range(len(events) - 1, -1, -1)
                                if events[i]["kind"] == "accepted" and events[i].get("draft")), None)
-                return completed_turn(events[latest:], lambda _: True) if latest is not None else None
+                if latest is None:
+                    return None
+                return completed_turn(events[latest:], lambda event: event["turn"] != previous)
 
-            _, response = wait(drafted, "plan confirmation")
+            turn, response = wait(drafted, "plan confirmation")
+            observations["first_visible_plan_seconds"] = round(time.monotonic() - requested_at, 3)
             plan = json.loads(response_text(response))
+            if clarification:
+                (root / "plan-before-clarification.json").write_text(json.dumps(plan, ensure_ascii=False))
+                asked = clarification["question"].casefold() in " ".join(
+                    [plan["summary"], *(step["task"] for step in plan["steps"])]).casefold()
+                premature = (any((home / ".ansa/orchestration").glob("**/ledger/event-*.json"))
+                             or bool(git(workspace, "status", "--porcelain", "--untracked-files=all")))
+                observations["clarification_verified"] = asked and not premature
+                if not observations["clarification_verified"]:
+                    raise TrialStopped("failed", "required clarification missing or execution preceded reply")
+                previous = turn["turn"]
+                screen.send(b"\r" if "[Refine]" in visible(screen) else b"\x1b[B\r")
+                wait(lambda frame: ready() and "Enter a clarification for the plan" in frame,
+                     "clarification composer")
+                submit(clarification["answer"])
+                _, response = wait(drafted, "plan after clarification")
+                plan = json.loads(response_text(response))
+            frame = visible(screen)
+            observations["plan_seconds"] = round(time.monotonic() - requested_at, 3)
+            observations["start_available"] = "[Start]" in frame or "[Start read only]" in frame
+            (root / "plan-before-start.json").write_text(json.dumps(plan, ensure_ascii=False))
             if mode == "planner":
                 screen.send(b"\x1b")
                 wait(lambda frame: ready() and not proposal(frame), "dismiss plan")
             else:
-                frame = visible(screen)
-                if "[Start]" not in frame and "[Start read only]" not in frame:
+                if not observations["start_available"]:
                     raise TrialStopped("failed", "Carbon did not admit plan execution")
                 screen.send(b"\r")
 

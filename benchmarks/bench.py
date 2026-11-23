@@ -138,7 +138,8 @@ def load_experiment(path):
     for task in spec["tasks"]:
         check_fields(task, ("id", "turns", "workspace", "verifier", "modes"),
                      ("source", "verifier_inputs", "mcp_config", "git_setup", "attachments",
-                      "category", "family", "split", "oracle_fixture"))
+                      "category", "family", "split", "oracle_fixture", "plan_requirements",
+                      "clarification"))
         key = task["id"]
         require(label(key) and key not in tasks, "invalid or duplicate task")
         require(isinstance(task["turns"], list) and 0 < len(task["turns"]) <= 32,
@@ -151,6 +152,26 @@ def load_experiment(path):
                 and len(set(modes)) == len(modes), "invalid task modes")
         require(len(task["turns"]) == 1 or set(modes) <= {"work", "plan"},
                 "multiple user turns require Work or Plan")
+        if "plan_requirements" in task:
+            requirements = task["plan_requirements"]
+            check_fields(requirements, ("paths",), ("check",))
+            require(isinstance(requirements["paths"], list) and requirements["paths"]
+                    and all(isinstance(path, str) and path and not Path(path).is_absolute()
+                            and all(part not in ("", ".", "..") for part in path.split("/"))
+                            for path in requirements["paths"]), "invalid plan write paths")
+            check = requirements.get("check")
+            require("check" not in requirements or isinstance(check, str)
+                    and 0 < len(check) <= 128 and all(c.isascii() and (c.isalnum() or c in "._-") for c in check),
+                    "invalid expected plan check")
+            require(set(modes) <= {"planner", "orchestrate", "orchestrate+"},
+                    "plan requirements need an orchestration mode")
+        if "clarification" in task:
+            clarification = task["clarification"]
+            check_fields(clarification, ("question", "answer"))
+            require("plan_requirements" in task
+                    and all(isinstance(v, str) and v.strip() and not v.lstrip().startswith("/")
+                            and len(v.encode()) <= 4096 and all(ord(c) >= 32 for c in v)
+                            for v in clarification.values()), "invalid scripted clarification")
         if "source" in task:
             require(isinstance(task["source"], str), "invalid task source")
         task["workspace"] = path_for(task["workspace"])
@@ -285,6 +306,9 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
         return result.stdout.decode()
 
     result = {}
+    trace = root / "timings.jsonl"
+    trace.touch(mode=0o600)
+    env["ANSA_BENCHMARK_TRACE"] = str(trace)
     started = time.monotonic()
     try:
         require(digest(arm["binary"]) == arm["binary_sha256"], "ansa executable changed")
@@ -328,7 +352,8 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
         agent_started = time.monotonic()
         grading_workspace, answer = capture(arm["binary"], root, home, workspace, env, arm,
                                              task["turns"], deadline, git, result["input_commit"],
-                                             fixture_args, attachments=task.get("attachments", ()))
+                                             fixture_args, attachments=task.get("attachments", ()),
+                                             clarification=task.get("clarification"), observations=result)
         if "image_inputs" in answer:
             result["image_inputs"] = answer["image_inputs"]
         result["agent_wall_seconds"] = round(time.monotonic() - agent_started, 3)
@@ -347,6 +372,7 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
         timeout = min(end - time.monotonic(), budget["verifier_seconds"])
         if timeout <= 0:
             raise TrialStopped("infra_error", "no time left for verifier")
+        verifier_started = time.monotonic()
         with (root / "verifier.log").open("wb") as log:
             argv = [str(task["verifier"]), str(grading_workspace), str(root / "answer.json")]
             with subprocess.Popen(argv, cwd=grading_workspace, env=env, stdin=subprocess.DEVNULL,
@@ -361,8 +387,16 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
                     if isinstance(error, KeyboardInterrupt):
                         raise
                     raise TrialStopped("infra_error", "verifier timed out") from error
+        result["verifier_seconds"] = round(time.monotonic() - verifier_started, 3)
+        if "plan_requirements" in task and arm["mode"] != "planner" and exit_code in (0, 1):
+            changed = (git(grading_workspace, "diff", "--no-renames", "--name-only", "-z",
+                           answer["candidate"] + "^!", "--").split("\0") if answer["candidate"] else [])
+            allowed_paths = set(task["plan_requirements"]["paths"])
+            result["unexpected_changed_paths"] = sorted(set(filter(None, changed)) - allowed_paths)
         result.update(status={0: "pass", 1: "fail"}.get(exit_code, "infra_error"),
                       verifier_exit=exit_code)
+        if result.get("unexpected_changed_paths") and exit_code == 0:
+            result["status"] = "fail"
     except TrialStopped as error:
         result.update(status=error.status, reason=str(error))
     except (AssertionError, KeyError, OSError, subprocess.SubprocessError, ValueError) as error:
@@ -372,6 +406,21 @@ def run_trial(root, arm, task, budget, end, fixture_launch=None):
             result["usage"] = usage(journals(home))
         except (AssertionError, KeyError, OSError, ValueError) as error:
             result.update(status="infra_error", evidence_error=str(error))
+    if trace.stat().st_size:
+        try:
+            result.update(comparison.trace_metrics(trace, journals(home)))
+        except (KeyError, OSError, ValueError) as error:
+            result["timing_error"] = str(error)
+            if result["status"] == "pass":
+                result["status"] = "infra_error"
+    if "plan_requirements" in task:
+        plan_file = root / "plan-before-start.json"
+        if plan_file.is_file():
+            result["plan_grade"] = comparison.grade_plan(
+                json.loads(plan_file.read_text()), task["plan_requirements"],
+                result.get("start_available", False))
+        elif result.get("clarification_verified") is False:
+            result["plan_grade"] = {"status": "fail", "criteria": {"clarification": False}}
     result["wall_seconds"] = round(time.monotonic() - started, 3)
     return result
 
@@ -396,11 +445,34 @@ def summarize(rows, arms):
     return counts, pairs
 
 
+def cgroup_sample():
+    relative, = [line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                 if line.startswith("0::")]
+    group = Path("/sys/fs/cgroup") / relative.lstrip("/")
+    require(group.name.startswith("ansa-benchmark-") and group.name.endswith(".scope"),
+            "resource measurement needs a fresh ansa-benchmark-* systemd scope")
+    cpu = {name: int(value) for name, value in
+           (line.split() for line in (group / "cpu.stat").read_text().splitlines())}
+    return cpu["usage_usec"], int((group / "memory.peak").read_text())
+
+
+def evidence_bytes(output):
+    sizes = {}
+    for directory, _, files in os.walk(output):
+        for name in files:
+            meta = (Path(directory) / name).lstat()
+            if stat.S_ISREG(meta.st_mode):
+                sizes[meta.st_dev, meta.st_ino] = meta.st_size
+    return sum(sizes.values())
+
+
 def main(argv=None, fixture_launch=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh evidence directory; omit to print the frozen plan")
     parser.add_argument("--live", action="store_true", help="authorize model requests")
+    parser.add_argument("--measure-cgroup", action="store_true",
+                        help="record process-tree CPU and peak memory in a fresh benchmark scope")
     parser.add_argument("--split", choices=("development", "holdout"), help="strict A/B split (default: development)")
     parser.add_argument("--frozen-plan", type=Path, help="require the exact configuration and input hashes saved in an earlier plan")
     args = parser.parse_args(argv)
@@ -443,6 +515,7 @@ def main(argv=None, fixture_launch=None):
                         and not any(arm["auth_dir"].is_relative_to(task["workspace"]) for task in tasks.values()),
                         "auth_dir must be outside trial workspaces and evidence")
         output.mkdir(mode=0o700)
+        cpu_start = cgroup_sample()[0] if args.measure_cgroup else None
         plan["tasks"] = {key: {field: str(value) if isinstance(value, Path) else value
                               for field, value in task.items()} for key, task in tasks.items()}
         write(output / "plan.json", plan)
@@ -478,7 +551,11 @@ def main(argv=None, fixture_launch=None):
             print(f'{row["id"]} {trial["status"]}', flush=True)
         counts, pairs = summarize(trials, arms)
         report = {"started_at": began, "finished_at": utc(), "summary": counts, "paired": pairs,
-                  "trials": trials}
+                  "trials": trials, "evidence_bytes": evidence_bytes(output)}
+        if cpu_start is not None:
+            cpu_finished, memory_peak = cgroup_sample()
+            report["process_tree"] = {"cpu_seconds": (cpu_finished - cpu_start) / 1e6,
+                                      "peak_memory_bytes": memory_peak}
         invalid_stage = False
         if experiment:
             details = comparison.report(experiment, trials, arms, tasks)
