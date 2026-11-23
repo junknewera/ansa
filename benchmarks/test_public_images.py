@@ -48,8 +48,15 @@ class ImageTaskTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "visual test baseline"):
                     report_score(report, INSTANCE)
                 asset.write_bytes(b"sample")
+                log = root / "test_output.txt"
+                log.write_text("irrelevant test passed")
+                with self.assertRaisesRegex(ValueError, "visual assertion"):
+                    report_score(report, INSTANCE)
+                target = "/base/test/fixtures/core.layouts/long-labels.js"
+                log.write_text(f"    ✓ {target}\n")
                 self.assertEqual(report_score(report, INSTANCE), 0)
                 report.write_text(json.dumps({INSTANCE: {"infra_failure": False, "resolved": False, "tests_status": {}}}))
+                log.write_text(f"    ✗ {target}\n")
                 self.assertEqual(report_score(report, INSTANCE), 1)
                 report.write_text(json.dumps({INSTANCE: {"infra_failure": True, "resolved": False}}))
                 with self.assertRaisesRegex(ValueError, "test results"):

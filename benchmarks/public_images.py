@@ -56,6 +56,23 @@ def chart_workspace(archive, target):
                 raise ValueError("unexpected Chart.js source entry")
 
 
+def configure_chart_evaluation(row):
+    # The pinned image provides Chromium and a Firefox snap launcher without
+    # its snap. The dev row grades exactly one Chrome visual regression.
+    target = "/base/test/fixtures/core.layouts/long-labels.js"
+    if row["FAIL_TO_PASS"] != [f"Chart.layouts auto {target} "] or row["PASS_TO_PASS"]:
+        raise ValueError("unexpected Chart.js grading targets")
+    script = row["eval_script"]
+    command = "--single-run --coverage --grep --auto-watch false"
+    if script.count(command) != 1 or script.count("npm install ;") != 1:
+        raise ValueError("unexpected upstream Karma invocation")
+    script = script.replace(command, "--single-run --coverage --grep core.layouts --browsers chrome --auto-watch false")
+    # Upstream FAIL_ONLY infers a pass from absence. Emit actual spec results
+    # so an unexecuted test or browser failure cannot be graded as a success.
+    row["eval_script"] = script.replace("npm install ;", "sed -i 's/suppressPassed: true/suppressPassed: false/' "
+                                        "./karma.conf.js ; npm install ;")
+
+
 def prepare(task_id, root):
     if task_id not in TASK_IDS:
         raise ValueError(f"unknown image task: {task_id}")
@@ -104,6 +121,7 @@ def prepare(task_id, root):
             row, = parquet.read_table(cache / "dev.parquet", filters=[("instance_id", "=", INSTANCE)]).to_pylist()
             if row["base_commit"] != CHART or row["repo"] != "chartjs/Chart.js":
                 raise ValueError("wrong SWE-bench instance")
+            configure_chart_evaluation(row)
             url, = row["image_assets"]["problem_statement"]
             attachment = operator / "issue.png"
             fetch(url, attachment, MIB, "a58026f2281051f054403ea9ea1c75bf5be9c5ccbffdb1ee002d4c3c55cacdef")

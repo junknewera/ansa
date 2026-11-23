@@ -3,6 +3,7 @@
 import hashlib
 import importlib.metadata
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -70,6 +71,12 @@ def report_score(report_file, instance):
     report = json.loads(report_file.read_bytes())[instance]
     if report["infra_failure"] or "tests_status" not in report:
         raise ValueError("upstream evaluator did not produce test results")
+    log = (report_file.parent / "test_output.txt").read_text(errors="replace")
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", log)
+    target = "/base/test/fixtures/core.layouts/long-labels.js"
+    marker = "✓" if report["resolved"] else "✗"
+    if not any(line.strip() == f"{marker} {target}" for line in plain.splitlines()):
+        raise ValueError("missing actual result of the long-labels visual assertion")
     return 0 if report["resolved"] is True else 1
 
 
