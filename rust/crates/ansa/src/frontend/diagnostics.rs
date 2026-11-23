@@ -191,6 +191,10 @@ pub(crate) fn pause_notice(view: &Snapshot, workspace: bool) -> String {
         return format!("{}: Session storage error", safe_code(&view.diagnostic));
     }
     if view.recovery_operation.is_some() {
+        if workspace && view.state == "paused" {
+            return "Paused · Tool outcome is unknown · /terminals for details · effect_unknown"
+                .into();
+        }
         return "effect_unknown: Tool outcome is unknown".into();
     }
     if view.diagnostic.is_empty() {

@@ -9,7 +9,10 @@ use super::{
     wire,
 };
 use crate::frontend::terminal_pane::EscapeFilter;
-use ansa_linux::{fs, local, managed, process as linux, pty::PtySession};
+use ansa_linux::{
+    fs, local, managed, process as linux,
+    pty::{LaunchError, PtySession},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -577,14 +580,23 @@ fn worker() -> io::Result<()> {
     command
         .args(&launch.argv[1..])
         .env("TERM", "xterm-256color");
-    let mut pty = match PtySession::spawn_in(
+    let mut pty = match PtySession::launch_in(
         command,
         launch.size.rows,
         launch.size.columns,
         Some(&directory),
     ) {
         Ok(pty) => pty,
-        Err(_) => {
+        Err(LaunchError::NotStarted(_)) => {
+            return wire::write(
+                &mut socket,
+                0,
+                Response::Effect {
+                    value: Effect::NotStarted,
+                },
+            );
+        }
+        Err(LaunchError::AfterSpawn(_)) => {
             let _ = wire::write(
                 &mut socket,
                 0,
