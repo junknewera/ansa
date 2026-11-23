@@ -145,6 +145,24 @@ Release - 448 и 9, ASan - 448. Регрессия проверяет поздн
 контрольные решения и строгий парный протокол. На x86-64 Linux проверены
 положительный и отрицательный контроль шести текстовых задач. Carbon передаёт оригинальные изображения в Work и Plan. Общая [проверка восьми задач](../benchmarks/README.md) запускает эталоны и контрпримеры, авторские тесты Chart.js и проверку байтов в тестовом транспорте. Модельный A/B запускает оператор отдельно.
 
+Первый живой прогон на [`0c21ac0`](https://github.com/junknewera/ansa/commit/0c21ac0de41f281110920386c1b9ec2cf803182b)
+прошёл 23 ноября 2026 на X13s с NixOS/aarch64 в debug, Work, SIWC,
+`gpt-6.2-sol`, effort `xhigh`. Выполнено по одной попытке на задачу.
+`fix-git`, InterCode-Bash и HumanEval-Decompile прошли. `mteb-retrieve`
+получил FAIL от авторского теста. Суммарное время работы агента составило
+342,803 с при 59 вызовах инструментов и 274 782 токенах по данным провайдера.
+Отчёт лежит в `~/Workspace/pet/ansa-baselines/live-sol62-xhigh-B0d6GV/report.json`.
+
+Для MTEB повторный расчёт дал строку 14 с исходным запросом и строку 2 с
+поисковой инструкцией BGE. Условие задаёт модель и метрику. Авторское
+решение использует режимы кодирования query и passage из MTEB для SciFact.
+Карточка модели рекомендует инструкцию для коротких поисковых запросов и
+допускает прямое кодирование. Авторский результат пилота остаётся FAIL.
+Если разбор этой задачи повлияет на настройку промпта, для контрольного
+сравнения понадобится другой кейс. [Условие](https://github.com/harbor-framework/terminal-bench-2/blob/2fd12b88aafdd04a52c298e3940bcb189f9766d6/mteb-retrieve/instruction.md),
+[карточка модели](https://huggingface.co/BAAI/bge-small-zh-v1.5/blob/7999e1d3359715c523056ef9478215996d62a620/README.md),
+[авторское решение](https://github.com/harbor-framework/terminal-bench-2/blob/2fd12b88aafdd04a52c298e3940bcb189f9766d6/mteb-retrieve/solution/solve.sh).
+
 На [`65f203d`](https://github.com/junknewera/ansa/commit/65f203dc36b4a848d3aa55eb72b0bf0cd64dd48d)
 внешний стенд запускает Work, Plan, planner, Orchestrate и Orchestrate+ через
 обычный Carbon. Манифест задаёт сборки, модели, effort, роли, инструкции,
