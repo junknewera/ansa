@@ -22,11 +22,20 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 mod agent_transcript;
+mod delegate;
+pub(super) type LiveDelegates = BTreeMap<String, (String, super::carbon::AgentLine)>;
 pub(super) use agent_transcript::AgentTranscript;
 mod role_preferences;
 mod siwc_lane;
 pub(super) use siwc_lane::{Priority, SiwcLane};
 const CONSOLE_ACCOUNT: &str = "ansa-local-console";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildKind {
+    Direct,
+    PlanStep,
+    Conversation,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -62,6 +71,7 @@ pub struct Factory {
     stop: Cancel,
     auth: Option<Arc<AuthManager>>,
     siwc_lane: SiwcLane,
+    pub(super) live_delegates: tokio::sync::watch::Sender<LiveDelegates>,
     editor: Option<(PathBuf, Arc<crate::tools::editor_context::EditorHub>)>,
     carbon_terminal: bool,
     terminal_owners: Arc<Mutex<BTreeMap<String, terminals::Owner>>>,
@@ -94,6 +104,7 @@ impl Factory {
             stop: Cancel::default(),
             auth,
             siwc_lane: SiwcLane::default(),
+            live_delegates: tokio::sync::watch::channel(BTreeMap::new()).0,
             editor: None,
             carbon_terminal: false,
             terminal_owners: Arc::default(),
@@ -793,7 +804,7 @@ impl Factory {
             source,
             dependencies,
             decisions,
-            false,
+            ChildKind::PlanStep,
             stop,
         )
     }
@@ -814,7 +825,7 @@ impl Factory {
             source,
             dependencies,
             &[],
-            true,
+            ChildKind::Conversation,
             stop,
         )
     }
@@ -828,12 +839,13 @@ impl Factory {
         source: &Request,
         dependencies: Option<&Json>,
         decisions: &[crate::provider::structured::ChildResult],
-        conversation: bool,
+        kind: ChildKind,
         stop: &Cancel,
     ) -> Result<Created> {
         self.orchestration_route()?;
         self.check_orchestration_context(source)?;
         let (generate, options) = self.orchestration_runtime(source, stop)?;
+        let conversation = kind == ChildKind::Conversation;
         let mut settings = self.settings.clone();
         settings.cwd = workspace.to_owned();
         settings.model.clone_from(&source.binding.requested_model);
@@ -887,6 +899,13 @@ impl Factory {
         if assignment.access == crate::orchestration::plan::Access::Read
             && assignment.paths.is_empty()
             && workspace == self.settings.cwd
+            && (kind != ChildKind::Direct
+                || source.tools.descriptors.iter().any(|tool| {
+                    matches!(
+                        tool.name.as_str(),
+                        "run_command" | "terminal_create" | "git_snapshot"
+                    )
+                }))
         {
             epoch.exact_state = epoch
                 .exact_state
@@ -1327,6 +1346,9 @@ impl Factory {
             (generate, options)
         };
         options.directory = Some(selected.directory.clone());
+        if matches!(kind, Kind::Main | Kind::Fork) {
+            self.enable_delegation(&mut options, &selected.id);
+        }
         options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&self.settings));
         options.fork_seed = seed;
         if kind == Kind::Main {

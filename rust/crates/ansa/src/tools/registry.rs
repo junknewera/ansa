@@ -226,6 +226,33 @@ impl Registry {
     }
 }
 impl Snapshot {
+    pub(crate) fn for_lead(&self, invoke: ContextExecutor) -> Result<Arc<Self>, &'static str> {
+        let advertisement = super::delegation::advertise(&self.advertisement)?;
+        let base = self.advertisement.clone();
+        let mut definitions = self.definitions.clone();
+        definitions.push(Definition {
+            descriptor: advertisement
+                .descriptors
+                .last()
+                .expect("added delegate")
+                .clone(),
+            validator: Arc::new(move |args| super::delegation::assignment(args, &base).is_ok()),
+            executor: Arc::new(|_| Outcome::not_started()),
+        });
+        let mut policies = self.policies.clone();
+        policies.push(Policy {
+            invoke: Some(invoke),
+            requires_journal: true,
+            ..Policy::default()
+        });
+        Ok(Arc::new(Self {
+            advertisement,
+            definitions,
+            policies,
+            owner: self.owner.clone(),
+        }))
+    }
+
     /// Retain the exact compiled subset and order of a saved advertisement.
     /// Saved descriptions never supply executable definitions or policies.
     /// Recomputing the revision also checks the saved durable-intent policy.
@@ -381,6 +408,34 @@ mod tests {
                 .unwrap();
         }
         registry.snapshot()
+    }
+    #[test]
+    fn delegate_admission_respects_parent_tools_and_relative_scope() {
+        let read = ["list_directory", "read_file", "search_files"];
+        for writable in [false, true] {
+            let mut names = read.to_vec();
+            if writable {
+                names.push("edit_file");
+            }
+            let tools = registered(&names)
+                .for_lead(Arc::new(|_, _| panic!("admission dispatched a helper")))
+                .unwrap();
+            let valid = &tools
+                .definition(super::super::delegation::NAME)
+                .unwrap()
+                .validator;
+            for (paths, allowed) in [
+                ("[]", true),
+                (r#"["src/lib.rs"]"#, writable),
+                (r#"["../outside"]"#, false),
+                (r#"["/tmp/write"]"#, false),
+                (r#"[".git/config"]"#, false),
+            ] {
+                let args =
+                    Json::parse(&format!(r#"{{"task":"Read or edit","paths":{paths}}}"#)).unwrap();
+                assert_eq!(valid(&args), allowed, "{paths}");
+            }
+        }
     }
     #[test]
     fn compatible_subset_uses_compiled_executors_and_exact_saved_order_and_policies() {

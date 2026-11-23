@@ -116,14 +116,17 @@ Path(answer).write_text(json.dumps({"answers": ["42" if expected == "pass" else 
         same = {"model": "fixture", "effort": "xhigh"}
         a, b = spec["arms"]
         b.pop("guidance")
-        a.update(same, mode="orchestrate")
-        b.update(same, mode="orchestrate+", roles={k: same.copy() for k in ("strong", "medium", "weak")})
-        for task in spec["tasks"]:
-            task["modes"] = ["orchestrate", "orchestrate+"]
-        self.assertEqual(len(bench.load(self.manifest(spec))[3]), 4)
-        b["roles"]["weak"]["effort"] = "high"
-        with self.assertRaisesRegex(ValueError, "roles must match"):
-            bench.load(self.manifest(spec))
+        for mode in ("orchestrate", "propose"):
+            with self.subTest(mode=mode):
+                a.update(same, mode=mode)
+                b.update(same, mode=mode + "+",
+                         roles={k: same.copy() for k in ("strong", "medium", "weak")})
+                for task in spec["tasks"]:
+                    task["modes"] = [mode, mode + "+"]
+                self.assertEqual(len(bench.load(self.manifest(spec))[3]), 4)
+                b["roles"]["weak"]["effort"] = "high"
+                with self.assertRaisesRegex(ValueError, "roles must match"):
+                    bench.load(self.manifest(spec))
 
     def test_trace_counts_failed_connect_and_retry_separately_from_sent(self):
         path = self.root / "trace.jsonl"

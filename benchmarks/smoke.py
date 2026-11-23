@@ -12,7 +12,7 @@ from carbon_workspace_pty import seed_siwc
 
 
 def plus_transport(root, home, arm):
-    if arm["mode"] != "orchestrate+":
+    if arm["mode"] != "propose+":
         return None
     marker = root / "fixture-owner"
     marker.write_bytes(b"ansa-m4-synthetic-v1\n")
@@ -53,6 +53,8 @@ elif len(answer["answers"]) == 2:
     assert file.read_text() == "before fixture\\n"
 elif answer["answers"] == ["PLUS_CARBON_DONE"]:
     assert file.read_text() == "after fixture reviewed\\n"
+elif answer["answers"] == ["DIRECT_LEAD_BLOCKED: A person needs to be present."]:
+    assert file.read_text() == "before fixture\\n"
 else:
     assert len(answer["answers"]) == 1 and file.read_text() == "after fixture\\n"
 """)
@@ -62,15 +64,22 @@ else:
     roles = {"strong": {"model": "gpt-6.2-sol", "effort": "high"},
              "medium": {"model": "gpt-6.1-sol", "effort": "medium"},
              "weak": {"model": "gpt-6.1-luna", "effort": "low"}}
+    offline_roles = {role: {"model": baseline["model"], "effort": None} for role in roles}
     arms = [baseline | {"id": "basic", "mode": "work", "guidance": "guidance.md"},
             baseline | {"id": "plan", "mode": "plan", "model": "gpt-6.1-luna"},
             baseline | {"id": "planner", "mode": "planner"},
             baseline | {"id": "orch", "mode": "orchestrate"},
-            baseline | {"id": "plus", "mode": "orchestrate+", "roles": roles,
+            baseline | {"id": "plus", "mode": "orchestrate+", "roles": offline_roles},
+            baseline | {"id": "proposal", "mode": "propose"},
+            baseline | {"id": "proposal-plus", "mode": "propose+", "roles": roles,
                         "model": "gpt-6.2-sol", "effort": "high",
                         "binary": str(args.frontend_adapter.resolve())}]
-    tasks = [{"id": "patch", "modes": ["work", "planner", "orchestrate", "orchestrate+"],
+    tasks = [{"id": "patch", "modes": ["work", "planner", "propose", "propose+"],
               "turns": ["ORCHESTRATION_COMMAND_FIXTURE"]},
+             {"id": "delegation", "modes": ["orchestrate", "orchestrate+"],
+              "turns": ["ORCHESTRATION_DIRECT_FIXTURE"]},
+             {"id": "blocked", "modes": ["orchestrate", "orchestrate+"],
+              "turns": ["ORCHESTRATION_DIRECT_BLOCKED_FIXTURE"]},
              {"id": "dialogue", "modes": ["plan"], "turns": ["Read the value", "Read again"]}]
     spec = {"version": 1, "seed": "carbon-smoke", "repetitions": 1, "arms": arms,
             "budget": {"trial_seconds": 30, "verifier_seconds": 3, "total_seconds": 120,
@@ -83,14 +92,26 @@ else:
     run = output / "runs"
     assert benchmark([str(manifest), "--output", str(run)], fixture_launch=plus_transport) == 0
     report = json.loads((run / "report.json").read_text())
-    trials = {trial["arm"]: trial for trial in report["trials"]}
+    trials = {(trial["task"], trial["arm"]): trial for trial in report["trials"]}
     assert all(trial["status"] == "pass" for trial in trials.values()), report
-    assert all(trials[arm]["candidate"] for arm in ("orch", "plus"))
-    assert not trials["planner"]["candidate"]
-    assert trials["plan"]["usage"]["observed_generations"] == [
+    assert all(trials["patch", arm]["candidate"] for arm in ("proposal", "proposal-plus"))
+    assert trials["patch", "planner"]["candidate"] is None
+    for task, response, tool_count in (
+        ("delegation", "DIRECT_LEAD_COMPLETED", 2),
+        ("blocked", "DIRECT_LEAD_BLOCKED: A person needs to be present.", 1),
+    ):
+        for arm in ("orch", "plus"):
+            trial = trials[task, arm]
+            answer = json.loads((run / trial["id"] / "answer.json").read_text())
+            assert answer == {"answers": [response], "plan": None, "candidate": None}
+            assert len(trial["usage"]["sessions"]) == 2
+            assert trial["usage"]["dispatched_tools"] == tool_count
+    assert trials["dialogue", "plan"]["usage"]["observed_generations"] == [
         {"requested": "gpt-6.1-luna", "returned": "gpt-6.1-luna", "effort": None}]
-    assert {row["requested"] for row in trials["plus"]["usage"]["observed_generations"]} == {
+    assert {row["requested"] for row in trials["patch", "proposal-plus"]["usage"]["observed_generations"]} == {
         choice["model"] for choice in roles.values()}
+    assert trials["delegation", "plus"]["usage"]["observed_generations"] == [
+        {"requested": baseline["model"], "returned": baseline["model"], "effort": None}]
 
 
 if __name__ == "__main__":

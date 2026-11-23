@@ -107,6 +107,8 @@ pub(crate) struct Owner {
     turn_stop: Cancel,
     storing: Option<PendingStore>,
     provider: Option<Identity>,
+    side_reply: Option<CommandId>,
+    side_cursor: usize,
     tool: Option<(Identity, ToolTask)>,
     auth: Option<(Identity, AuthTask, bool)>,
     release_sent: bool,
@@ -189,6 +191,8 @@ impl Owner {
             turn_stop: Cancel::default(),
             storing: None,
             provider: None,
+            side_reply: None,
+            side_cursor: 0,
             tool: None,
             auth: None,
             release_sent: false,
@@ -600,7 +604,7 @@ impl Owner {
         );
     }
 
-    fn reject_plan(&mut self, command: &RuntimeCommand, code: &str) {
+    fn reject_pending_submit(&mut self, command: &RuntimeCommand, code: &str) {
         // This Submit was queued but never reached the durable admission.
         self.receipts.remove(&command.command.0);
         self.reject(command, code);
@@ -807,7 +811,25 @@ impl Owner {
     }
     fn prepare(&mut self, workers: &Workers) -> Result<()> {
         let current = self.state.turn.as_ref().ok_or("runtime_turn")?;
-        let selected = if current.next.tools.revision == self.plan_tools.advertisement().revision {
+        let selected = if current.receipt.mode.leads() {
+            let delegate = self
+                .options
+                .delegate
+                .clone()
+                .ok_or("delegation_unavailable")?;
+            let source = &current.next;
+            let request = Request::new(
+                source.binding.clone(),
+                source.epoch.clone(),
+                source.tools.clone(),
+                vec![],
+            )?
+            .with_effort(source.effort.clone())?;
+            let roles = current.receipt.lead_profile.clone();
+            self.tools.for_lead(Arc::new(move |invocation, stop| {
+                delegate(&request, roles.as_ref(), &invocation.arguments, stop)
+            }))?
+        } else if current.next.tools.revision == self.plan_tools.advertisement().revision {
             self.plan_tools.clone()
         } else {
             self.tools.clone()
@@ -981,6 +1003,12 @@ impl Owner {
                 {
                     return Ok(PostStatus::StaleTarget);
                 }
+                if self.state.turn.as_ref().is_some_and(|turn| {
+                    turn.receipt.mode.leads()
+                        && (self.cancelling.is_some() || turn.stage == "cancelled")
+                }) {
+                    return Ok(PostStatus::StaleTarget);
+                }
                 if self.storage_failed {
                     return Err("journal_read_only");
                 }
@@ -1111,11 +1139,13 @@ impl Owner {
             }
             CommandPayload::Submit(submitted)
             | CommandPayload::SubmitImages(submitted, _)
+            | CommandPayload::SubmitWithRoles(submitted, _, _)
             | CommandPayload::Handoff(submitted)
             | CommandPayload::DraftPlan(submitted, _) => {
                 let internal = matches!(command.payload, CommandPayload::Handoff(_));
                 let image_sha256 = match &command.payload {
-                    CommandPayload::SubmitImages(_, images) => images
+                    CommandPayload::SubmitImages(_, images)
+                    | CommandPayload::SubmitWithRoles(_, images, _) => images
                         .iter()
                         .map(|image| image.sha256().to_owned())
                         .collect(),
@@ -1123,6 +1153,10 @@ impl Owner {
                 };
                 let draft = match &command.payload {
                     CommandPayload::DraftPlan(_, draft) => Some(draft.as_ref()),
+                    _ => None,
+                };
+                let lead_profile = match &command.payload {
+                    CommandPayload::SubmitWithRoles(_, _, roles) => Some(roles.as_ref()),
                     _ => None,
                 };
                 if self
@@ -1149,6 +1183,7 @@ impl Owner {
                         || receipt.mode != submitted.mode
                         || receipt.internal != internal
                         || receipt.draft.as_ref() != draft
+                        || receipt.lead_profile.as_ref() != lead_profile
                     {
                         return Ok(PostStatus::CommandConflict);
                     }
@@ -1195,6 +1230,7 @@ impl Owner {
                         mode: submitted.mode,
                         internal,
                         draft: draft.cloned(),
+                        lead_profile: lead_profile.cloned(),
                     },
                 );
                 self.queued.push_back(command.clone());
@@ -1272,6 +1308,12 @@ impl Owner {
         Ok(PostStatus::Accepted)
     }
     fn submit(&mut self, workers: &Workers, command: RuntimeCommand) -> Result<()> {
+        if matches!(&command.payload, CommandPayload::Submit(s) | CommandPayload::SubmitImages(s, _) | CommandPayload::SubmitWithRoles(s, _, _) if s.mode.leads())
+            && (self.options.delegate.is_none() || self.options.directory.is_none())
+        {
+            self.reject_pending_submit(&command, "delegation_unavailable");
+            return Ok(());
+        }
         if self.recovery.is_some() || self.storage_failed {
             self.reject(
                 &command,
@@ -1286,20 +1328,23 @@ impl Owner {
         if matches!(&command.payload, CommandPayload::Submit(submitted) | CommandPayload::SubmitImages(submitted, _) | CommandPayload::Handoff(submitted) if submitted.mode == AgentMode::Plan)
             && !self.tools.plan_ready()
         {
-            self.reject_plan(&command, "terminal_workspace_busy");
+            self.reject_pending_submit(&command, "terminal_workspace_busy");
             return Ok(());
         }
         if matches!(&command.payload, CommandPayload::DraftPlan(_, draft)
             if !draft.accepts_generation(&self.state.generation))
+            || matches!(&command.payload, CommandPayload::SubmitWithRoles(_, _, roles)
+                if roles.strong != self.state.generation)
         {
-            self.reject(&command, "orchestration_generation_changed");
+            self.reject_pending_submit(&command, "orchestration_generation_changed");
             return Ok(());
         }
         let (submitted, internal, images) = match command.payload {
             CommandPayload::Submit(submitted) | CommandPayload::DraftPlan(submitted, _) => {
                 (submitted, false, Vec::new())
             }
-            CommandPayload::SubmitImages(submitted, images) => (submitted, false, images),
+            CommandPayload::SubmitImages(submitted, images)
+            | CommandPayload::SubmitWithRoles(submitted, images, _) => (submitted, false, images),
             CommandPayload::Handoff(submitted) => (submitted, true, Vec::new()),
             _ => return Err("submit_contract"),
         };
@@ -1412,6 +1457,15 @@ impl Owner {
                 if submitted.mode == AgentMode::OrchestrationChat {
                     fields.push(("orchestration_chat", Json::parse("true")?));
                 }
+                if submitted.mode.leads() {
+                    fields.push(("orchestration_lead", Json::parse("true")?));
+                    if submitted.mode == AgentMode::LeadPlus {
+                        fields.push(("orchestration_plus", Json::parse("true")?));
+                        if let Some(roles) = &receipt.lead_profile {
+                            fields.push(("orchestration_roles", roles.encode()?));
+                        }
+                    }
+                }
                 if let Some(draft) = receipt.draft {
                     fields.push(("draft", draft.save()?));
                 }
@@ -1435,8 +1489,30 @@ impl Owner {
             }
             return Ok(());
         }
+        let cancelling_lead = self.cancelling.is_some()
+            && self
+                .state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.receipt.mode.leads());
+        if cancelling_lead && let Some(command) = self.new_followups.pop_front() {
+            // Cancel has already closed the dispatch gate. Finish admitting
+            // previously reserved questions so the cancel record covers them.
+            return self.queue_followup(workers, command);
+        }
         if self.cancelling.is_some() && self.state.turn.is_some() {
-            return self.record(workers, Kind::Cancel, "cancel", vec![]);
+            let mut fields = vec![];
+            if cancelling_lead {
+                let ids = self
+                    .state
+                    .pending_followups()
+                    .map(|m| Json::string(&m.command.0))
+                    .collect::<Result<Vec<_>>>()?;
+                if !ids.is_empty() {
+                    fields.push(("dismissed", Json::array(ids)?));
+                }
+            }
+            return self.record(workers, Kind::Cancel, "cancel", fields);
         }
         if let Some(outcome) = self.pending_outcome.take() {
             let known = outcome.clone();
@@ -1471,19 +1547,7 @@ impl Owner {
         if !self.starting
             && let Some(command) = self.new_followups.pop_front()
         {
-            let CommandPayload::Steer(message) = command.payload else {
-                return Err("steer_contract");
-            };
-            return self.record(
-                workers,
-                Kind::Queued,
-                "queued",
-                vec![
-                    ("command", Json::string(&command.command.0)?),
-                    ("target", Json::string(&message.target.0)?),
-                    ("text", Json::string(&message.text)?),
-                ],
-            );
+            return self.queue_followup(workers, command);
         }
         if self.starting {
             if !self.recovery_attempted {
@@ -1555,6 +1619,23 @@ impl Owner {
             self.auth = Some((identity, AuthTask::SelectGeneration, false));
             self.selecting = Some(command);
             return Ok(());
+        }
+        // The helper is already inside its executor, so the parent provider is
+        // free. Its tool-free reply can use the same worker and cancel gate.
+        if self.can_act()
+            && self.provider.is_none()
+            && self.auth.is_none()
+            && self.tool.as_ref().is_some_and(|(_, task)| *task == ToolTask::Execute)
+            && self.state.turn.as_ref().is_some_and(|turn| turn.receipt.mode.leads()
+                && turn.intent.as_ref().is_some_and(|intent| intent.name == crate::tools::delegation::NAME
+                    && self.activity.iter().any(|item| matches!(item, Activity::Started(started) if started.operation.0 == intent.operation))))
+            && let Some((index, message)) = self.state.followups.iter().enumerate().skip(self.side_cursor)
+                .find(|(_, m)| m.state == "queued")
+        {
+            let command = message.command.clone();
+            self.side_cursor = index + 1;
+            self.side_reply = Some(command.clone());
+            return self.provider(workers, ProviderTask::SideReply(command));
         }
         if self.busy() {
             return Ok(());
@@ -1674,7 +1755,21 @@ impl Owner {
             "tools" => {
                 if current.intent.is_some() {
                     if self.permit.is_some() {
-                        return self.authorize(workers, AuthTask::ToolLease);
+                        // A nested runtime acquires its own account lease for each operation.
+                        // Holding the parent's lease while waiting on it would deadlock SIWC.
+                        let nested = current.receipt.mode.leads()
+                            && current
+                                .intent
+                                .as_ref()
+                                .is_some_and(|i| i.name == crate::tools::delegation::NAME);
+                        return self.authorize(
+                            workers,
+                            if nested {
+                                AuthTask::ChildDispatch
+                            } else {
+                                AuthTask::ToolLease
+                            },
+                        );
                     }
                     return Ok(());
                 }
@@ -1725,6 +1820,21 @@ impl Owner {
             _ => Ok(()),
         }
     }
+    fn queue_followup(&mut self, workers: &Workers, command: RuntimeCommand) -> Result<()> {
+        let CommandPayload::Steer(message) = command.payload else {
+            return Err("steer_contract");
+        };
+        self.record(
+            workers,
+            Kind::Queued,
+            "queued",
+            vec![
+                ("command", Json::string(&command.command.0)?),
+                ("target", Json::string(&message.target.0)?),
+                ("text", Json::string(&message.text)?),
+            ],
+        )
+    }
     fn stored(&mut self, done: Stored) -> Result<()> {
         let Some(pending) = self.storing.as_ref() else {
             return Ok(());
@@ -1734,6 +1844,10 @@ impl Owner {
         }
         let pending = self.storing.take().expect("matched store job");
         if done.rejected_frame {
+            if done.kind == Kind::SideReply {
+                // The question is already queued for the normal follow-up.
+                return Ok(());
+            }
             if done.kind != Kind::Accepted {
                 if self.cancelling.is_none() {
                     self.pause("request_frame_limit");
@@ -1787,6 +1901,7 @@ impl Owner {
         }
         self.pending_receipt = None;
         match done.kind {
+            Kind::SideReply => self.snapshot(None),
             Kind::Queued => {
                 let command: CommandId = receipt.event().text_field("command")?.into();
                 self.control_commands.remove(&command.0);
@@ -2001,10 +2116,12 @@ impl Owner {
                             self.plan_workspace = Some(lease);
                             self.submit(workers, command)?;
                         } else {
-                            self.reject_plan(&command, "terminal_workspace_busy");
+                            self.reject_pending_submit(&command, "terminal_workspace_busy");
                         }
                     }
-                    (PlanTarget::Submit(command), Err(code)) => self.reject_plan(&command, code),
+                    (PlanTarget::Submit(command), Err(code)) => {
+                        self.reject_pending_submit(&command, code)
+                    }
                     (PlanTarget::Resume(command), Ok(lease))
                         if self.phase == "paused"
                             && self.recovery.is_none()
@@ -2036,8 +2153,32 @@ impl Owner {
                     return Ok(());
                 }
                 self.provider = None;
+                let side = self.side_reply.take();
                 if !self.can_act() {
                     self.snapshot(None);
+                    return Ok(());
+                }
+                if let Some(command) = side {
+                    // If generation failed, the ordinary queued question still
+                    // reaches the parent as soon as the tool outcome is known.
+                    if let Ok(ProviderValue::Response(response)) = result {
+                        let turn = self.turn();
+                        return self.persist(
+                            workers,
+                            Kind::SideReply,
+                            Box::new(move |_| {
+                                transition(
+                                    &turn,
+                                    "side_reply",
+                                    vec![
+                                        ("command", Json::string(&command.0)?),
+                                        ("response", save_response(&response)?),
+                                    ],
+                                )
+                            }),
+                            None,
+                        );
+                    }
                     return Ok(());
                 }
                 match result {
@@ -2211,7 +2352,7 @@ impl Owner {
                 }
                 match result {
                     Err(code) => {
-                        if task == AuthTask::ToolLease
+                        if matches!(task, AuthTask::ToolLease | AuthTask::ChildDispatch)
                             && let Some(intent) =
                                 self.state.turn.as_ref().and_then(|t| t.intent.as_ref())
                         {
@@ -2245,7 +2386,7 @@ impl Owner {
                                 vec![("invocation", invocation.save()?)],
                             )?;
                         }
-                        AuthTask::ToolLease => {
+                        AuthTask::ToolLease | AuthTask::ChildDispatch => {
                             if stop.cancelled() || self.state.pending_followups().next().is_some() {
                                 let intent = self
                                     .state

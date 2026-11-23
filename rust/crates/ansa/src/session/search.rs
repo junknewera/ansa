@@ -169,6 +169,15 @@ fn scan(
                 .as_ref()
                 .and_then(|turn| turn.intent.as_ref())
                 .map(|intent| intent.name.clone());
+            let unanswered = if kind == "steered" {
+                state
+                    .pending_followups()
+                    .filter(|m| m.state == "queued")
+                    .map(|m| m.text.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            };
             state.apply(event)?;
             let Some(turn) = &state.turn else {
                 return Ok(());
@@ -185,16 +194,20 @@ fn scan(
             };
             match kind {
                 "accepted" => add("User", &turn.receipt.text),
+                "side_reply" => {
+                    let id = event.text_field("command")?;
+                    let message = state
+                        .followups
+                        .iter()
+                        .find(|m| m.command.0 == id)
+                        .ok_or("session_side_reply")?;
+                    add("User", &message.text);
+                    let response = codec_v1::load_response(event.field("response")?)?;
+                    add("Assistant", &codec_v1::response_text(&response)?);
+                }
                 "steered" => {
-                    for message in event.field("commands")?.elements()? {
-                        let command = message.text()?;
-                        if let Some(delivered) = state
-                            .followups
-                            .iter()
-                            .find(|followup| followup.command.0 == command)
-                        {
-                            add("User", &delivered.text);
-                        }
+                    for text in unanswered {
+                        add("User", &text);
                     }
                 }
                 "done" => {

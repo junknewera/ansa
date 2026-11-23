@@ -60,6 +60,7 @@ impl Default for Limits {
 }
 #[derive(Clone)]
 pub struct Options {
+    pub delegate: Option<crate::tools::delegation::Delegate>,
     pub fork_seed: Option<crate::session::state::ForkSeed>,
     pub check_request: CheckRequest,
     pub select_generation: SelectGeneration,
@@ -80,6 +81,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            delegate: None,
             fork_seed: None,
             check_request: Arc::new(|_, _, _| Ok(())),
             select_generation: Arc::new(|_, _| Err("generation_selection_unavailable")),

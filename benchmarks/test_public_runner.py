@@ -80,7 +80,7 @@ class PublicInputs(unittest.TestCase):
         f = self.root / "plot.png"
         f.write_bytes(b"PNG")
         self.task["attachments"] = [{"turn": 0, "path": str(f)}]
-        self.task["modes"] = ["work", "plan", "planner"]
+        self.task["modes"] = ["work", "plan", "planner", "orchestrate"]
         self.spec["arms"].extend([
             self.arm | {"id": "legacy", "route": "siwc", "auth_dir": "inputs"},
             self.arm | {"id": "siwc", "route": "siwc", "auth_dir": "inputs", "image_input": True},
@@ -92,8 +92,9 @@ class PublicInputs(unittest.TestCase):
                         "mode": "orchestrate", "image_input": True}])
         self.freeze()
         rows = {row["arm"]: row for row in load(self.manifest)[3]}
-        self.assertEqual({name for name, row in rows.items() if "unsupported" not in row}, {"siwc", "plan"})
-        self.assertIn("this task", rows["orch"]["unsupported"])
+        self.assertEqual({name for name, row in rows.items() if "unsupported" not in row},
+                         {"siwc", "plan", "orch"})
+        self.assertIn("proposal workflow", rows["planner"]["unsupported"])
         self.assertEqual(rows["plan"]["route"], "openrouter")
         self.assertEqual(rows["legacy"]["model"], "fixture")
         self.spec["arms"][1]["image_input"] = 1

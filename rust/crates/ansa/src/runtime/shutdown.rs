@@ -120,6 +120,7 @@ impl Handle {
             | CommandPayload::GetContext => &self.transcript,
             CommandPayload::Submit(_)
             | CommandPayload::SubmitImages(_, _)
+            | CommandPayload::SubmitWithRoles(..)
             | CommandPayload::Handoff(_)
             | CommandPayload::DraftPlan(_, _)
             | CommandPayload::Steer(_)

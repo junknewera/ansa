@@ -58,7 +58,9 @@ fn command(c: &RuntimeCommand) -> Result<Json> {
     ];
     match &c.payload {
         CommandPayload::SubmitImages(_, _) => return Err("image_submit_unavailable_in_jsonl"),
-        CommandPayload::Handoff(_) | CommandPayload::DraftPlan(_, _) => {
+        CommandPayload::Handoff(_)
+        | CommandPayload::DraftPlan(_, _)
+        | CommandPayload::SubmitWithRoles(..) => {
             return Err("internal_command");
         }
         CommandPayload::Submit(v) => f.extend([

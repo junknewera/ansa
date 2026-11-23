@@ -209,12 +209,18 @@ pub(crate) fn export(path: &Path, compiled: &Snapshot, fixture: &Snapshot) -> Re
                         Json::string(&sha256(turn.receipt.text.as_bytes()))?,
                     ));
                 }
-                "response" => {
-                    let response = current
-                        .turn
-                        .as_ref()
-                        .and_then(|turn| turn.response.as_ref())
-                        .ok_or("session_response_stage")?;
+                "response" | "side_reply" => {
+                    let side;
+                    let response = if kind == "side_reply" {
+                        side = super::codec_v1::load_response(event.field("response")?)?;
+                        &side
+                    } else {
+                        current
+                            .turn
+                            .as_ref()
+                            .and_then(|turn| turn.response.as_deref())
+                            .ok_or("session_response_stage")?
+                    };
                     fields.push(("request_manifest", identity(response.request())?));
                     fields.push(("response_id", Json::string(response.id())?));
                     fields.push(("requested_tool_calls", num(response.calls().len())?));

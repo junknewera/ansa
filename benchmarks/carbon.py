@@ -14,7 +14,11 @@ from carbon_workspace_pty import Pty, Terminal, visible
 from parity import session_cases
 
 MODES = {"work": "Work", "plan": "Plan", "planner": "Orchestrate",
-         "orchestrate": "Orchestrate", "orchestrate+": "Orchestrate+"}
+         "orchestrate": "Orchestrate", "orchestrate+": "Orchestrate+",
+         "propose": "Orchestrate", "propose+": "Orchestrate+"}
+DIRECT_MODES = ("orchestrate", "orchestrate+")
+PROPOSAL_MODES = ("planner", "propose", "propose+")
+PLUS_MODES = ("orchestrate+", "propose+")
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_JOURNAL = 64 * 1024 * 1024
@@ -240,7 +244,7 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
         binding = rows[0]["configuration"]["binding"]
         if binding["requested_model"] != model:
             raise ValueError("unexpected initial model")
-        if mode == "orchestrate+":
+        if mode in PLUS_MODES:
             route = arm["route"] if fixture_args is None else "siwc"
             install_roles(home, route, binding["account"], arm["roles"])
         if arm["effort"] is not None:
@@ -249,17 +253,20 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
                  and event.get("model") == model and event.get("effort") == arm["effort"]
                  for event in parent_events()), "reasoning effort selection")
 
-        target = ("Work", "Plan", "Orchestrate", "Orchestrate+").index(MODES[mode])
-        for label in ("Plan", "Orchestrate", "Orchestrate+")[:target]:
-            screen.send(b"\t")
-            wait(lambda frame: ready() and selected(frame, label), "mode selection")
+        if mode not in PROPOSAL_MODES:
+            target = ("Work", "Plan", "Orchestrate", "Orchestrate+").index(MODES[mode])
+            for label in ("Plan", "Orchestrate", "Orchestrate+")[:target]:
+                screen.send(b"\t")
+                wait(lambda frame: ready() and selected(frame, label), "mode selection")
+        if mode == "orchestrate+":
+            model = arm["roles"]["strong"]["model"]
 
         answers = []
         image_inputs = []
         plan = None
         candidate = None
         result_workspace = workspace
-        if mode in ("work", "plan"):
+        if mode not in PROPOSAL_MODES:
             for index, (message, images) in enumerate(zip(turns, turn_images)):
                 for count, image in enumerate(images, 1):
                     submit("/attach " + str(image["path"]))
@@ -279,7 +286,10 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
                 turn, response = wait(lambda _: completed_turn(
                     parent_events()[before:], lambda event: event["text"] == message),
                     "completing turn")
-                if turn["mode"] != ("basic" if mode == "work" else "plan") or turn.get("draft"):
+                if (turn["mode"] != ("plan" if mode == "plan" else "basic")
+                        or turn.get("draft")
+                        or turn.get("orchestration_lead", False) != (mode in DIRECT_MODES)
+                        or turn.get("orchestration_plus", False) != (mode == "orchestrate+")):
                     raise ValueError("unexpected native turn mode")
                 if attachments:
                     verify_turn_images(images, message, turn, response)
@@ -293,7 +303,8 @@ def capture(binary, root, home, workspace, env, arm, turns, deadline, git, input
         else:
             message, = turns
             requested_at = time.monotonic()
-            submit(message)
+            command = "/propose+" if mode == "propose+" else "/propose"
+            submit(f"{command} {message}")
 
             previous = None
 

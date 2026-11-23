@@ -1,4 +1,4 @@
-"""Prepare the development and holdout inputs for the matched-model mode comparison."""
+"""Compare explicit proposals from /propose and /propose+ on matched models."""
 import argparse
 from pathlib import Path
 import sys
@@ -6,7 +6,7 @@ import sys
 from bench import load, write
 from public_terminal import prepare as public_task
 
-MODES = ["orchestrate", "orchestrate+"]
+MODES = ["propose", "propose+"]
 MODEL = {"model": "gpt-6.2-sol", "effort": "xhigh"}
 
 
@@ -103,8 +103,8 @@ def main():
         tasks.append(task)
     common = MODEL | {"binary": str(args.binary.resolve(strict=True)), "route": "siwc",
                       "auth_dir": str(args.auth_dir.resolve(strict=True))}
-    arms = [common | {"id": "orch", "mode": "orchestrate"},
-            common | {"id": "plus", "mode": "orchestrate+",
+    arms = [common | {"id": "orch", "mode": "propose"},
+            common | {"id": "plus", "mode": "propose+",
                       "roles": {role: MODEL for role in ("strong", "medium", "weak")}}]
     manifest = root / "manifest.json"
     spec = {"version": 1, "seed": "matched-orchestration-v1", "repetitions": 1,

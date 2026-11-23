@@ -133,10 +133,13 @@ def local(screen, command):
     screen.send(command.rstrip() + "\r")
 
 
-def approve_helpers(screen, prompt):
+def approve_helpers(screen, prompt, *, refinement=False):
     until(screen, lambda frame: ready(screen) and "Ctrl+C stop" not in screen.vt.line(-2),
           "current turn settled before proposing helpers")
-    screen.send(prompt + "\r")
+    if refinement:
+        screen.send(prompt + "\r")
+    else:
+        local(screen, "/propose " + prompt)
     until(screen, lambda frame: "Start" in frame and "Refine" in frame and "Cancel" in frame,
           "interactive orchestration approval")
     screen.send(b"\r")
@@ -1034,12 +1037,13 @@ def completion_and_help(screen, root, cwd):
     screen.send(b"\x05\x15")
     screen.send("?")
     until(screen, lambda frame: "ANSA commands" in frame, "empty composer question mark opens help")
+    paint_quiet(screen)
     command_rows = [match for row in range(screen.vt.rows)
-                    if (match := re.match(r"^\s*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
+                    if (match := re.match(r"^[\s─]*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
                 "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
-                "/orchestrate", "/orchestrate+", "/terminals", "/accept", "/clarify", "/attach"}
+                "/orchestrate", "/orchestrate+", "/propose", "/propose+", "/terminals", "/accept", "/clarify", "/attach"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"
@@ -1206,16 +1210,16 @@ def plan_agent_inherits(screen, root, cwd):
     local(screen, "/plan")
     until(screen, lambda frame: "Plan" in screen.vt.line(-2), "parent entered plan")
     before = records(root)
-    screen.send("Запусти субагента: подготовка\r")
+    local(screen, "/propose Запусти субагента: подготовка")
     until(screen, lambda frame: "Refine" in frame, "cancel preview")
     escape(screen)
     screen.send(b"\t")
     until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "third Tab mode")
-    screen.send("ORCHESTRATION_MANUAL_CHECKS_FIXTURE\r")
+    local(screen, "/propose ORCHESTRATION_MANUAL_CHECKS_FIXTURE")
     until(screen, lambda frame: "Manual checks are due after" in frame and "[Start]" in frame,
           "manual checks allow Start while still disclosing the later acceptance")
     escape(screen)
-    screen.send("ORCHESTRATION_LONG_PLAN_FIXTURE\r")
+    local(screen, "/propose ORCHESTRATION_LONG_PLAN_FIXTURE")
     until(screen, lambda frame: "Проверить перенос длинного плана" in frame, "long proposal")
     assert "VISIBLE_END_OF_STEP" not in visible(screen)
     screen.send(b"\x1b[6~")
@@ -1256,13 +1260,13 @@ def session_agent_titles_restart(screen, root, cwd):
           and "Ctrl+C stop" not in screen.vt.line(-2), "parent turn settled and title committed")
     screen.send(b"\t\t")
     until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "third Tab mode")
-    screen.send("Почему отчёт иногда пустой?\r")
+    local(screen, "/propose Почему отчёт иногда пустой?")
     until(screen, lambda frame: "Refine" in frame, "plan from a vague request")
     before_refine = journals(root)
     screen.send(b"\x1b[B\r")
     until(screen, lambda frame: "Enter a clarification" in frame, "refinement returned to composer")
     assert journals(root) == before_refine, "refinement launched a helper"
-    approve_helpers(screen, "Проверить формат входных данных")
+    approve_helpers(screen, "Проверить формат входных данных", refinement=True)
     open_helper(screen)
     escape(screen)
     until(screen, lambda frame: "PARENT_TITLE" in screen.vt.line(1) and not helper_title(screen.vt.line(1)), "agent returned to root conversation")
@@ -1322,6 +1326,61 @@ def session_agent_titles_restart(screen, root, cwd):
     return "normal"
 
 
+def orchestration_direct(screen, root, cwd):
+    message = "ORCHESTRATION_DIRECT_FIXTURE"
+    title = "Direct fixture report edit"
+    report = cwd / "report.txt"
+    report.write_text("before fixture\n")
+    local(screen, "/agents")
+    until(screen, lambda _: agents_open(screen), "Agents panel opened")
+    local(screen, "/orchestrate " + message)
+    until(screen, lambda frame: title in frame and "Running" in frame,
+          "delegate progresses in the Agents panel")
+    question = "DIRECT_SIDE_QUESTION"
+    answer = "DIRECT_SIDE_ANSWER"
+    screen.send(question + "\r")
+    until(screen, lambda frame: answer in frame and "Running" in frame,
+          "the lead answers a question while the same helper is running")
+    until(screen, lambda frame: completed(root, message) and "DIRECT_LEAD_COMPLETED" in frame,
+          "the lead continues from the helper result")
+    until(screen, lambda frame: title in frame and "· Done" in frame and "Running" not in frame,
+          "the Agents panel shows the archived helper as done")
+    frame = visible(screen)
+    assert "[Start]" not in frame and "Refine" not in frame
+    assert report.read_text() == "after fixture\n"
+    assert not (root / "home/.ansa/orchestration").exists()
+    rows = records(root)
+    accepted, = [row for row in rows if row["kind"] == "accepted" and row["text"] == message]
+    assert accepted["mode"] == "basic" and accepted["orchestration_lead"] and not accepted.get("draft")
+    intent, = [row["invocation"] for row in rows if row["kind"] == "intent"
+               and row["invocation"]["name"] == "delegate_task"]
+    outcome_index, outcome = next((index, row["result"]) for index, row in enumerate(rows)
+                                  if row["kind"] == "outcome"
+                                  and row["result"]["operation"] == intent["operation"])
+    assert outcome["dispatched"] and json.loads(outcome["output"])["status"] == "completed"
+
+    def assistant_text(items):
+        return [part["text"] for item in items if item.get("role") == "assistant"
+                for part in item["content"] if part["type"] == "output_text"]
+
+    side, = [(index, row) for index, row in enumerate(rows) if row["kind"] == "side_reply"]
+    steered, = [(index, row) for index, row in enumerate(rows) if row["kind"] == "steered"]
+    assert side[0] < outcome_index < steered[0]
+    assert assistant_text(side[1]["response"]["items"]) == [answer]
+    native = steered[1]["next"]["input"]
+    assert sum(item.get("role") == "user" and item.get("content") == question for item in native) == 1
+    assert assistant_text(native).count(answer) == 1
+    assert len(list((root / "home/.ansa/sessions").iterdir())) == 2
+    paint_quiet(screen)
+    row = next(row for row in range(screen.vt.rows) if title in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index(title), row)
+    until(screen, lambda frame: "Agent transcript" in frame and "Синтетический результат" in frame,
+          "archived helper opens the same transcript")
+    escape(screen)
+    local(screen, "/exit")
+    return "normal"
+
+
 def orchestration_candidate(screen, root, cwd):
     def git(*args, path=cwd):
         return subprocess.check_output(["git", *args], cwd=path, text=True)
@@ -1340,7 +1399,7 @@ def orchestration_candidate(screen, root, cwd):
     before = git("status", "--short")
     screen.send(b"\t\t")
     until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "writer plan mode")
-    screen.send("ORCHESTRATION_COMMAND_FIXTURE\r")
+    local(screen, "/propose ORCHESTRATION_COMMAND_FIXTURE")
     until(screen, lambda frame: "Independent review" in frame or "independent review" in frame,
           "plan discloses verification and fixes")
     assert not (home := root / "home/.ansa/orchestration").exists()
@@ -1450,7 +1509,7 @@ def orchestration_candidate(screen, root, cwd):
         close_activity(restarted)
     until(restarted, lambda _: "Tab mode" in restarted.vt.line(-2)
           and "Ctrl+C stop" not in restarted.vt.line(-2), "composer ready for a manual-check plan")
-    local(restarted, "/orchestrate ORCHESTRATION_MANUAL_CHECKS_FIXTURE")
+    local(restarted, "/propose ORCHESTRATION_MANUAL_CHECKS_FIXTURE")
     until(restarted, lambda frame: "[Start]" in frame and "Manual checks are due after" in frame,
           "the manual-check plan is actionable")
     restarted.send(b"\r")
@@ -1520,7 +1579,7 @@ def orchestration_review_resume(screen, root, cwd, more_segments=False):
     previous_status = git("status", "--short")
     screen.send(b"\t\t")
     until(screen, lambda _: "Orchestrate" in screen.vt.line(-2), "ordinary orchestration mode")
-    screen.send("ORCHESTRATION_REVIEW_RESUME_FIXTURE\r")
+    local(screen, "/propose ORCHESTRATION_REVIEW_RESUME_FIXTURE")
     until(screen, lambda frame: "./check.sh" in frame and "Verify review-resume fixture" in frame,
           "review and command require approval")
     assert not check_marker.exists()
@@ -1612,7 +1671,7 @@ def openrouter_orchestration(screen, root, cwd):
     held_child.touch()
     held_summary.touch()
     prompt = "summarize fixture " + ("details " * 70) + "END_OF_USER_REQUEST"
-    screen.send(prompt + "\r")
+    local(screen, "/propose " + prompt)
     until(screen, lambda frame: "OPENROUTER_CARBON_PLAN" in frame and "Start" in frame, "validated strict plan")
     assert not (root / "home/.ansa/orchestration").exists()
     assert "Follow-up recommendation" in visible(screen)
@@ -1708,7 +1767,7 @@ def siwc_orchestrate_plus(screen, root, cwd):
           and "Ctrl+C stop" not in screen.vt.line(-2),
           "previous Work turn from a different model settled")
     prompt = "Exercise quick, fresh, and final review decisions"
-    screen.send("/orchestrate+ " + prompt + "\r")
+    screen.send("/propose+ " + prompt + "\r")
     until(screen, lambda frame: all(label in frame for label in ("PLUS_CARBON_PLAN", "Start", "Refine", "Cancel")),
           "approval shows plan and role models")
     frame = visible(screen)
@@ -1944,7 +2003,7 @@ def siwc_orchestrate_plus_budget(screen, root, cwd):
     subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost",
                     "commit", "-qm", "fixture"], cwd=cwd, check=True)
     configure_plus_roles(screen)
-    screen.send("/orchestrate+ Read and update report.txt\r")
+    local(screen, "/propose+ Read and update report.txt")
     until(screen, lambda frame: "Budget regression" in frame and "Start" in frame, "approved budget test plan")
     screen.send(b"\r")
     until(screen, lambda frame: "BUDGET_WORK_COMPLETE" in frame, "automatic worker continuation", timeout=35)
@@ -1965,7 +2024,7 @@ def siwc_orchestrate_plus_budget(screen, root, cwd):
 
 def siwc_orchestrate_plus_plan_only(screen, root, cwd):
     configure_plus_roles(screen)
-    screen.send("/orchestrate+ PLUS_PLAN_ONLY\r")
+    local(screen, "/propose+ PLUS_PLAN_ONLY")
     until(screen, lambda frame: "Put a sock on the table" in body(screen)
           and "Ctrl+C stop" not in screen.vt.line(-2), "plan-only goes straight to the conversation")
     assert "[Start]" not in visible(screen) and "Refine" not in visible(screen)
@@ -1993,7 +2052,7 @@ def siwc_orchestrate_plus_blocked(screen, root, cwd, reject=False):
     configure_plus_roles(screen)
     screen.send(b"\t\t\t")
     until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2), "orchestration mode")
-    screen.send(b"Inspect Git status with the approved read scope\r")
+    local(screen, "/propose+ Inspect Git status with the approved read scope")
     until(screen, lambda frame: "PLUS_BLOCKED_PLAN" in frame and "Start" in frame,
           "read-only plan approval")
     screen.send(b"\r")
@@ -2077,11 +2136,9 @@ def siwc_orchestrate_plus_implement(screen, root, cwd):
     check = cwd / "check.sh"
     check.write_text(f'#!/bin/sh\nset -eu\ngrep -q "^after fixture" report.txt\ntouch "{marker}"\n')
     check.chmod(0o700)
-    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "SIWC adapter starts Carbon")
-    local(screen, "/plan")
-    until(screen, lambda _: "Plan" in screen.vt.line(-2), "start from read-only planning mode")
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "SIWC adapter starts in Work")
     prompt = "Change report.txt to after fixture and run the test\nInspect /files"
-    screen.send("/orchestrate+ " + prompt + "\r")
+    screen.send("/propose+ " + prompt + "\r")
     until(screen, lambda frame: "Save role models" in frame, "first use asks for role models")
     assert not any(row["kind"] == "accepted" for row in records(root))
     screen.send(b"\r")
@@ -2114,6 +2171,23 @@ def siwc_orchestrate_plus_implement(screen, root, cwd):
     return "normal"
 
 
+def siwc_orchestration_direct(screen, root, cwd):
+    prompt = "DIRECT_SIWC_FIXTURE"
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "synthetic SIWC conversation is ready")
+    local(screen, "/orchestrate " + prompt)
+    until(screen, lambda frame: completed(root, prompt) and "DIRECT_SIWC_DONE" in frame,
+          "SIWC receives a tool call, a structured child outcome, and a normal lead response")
+    assert "[Start]" not in visible(screen)
+    rows = records(root)
+    accepted, = [row for row in rows if row["kind"] == "accepted" and row["text"] == prompt]
+    assert accepted["mode"] == "basic" and accepted["orchestration_lead"] and not accepted.get("draft")
+    assert len(list((root / "home/.ansa/sessions").iterdir())) == 2
+    assert sorted(row["invocation"]["name"] for row in rows if row["kind"] == "intent") == [
+        "delegate_task", "list_directory"]
+    local(screen, "/exit")
+    return "normal"
+
+
 def siwc_orchestration(screen, root, cwd):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "GPT ready without a network call")
     screen.send(b"\t\t")
@@ -2128,11 +2202,11 @@ def siwc_orchestration(screen, root, cwd):
                 for row in rows
             )
 
-        screen.send(prompt + "\r")
+        local(screen, "/propose " + prompt)
         until(screen, lambda frame: paused_draft()
               and "ChatGPT did not confirm the strict plan format" in frame
               and "Drafting a plan" not in frame
-              and screen.vt.line(-4) == "  › " + prompt, "unconfirmed response rejected and draft restored")
+              and screen.vt.line(-4) == "  › /propose " + prompt, "unconfirmed response rejected and draft restored")
         assert not (root / "home/.ansa/orchestration").exists()
         draft = [row for row in records(root) if row["kind"] == "accepted" and row["text"] == prompt][-1]
         until(screen, lambda _: [line.strip() for line in body(screen).splitlines()].count("> " + prompt) == 1,
@@ -2152,13 +2226,13 @@ def siwc_orchestration(screen, root, cwd):
         until(screen, lambda _: "cancelled" in screen.vt.line(-2)
               and any(row["kind"] == "cancel" and row["turn"] == draft["turn"]
                       for row in records(root)), "cancel paused unconfirmed draft")
-    screen.send(b"UNNAMED_READ_SCOPE\r")
+    local(screen, "/propose UNNAMED_READ_SCOPE")
     until(screen, lambda frame: "Name the read folder in your request" in frame
-          and screen.vt.line(-4) == "  › UNNAMED_READ_SCOPE", "the model cannot select an unrelated folder")
+          and screen.vt.line(-4) == "  › /propose UNNAMED_READ_SCOPE", "the model cannot select an unrelated folder")
     assert completed(root, "UNNAMED_READ_SCOPE"), "strict response is retained as an unapproved draft"
     screen.send(b"\x03")
     until(screen, lambda _: screen.vt.line(-4) == "  ›", "clear the unnamed folder request")
-    screen.send(b"/orchestrate Inspect Workspace/pet\r")
+    local(screen, "/propose Inspect Workspace/pet")
     until(screen, lambda frame: "Read folder" in frame and "SIWC_CARBON_PLAN" in frame and "Start" in frame,
           "the read folder and plan are visible before approval")
     selected = str(root / "home/Workspace/pet")
@@ -2180,20 +2254,20 @@ def siwc_orchestration(screen, root, cwd):
     paint_quiet(screen)
 
     timed_out = "SYNTHETIC_PLAN_TIMEOUT"
-    screen.send(timed_out + "\r")
+    local(screen, "/propose " + timed_out)
     until(screen, lambda frame: "Plan paused" in body(screen) and "http_timeout" in frame
-          and screen.vt.line(-4) == "  › " + timed_out, "a transport timeout is visible next to the request")
+          and screen.vt.line(-4) == "  › /propose " + timed_out, "a transport timeout is visible next to the request")
     timeout_turn, = (row["turn"] for row in records(root)
                      if row["kind"] == "accepted" and row["text"] == timed_out)
     assert [(row["kind"], row.get("diagnostic")) for row in records(root)
             if row.get("turn") == timeout_turn] == [("accepted", None), ("pause", "http_timeout")]
     screen.send(b"\x13\x03")
     until(screen, lambda _: screen.vt.line(-4) == "  ›", "Ctrl+S cannot freeze the paused composer")
-    screen.send(b"AFTER_TIMEOUT\t")
-    until(screen, lambda _: "Orchestrate+" in screen.vt.line(-2)
-          and screen.vt.line(-4) == "  › AFTER_TIMEOUT", "Tab after a timeout preserves typed text")
+    screen.send(b"/propose AFTER_TIMEOUT\t")
+    until(screen, lambda _: screen.vt.line(-2).strip().startswith("Plan ·")
+          and screen.vt.line(-4) == "  › /propose AFTER_TIMEOUT", "Tab after a timeout preserves typed text")
     screen.send(b"\r")
-    until(screen, lambda _: screen.vt.line(-4) == "  › AFTER_TIMEOUT"
+    until(screen, lambda _: screen.vt.line(-4) == "  › /propose AFTER_TIMEOUT"
           and "Plan paused" in body(screen), "Enter preserves a new draft while the prior plan can resume")
     assert not any(row.get("text") == "AFTER_TIMEOUT" for row in records(root))
     screen.send(b"\x03")
@@ -2214,14 +2288,14 @@ def siwc_orchestration(screen, root, cwd):
 
     with (root / "home/.ansa/auth/lock").open("rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        screen.send(b"Cancel this draft\r")
+        local(screen, "/propose Cancel this draft")
         until(screen, lambda _: "Drafting a plan" in screen.vt.line(-1),
               "plan waits in the footer for the shared account lock")
         until(screen, lambda _: "Drafting a plan" in body(screen) and screen.vt.line(-4) == "  ›",
               "planning status is also visible below the request")
         screen.send(b"\x03")
         until(screen, lambda frame: "Drafting a plan" not in frame
-              and screen.vt.line(-4) == "  › Cancel this draft", "cancel keeps the pending draft")
+              and screen.vt.line(-4) == "  › /propose Cancel this draft", "cancel keeps the pending draft")
         def cancelled_draft():
             rows = records(root)
             request = next((row["turn"] for row in rows if row["kind"] == "accepted"
@@ -2305,7 +2379,7 @@ def active_plan_clarification(screen, root, cwd):
     (cwd / "second.txt").write_text("second\n")
     screen.send(b"\t\t")
     until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "orchestration mode")
-    screen.send("ORCHESTRATION_CLARIFICATION_FIXTURE\r")
+    local(screen, "/propose ORCHESTRATION_CLARIFICATION_FIXTURE")
     until(screen, lambda frame: "Start" in frame and "Refine" in frame, "clarification plan")
     screen.send(b"\r")
     ledgers = root / "home/.ansa/orchestration"
@@ -2348,6 +2422,7 @@ def main():
              ("matugen-palette", matugen_palette),
              ("plan-agent-inherits", plan_agent_inherits),
              ("session-agent-titles-restart", session_agent_titles_restart),
+             ("orchestration-direct", orchestration_direct),
              ("orchestration-candidate", orchestration_candidate),
              ("orchestration-review-resume", orchestration_review_resume),
              ("orchestration-review-resume-multiple", lambda *a: orchestration_review_resume(*a, True)),
@@ -2362,13 +2437,14 @@ def main():
              ("editor-missing", editor_missing), ("normal-exit", normal_exit),
              ("openrouter-orchestration", openrouter_orchestration),
              ("siwc-orchestration", siwc_orchestration),
+             ("siwc-orchestration-direct", siwc_orchestration_direct),
              ("siwc-orchestrate-plus", siwc_orchestrate_plus),
              ("siwc-orchestrate-plus-budget", siwc_orchestrate_plus_budget),
              ("siwc-orchestrate-plus-implement", siwc_orchestrate_plus_implement),
              ("siwc-orchestrate-plus-plan-only", siwc_orchestrate_plus_plan_only),
              ("siwc-orchestrate-plus-blocked", siwc_orchestrate_plus_blocked),
              ("siwc-orchestrate-plus-blocked-rejected", lambda *args: siwc_orchestrate_plus_blocked(*args, reject=True))]
-    transport_cases = {"openrouter-orchestration", "siwc-orchestration",
+    transport_cases = {"openrouter-orchestration", "siwc-orchestration", "siwc-orchestration-direct",
                        *(name for name, _ in cases if name.startswith("siwc-orchestrate-plus"))}
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)

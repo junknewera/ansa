@@ -2,6 +2,7 @@ pub mod admission;
 mod analysis;
 pub mod artifacts;
 pub mod command;
+pub(crate) mod delegation;
 mod edit;
 pub mod editor_context;
 pub mod evidence;

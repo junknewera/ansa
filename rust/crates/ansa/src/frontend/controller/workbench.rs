@@ -1006,6 +1006,7 @@ struct Workbench {
     orchestration_handoffs: BTreeMap<String, String>,
     orchestration_summary: BTreeMap<String, CommandId>,
     orchestration_mode: Option<OrchestrationMode>,
+    live_delegates: tokio::sync::watch::Receiver<crate::frontend::sessions::LiveDelegates>,
     refinement: Option<(String, bool, Option<String>)>,
     plan_after_roles: Option<(String, Option<String>, bool)>,
     menu: Option<Menu>,
@@ -1101,6 +1102,7 @@ impl Workbench {
         let factory = factory.with_stop(stop.clone());
         let (sender, events) = mpsc::channel(64);
         let mut value = Self {
+            live_delegates: factory.live_delegates.subscribe(),
             factory,
             files,
             theme_store,
@@ -1579,14 +1581,15 @@ impl Workbench {
         let Some(Panel::AgentTranscript(reader)) = &self.panel else {
             return;
         };
-        let live = self
-            .orchestration_views
-            .get(&reader.parent)
-            .is_some_and(|view| {
-                view.agents
-                    .iter()
-                    .any(|(id, agent)| id == &reader.id && agent.state == "Running")
-            })
+        let live = self.live_delegates.borrow().contains_key(&reader.id)
+            || self
+                .orchestration_views
+                .get(&reader.parent)
+                .is_some_and(|view| {
+                    view.agents
+                        .iter()
+                        .any(|(id, agent)| id == &reader.id && agent.state == "Running")
+                })
             || self
                 .slots
                 .iter()
@@ -2220,41 +2223,21 @@ impl Workbench {
             self.report(io, "Mode can change after the current request finishes");
             return;
         }
-        if slot.state.mode == AgentMode::Plan
-            && (slot.state.image_loading || !slot.state.images.is_empty())
-            && self.factory.orchestration_route().is_ok()
-        {
-            self.report(
-                io,
-                "Send or clear attached images before switching to Orchestrate",
-            );
-            return;
-        }
+        self.orchestration_mode = None;
         self.refinement = None;
-        (self.orchestration_mode, slot.state.mode) =
-            match (self.orchestration_mode, slot.state.mode) {
-                (Some(OrchestrationMode::Standard), _) => {
-                    (Some(OrchestrationMode::Plus), AgentMode::Basic)
-                }
-                (Some(OrchestrationMode::Plus), _) => (None, AgentMode::Basic),
-                (None, AgentMode::Plan) if self.factory.orchestration_route().is_ok() => {
-                    (Some(OrchestrationMode::Standard), AgentMode::Basic)
-                }
-                (None, AgentMode::Plan) => (None, AgentMode::Basic),
-                (None, AgentMode::Basic | AgentMode::OrchestrationChat) => (None, AgentMode::Plan),
-            };
+        slot.state.mode = match slot.state.mode {
+            AgentMode::Basic | AgentMode::OrchestrationChat => AgentMode::Plan,
+            AgentMode::Plan if self.factory.orchestration_route().is_ok() => AgentMode::Lead,
+            AgentMode::Lead => AgentMode::LeadPlus,
+            AgentMode::Plan | AgentMode::LeadPlus => AgentMode::Basic,
+        };
         slot.state.mode_ready = true;
-        self.factory
-            .set_editor_mode(if self.orchestration_mode.is_some() {
-                AgentMode::Plan
-            } else {
-                slot.state.mode
-            });
-        let mode = match self.orchestration_mode {
-            Some(OrchestrationMode::Standard) => "Orchestrate",
-            Some(OrchestrationMode::Plus) => "Orchestrate+",
-            None if slot.state.mode == AgentMode::Plan => "Planning",
-            None => "Work",
+        self.factory.set_editor_mode(slot.state.mode);
+        let mode = match slot.state.mode {
+            AgentMode::Lead => "Orchestrate",
+            AgentMode::LeadPlus => "Orchestrate+",
+            AgentMode::Plan => "Planning",
+            _ => "Work",
         };
         self.report(io, mode);
     }
@@ -2762,6 +2745,28 @@ impl Workbench {
         });
     }
 
+    fn lead_message(&mut self, text: &str, mode: AgentMode, io: &Io) -> (bool, bool) {
+        let slot = &mut self.slots[self.current];
+        if mode == AgentMode::LeadPlus && slot.state.available() {
+            match self.factory.role_profile() {
+                Ok(profile) => slot.state.lead_profile = profile,
+                Err(code) => {
+                    self.report(io, code);
+                    return (false, false);
+                }
+            }
+        }
+        if slot.title.is_none() {
+            slot.title = Some(display_title(text));
+        }
+        let previous = std::mem::replace(&mut slot.state.mode, mode);
+        let result = slot
+            .state
+            .message(text, &slot.handle, io, &mut slot.replies);
+        slot.state.mode = previous;
+        result
+    }
+
     fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
         if !text.trim_start().starts_with('/')
             && !text.trim().is_empty()
@@ -2780,6 +2785,18 @@ impl Workbench {
                 "The coordinator is writing the summary · your draft is still here",
             );
             return (false, false);
+        }
+        let mode = self.slots[self.current].state.mode;
+        if !text.trim_start().starts_with('/')
+            && !text.trim().is_empty()
+            && self.refinement.is_none()
+            && self.orchestration_mode.is_none()
+            && (mode.leads()
+                || mode == AgentMode::Basic
+                    && commands::agent_task(text).is_some()
+                    && matches!(self.slots[self.current].kind, Kind::Main | Kind::Fork))
+        {
+            return self.lead_message(text, if mode.leads() { mode } else { AgentMode::Lead }, io);
         }
         let delegation = commands::skill_request(text).map(|(name, _)| name.to_owned());
         if !text.trim().is_empty()
@@ -2801,7 +2818,7 @@ impl Workbench {
         let argument = raw_argument.trim();
         match commands::canonical(command) {
             "/attach" => (self.attach(argument, io), false),
-            "/orchestrate" | "/orchestrate+"
+            "/propose" | "/propose+"
                 if self.slots[self.current].state.image_loading
                     || !self.slots[self.current].state.images.is_empty() =>
             {
@@ -2974,7 +2991,7 @@ impl Workbench {
                 }
             }
             "/orchestrate+" if argument.is_empty() => (self.open_role_picker(io), false),
-            "/orchestrate" | "/orchestrate+" => {
+            "/orchestrate" | "/orchestrate+" | "/propose" | "/propose+" => {
                 if self.factory.orchestration_route().is_err()
                     || !matches!(self.slots[self.current].kind, Kind::Main | Kind::Fork)
                 {
@@ -2985,17 +3002,37 @@ impl Workbench {
                     self.report(io, "Wait for the current task to finish");
                     return (false, false);
                 }
-                self.orchestration_mode = Some(if command == "/orchestrate+" {
+                self.refinement = None;
+                if command.starts_with("/orchestrate") {
+                    let mode = if command == "/orchestrate+" {
+                        AgentMode::LeadPlus
+                    } else {
+                        AgentMode::Lead
+                    };
+                    self.orchestration_mode = None;
+                    let slot = &mut self.slots[self.current];
+                    slot.state.mode = mode;
+                    slot.state.mode_ready = true;
+                    self.factory.set_editor_mode(mode);
+                    if !argument.is_empty() {
+                        return self.lead_message(raw_argument.trim_start(), mode, io);
+                    }
+                    self.report(io, "Orchestrate");
+                    return (true, false);
+                }
+                self.orchestration_mode = Some(if command == "/propose+" {
                     OrchestrationMode::Plus
                 } else {
                     OrchestrationMode::Standard
                 });
                 self.refinement = None;
-                self.slots[self.current].state.mode = AgentMode::Basic;
+                if self.slots[self.current].state.mode != AgentMode::Plan {
+                    self.slots[self.current].state.mode = AgentMode::Basic;
+                }
                 self.slots[self.current].state.mode_ready = true;
                 self.factory.set_editor_mode(AgentMode::Plan);
                 if argument.is_empty() {
-                    self.report(io, "Enter the task for Orchestrate");
+                    self.report(io, "Enter the task to propose");
                     (true, false)
                 } else {
                     (
@@ -5895,6 +5932,8 @@ impl Workbench {
             activity: match self.orchestration_mode {
                 Some(OrchestrationMode::Standard) => "Orchestrate".into(),
                 Some(OrchestrationMode::Plus) => "Orchestrate+".into(),
+                None if slot.state.mode == AgentMode::Lead => "Orchestrate".into(),
+                None if slot.state.mode == AgentMode::LeadPlus => "Orchestrate+".into(),
                 None => String::new(),
             },
             exit_confirmation: self.exit_deadline.is_some(),
@@ -6449,6 +6488,13 @@ pub async fn run_attached(
             }
             let now = Instant::now();
             dirty |= work.update_orchestration_progress();
+            if work.live_delegates.has_changed().unwrap_or(false) {
+                work.live_delegates.borrow_and_update();
+                if matches!(work.panel, Some(Panel::Activity(_) | Panel::AgentTranscript(_))) {
+                    work.refresh_agent_summaries();
+                }
+                dirty = true;
+            }
             dirty |= work.tick_drag(io, now);
             work.refresh_terminal_screen(now);
             work.refresh_agent_reader();

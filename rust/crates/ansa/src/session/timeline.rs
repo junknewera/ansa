@@ -373,6 +373,19 @@ impl Timeline {
                     event.text_field("text")?.into(),
                 );
             }
+            "side_reply" => {
+                let question = self
+                    .pending
+                    .remove(event.text_field("command")?)
+                    .ok_or("session_side_reply")?;
+                self.append("user", question, "delivered");
+                let response = codec_v1::load_response(event.field("response")?)?;
+                self.append(
+                    "assistant",
+                    codec_v1::response_text(&response)?,
+                    "delivered",
+                );
+            }
             kind @ ("steered" | "steer_rejected") => {
                 for command in event.field("commands")?.elements()? {
                     if let Some(text) = self.pending.remove(command.text()?) {
@@ -576,7 +589,16 @@ impl Timeline {
                 };
                 self.append("assistant", text, state);
             }
-            "cancel" => self.append("notice", "Current step stopped".into(), "cancelled"),
+            "cancel" => {
+                if event.has("dismissed") {
+                    for command in event.field("dismissed")?.elements()? {
+                        if let Some(text) = self.pending.remove(command.text()?) {
+                            self.append("user", text, "cancelled");
+                        }
+                    }
+                }
+                self.append("notice", "Current step stopped".into(), "cancelled");
+            }
             _ => {}
         }
         Ok(())

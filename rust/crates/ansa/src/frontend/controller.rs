@@ -12,6 +12,7 @@ use super::{
     terminal::{Drain, Io},
 };
 use crate::{
+    orchestration::profile::RoleProfile,
     provider::contracts::ImageInput,
     runtime::{Handle, PostStatus, Runtime},
     session::transcript,
@@ -50,6 +51,7 @@ pub struct State {
     pub query: GetTranscript,
     pub editor: Editor,
     pub mode: AgentMode,
+    lead_profile: Option<RoleProfile>,
     pub expanded: bool,
     pub scroll: usize,
     pub scroll_limit: usize,
@@ -99,6 +101,7 @@ impl State {
             },
             editor: Editor::default(),
             mode: AgentMode::Basic,
+            lead_profile: None,
             expanded: true,
             scroll: 0,
             scroll_limit: 0,
@@ -242,6 +245,7 @@ impl State {
             command.payload,
             CommandPayload::Submit(_)
                 | CommandPayload::SubmitImages(_, _)
+                | CommandPayload::SubmitWithRoles(..)
                 | CommandPayload::Handoff(_)
                 | CommandPayload::DraftPlan(_, _)
         );
@@ -249,6 +253,7 @@ impl State {
             command.payload,
             CommandPayload::Submit(_)
                 | CommandPayload::SubmitImages(_, _)
+                | CommandPayload::SubmitWithRoles(..)
                 | CommandPayload::Handoff(_)
                 | CommandPayload::DraftPlan(_, _)
                 | CommandPayload::Steer(_)
@@ -260,6 +265,20 @@ impl State {
             self.progress
                 .resume_sent(command.command.clone(), target.clone(), Instant::now());
         }
+        let selection = match &command.payload {
+            CommandPayload::SubmitWithRoles(_, _, profile)
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|s| s.generation != profile.strong) =>
+            {
+                Some(self.command(
+                    handle,
+                    CommandPayload::SetGeneration(profile.strong.clone()),
+                ))
+            }
+            _ => None,
+        };
         let h = handle.clone();
         replies.spawn(async move {
             // These read kinds share one capacity-one runtime mailbox. Hold
@@ -270,6 +289,12 @@ impl State {
                 None
             };
             let id = command.command.clone();
+            if let Some(selection) = selection {
+                match h.post(selection).await {
+                    Ok(PostStatus::Accepted | PostStatus::Duplicate) => {}
+                    result => return (id, submit, internal_read, result),
+                }
+            }
             (id, submit, internal_read, h.post(command).await)
         });
         true
@@ -520,14 +545,24 @@ impl State {
             "" => return (true, false),
             _ => {}
         }
+        self.message(text, handle, io, replies)
+    }
+
+    fn message(
+        &mut self,
+        text: &str,
+        handle: &Handle,
+        io: &Io,
+        replies: &mut Replies,
+    ) -> (bool, bool) {
         if let Some(view) = self.snapshot.as_ref().filter(|v| v.state == "paused") {
             let message = format!("ansa: {}\n", diagnostics::pause(view));
             if io.raw.is_none() {
                 self.report(io, &message);
+                self.exit = 1;
             } else {
                 self.status.clear();
             }
-            self.exit = 1;
             return (false, false);
         }
         if self.image_loading || self.image_submission.is_some() {
@@ -588,10 +623,14 @@ impl State {
             text: text.into(),
             mode,
         };
-        let payload = if self.images.is_empty() {
+        let payload = if mode == AgentMode::LeadPlus
+            && let Some(profile) = self.lead_profile.take()
+        {
+            CommandPayload::SubmitWithRoles(submit, self.images.clone(), Box::new(profile))
+        } else if self.images.is_empty() {
             CommandPayload::Submit(submit)
         } else {
-            if !matches!(mode, AgentMode::Basic | AgentMode::Plan) {
+            if mode == AgentMode::OrchestrationChat {
                 self.report(io, "Image attachments require Work or Plan");
                 return false;
             }
