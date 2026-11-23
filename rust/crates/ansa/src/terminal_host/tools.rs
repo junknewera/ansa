@@ -37,7 +37,7 @@ pub(crate) fn add_agent_instructions(epoch: &mut crate::provider::request::Epoch
     epoch.instructions.push_str(concat!(
         "\n\nWhen terminal tools are advertised, use the conversation's one terminal for shell commands, ",
         "interactive programs, and connections. Call terminal_list first. If no terminal exists, ",
-        "open an interactive shell in the working directory. Reuse its current terminal ID and writer epoch ",
+        "open an interactive shell by name from PATH (e.g. bash) in the working directory. Reuse its current terminal ID and writer epoch ",
         "across commands and user messages. Check the active program and working directory before entering commands. ",
         "A terminal_input receipt confirms byte delivery. Check the output to tell when the command finishes. ",
         "Set lifetime_seconds=0 and idle_seconds=0 to keep the terminal for the conversation. ",
@@ -563,19 +563,26 @@ fn status_value(status: OperationStatus) -> Value {
 }
 
 fn receipt(intent: &Intent, status: OperationStatus) -> Outcome {
+    let create = matches!(intent.action, Action::Create { .. });
     let (execution, effects) = match status {
         OperationStatus::Durable(Effect::Applied | Effect::Delivered { .. }) => {
             (Execution::Succeeded, Effects::KnownResult)
         }
+        // The host completed the tool call and proved the requested process never ran.
+        OperationStatus::Durable(Effect::NotStarted) if create => {
+            (Execution::Failed, Effects::KnownResult)
+        }
         OperationStatus::Durable(Effect::NotStarted) => (Execution::Failed, Effects::NotStarted),
         _ => (Execution::Failed, Effects::Unknown),
     };
-    let epoch = if matches!(intent.action, Action::Create { .. }) {
-        1
-    } else {
-        intent.epoch
-    };
-    Outcome::from_bytes(execution, effects, json!({"operation":intent.operation,"terminal":intent.terminal,"epoch":epoch,"receipt":status_value(status)}).to_string().into_bytes())
+    let epoch = if create { 1 } else { intent.epoch };
+    let mut output = json!({"operation":intent.operation,"terminal":intent.terminal,"epoch":epoch,"receipt":status_value(status)});
+    if create && status == OperationStatus::Durable(Effect::NotStarted) {
+        output["hint"] = json!(
+            "No terminal was opened. Check the executable, working directory and workspace availability. A shell name such as bash is resolved through PATH."
+        );
+    }
+    Outcome::from_bytes(execution, effects, output.to_string().into_bytes())
 }
 
 fn rejected(code: &'static str) -> Outcome {

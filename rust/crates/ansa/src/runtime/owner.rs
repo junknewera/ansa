@@ -2005,8 +2005,11 @@ impl Owner {
                     .state
                     .unknown_operation()
                     .map(|id| OperationId(id.into()));
-                if self.recovery.is_some() && self.phase != "cancelled" {
-                    self.phase = "paused".into();
+                if self.recovery.is_some() {
+                    if self.phase != "cancelled" {
+                        self.phase = "paused".into();
+                    }
+                    self.snapshot(None);
                 }
             }
             Kind::Done => {

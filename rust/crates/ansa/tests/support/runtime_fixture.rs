@@ -1618,6 +1618,9 @@ pub async fn unknown_restart() {
         matches!(p, EventPayload::RecoveryRequired { .. })
     })
     .await;
+    until(&handle, |p| matches!(p, EventPayload::FrontendSnapshot(s)
+        if s.command.is_none() && s.state == "paused" && s.recovery_operation.is_some() && !s.resume_available
+    )).await;
     finish(&mut runtime).await;
     let tools = make_tools();
     let mut runtime = Runtime::new(

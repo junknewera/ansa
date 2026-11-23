@@ -90,7 +90,8 @@ impl Workbench {
     }
 
     pub(super) fn projected_slot(&self, slot: &Slot) -> Option<Vec<Entry>> {
-        slot.conversation()
+        let activity_open = matches!(&self.panel, Some(Panel::Activity(nav)) if !nav.agents_only);
+        slot.conversation(!activity_open)
     }
 
     pub(super) fn orchestration_notice(&self) -> Option<String> {

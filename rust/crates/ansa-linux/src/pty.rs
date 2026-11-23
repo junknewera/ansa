@@ -47,17 +47,45 @@ pub struct PtySession {
     ownership_unknown: Cell<bool>,
 }
 
+#[derive(Debug)]
+pub enum LaunchError {
+    NotStarted(io::Error),
+    AfterSpawn(io::Error),
+}
+
 impl PtySession {
     pub fn spawn(command: Command, rows: u16, cols: u16) -> io::Result<Self> {
         Self::spawn_in(command, rows, cols, None)
     }
 
     pub fn spawn_in(
-        mut command: Command,
+        command: Command,
         rows: u16,
         cols: u16,
         directory: Option<&File>,
     ) -> io::Result<Self> {
+        Self::launch_in(command, rows, cols, directory).map_err(|err| match err {
+            LaunchError::NotStarted(e) | LaunchError::AfterSpawn(e) => e,
+        })
+    }
+
+    pub fn launch_in(
+        command: Command,
+        rows: u16,
+        cols: u16,
+        directory: Option<&File>,
+    ) -> Result<Self, LaunchError> {
+        let (master, child) =
+            Self::start_child(command, rows, cols, directory).map_err(LaunchError::NotStarted)?;
+        Self::from_child(master, child).map_err(LaunchError::AfterSpawn)
+    }
+
+    fn start_child(
+        mut command: Command,
+        rows: u16,
+        cols: u16,
+        directory: Option<&File>,
+    ) -> io::Result<(OwnedFd, Child)> {
         require_waitable_sigchld()?;
         if rows == 0 || cols == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "pty_size"));
@@ -136,7 +164,10 @@ impl PtySession {
                 Ok(())
             });
         }
-        let child = command.spawn()?;
+        Ok((master, command.spawn()?))
+    }
+
+    fn from_child(master: OwnedFd, child: Child) -> io::Result<Self> {
         let leader = Pid::from_raw(child.id() as i32).expect("spawned PID");
         let mut value = Self {
             master,

@@ -1007,16 +1007,18 @@ fn runtime_publishes_session_intent_before_compiled_terminal_calls() {
                         thread::sleep(Duration::from_millis(5));
                     }
                 };
+                let create = |index, executable: &str| {
+                    call(
+                        index,
+                        "terminal_create",
+                        json!({"cwd":".","label":"Shell","argv":[executable,"--noprofile","--norc","-i"],"rows":24,"columns":80,"lifetime_seconds":30,"idle_seconds":20}),
+                    )
+                };
                 let items = match index {
                     0 => {
-                        let launch = call(
-                            0,
-                            "terminal_create",
-                            json!({"cwd":".","label":"Shell","argv":["bash","--noprofile","--norc","-i"],"rows":24,"columns":80,"lifetime_seconds":30,"idle_seconds":20}),
-                        );
                         if invalid_batch {
                             vec![
-                                launch,
+                                create(0, "bash"),
                                 call(
                                     1,
                                     "terminal_input",
@@ -1024,38 +1026,46 @@ fn runtime_publishes_session_intent_before_compiled_terminal_calls() {
                                 ),
                             ]
                         } else {
-                            vec![launch]
+                            vec![create(0, workspace.join("missing-shell").to_str().unwrap())]
                         }
                     }
-                    1 => vec![call(
-                        1,
+                    1 => {
+                        let output = receipt()?;
+                        assert_eq!(
+                            output["receipt"],
+                            json!({"durable":true,"effect":{"state":"not_started"}})
+                        );
+                        vec![create(1, "bash")]
+                    }
+                    2 => vec![call(
+                        2,
                         "terminal_input",
                         json!({"terminal":receipt()?["terminal"],"epoch":1,"encoding":"utf8","data":"mkdir -p saved; cd saved; export ANSA_FIXTURE=retained; printf '%s' \"$$\" > ../first_pid\r"}),
                     )],
-                    2 => {
+                    3 => {
                         wait_for("first_pid");
                         vec![message("environment_ready", "Окружение готово")]
                     }
-                    3 => {
+                    4 => {
                         assert_eq!(
                             request.input.last().unwrap().text_field("content")?,
                             "Используй это окружение"
                         );
-                        vec![call(3, "terminal_list", json!({}))]
+                        vec![call(4, "terminal_list", json!({}))]
                     }
-                    4 => {
+                    5 => {
                         let listing = receipt()?;
                         let entries = listing["terminals"].as_array().unwrap();
-                        assert_eq!(entries.len(), 1);
-                        let terminal = &entries[0];
-                        assert_eq!(terminal["state"], "live");
+                        assert_eq!(entries.len(), 2);
+                        let terminal = entries.iter().find(|e| e["state"] == "live").unwrap();
+                        assert!(entries.iter().any(|e| e["state"] == "closed"));
                         vec![call(
-                            4,
+                            5,
                             "terminal_input",
                             json!({"terminal":terminal["terminal"],"epoch":terminal["epoch"],"encoding":"utf8","data":"printf '%s:%s:%s' \"$ANSA_FIXTURE\" \"$PWD\" \"$$\" > ../continued\r"}),
                         )]
                     }
-                    5 => {
+                    6 => {
                         assert_eq!(
                             wait_for("continued"),
                             format!(
@@ -1066,12 +1076,12 @@ fn runtime_publishes_session_intent_before_compiled_terminal_calls() {
                         );
                         let receipt = receipt()?;
                         vec![call(
-                            5,
+                            6,
                             "terminal_close",
                             json!({"terminal":receipt["terminal"],"epoch":receipt["epoch"]}),
                         )]
                     }
-                    6 => vec![message("finished", "PTY_FINISHED")],
+                    7 => vec![message("finished", "PTY_FINISHED")],
                     _ => return Err("terminal_fixture_unexpected_generation"),
                 };
                 native::load(&Json::object(vec![
@@ -1173,7 +1183,7 @@ fn runtime_publishes_session_intent_before_compiled_terminal_calls() {
             });
         assert_eq!(observed_intent.load(Ordering::SeqCst), !invalid_batch);
         let owner = owner.lock().unwrap();
-        assert_eq!(owner.terminals().len(), usize::from(!invalid_batch));
+        assert_eq!(owner.terminals().len(), if invalid_batch { 0 } else { 2 });
         assert!(
             owner
                 .terminals()

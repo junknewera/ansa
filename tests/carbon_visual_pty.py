@@ -225,6 +225,7 @@ def open_activity(screen):
     screen.send(b'\x14')
     until(screen, lambda text: 'Activity' in text, 'Agents panel opened')
     click_text(screen, 'Activity')
+    until(screen, lambda text: '↑/↓ select · Enter open' in text, 'Activity tab opened')
 
 
 def close_activity(screen):
@@ -479,7 +480,8 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         screen.send('EDIT_VISUAL_TASK\r')
         spinners = set('⠋⠙⠹⠸⠼⠴⠦⠧')
         until(screen, lambda text: 'EDIT_VISUAL_TASK' in text, 'accepted user message under fixture hold', timeout=3)
-        assert 'waiting for model' not in visible(screen)
+        until(screen, lambda text: re.search(r'waiting for model · [1-9]\d* s', text),
+              'main chat shows the elapsed turn time while the provider is silent', timeout=4)
         open_activity(screen)
 
         def activity():
@@ -580,7 +582,8 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
             quiet.send('EDIT_REDUCED_MOTION_TASK\r')
             until(quiet, lambda text: 'EDIT_REDUCED_MOTION_TASK' in text,
                   'reduced-motion message under fixture hold', timeout=3)
-            assert 'waiting for model' not in visible(quiet)
+            until(quiet, lambda text: '◷ waiting for model' in text,
+                  'main chat shows static progress with reduced motion', timeout=3)
             open_activity(quiet)
 
             def quiet_activity():

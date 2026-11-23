@@ -465,7 +465,7 @@ impl Slot {
             self.state.report(io, "No active step");
         }
     }
-    fn conversation(&self) -> Option<Vec<Entry>> {
+    fn conversation(&self, show_activity: bool) -> Option<Vec<Entry>> {
         let page = self.conversation_page.as_ref()?;
         let view = self.state.snapshot.as_ref()?;
         let mut entries = page
@@ -523,8 +523,43 @@ impl Slot {
                     ),
                 });
             }
+            if show_activity
+                && !view
+                    .submit
+                    .as_ref()
+                    .is_some_and(|id| id.0.starts_with("draft-"))
+            {
+                entries.extend(self.live_activity(view));
+            }
         }
         Some(entries)
+    }
+
+    fn live_activity(&self, view: &Snapshot) -> Option<Entry> {
+        if !view.worker_busy
+            || view.request.is_none()
+            || diagnostics::needs_attention(view)
+            || matches!(view.state.as_str(), "idle" | "completed" | "cancelled")
+        {
+            return None;
+        }
+        let preview = self.state.preview.as_ref().is_some_and(|p| {
+            p.state == "preview" && !p.text.is_empty() && self.state.preview_request == view.request
+        });
+        let phase = Progress::phase(view, preview);
+        let text = self.state.progress.elapsed().map_or_else(
+            || phase.to_owned(),
+            |elapsed| format!("{phase} · {elapsed}"),
+        );
+        Some(Entry {
+            role: "activity".into(),
+            text,
+            action: None,
+            edit: None,
+            output: None,
+            agent: None,
+            status: None,
+        })
     }
 
     fn activity_page(&self) -> Option<&TranscriptPage> {
@@ -569,23 +604,8 @@ impl Slot {
                 },
             );
         }
-        if at_tail
-            && view.worker_busy
-            && !matches!(view.state.as_str(), "completed" | "cancelled" | "paused")
-        {
-            entries.push(Entry {
-                action: None,
-                edit: None,
-                output: None,
-                agent: None,
-                status: None,
-                role: "activity".into(),
-                text: format!(
-                    "{} · {}",
-                    Progress::phase(view, self.state.preview.is_some()),
-                    self.state.progress.elapsed().unwrap_or_default()
-                ),
-            });
+        if at_tail {
+            entries.extend(self.live_activity(view));
         }
         Some(entries)
     }
@@ -5243,7 +5263,7 @@ impl Workbench {
                         None
                     };
                     if in_chat && self.selection.is_some() {
-                        let reading = slot.conversation();
+                        let reading = slot.conversation(false);
                         slot.state.follow_tail = false;
                         slot.state.reading_total = slot
                             .state
