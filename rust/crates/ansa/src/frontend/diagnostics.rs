@@ -145,6 +145,12 @@ fn explanation(code: &str) -> &'static str {
         "http_timeout" => "HTTP request timed out",
         "http_connect" | "http_handshake" => "Could not connect to the server",
         "http_transfer" => "Connection lost or response incomplete",
+        "unknown_response_event" => "Provider sent an unsupported stream event",
+        "response_failed" => "Provider reported a failed response",
+        "response_stream_error" => "Provider reported a stream error",
+        "response_incomplete" => "Provider stopped before completing the response",
+        "response_output_token_limit" => "Provider stopped at its output token limit",
+        "response_content_filter" => "Provider stopped the response for content filtering",
         "http_content_type_count"
         | "http_content_type_missing"
         | "http_mime"
