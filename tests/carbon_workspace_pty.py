@@ -1360,7 +1360,9 @@ def orchestration_direct(screen, root, cwd):
     report = cwd / "report.txt"
     report.write_text("before fixture\n")
     screen.send("TERMINAL_DEMO\r")
-    until(screen, lambda _: completed(root, "TERMINAL_DEMO"), "lead opened its workspace shell")
+    until(screen, lambda frame: completed(root, "TERMINAL_DEMO") and "Demo terminal opened" in frame
+          and ready(screen) and "Ctrl+C stop" not in screen.vt.line(-2),
+          "lead opened its workspace shell and the composer is ready")
     local(screen, "/orchestrate " + message)
     note = "I will ask a helper to work on this task."
     until(screen, lambda frame: note in frame and title in frame and "Agent gpt-" in frame and "/agents" in frame,
