@@ -310,11 +310,7 @@ impl Host {
             timeout_ms,
             output_bytes: self.settings.process_output_bytes,
         };
-        let workspace = crate::terminal_host::acquire_workspace_writer(
-            &self.settings.directory.join("terminal-workspaces"),
-            &self.settings.cwd,
-            &options.cwd,
-        )?;
+        let workspace = self.workspace_writer(&options.cwd)?;
         self.processes
             .run_in(invocation, &options, stop, Some(workspace))
     }
@@ -489,14 +485,36 @@ pub fn local_task_tools(
     worker: &Path,
     scope: TaskScope,
 ) -> Result<Arc<Snapshot>> {
+    local_task_tools_with_writer(settings, epoch, session, auth, worker, scope, None)
+}
+
+pub(crate) fn local_task_tools_with_writer(
+    settings: AgentSettings,
+    epoch: Epoch,
+    session: &Path,
+    auth: &Path,
+    worker: &Path,
+    scope: TaskScope,
+    shared_writer: Option<WorkspaceWriter>,
+) -> Result<Arc<Snapshot>> {
     let advertised = epoch.exact_state.has("orchestration_git_snapshot")
         && epoch
             .exact_state
             .field("orchestration_git_snapshot")?
             .boolean()?;
-    local_task_tools_with_git(settings, epoch, session, auth, worker, scope, advertised)
+    local_task_tools_with_git(
+        settings,
+        epoch,
+        session,
+        auth,
+        worker,
+        scope,
+        advertised,
+        shared_writer,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn local_task_tools_with_git(
     settings: AgentSettings,
     epoch: Epoch,
@@ -505,6 +523,7 @@ pub(crate) fn local_task_tools_with_git(
     worker: &Path,
     scope: TaskScope,
     advertised_git: bool,
+    shared_writer: Option<WorkspaceWriter>,
 ) -> Result<Arc<Snapshot>> {
     if !settings.cwd.starts_with(&scope.root) {
         return Err("task_workspace");
@@ -518,6 +537,7 @@ pub(crate) fn local_task_tools_with_git(
     }
     let mut host = local_host(settings, epoch, session, auth, worker, None)?;
     host.scope = Some(scope);
+    host.shared_writer = shared_writer;
     let host = Arc::new(host);
     Ok(register_local_tools(host.clone(), |registry| {
         if names.contains(&"git_snapshot") {
@@ -710,4 +730,85 @@ fn register_local_tools(
     registry.register_with_policy(Definition {descriptor:Descriptor{name:"get_test_value".into(),description:"Return a fixed test JSON value without side effects".into(),revision:"1".into(),schema:Json::parse(r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#)?},validator:Arc::new(|_|true),executor:Arc::new(|_|Outcome::succeeded(r#"{"ok":true,"value":"OMH_FIXED_VALUE_42"}"#.into()))},Policy {read_only:true,..Policy::default()})?;
     extend(&mut registry)?;
     Ok(registry.snapshot())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ansa_linux::local::WorkspaceWrite;
+
+    #[test]
+    fn legacy_run_command_uses_its_own_terminal_writer_but_not_a_peer_writer() {
+        struct Root(PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(std::env::temp_dir().join(format!(
+            "ansa-command-terminal-{}",
+            crate::auth::pkce::random_token(16).unwrap()
+        )));
+        ansa_linux::fs::create_private_leaf(&root.0).unwrap();
+        let cwd = root.0.join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let settings = crate::config::load_agent_settings(&cwd, &root.0).unwrap();
+        let epoch = crate::config::agent_epoch(&settings).unwrap();
+        let instructions = epoch.exact_state.field("instructions").unwrap().dump();
+        let registry = settings.directory.join("terminal-workspaces");
+        let mut host = local_host(
+            settings,
+            epoch,
+            &root.0.join("session"),
+            &root.0.join("auth"),
+            &std::env::current_exe().unwrap(),
+            None,
+        )
+        .unwrap();
+        let invocation = Invocation {
+            operation: "fixture:op:1".into(),
+            call: "command".into(),
+            name: "run_command".into(),
+            revision: "ansa_process_v1".into(),
+            arguments: Json::object(vec![
+                ("cwd", s(".").unwrap()),
+                ("argv", Json::parse(r#"["true"]"#).unwrap()),
+                ("timeout_ms", n(100)),
+                (
+                    "instruction_token",
+                    s(&sha256(instructions.as_bytes())).unwrap(),
+                ),
+            ])
+            .unwrap(),
+        };
+        let marker = b"owned terminal fixture";
+        let mut terminal = WorkspaceWrite::acquire(&registry, &cwd, &cwd).unwrap();
+        terminal.start_terminal(marker, &sha256(marker)).unwrap();
+        let stop = Cancel::default();
+        // Stop inside ProcessRunner so this test checks the admission boundary
+        // without launching the fixture executable as a process supervisor.
+        stop.cancel();
+        assert_eq!(host.run(&invocation, &stop), Err("terminal_workspace_busy"));
+        let terminal = Arc::new(terminal);
+        let owner = terminal.clone();
+        host.shared_writer = Some(Arc::new(move |path| {
+            let Ok(relative) = path.strip_prefix(&cwd) else {
+                return Ok(None);
+            };
+            owner.write_descendant(relative, Some(marker)).map(Some)
+        }));
+        let outcome = host.run(&invocation, &stop).unwrap();
+        assert_eq!(
+            (outcome.execution(), outcome.effects()),
+            (Execution::Cancelled, Effects::KnownResult)
+        );
+        assert!(!host.processes.has_job(&invocation).unwrap());
+        host.shared_writer = None;
+        assert_eq!(host.run(&invocation, &stop), Err("terminal_workspace_busy"));
+        Arc::try_unwrap(terminal)
+            .ok()
+            .unwrap()
+            .finish_terminal(marker)
+            .unwrap();
+    }
 }

@@ -569,6 +569,7 @@ fn text_with_providers(
     if terminal.is_some() {
         terminals::add_agent_instructions(&mut epoch);
     }
+    let shared_writer = terminal.as_ref().map(terminals::workspace_writer);
     // Mask signals before MCP and runtime workers inherit the process mask.
     let mut io = Io::open(parsed.prompt.is_none())?;
     let tools = local_tools_extended(
@@ -579,7 +580,7 @@ fn text_with_providers(
         &std::env::current_exe().map_err(|_| "process_executable")?,
         LocalExtensions {
             editor: editor.clone(),
-            shared_writer: terminal.as_ref().map(terminals::workspace_writer),
+            shared_writer: shared_writer.clone(),
         },
         |registry| {
             terminal.clone().map_or(Ok(()), |owner| {
@@ -608,7 +609,7 @@ fn text_with_providers(
     let configuration =
         Request::new(bound, epoch, tools.advertisement().clone(), vec![])?.with_effort(effort)?;
     options.directory = Some(selected.directory.clone());
-    factory.enable_delegation(&mut options, &selected.id);
+    factory.enable_delegation(&mut options, &selected.id, shared_writer);
     if !parsed.resume && parsed.session.is_empty() {
         options.autocompact_percent = factory.saved_autocompact();
     }
@@ -790,6 +791,7 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
     let cwd = fixture_home.join("workspace");
     ansa_linux::fs::private_directory(&cwd).map_err(|_| "fixture_workspace")?;
     let plus = root.join("orchestration-plus").is_file();
+    let direct_edit = root.join("direct-edit-check").is_file();
     let inputs = if root.join("fixture-image-model").is_file() {
         vec!["text", "image"]
     } else {
@@ -868,9 +870,11 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                     {
                         return Err("fixture_format");
                     }
-                    if plus {
+                    if plus || direct_edit {
                         let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let items = if trace.with_file_name("orchestration-plus-budget").is_file() {
+                        let items = if direct_edit {
+                            direct_edit_fixture::items(&request, input, index)?
+                        } else if trace.with_file_name("orchestration-plus-budget").is_file() {
                             plus_budget_fixture::items(&request, input, index)?
                         } else {
                             vec![plus_fixture_response(&request, input, &trace, index, stop)?]
@@ -940,7 +944,7 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                             return Err("fixture_delegate_tool");
                         }
                         let arguments =
-                            json!({"task":"Inspect the synthetic SIWC workspace","paths":[]})
+                            json!({"task":"Inspect the synthetic SIWC workspace","paths":[],"read_paths":[]})
                                 .to_string();
                         json!({"type":"function_call","id":"fixture-direct-item","call_id":"fixture-direct-call","namespace":"omh","name":"delegate_task","arguments":arguments,"status":"completed"})
                     } else if direct_child && last["type"] != "function_call_output" {
@@ -1026,6 +1030,8 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
     )
 }
 
+#[cfg(feature = "frontend-test-adapter")]
+mod direct_edit_fixture;
 #[cfg(feature = "frontend-test-adapter")]
 mod plus_budget_fixture;
 

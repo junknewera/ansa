@@ -12,7 +12,10 @@ use crate::{
         journal_v1::Journal,
     },
     terminal_host::tools as terminals,
-    tools::files::{LocalExtensions, TaskScope, local_task_tools, local_tools_extended},
+    tools::files::{
+        LocalExtensions, TaskScope, WorkspaceWriter, local_task_tools_with_writer,
+        local_tools_extended,
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -39,9 +42,11 @@ mod siwc_lane;
 pub(super) use siwc_lane::{Priority, SiwcLane};
 const CONSOLE_ACCOUNT: &str = "ansa-local-console";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum ChildKind {
-    Direct,
+    Direct {
+        writer: Option<WorkspaceWriter>,
+        reads: Vec<String>,
+    },
     PlanStep,
     Conversation,
 }
@@ -854,7 +859,7 @@ impl Factory {
         self.orchestration_route()?;
         self.check_orchestration_context(source)?;
         let (generate, options) = self.orchestration_runtime(source, stop)?;
-        let conversation = kind == ChildKind::Conversation;
+        let conversation = matches!(&kind, ChildKind::Conversation);
         let mut settings = self.settings.clone();
         settings.cwd = workspace.to_owned();
         settings.model.clone_from(&source.binding.requested_model);
@@ -866,7 +871,11 @@ impl Factory {
         } else {
             &[]
         };
-        let scope = TaskScope::new(workspace, writes)?.restrict_reads(&assignment.paths)?;
+        let reads = match &kind {
+            ChildKind::Direct { reads, .. } => reads.as_slice(),
+            _ => &assignment.paths,
+        };
+        let scope = TaskScope::new(workspace, writes)?.restrict_reads(reads)?;
         let mut epoch = agent_epoch(&settings)?;
         epoch.instructions.push_str(&format!(
             "\nYour task workspace is {}. Use paths relative to this directory.",
@@ -904,11 +913,11 @@ impl Factory {
             .exact_state
             .with("orchestration_parent", Json::string(parent)?)?
             .with("orchestration_writes", paths(writes)?)?
-            .with("orchestration_reads", paths(&assignment.paths)?)?;
+            .with("orchestration_reads", paths(reads)?)?;
         if assignment.access == crate::orchestration::plan::Access::Read
-            && assignment.paths.is_empty()
+            && reads.is_empty()
             && workspace == self.settings.cwd
-            && (kind != ChildKind::Direct
+            && (!matches!(&kind, ChildKind::Direct { .. })
                 || source.tools.descriptors.iter().any(|tool| {
                     matches!(
                         tool.name.as_str(),
@@ -944,13 +953,22 @@ impl Factory {
             .settings
             .catalog(self.profile())?
             .create_kind("agent", Some(parent))?;
-        let tools = local_task_tools(
+        let shared_writer = match kind {
+            ChildKind::Direct { writer, .. }
+                if workspace == self.settings.cwd && !writes.is_empty() =>
+            {
+                writer
+            }
+            _ => None,
+        };
+        let tools = local_task_tools_with_writer(
             settings,
             epoch.clone(),
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
             scope,
+            shared_writer,
         )?;
         let configuration = Request::new(
             source.binding.clone(),
@@ -1060,7 +1078,10 @@ impl Factory {
             &std::env::current_exe().map_err(|_| "process_executable")?,
             scope,
             advertised_git,
-        )?;
+            None,
+        )?
+        .compatible(&configuration.tools)
+        .ok_or("session_fork_tools")?;
         let (generate, options) = if inspect_only {
             let generate: Generate = Arc::new(|_, _, _| Err("session_read_only"));
             (generate, Options::default())
@@ -1207,6 +1228,7 @@ impl Factory {
         let terminal = wants_terminals
             .then(|| self.open_terminal_owner(&selected, restored.is_some()))
             .transpose()?;
+        let shared_writer = terminal.as_ref().map(terminals::workspace_writer);
         let tools = local_tools_extended(
             self.settings.clone(),
             initial_epoch.clone(),
@@ -1219,7 +1241,7 @@ impl Factory {
                     .as_ref()
                     .filter(|(directory, _)| directory == &selected.directory)
                     .map(|(_, hub)| hub.clone()),
-                shared_writer: terminal.as_ref().map(terminals::workspace_writer),
+                shared_writer: shared_writer.clone(),
             },
             |registry| {
                 terminal.clone().map_or(Ok(()), |owner| {
@@ -1358,7 +1380,7 @@ impl Factory {
         };
         options.directory = Some(selected.directory.clone());
         if matches!(kind, Kind::Main | Kind::Fork) {
-            self.enable_delegation(&mut options, &selected.id);
+            self.enable_delegation(&mut options, &selected.id, shared_writer);
         }
         options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&self.settings));
         options.fork_seed = seed;

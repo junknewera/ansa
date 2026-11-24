@@ -867,6 +867,11 @@ fn main() {
         }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
+    if let Some(result) = ansa::terminal_host::native::private_entry(&args)
+        .or_else(|| ansa::terminal_host::daemon::private_entry(&args))
+    {
+        std::process::exit(if result.is_ok() { 0 } else { 125 });
+    }
     if let Some(result) = ansa::process::runner::private_entry(&args) {
         std::process::exit(if result.is_ok() { 0 } else { 125 });
     }

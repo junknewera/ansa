@@ -14,7 +14,7 @@ use crate::{
         state::{Receipt as SubmitReceipt, State, display_response},
         transcript::ToolDetail,
     },
-    tools::registry::Snapshot as Tools,
+    tools::{delegation::Revision as DelegationRevision, registry::Snapshot as Tools},
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -827,9 +827,12 @@ impl Owner {
             )?
             .with_effort(source.effort.clone())?;
             let roles = current.receipt.lead_profile.clone();
-            self.tools.for_lead(Arc::new(move |invocation, stop| {
-                delegate(&request, roles.as_ref(), invocation, stop)
-            }))?
+            self.tools.for_lead(
+                DelegationRevision::advertised(&source.tools)?,
+                Arc::new(move |invocation, stop| {
+                    delegate(&request, roles.as_ref(), invocation, stop)
+                }),
+            )?
         } else if current.next.tools.revision == self.plan_tools.advertisement().revision {
             self.plan_tools.clone()
         } else {
@@ -1390,6 +1393,7 @@ impl Owner {
                     internal,
                     receipt.draft.as_ref(),
                     image_content.as_ref(),
+                    DelegationRevision::V2,
                 )?;
                 let archived_images = next.archive_history_images()?;
                 let inherited_incomplete_turn = next.input.len() != state.history.len() + 1;

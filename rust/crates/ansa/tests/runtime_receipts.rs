@@ -87,8 +87,17 @@ async fn direct_plus_resumes_with_the_roles_accepted_before_restart() {
     let expected = roles.clone();
     let options = Options {
         directory: Some(root.journal()),
-        delegate: Some(Arc::new(move |_, saved, _, _| {
+        delegate: Some(Arc::new(move |source, saved, invocation, _| {
             assert_eq!(saved, Some(&expected));
+            assert_eq!(
+                source.tools.descriptors.last().unwrap().revision,
+                "ansa_delegate_v2"
+            );
+            assert_eq!(invocation.revision, "ansa_delegate_v2");
+            assert_eq!(
+                invocation.arguments.field("read_paths").unwrap().dump(),
+                r#"["tests/report.txt"]"#
+            );
             Outcome::succeeded("observed saved roles".into())
         })),
         ..Options::default()
@@ -141,7 +150,9 @@ async fn direct_plus_resumes_with_the_roles_accepted_before_restart() {
             .with("name", Json::string("delegate_task")?)?
             .with(
                 "arguments",
-                Json::string(r#"{"task":"Inspect project","paths":[]}"#)?,
+                Json::string(
+                    r#"{"task":"Inspect project","paths":[],"read_paths":["tests/report.txt"]}"#,
+                )?,
             )?;
         native::load(&response.with("items", Json::array(vec![call])?)?)
     });

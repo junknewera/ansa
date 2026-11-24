@@ -230,6 +230,24 @@ fn compare<'a>(before: &[&'a str], after: &[&'a str]) -> Option<Vec<(Kind, &'a s
     None
 }
 pub fn between(before: &str, after: &str) -> Option<Diff> {
+    between_at(before, after, 1, true)
+}
+
+pub(super) fn fragment(before: &str, after: &str, line: usize, offset: usize) -> Option<Diff> {
+    let mut diff = between_at(before, after, line, false)?;
+    diff.rows.insert(
+        0,
+        Row {
+            kind: Kind::Notice,
+            old: None,
+            new: None,
+            text: format!("Changed fragment at byte offset {offset}"),
+        },
+    );
+    Some(diff)
+}
+
+fn between_at(before: &str, after: &str, line: usize, whole_file: bool) -> Option<Diff> {
     if before.len() > 64 * 1024 || after.len() > 64 * 1024 {
         return None;
     }
@@ -237,7 +255,7 @@ pub fn between(before: &str, after: &str) -> Option<Diff> {
     let new: Vec<_> = after.split_inclusive('\n').collect();
     let edits = compare(&old, &new)?;
     let mut numbered = Vec::with_capacity(edits.len());
-    let (mut old_line, mut new_line) = (1, 1);
+    let (mut old_line, mut new_line) = (line, line);
     let (mut added, mut removed) = (0, 0);
     for (kind, text) in edits {
         let (old, new) = match kind {
@@ -266,7 +284,7 @@ pub fn between(before: &str, after: &str) -> Option<Diff> {
             new,
             text: text.strip_suffix('\n').unwrap_or(text).into(),
         });
-        if !text.ends_with('\n') && kind != Kind::Context {
+        if whole_file && !text.ends_with('\n') && kind != Kind::Context {
             numbered.push(Row {
                 kind: Kind::Notice,
                 old: None,

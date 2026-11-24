@@ -2,16 +2,28 @@ use super::*;
 use crate::{
     orchestration::plan::{Access, Step},
     runtime::{ChildAttemptState, CommandPayload, PostStatus, RuntimeCommand},
-    tools::registry::Outcome,
+    tools::{delegation, registry::Outcome},
 };
 
 impl Factory {
-    pub(in crate::frontend) fn enable_delegation(&self, options: &mut Options, parent: &str) {
+    pub(in crate::frontend) fn enable_delegation(
+        &self,
+        options: &mut Options,
+        parent: &str,
+        shared_writer: Option<WorkspaceWriter>,
+    ) {
         if self.orchestration_route().is_ok() {
             let factory = self.clone();
             let parent = parent.to_owned();
             options.delegate = Some(Arc::new(move |source, roles, invocation, stop| {
-                factory.delegate(&parent, source, roles, invocation, stop)
+                factory.delegate(
+                    &parent,
+                    source,
+                    roles,
+                    invocation,
+                    stop,
+                    shared_writer.clone(),
+                )
             }));
         }
     }
@@ -22,17 +34,21 @@ impl Factory {
         roles: Option<&crate::orchestration::profile::RoleProfile>,
         invocation: &crate::tools::invocation::Invocation,
         stop: &Cancel,
+        shared_writer: Option<WorkspaceWriter>,
     ) -> Outcome {
         let start = || -> Result<_> {
             stop.check()?;
-            let (task, paths) =
-                crate::tools::delegation::assignment(&invocation.arguments, &source.tools)?;
-            let read = paths.is_empty();
+            let scope = delegation::assignment(
+                &invocation.arguments,
+                &source.tools,
+                delegation::Revision::parse(&invocation.revision)?,
+            )?;
+            let read = scope.writes.is_empty();
             let step = Step {
                 id: "delegate".into(),
-                task: task.into(),
+                task: scope.task.into(),
                 access: if read { Access::Read } else { Access::Write },
-                paths,
+                paths: scope.writes,
                 depends_on: vec![],
                 acceptance: String::new(),
             };
@@ -53,7 +69,10 @@ impl Factory {
                 source,
                 None,
                 &[],
-                ChildKind::Direct,
+                ChildKind::Direct {
+                    writer: shared_writer,
+                    reads: scope.reads,
+                },
                 stop,
             )?;
             let line = super::super::carbon::AgentLine {
