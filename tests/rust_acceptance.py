@@ -125,16 +125,20 @@ def canaries(binary, output):
                 prefix = {k: first[k] for k in ('schema_version', 'session', 'incarnation')}
                 lines.send(dict(prefix, turn='canary', command_id='submit', type='submit', text='hello', mode='basic'))
                 lines.until(lambda es: any(e['type'] == 'command_accepted' for e in es))
-                assert select.select([listener], [], [], 3)[0], 'no auth dispatch'
-                with listener.accept()[0] as connection:
-                    connection.settimeout(3)
-                    head = b''
-                    while b'\r\n\r\n' not in head:
-                        data = connection.recv(4096)
-                        assert data and len(head) < 16384
-                        head += data
-                    assert head.startswith(b'CONNECT auth.openai.com:443 ')
-                    connection.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+                # Each dial fails before TLS. No OAuth request may reach the proxy.
+                for _ in range(3):
+                    assert select.select([listener], [], [], 3)[0], 'missing auth proxy dial'
+                    with listener.accept()[0] as connection:
+                        connection.settimeout(3)
+                        head = b''
+                        while b'\r\n\r\n' not in head:
+                            data = connection.recv(4096)
+                            assert data and len(head) + len(data) <= 16384
+                            head += data
+                        assert head.split(b'\r\n', 1)[0] == b'CONNECT auth.openai.com:443 HTTP/1.1'
+                        assert head.partition(b'\r\n\r\n')[2] == b''
+                        assert all(secret not in head for secret in secrets)
+                        connection.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
                 lines.until(lambda es: any(e['type'] == 'snapshot' and e['state'] == 'paused' for e in es))
                 result = lines.finish()
                 # A handled runtime failure is a versioned JSONL error/snapshot;
