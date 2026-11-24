@@ -12,7 +12,7 @@ use crate::{
         store::Store,
     },
     tools::{
-        admission::{OperationIds, PreparedBatch},
+        admission::{OperationIds, PrepareError, PreparedBatch},
         registry::Snapshot as Tools,
     },
 };
@@ -47,6 +47,7 @@ pub(crate) enum Kind {
     AutocompactSelected,
     Accepted,
     Response,
+    RejectBatch,
     Intent,
     Outcome,
     Continued,
@@ -140,6 +141,11 @@ pub(crate) enum ToolJob {
 }
 pub(crate) enum ToolValue {
     Plan(Vec<Invocation>),
+    InvalidArguments {
+        response_id: String,
+        call_id: String,
+        message: String,
+    },
     Outcome(SavedResult),
     Recovered(Option<SavedResult>),
 }
@@ -593,8 +599,42 @@ impl Workers {
                                         &current.operation_run,
                                         current.operation_offset as u64,
                                     )?;
-                                    let plan = PreparedBatch::prepare(response, tools, &mut ids)?
-                                        .into_plan()?;
+                                    let batch = match PreparedBatch::prepare_checked(
+                                        response, tools, &mut ids,
+                                    ) {
+                                        Ok(batch) => batch,
+                                        Err(PrepareError::Fatal(code)) => return Err(code),
+                                        Err(PrepareError::Invalid { index, message }) => {
+                                            if !current.results.is_empty()
+                                                || current.intent.is_some()
+                                            {
+                                                return Err("tool_arguments_rejected");
+                                            }
+                                            let call = response
+                                                .calls()
+                                                .get(index)
+                                                .ok_or("runtime_plan")?;
+                                            current
+                                                .rejected_batch_request(
+                                                    response.id(),
+                                                    &call.call_id,
+                                                    &message,
+                                                )
+                                                .and_then(|next| next.save())
+                                                .map_err(|code| match code {
+                                                    "json_build_limit"
+                                                    | "json_structure_limit"
+                                                    | "request_context" => "request_frame_limit",
+                                                    other => other,
+                                                })?;
+                                            return Ok(ToolValue::InvalidArguments {
+                                                response_id: response.id().into(),
+                                                call_id: call.call_id.clone(),
+                                                message,
+                                            });
+                                        }
+                                    };
+                                    let plan = batch.into_plan()?;
                                     if current.results.len() > plan.len() {
                                         return Err("completed_prefix_size");
                                     }

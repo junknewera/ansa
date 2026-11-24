@@ -14,17 +14,18 @@ pub fn append_flags() -> OFlags {
     OFlags::WRONLY | OFlags::APPEND | OFlags::NONBLOCK
 }
 pub fn read(directory: &File, name: &str, limit: usize) -> io::Result<Option<Vec<u8>>> {
-    read_impl(directory, name, limit, true)
+    read_impl(directory, name, limit, true, false)
 }
 /// Bounded public UI palette data, anchored to an already opened directory.
 pub fn read_regular(directory: &File, name: &str, limit: usize) -> io::Result<Option<Vec<u8>>> {
-    read_impl(directory, name, limit, false)
+    read_impl(directory, name, limit, false, false)
 }
 fn read_impl(
     directory: &File,
     name: &str,
     limit: usize,
     private: bool,
+    allow_empty: bool,
 ) -> io::Result<Option<Vec<u8>>> {
     if name.contains('/') || name.contains('\0') {
         return Err(io::Error::other("local_file_name"));
@@ -45,7 +46,7 @@ fn read_impl(
         || meta.nlink() != 1
         || private
             && (meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0)
-        || meta.len() == 0
+        || !allow_empty && meta.len() == 0
         || meta.len() > limit as u64
     {
         return Err(io::Error::other("local_file_permissions"));
@@ -294,6 +295,16 @@ pub fn lock_new(directory: &File) -> io::Result<File> {
 }
 
 pub const ACTIVE_TERMINAL_SCOPE: &str = "active-terminal-scope.json";
+/// Pin the exact marker for inspection and operator confirmation.
+pub fn terminal_marker_stamp(directory: &File) -> io::Result<std::fs::Metadata> {
+    let fd = rustix::fs::openat(
+        directory,
+        ACTIVE_TERMINAL_SCOPE,
+        read_flags() | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    File::from(fd).metadata()
+}
 const WRITER_PREFIX: &str = "workspace-writer-";
 const ROOT_WRITER_PREFIX: &str = "workspace-root-writer-";
 
@@ -403,9 +414,9 @@ impl WorkspaceWrite {
         }
         let mut scopes = Vec::new();
         if !target.starts_with(workspace) && !workspace.starts_with(target) {
-            open_workspace_tree(registry, workspace, &mut scopes, writer)?;
+            open_workspace_tree(registry, workspace, &mut scopes, writer, false)?;
         }
-        let directory = open_workspace_tree(registry, target, &mut scopes, writer)?;
+        let directory = open_workspace_tree(registry, target, &mut scopes, writer, false)?;
         Ok(Self {
             directory,
             registry: registry.to_path_buf(),
@@ -455,6 +466,7 @@ impl WorkspaceWrite {
                 components.peek().is_none(),
                 &mut scopes,
                 true,
+                false,
             )?;
         }
         Ok(Self {
@@ -502,6 +514,89 @@ impl WorkspaceWrite {
         }
         known.then_some(()).ok_or("terminal_workspace_evidence")
     }
+
+    /// The exclusive root lock remains held until the final marker unlink is durable.
+    pub fn finish_terminal(self, marker: &[u8]) -> Result<(), &'static str> {
+        let operation = self
+            .operation
+            .as_deref()
+            .ok_or("terminal_workspace_evidence")?;
+        retire_terminal_markers(&self.scopes, marker, operation)
+    }
+
+    pub fn start_terminal(&mut self, marker: &[u8], operation: &str) -> Result<(), &'static str> {
+        let root = self
+            .scopes
+            .iter()
+            .find(|s| s.root)
+            .ok_or("terminal_workspace_identity")?;
+        publish_recovered(&root.record, ACTIVE_TERMINAL_SCOPE, marker)
+            .map_err(|_| "terminal_workspace_evidence")?;
+        if let Err(error) = self.begin(operation) {
+            retire_terminal_markers(&self.scopes, marker, operation)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+/// Recovery can only remove a verified terminal's own publications. This path
+/// never returns a usable writer lease or removes another operation's records.
+pub fn retire_terminal_claim(
+    registry: &Path,
+    workspace: &Path,
+    operation: &str,
+    verify: impl FnOnce(&File, &File) -> Result<Vec<u8>, &'static str>,
+) -> Result<(), &'static str> {
+    if !workspace.is_absolute()
+        || crate::fs::normalize(workspace) != workspace
+        || registry.starts_with(workspace)
+        || !registry.is_absolute()
+        || crate::fs::normalize(registry) != registry
+        || !valid_writer_operation(operation)
+    {
+        return Err("terminal_workspace_registry");
+    }
+    let mut scopes = Vec::new();
+    let directory = open_workspace_tree(registry, workspace, &mut scopes, true, true)?;
+    let root = scopes
+        .iter()
+        .find(|scope| scope.root)
+        .ok_or("terminal_workspace_identity")?;
+    let marker = verify(&directory, &root.record)?;
+    retire_terminal_markers(&scopes, &marker, operation)
+}
+
+fn retire_terminal_markers(
+    scopes: &[std::sync::Arc<WriteScope>],
+    marker: &[u8],
+    operation: &str,
+) -> Result<(), &'static str> {
+    let root = scopes
+        .iter()
+        .find(|scope| scope.root)
+        .ok_or("terminal_workspace_identity")?;
+    if read(&root.record, ACTIVE_TERMINAL_SCOPE, 8192)
+        .map_err(|_| "terminal_workspace_evidence")?
+        .as_deref()
+        != Some(marker)
+    {
+        return Err("terminal_workspace_evidence");
+    }
+    for scope in scopes {
+        let pending = format!("{}.pending", writer_marker(operation, scope.root));
+        if let Some(bytes) = read_impl(&scope.record, &pending, 64, true, true)
+            .map_err(|_| "terminal_workspace_evidence")?
+        {
+            if !operation.as_bytes().starts_with(&bytes) {
+                return Err("terminal_workspace_evidence");
+            }
+            unlink(&scope.record, &pending).map_err(|_| "terminal_workspace_evidence")?;
+        }
+        remove_writer(&scope.record, operation, scope.root)
+            .map_err(|_| "terminal_workspace_evidence")?;
+    }
+    unlink(&root.record, ACTIVE_TERMINAL_SCOPE).map_err(|_| "terminal_workspace_evidence")
 }
 
 fn valid_writer_operation(operation: &str) -> bool {
@@ -547,16 +642,31 @@ fn open_workspace_tree(
     target: &Path,
     scopes: &mut Vec<std::sync::Arc<WriteScope>>,
     writer: bool,
+    retiring_terminal: bool,
 ) -> Result<File, &'static str> {
     let mut directory = crate::fs::open_nofollow(Path::new("/"), read_flags())
         .map_err(|_| "terminal_workspace_identity")?;
     let mut path = std::path::PathBuf::from("/");
-    hold_scope(registry, &directory, path == target, scopes, writer)?;
+    hold_scope(
+        registry,
+        &directory,
+        path == target,
+        scopes,
+        writer,
+        retiring_terminal,
+    )?;
     for name in target.iter().skip(1) {
         path.push(name);
         directory = crate::fs::open_relative_directory(&directory, Path::new(name))
             .map_err(|_| "terminal_workspace_identity")?;
-        hold_scope(registry, &directory, path == target, scopes, writer)?;
+        hold_scope(
+            registry,
+            &directory,
+            path == target,
+            scopes,
+            writer,
+            retiring_terminal,
+        )?;
     }
     Ok(directory)
 }
@@ -567,6 +677,7 @@ fn hold_scope(
     root: bool,
     scopes: &mut Vec<std::sync::Arc<WriteScope>>,
     writer: bool,
+    retiring_terminal: bool,
 ) -> Result<(), &'static str> {
     let (record, identity) =
         workspace_entry(registry, directory).map_err(|_| "terminal_workspace_registry")?;
@@ -589,7 +700,9 @@ fn hold_scope(
     } else {
         None
     };
-    ensure_no_writers(&record, !root)?;
+    if !retiring_terminal {
+        ensure_no_writers(&record, !root)?;
+    }
     scopes.push(std::sync::Arc::new(WriteScope {
         record,
         _lock: lock,

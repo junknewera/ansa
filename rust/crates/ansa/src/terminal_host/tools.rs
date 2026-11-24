@@ -57,15 +57,20 @@ pub(crate) fn open_for(
     let binding = Binding::attached(session, crate::config::path_text(&settings.cwd)?.to_owned());
     let executable = std::env::current_exe().map_err(|_| "process_executable")?;
     let registry = settings.directory.join("terminal-workspaces");
-    let backend = || NativeBackend::new(executable.clone(), registry.clone());
+    let backend =
+        |path: &Path| NativeBackend::new(executable.clone(), registry.clone()).with_evidence(path);
     let mut archived = BTreeMap::new();
     let mut next_generation = 1;
     if restoring {
         let last = terminal_store_generation(directory)?;
         for generation in 1..=last {
             let path = terminal_store_path(directory, generation);
-            let mut previous =
-                Host::restore_in_mode(&path, binding.clone(), backend(), HostMode::Conversation)?;
+            let mut previous = Host::restore_in_mode(
+                &path,
+                binding.clone(),
+                backend(&path),
+                HostMode::Conversation,
+            )?;
             if previous
                 .operations
                 .keys()
@@ -73,7 +78,17 @@ pub(crate) fn open_for(
             {
                 return Err("terminal_store_chain");
             }
-            if !previous.recovery().is_some_and(|value| value.closure_known) {
+            // An unsealed generation can also prove that no terminal ever ran.
+            // Keep its failed create receipts for recovery under their original IDs.
+            let reusable = previous.recovery().is_some_and(|value| {
+                value.closure_known
+                    || value.tail == super::Tail::End
+                        && previous.operations.values().all(|op| {
+                            matches!(op.intent.action, Action::Create { .. })
+                                && op.status == OperationStatus::Durable(Effect::NotStarted)
+                        })
+            });
+            if !reusable {
                 if generation != last {
                     return Err("terminal_store_chain");
                 }
@@ -85,14 +100,14 @@ pub(crate) fn open_for(
         next_generation = last + 1;
     }
     let path = terminal_store_path(directory, next_generation);
-    let mut host = Host::create_in_mode(&path, binding, backend(), HostMode::Conversation)?;
+    let mut host = Host::create_in_mode(&path, binding, backend(&path), HostMode::Conversation)?;
     host.archived_operations = archived;
     Ok(Arc::new(Mutex::new(host)))
 }
 
 const TERMINAL_STORE: &str = "terminal-host-v1";
 
-fn terminal_store_path(directory: &Path, generation: usize) -> PathBuf {
+pub(super) fn terminal_store_path(directory: &Path, generation: usize) -> PathBuf {
     if generation == 1 {
         directory.join(TERMINAL_STORE)
     } else {
@@ -100,7 +115,7 @@ fn terminal_store_path(directory: &Path, generation: usize) -> PathBuf {
     }
 }
 
-fn terminal_store_generation(directory: &Path) -> Result<usize> {
+pub(super) fn terminal_store_generation(directory: &Path) -> Result<usize> {
     let directory =
         ansa_linux::fs::private_directory(directory).map_err(|_| "terminal_store_chain")?;
     let (names, more) =
@@ -298,6 +313,14 @@ pub fn register(registry: &mut Registry, owner: Owner, conversation: &Path) -> R
                 executor: Arc::new(|_| Outcome::failed_unknown()),
             },
             Policy {
+                argument_hint: Some(Arc::new(move |args| {
+                    Arguments::parse(tool, args).err().map(|reason| match reason {
+                        "terminal_cwd" => "cwd must be a nonempty path up to 1024 bytes, without control characters.",
+                        "terminal_launch" => "Check label, argv and the two timeouts. For an interactive shell use a short label, argv [\"bash\"], lifetime_seconds 0 and idle_seconds 0.",
+                        "terminal_input_encoding" | "terminal_input_limit" => "Use utf8 or base64 encoding and send 1..4096 bytes of data per call.",
+                        _ => description,
+                    })
+                })),
                 requires_journal: true,
                 invoke: Some(Arc::new(move |invocation, stop| {
                     invoke(&executor, tool, invocation, stop).unwrap_or_else(rejected)

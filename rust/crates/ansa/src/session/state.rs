@@ -266,6 +266,8 @@ pub struct SavedTurn {
     archived_images: bool,
     pub response: Option<Arc<AdmittedResponse>>,
     pub tools_response: Option<Arc<AdmittedResponse>>,
+    // Its outputs are already in next, but its measured usage still covers the input prefix.
+    rejected_response: Option<Arc<AdmittedResponse>>,
     pub results: Vec<SavedResult>,
     pub previous_results: Vec<SavedResult>,
     pub intent: Option<Invocation>,
@@ -283,6 +285,67 @@ pub struct SavedTurn {
     pub resume_operation: usize,
 }
 impl SavedTurn {
+    /// A rejected batch has no intents or outcomes. Its native calls still
+    /// need matching outputs before the provider can correct the request.
+    pub(crate) fn rejected_batch_request(
+        &self,
+        response_id: &str,
+        invalid_call: &str,
+        message: &str,
+    ) -> Result<Request> {
+        let response = self
+            .tools_response
+            .as_ref()
+            .ok_or("session_tool_rejection")?;
+        need(
+            self.stage == "tools"
+                && !self.paused
+                && self.intent.is_none()
+                && self.results.is_empty()
+                && response.id() == response_id
+                && response
+                    .calls()
+                    .iter()
+                    .any(|call| call.call_id == invalid_call)
+                && !message.is_empty()
+                && message.len() <= 512,
+            "session_tool_rejection",
+        )?;
+        let invalid = Json::object(vec![
+            ("error", Json::string("tool_arguments_rejected")?),
+            ("message", Json::string(message)?),
+            ("applied", Json::parse("false")?),
+        ])?
+        .dump();
+        let results = response
+            .calls()
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let output = if call.call_id == invalid_call {
+                    invalid.clone()
+                } else {
+                    r#"{"error":"tool_batch_not_executed","applied":false}"#.into()
+                };
+                SavedResult {
+                    result: crate::provider::replay::ToolResult::new(
+                        format!(
+                            "{}:op:{}",
+                            self.operation_run,
+                            self.operation_offset + index + 1
+                        ),
+                        call.call_id.clone(),
+                        output,
+                        Execution::Denied,
+                        Effects::NotStarted,
+                    ),
+                    dispatched: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        next_request(response, &results)
+    }
+
     pub(crate) fn pause_diagnostic(&self) -> &str {
         if self.diagnostic == "tool_failed"
             && let Some(result) = self.results.last()
@@ -467,11 +530,11 @@ impl State {
         model_window: impl FnOnce() -> Option<usize>,
     ) -> Option<(usize, usize)> {
         let budget = self.context_budget_for(request);
-        if let Some(response) = self
-            .turn
-            .as_ref()
-            .and_then(|turn| turn.tools_response.as_ref())
-            && response.request().binding == request.binding
+        if let Some(response) = self.turn.as_ref().and_then(|turn| {
+            turn.tools_response
+                .as_ref()
+                .or(turn.rejected_response.as_ref())
+        }) && response.request().binding == request.binding
             && response.request().epoch.id == request.epoch.id
             && response.request().tools == request.tools
             && let Some(budget) = response.context_budget()
@@ -1474,6 +1537,7 @@ impl State {
                 next,
                 response: None,
                 tools_response: None,
+                rejected_response: None,
                 results: vec![],
                 previous_results: vec![],
                 intent: None,
@@ -1622,6 +1686,7 @@ impl State {
                         current.tools_response = None;
                     }
                     let response = Arc::new(response);
+                    current.rejected_response = None;
                     if response.calls().is_empty() {
                         current.stage = "final".into();
                     } else {
@@ -1631,6 +1696,22 @@ impl State {
                     }
                     current.next = response.request().clone();
                     current.response = Some(response);
+                }
+                "tool_batch_rejected" => {
+                    let next = current.rejected_batch_request(
+                        event.text_field("response_id")?,
+                        event.text_field("call_id")?,
+                        event.text_field("message")?,
+                    )?;
+                    let response = current
+                        .tools_response
+                        .take()
+                        .ok_or("session_tool_rejection")?;
+                    current.operation_offset += response.calls().len();
+                    current.rejected_response = Some(response);
+                    current.response = None;
+                    current.next = next;
+                    current.stage = "generating".into();
                 }
                 "intent" => {
                     need(

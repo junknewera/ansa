@@ -31,6 +31,17 @@ impl OperationIds {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum PrepareError {
+    Fatal(&'static str),
+    Invalid { index: usize, message: String },
+}
+impl From<&'static str> for PrepareError {
+    fn from(code: &'static str) -> Self {
+        Self::Fatal(code)
+    }
+}
+
 /// A prepared batch cannot be cloned or dispatched twice.
 /// ```compile_fail,E0277
 /// use ansa::tools::admission::PreparedBatch;
@@ -74,28 +85,56 @@ impl PreparedBatch {
         snapshot: Arc<Snapshot>,
         ids: &mut OperationIds,
     ) -> Result<Self, &'static str> {
+        Self::prepare_checked(response, snapshot, ids).map_err(|error| match error {
+            PrepareError::Invalid { .. } => "tool_arguments_rejected",
+            PrepareError::Fatal(code) => code,
+        })
+    }
+    pub(crate) fn prepare_checked(
+        response: &AdmittedResponse,
+        snapshot: Arc<Snapshot>,
+        ids: &mut OperationIds,
+    ) -> Result<Self, PrepareError> {
         if !snapshot.definitions_match_advertisement()
             || response.request().tools != *snapshot.advertisement()
         {
-            return Err("snapshot_provenance_conflict");
+            return Err("snapshot_provenance_conflict".into());
         }
         let mut pending = Vec::with_capacity(response.calls().len());
         // Validate the entire batch before allocating IDs or making any executor reachable.
-        for call in response.calls() {
+        let mut invalid = None;
+        for (index, call) in response.calls().iter().enumerate() {
             let definition = snapshot.definition(&call.name).ok_or("unknown_tool")?;
             let args = Json::parse_with_limits(&call.arguments, 256 * 1024, 64, 131072)?;
-            let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                args.is_object()
-                    && super::schema::matches(&definition.descriptor.schema, &args)
-                    && (definition.validator)(&args)
+            let issue = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let schema = &definition.descriptor.schema;
+                if let Err(message) = super::schema::check_arguments(schema, &args) {
+                    return Some(message);
+                }
+                if (definition.validator)(&args) {
+                    return None;
+                }
+                let detail = snapshot
+                    .policy(&call.name)
+                    .and_then(|policy| policy.argument_hint.as_ref())
+                    .and_then(|hint| hint(&args))
+                    .unwrap_or(&definition.descriptor.description);
+                Some(format!("Check the argument values. {detail}"))
             }))
             .map_err(|_| "tool_validator_panicked")?;
-            if !valid {
-                return Err("tool_arguments_rejected");
+            if let Some(issue) = issue
+                && invalid.is_none()
+            {
+                let mut message = format!("{}: {issue}", call.name);
+                message.truncate(message.floor_char_boundary(512));
+                invalid = Some(PrepareError::Invalid { index, message });
             }
             pending.push((String::new(), call.call_id.clone(), call.name.clone(), args));
         }
         let fingerprint = super::super::provider::replay::response_binding(response)?;
+        if let Some(error) = invalid {
+            return Err(error);
+        }
         for entry in &mut pending {
             entry.0 = ids.allocate()?
         }

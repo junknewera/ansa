@@ -2237,7 +2237,21 @@ def siwc_orchestration_direct(screen, root, cwd):
     assert len(list((root / "home/.ansa/sessions").iterdir())) == 2
     assert sorted(row["invocation"]["name"] for row in rows if row["kind"] == "intent") == [
         "delegate_task", "list_directory"]
-    local(screen, "/exit")
+    sessions = root / "home/.ansa/sessions"
+    child, = [directory for directory in sessions.iterdir()
+              if json.loads((directory / "info.json").read_text()).get("kind") == "agent"]
+    events = session_cases.decode({path.name: path.read_bytes() for path in child.glob("part-*.log")})
+    rejected, = [row for row in events if row["kind"] == "tool_batch_rejected"]
+    assert rejected["call_id"] == "fixture-rejected-directory"
+    assert not any(row["kind"] == "pause" for row in events)
+    intent, = [row["invocation"] for row in events if row["kind"] == "intent"]
+    assert intent["name"] == "list_directory" and intent["call"] != rejected["call_id"]
+    parent = json.loads((child / "info.json").read_text())["parent"]
+    restored = reopen_agents(screen, root, cwd, parent)
+    until(restored, lambda _: "Inspect the synthetic" in activity_body(restored)
+          and "· Done" in activity_body(restored), "catalog summary shows the recovered child as completed")
+    local(restored, "/exit")
+    assert restored.finish()["exit"] == 0
     return "normal"
 
 

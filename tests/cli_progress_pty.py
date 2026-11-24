@@ -358,7 +358,7 @@ def tools(adapter, output, failed=False, plain=True):
             until(screen,lambda:state in body_text(screen.vt),'tool terminal status')
             until(screen,lambda:('TOOL_FAILURE' if failed else 'TOOL_RESULT') in body_text(screen.vt),'tool output')
             until(screen,lambda:'done' in body_text(screen.vt) and footer_phase(screen.vt,'ready'),'durable completion',timeout=6)
-            until(screen,lambda:'tools 1/1' in screen.vt.line(-1),'tool count')
+            until(screen,lambda:'tools 1 done' in screen.vt.line(-1),'one completed tool')
             elapsed = re.findall(r"basic  [^\r\n]*? ([0-9]+) s  tools", screen.vt.line(-1))
             assert elapsed and int(elapsed[-1]) >= 2, elapsed
             if not failed:

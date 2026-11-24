@@ -58,30 +58,51 @@ pub fn validate_schema(schema: &Json, depth: usize) -> Result<(), &'static str> 
     Ok(())
 }
 pub fn matches(schema: &Json, value: &Json) -> bool {
-    match schema.field("type").and_then(Json::text) {
-        Ok("string") => value.is_string(),
-        Ok("integer") => value.is_integer(),
-        Ok("number") => value.is_number(),
-        Ok("boolean") => value.boolean().is_ok(),
-        Ok("null") => value.dump() == "null",
-        Ok("array") => value.elements().is_ok_and(|vs| {
-            vs.iter()
-                .all(|v| matches(schema.field("items").expect("validated schema"), v))
-        }),
-        Ok("object") => schema
-            .field("properties")
-            .and_then(|props| {
-                let keys = props.keys()?;
-                if value.keys()?.len() != keys.len() {
-                    return Ok(false);
-                };
-                Ok(keys.into_iter().all(|k| {
-                    value
-                        .field(k)
-                        .is_ok_and(|v| matches(props.field(k).expect("key from props"), v))
-                }))
-            })
-            .unwrap_or(false),
+    check_arguments(schema, value).is_ok()
+}
+
+pub(super) fn check_arguments(schema: &Json, value: &Json) -> Result<(), String> {
+    let ty = schema.text_field("type")?;
+    let valid = match ty {
+        "string" => value.is_string(),
+        "integer" => value.is_integer(),
+        "number" => value.is_number(),
+        "boolean" => value.boolean().is_ok(),
+        "null" => value.dump() == "null",
+        "array" if let Ok(items) = value.elements() => {
+            let item_schema = schema.field("items")?;
+            for (index, item) in items.iter().enumerate() {
+                check_arguments(item_schema, item)
+                    .map_err(|error| format!("[{index}]: {error}"))?;
+            }
+            true
+        }
+        "object" if value.is_object() => {
+            let properties = schema.field("properties")?;
+            let names = properties.keys()?;
+            for name in &names {
+                let field = value
+                    .field(name)
+                    .map_err(|_| format!("Missing required field {name}"))?;
+                check_arguments(properties.field(name)?, field)
+                    .map_err(|error| format!("{name}: {error}"))?;
+            }
+            if value.keys()?.len() != names.len() {
+                if names.is_empty() {
+                    return Err("This tool takes no arguments. Pass an empty object {}".into());
+                }
+                return Err(format!(
+                    "Unexpected field. Allowed fields: {}",
+                    names.join(", ")
+                ));
+            }
+            true
+        }
         _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("Expected {ty}"))
     }
 }

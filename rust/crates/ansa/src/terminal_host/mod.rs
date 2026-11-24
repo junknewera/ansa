@@ -9,6 +9,7 @@ pub mod protocol;
 pub mod tools;
 mod wire;
 pub(crate) mod workspace;
+pub use workspace::writer as acquire_workspace_writer;
 
 pub use evidence::{FileJournal, Journal, Record, Tail};
 use evidence::{MAX_OPERATIONS, NORMAL_OPERATIONS};

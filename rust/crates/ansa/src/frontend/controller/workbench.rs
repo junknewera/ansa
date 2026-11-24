@@ -550,12 +550,11 @@ impl Slot {
                     "/sessions for details"
                 } else if view.diagnostic == "tool_batch_limit" && view.resume_available {
                     "Increase or remove tool_calls in config, reopen ANSA, then /retry"
+                } else if view.diagnostic == "terminal_workspace_quarantined" {
+                    "Inspect the terminal lease in this workspace with ansa --workspace-lease"
                 } else if matches!(
                     view.diagnostic.as_str(),
-                    "tool_failed"
-                        | "task_path_scope"
-                        | "terminal_workspace_quarantined"
-                        | "terminal_workspace_busy"
+                    "tool_failed" | "task_path_scope" | "terminal_workspace_busy"
                 ) {
                     "/cancel this turn and send a new request"
                 } else if view.resume_available {
