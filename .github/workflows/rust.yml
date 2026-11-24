@@ -50,6 +50,12 @@ jobs:
           python3 -B -m unittest discover -s tests -p test_hooks.py
       - name: Find and read a large log tail through Carbon Plan
         run: python3 -B tests/carbon_search_pty.py --binary rust/target/debug/examples/frontend_adapter
+      - name: Read a paged skill with an image through Carbon
+        run: |
+          python3 -B benchmarks/image_transport_smoke.py --binary rust/target/debug/examples/frontend_adapter \
+            --output "${RUNNER_TEMP}/carbon-images"
+      - name: Test sanitizer inventory validation
+        run: PYTHONPATH=tests/parity python3 -B -m unittest test_m8.QualityControls
       - name: Exercise benchmark modes through Carbon
         run: |
           python3 -B benchmarks/smoke.py --binary rust/target/debug/ansa \

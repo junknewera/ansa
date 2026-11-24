@@ -95,7 +95,7 @@ pub struct Factory {
 }
 pub struct Created {
     pub(super) skill_commands: Vec<super::commands::SkillCommand>,
-    pub(super) skill_notice: Option<&'static str>,
+    pub(super) skill_notice: Option<String>,
     pub runtime: Runtime,
     pub selected: Selected,
     pub kind: Kind,

@@ -102,8 +102,16 @@ def check_composer(binary):
         skill = skills / "inspect-picture"
         skill.mkdir(mode=0o700)
         document = skill / "SKILL.md"
-        document.write_text("---\nname: inspect-picture\ndescription: Review an image\n---\nLocate the subject.\n")
+        skill_body = "Locate the subject.\n" + "Review framing and lighting.\n" * 800
+        document.write_text("---\nname: inspect-picture\ndescription: Review an image\n---\n" + skill_body)
         document.chmod(0o600)
+        for number in range(32):
+            name = f"example-{number:02d}"
+            extra = skills / name
+            extra.mkdir(mode=0o700)
+            item = extra / "SKILL.md"
+            item.write_text(f"---\nname: {name}\ndescription: Example procedure\n---\nExample.\n")
+            item.chmod(0o600)
         (root / "fixture-image-model").touch(mode=0o600)
         wire = root / "outbound-messages.jsonl"
         wire.touch(mode=0o600)
@@ -167,7 +175,9 @@ def check_composer(binary):
             submit("/exit")
             result = screen.finish()
             assert result["exit"] == 0 and result["termios_restored"]
-            first, second, third, mentioned, last, skill_turn, skill_result = [json.loads(line) for line in wire.read_text().splitlines()]
+            first, second, third, mentioned, last, skill_turn, *skill_results = [
+                json.loads(line) for line in wire.read_text().splitlines()
+            ]
             url = "data:image/png;base64," + base64.b64encode(PNG).decode()
             assert first[-1]["content"][1] == {"type": "input_image", "image_url": url}
             assert second[-1]["content"] == "Answer without an attachment."
@@ -180,8 +190,18 @@ def check_composer(binary):
                 {"type": "input_text", "text": skill_prompt},
                 {"type": "input_image", "image_url": url},
             ]
-            assert skill_result[-1]["call_id"] == "fixture-skill-call"
-            assert json.loads(skill_result[-1]["output"])["body"] == "Locate the subject.\n"
+            assert len(skill_results) >= 3
+            assert skill_results[0][-1]["call_id"] == "fixture-skill-call"
+            reconstructed = ""
+            for request in skill_results:
+                page = json.loads(request[-1]["output"])
+                assert page["offset"] == len(reconstructed.encode())
+                assert len(page["body"].encode()) <= 8192
+                reconstructed += page["body"]
+                assert page["next_offset"] == (
+                    None if reconstructed == skill_body else len(reconstructed.encode())
+                )
+            assert reconstructed == skill_body
             sent = third[-1]["content"][1]["image_url"]
             assert len(base64.b64decode(sent.split(",", 1)[1])) <= 2 * 1024 * 1024
             accepted, = [event for event in records(root) if event.get("text") == "Describe the compressed attachment." and event["kind"] == "accepted"]

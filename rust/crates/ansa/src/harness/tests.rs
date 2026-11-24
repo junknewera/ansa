@@ -273,7 +273,7 @@ fn legacy_skill_wins_name_collision_and_keeps_its_profile_revision() {
 }
 
 #[test]
-fn discovery_accepts_only_bounded_owned_skill_documents() {
+fn discovery_keeps_owned_skill_documents_when_another_entry_is_invalid() {
     let home = Project::new();
     let settings = AgentSettings::defaults(&home.0, &home.0);
     let file = install_skill(&settings, "good", "original", "body");
@@ -293,7 +293,9 @@ fn discovery_accepts_only_bounded_owned_skill_documents() {
         }
     }
     symlink(root.join("good"), root.join("linked-folder")).unwrap();
-    let profile = select(&settings, None, None).unwrap().unwrap();
+    let (profile, notice) = select_with_notice(&settings, None, None).unwrap();
+    let profile = profile.unwrap();
+    assert!(notice.unwrap().contains("skill_"));
     assert_eq!(profile.complete(""), [("good", "original")]);
     let mut epoch = agent_epoch(&settings).unwrap();
     profile.attach(&mut epoch).unwrap();
@@ -303,6 +305,62 @@ fn discovery_accepts_only_bounded_owned_skill_documents() {
             .contains("When a description matches the task, call read_skill")
     );
     assert!(epoch.instructions.contains("original"));
+}
+
+#[test]
+fn a_new_long_skill_keeps_all_previous_skills_and_roundtrips_utf8_pages() {
+    use crate::tools::skills::Catalog;
+
+    let home = Project::new();
+    let settings = AgentSettings::defaults(&home.0, &home.0);
+    for number in 0..32 {
+        install_skill(
+            &settings,
+            &format!("skill-{number:02}"),
+            "Review a draft",
+            "short",
+        );
+    }
+    let previous = select(&settings, None, None).unwrap().unwrap();
+    assert_eq!(previous.complete("").len(), 32);
+
+    let body = format!("{}🦀\n{}\n", "x".repeat(8191), "строка\n".repeat(1600));
+    let file = install_skill(&settings, "review-long", "Review a long draft", &body);
+    let (pin, notice) = select_with_notice(&settings, None, None).unwrap();
+    assert!(notice.is_none());
+    let pin = pin.unwrap();
+    assert_eq!(pin.complete("").len(), 33);
+    for (name, _) in previous.complete("") {
+        assert_eq!(pin.read(name).unwrap(), previous.read(name).unwrap());
+    }
+    assert_eq!(pin.list()["skills"].as_array().unwrap().len(), 33);
+
+    fs::remove_file(file).unwrap();
+    let first = pin.read("review-long").unwrap();
+    assert_eq!(first["body"].as_str().unwrap().len(), 8191);
+    let mut text = first["body"].as_str().unwrap().to_owned();
+    let mut next = first["next_offset"].as_u64();
+    while let Some(offset) = next {
+        assert_eq!(offset as usize, text.len());
+        let page = pin.read_page("review-long", offset as usize).unwrap();
+        assert!(page["body"].as_str().unwrap().len() <= 8192);
+        text.push_str(page["body"].as_str().unwrap());
+        next = page["next_offset"].as_u64();
+    }
+    assert_eq!(text, body);
+    assert_eq!(
+        pin.read_page("review-long", 8192),
+        Err("harness_skill_offset")
+    );
+
+    let catalogs = settings
+        .directory
+        .join("harness-profiles")
+        .join(scope(&settings.cwd))
+        .join("catalogs");
+    let pinned = catalogs.join(format!("body-{}", sha256(body.as_bytes())));
+    fs::write(pinned, format!("z{}", &body[1..])).unwrap();
+    assert_eq!(pin.read_page("review-long", 0), Err("harness_skill_digest"));
 }
 
 #[test]
@@ -379,7 +437,7 @@ fn unavailable_local_skills_allow_unrelated_chat() {
     .unwrap();
     let (pin, notice) = select_with_notice(&settings, None, None).unwrap();
     assert!(pin.is_none());
-    assert_eq!(notice, Some("skill_directory_unavailable"));
+    assert_eq!(notice.as_deref(), Some("skill_directory_unavailable"));
 }
 
 #[test]
@@ -400,5 +458,8 @@ fn legacy_inline_catalog_still_reads_the_exact_body() {
         .unwrap()
         .unwrap();
     assert_eq!(profile, None);
-    assert_eq!(skills.read("review").unwrap()["body"], "legacy body\n");
+    assert_eq!(
+        skills.read("review", None).unwrap()["body"],
+        "legacy body\n"
+    );
 }

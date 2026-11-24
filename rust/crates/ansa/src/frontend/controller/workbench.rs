@@ -4297,8 +4297,7 @@ impl Workbench {
                         Slot::new(created.runtime, id, created.kind, created.parent, prompt);
                     slot.skill_commands = created.skill_commands;
                     if let Some(code) = created.skill_notice {
-                        slot.state
-                            .report(io, &format!("Local skills unavailable ({code})"));
+                        slot.state.report(io, &format!("Local skills ({code})"));
                     }
                     if plan_only {
                         slot.state.mode = AgentMode::Plan;
@@ -6513,7 +6512,7 @@ pub(in crate::frontend) async fn run_session(
     kind: Kind,
     parent: Option<String>,
     skill_commands: Vec<commands::SkillCommand>,
-    skill_notice: Option<&'static str>,
+    skill_notice: Option<String>,
     bridge_options: Option<super::super::bridge::BridgeOptions>,
 ) -> Result<i32> {
     if io.raw.is_none() {
@@ -6536,7 +6535,7 @@ pub(in crate::frontend) async fn run_session(
     let mut work = Workbench::new(runtime, factory, root_id, kind, parent)?;
     work.slots[work.current].skill_commands = skill_commands;
     if let Some(code) = skill_notice {
-        work.report(io, &format!("Local skills unavailable ({code})"));
+        work.report(io, &format!("Local skills ({code})"));
     }
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

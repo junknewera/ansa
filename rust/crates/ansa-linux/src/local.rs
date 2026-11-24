@@ -27,6 +27,32 @@ fn read_impl(
     private: bool,
     allow_empty: bool,
 ) -> io::Result<Option<Vec<u8>>> {
+    let Some((mut file, meta)) = open_read(directory, name, private)? else {
+        return Ok(None);
+    };
+    let len = meta.len();
+    if !allow_empty && len == 0 || len > limit as u64 {
+        return Err(io::Error::other("local_file_permissions"));
+    }
+    let mut bytes = vec![];
+    Read::by_ref(&mut file)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::other("local_file_limit"));
+    }
+    Ok(Some(bytes))
+}
+
+pub fn open_private_read(directory: &File, name: &str) -> io::Result<Option<File>> {
+    Ok(open_read(directory, name, true)?.map(|(file, _)| file))
+}
+
+fn open_read(
+    directory: &File,
+    name: &str,
+    private: bool,
+) -> io::Result<Option<(File, std::fs::Metadata)>> {
     if name.contains('/') || name.contains('\0') {
         return Err(io::Error::other("local_file_name"));
     }
@@ -40,25 +66,16 @@ fn read_impl(
         Err(rustix::io::Errno::NOENT) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let mut file = File::from(fd);
+    let file = File::from(fd);
     let meta = file.metadata()?;
     if !meta.is_file()
         || meta.nlink() != 1
         || private
             && (meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0)
-        || !allow_empty && meta.len() == 0
-        || meta.len() > limit as u64
     {
         return Err(io::Error::other("local_file_permissions"));
     }
-    let mut bytes = vec![];
-    Read::by_ref(&mut file)
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(io::Error::other("local_file_limit"));
-    }
-    Ok(Some(bytes))
+    Ok(Some((file, meta)))
 }
 pub fn names(directory: &File, limit: usize) -> io::Result<(Vec<std::ffi::OsString>, bool)> {
     use std::os::unix::ffi::OsStrExt;
@@ -241,7 +258,7 @@ fn replace_preference(directory: &File, name: &str, bytes: &[u8], suffix: &str) 
     // Validate any existing destination before publication, including its link
     // count and owner. This never follows a substituted symlink.
     let _ = read_regular(directory, name, 4096)?;
-    write_pending(directory, name, bytes, suffix, false)
+    write_pending(directory, name, suffix, false, |file| file.write_all(bytes))
 }
 
 /// Publish a private record without replacing a concurrent writer's record.
@@ -252,6 +269,15 @@ pub fn create_immutable(
     bytes: &[u8],
     suffix: &str,
 ) -> io::Result<()> {
+    create_immutable_with(directory, name, suffix, |file| file.write_all(bytes))
+}
+
+pub fn create_immutable_with(
+    directory: &File,
+    name: &str,
+    suffix: &str,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
     if [name, suffix].into_iter().any(|value| {
         value.is_empty()
             || !value
@@ -260,15 +286,15 @@ pub fn create_immutable(
     }) {
         return Err(io::Error::other("local_file_name"));
     }
-    write_pending(directory, name, bytes, suffix, true)
+    write_pending(directory, name, suffix, true, write)
 }
 
 fn write_pending(
     directory: &File,
     name: &str,
-    bytes: &[u8],
     suffix: &str,
     immutable: bool,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
     let pending = format!(".{name}.pending-{suffix}");
     let fd = rustix::fs::openat(
@@ -285,7 +311,7 @@ fn write_pending(
     }
     let _cleanup = Cleanup(directory, &pending);
     let mut file = File::from(fd);
-    file.write_all(bytes)?;
+    write(&mut file)?;
     file.sync_all()?;
     if immutable {
         rustix::fs::renameat_with(
