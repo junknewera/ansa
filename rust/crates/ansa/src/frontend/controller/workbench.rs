@@ -31,6 +31,7 @@ use std::{
 use tokio::sync::mpsc;
 mod activity;
 mod attachments;
+mod mentions;
 mod roles;
 mod ux;
 
@@ -65,6 +66,7 @@ struct Slot {
     settled: Instant,
     resync: bool,
     pending_prompt: Option<String>,
+    sending_mention: bool,
     follow_accepted_submit: Option<CommandId>,
     chat_priority: Option<(CommandId, crate::frontend::sessions::Priority)>,
     pending_summary: Option<PendingSummary>,
@@ -117,6 +119,7 @@ impl Slot {
             settled: Instant::now(),
             resync: true,
             pending_prompt: prompt,
+            sending_mention: false,
             follow_accepted_submit: None,
             chat_priority: None,
             pending_summary: None,
@@ -712,6 +715,17 @@ enum SummaryDispatch {
 }
 
 enum Job {
+    MentionImages {
+        owner: String,
+        text: String,
+        mode: AgentMode,
+        result: Result<Vec<ImageInput>>,
+    },
+    MentionFiles {
+        directory: String,
+        prefix: String,
+        listing: Option<FileListing>,
+    },
     Attachment {
         owner: String,
         result: Result<ImageInput>,
@@ -1085,6 +1099,8 @@ struct Workbench {
     plan_after_roles: Option<(String, Option<String>, bool)>,
     menu: Option<Menu>,
     completion: Option<Completion>,
+    mention_listing: Option<(String, String, Option<FileListing>)>,
+    mention_listing_job: Option<(String, String, Cancel)>,
     navigation_editor: super::super::input::Editor,
     completion_closed: Option<(Vec<u8>, usize)>,
     models_cache: Option<Json>,
@@ -1215,6 +1231,8 @@ impl Workbench {
             plan_after_roles: None,
             menu: None,
             completion: None,
+            mention_listing: None,
+            mention_listing_job: None,
             navigation_editor: Default::default(),
             completion_closed: None,
             models_cache: None,
@@ -1301,6 +1319,7 @@ impl Workbench {
             return false;
         }
         let slot = &mut self.slots[self.current];
+        slot.sending_mention = false;
         if !slot.state.editor.bytes.is_empty()
             || slot.state.editor.overflow
             || slot.state.editor.pasting()
@@ -1370,6 +1389,7 @@ impl Workbench {
         self.disarm_exit();
         self.cancel_modal();
         self.cancel_editor_request();
+        self.slots[self.current].sending_mention = false;
         self.current = index;
         self.orchestration_mode = None;
         self.refinement = None;
@@ -1934,7 +1954,10 @@ impl Workbench {
                 slot.state.report(io, "ansa: submit_size");
             } else if !slot.state.editor.bytes.is_empty() {
                 match slot.state.editor.text().map(str::to_owned) {
-                    Ok(text) => finished = self.text(&text, io).1,
+                    Ok(text) if !self.prepare_mention_images(&text, io) => {
+                        finished = self.text(&text, io).1
+                    }
+                    Ok(_) => {}
                     Err(code) => {
                         let slot = &mut self.slots[self.current];
                         slot.state.exit = 1;
@@ -3753,6 +3776,28 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
+            Job::MentionImages {
+                owner,
+                text,
+                mode,
+                result,
+            } => {
+                self.submit_mention_images(&owner, &text, mode, result, io);
+            }
+            Job::MentionFiles {
+                directory,
+                prefix,
+                listing,
+            } => {
+                if self
+                    .mention_listing_job
+                    .take()
+                    .is_some_and(|(_, _, stop)| !stop.cancelled())
+                {
+                    self.mention_listing = Some((directory, prefix, listing));
+                }
+                self.refresh_completion();
+            }
             Job::Attachment { owner, result } => {
                 if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
                     slot.state.image_loading = false;
@@ -4951,6 +4996,7 @@ impl Workbench {
         if let Some(completion) = &self.completion
             && self.menu.is_none()
             && self.focus == Focus::Chat
+            && !completion.loading()
             && !completion.exact_command(&self.slots[self.current].state.editor)
         {
             self.complete_command();
@@ -6508,7 +6554,10 @@ pub async fn run_attached(
                     }
                     dirty = true;
                 } }
-                job = work.jobs.join_next(), if !work.jobs.is_empty() => { if let Some(job) = job { work.job(job.map_err(|_| "workspace_job")?, io); dirty = true; } }
+                job = work.jobs.join_next(), if !work.jobs.is_empty() => { if let Some(job) = job {
+                    work.job(job.map_err(|_| "workspace_job")?, io);
+                    dirty = true;
+                } }
                 ready = async { input_events.as_ref().expect("enabled").readable().await }, if input_events.is_some() && input_enabled => { input_guard = Some(ready.map_err(|_| "cli_input_poll")?); }
                 _ = io.writer.changed() => { dirty = true; }
                 _ = interval.tick() => {}
@@ -6692,6 +6741,11 @@ pub async fn run_attached(
                             0
                         } else { count };
                         for (position, &byte) in bytes[..count].iter().enumerate() {
+                            // Loading an image is asynchronous. A new input must not send an
+                            // old draft, even if the user deletes and retypes the same text.
+                            if !matches!(byte, b'\r' | b'\n') {
+                                work.slots[work.current].sending_mention = false;
+                            }
                             work.disarm_exit();
                             if matches!(&work.menu, Some(Menu::Palette { stage, .. }) if stage.editing()) {
                                 match work.navigation_editor.feed(byte, true) {
@@ -6788,8 +6842,12 @@ pub async fn run_attached(
                             } else {
                                 let slot = &mut work.slots[work.current];
                                 let before = (slot.state.editor.bytes.len(), slot.state.editor.cursor);
+                                let was_pasting = slot.state.editor.pasting();
                                 slot.state.editor.set_completion(complete);
                                 let action = slot.state.editor.feed(byte, true);
+                                if was_pasting && !slot.state.editor.pasting() && commands::mention::Mention::at(&slot.state.editor).is_some() {
+                                    work.completion_closed = Some((slot.state.editor.bytes.clone(), slot.state.editor.cursor));
+                                }
                                 if before != (slot.state.editor.bytes.len(), slot.state.editor.cursor) {
                                     slot.state.input_history.edited(&slot.state.editor); slot.state.status.clear();
                                 }
@@ -6798,23 +6856,10 @@ pub async fn run_attached(
                             if let Some(action) = action {
                                 match action {
                                     Action::Submit | Action::QueueSubmit => {
-                                        let origin = work.current;
-                                        if let Some(text) = work.enter(io) {
-                                            let (accepted, done) = work.text(&text, io); finished |= done;
-                                            if accepted {
-                                                work.selection = None;
-                                                let slot = &mut work.slots[origin];
-                                                if let Some((id, _, _)) = &slot.state.pending_draft
-                                                    && slot.state.pending.as_ref() == Some(id)
-                                                {
-                                                    slot.follow_accepted_submit = Some(id.clone());
-                                                }
-                                                if !matches!(work.menu, Some(Menu::DraftingPlan)) {
-                                                    slot.state.editor.clear();
-                                                    slot.state.input_history.reset();
-                                                }
-                                                slot.refresh = Instant::now();
-                                            }
+                                        if let Some(text) = work.enter(io)
+                                            && !work.prepare_mention_images(&text, io)
+                                        {
+                                            finished |= work.submit_composer(&text, io);
                                         }
                                     }
                                     Action::Complete => { if matches!(work.menu, Some(Menu::Help { .. })) { work.enter(io); } else { work.complete_command(); } }
@@ -6843,6 +6888,17 @@ pub async fn run_attached(
                     Err(error) if matches!(error.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => {}
                     Err(_) => return Err("cli_input_read"),
                 }
+            }
+            if let Some((_, _, stop)) = &work.mention_listing_job {
+                if work.completion.is_none() || work.input_closed || work.terminating || finished {
+                    stop.cancel();
+                }
+            } else if !finished && !work.input_closed && !work.terminating
+                && work.completion.as_ref().is_some_and(Completion::loading)
+                && work.jobs.len() + work.pending_context.len() < MAX_JOBS
+            {
+                work.refresh_completion();
+                dirty = true;
             }
             work.close_owners();
             if work.jobs.is_empty() && work.pending_context.is_empty() && work.slots.iter().all(|slot| slot.closed) { finished = true; }

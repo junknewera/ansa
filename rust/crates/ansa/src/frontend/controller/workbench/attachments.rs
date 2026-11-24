@@ -7,6 +7,14 @@ use std::io::Read;
 fn read_image(path: &Path, remaining: usize, original_remaining: usize) -> Result<ImageInput> {
     let file = ansa_linux::fs::open_nofollow(path, ansa_linux::local::read_flags())
         .map_err(|_| "image_open")?;
+    read_open_image(file, remaining, original_remaining)
+}
+
+pub(super) fn read_open_image(
+    file: std::fs::File,
+    remaining: usize,
+    original_remaining: usize,
+) -> Result<ImageInput> {
     let metadata = file.metadata().map_err(|_| "image_stat")?;
     if !metadata.is_file() {
         return Err("image_regular_file_required");

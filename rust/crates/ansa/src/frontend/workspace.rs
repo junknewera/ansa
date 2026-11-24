@@ -86,6 +86,9 @@ impl FileHost {
             auth.to_path_buf(),
             settings.directory.join("auth"),
             settings.directory.join("sessions"),
+            settings.directory.join("openrouter"),
+            settings.directory.join("harness-profiles"),
+            settings.directory.join("terminal-workspaces"),
         ] {
             // Opens reject every symlink component. Lexical protected roots
             // therefore suffice, and construction does not touch filesystem I/O.
@@ -127,16 +130,29 @@ impl FileHost {
 
     /// Never follows a symlink component; a hard-linked file is also rejected.
     pub fn validate_file(&self, path: &Path) -> Result<PathBuf> {
+        self.open_regular(path).map(|(path, _)| path)
+    }
+
+    pub(super) fn open_regular(&self, path: &Path) -> Result<(PathBuf, std::fs::File)> {
         let path = self.path(path)?;
         let file = ansa_linux::fs::open_nofollow(&path, ansa_linux::local::read_flags())
             .map_err(|_| "workspace_file_access")?;
         if !ansa_linux::fs::regular_single(&file).map_err(|_| "workspace_file_type")? {
             return Err("workspace_file_type");
         }
-        Ok(path)
+        Ok((path, file))
     }
 
     pub fn list(&self, path: &Path, stop: &Cancel) -> Result<FileListing> {
+        self.list_matching(path, "", stop)
+    }
+
+    pub(super) fn list_matching(
+        &self,
+        path: &Path,
+        prefix: &str,
+        stop: &Cancel,
+    ) -> Result<FileListing> {
         check_cancel(stop)?;
         let path = self.path(path)?;
         let directory = ansa_linux::fs::open_nofollow(&path, ansa_linux::local::read_flags())
@@ -157,12 +173,15 @@ impl FileHost {
         for entry in std::fs::read_dir(held_directory).map_err(|_| "workspace_directory")? {
             check_cancel(stop)?;
             visited += 1;
-            if visited > 4096 || entries.len() == LIST_ENTRIES {
+            if (prefix.is_empty() && visited > 4096) || entries.len() == LIST_ENTRIES {
                 truncated = true;
                 break;
             }
             let entry = entry.map_err(|_| "workspace_directory")?;
             let name = entry.file_name();
+            if !name.as_encoded_bytes().starts_with(prefix.as_bytes()) {
+                continue;
+            }
             let original = path.join(&name);
             if self.blocked(&original)
                 || self

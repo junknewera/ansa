@@ -1010,6 +1010,30 @@ def live_terminal_default(screen, root, cwd):
         assert not select.select([listener], [], [], 0)[0], "provider connection during startup"
 
 
+def file_mentions(screen, root, cwd):
+    before = journals(root)
+    folder = cwd / "mention samples"
+    folder.mkdir()
+    with (folder / "данные 1.docx").open("wb") as file:
+        file.truncate(100 * 1024 * 1024)  # A sparse file proves selection does not inline its bytes.
+    screen.send("Проверь @")
+    until(screen, lambda frame: "mention samples/" in frame, "workspace paths at the cursor")
+    screen.send("mention")
+    screen.send(b"\t")
+    until(screen, lambda frame: "данные 1.docx" in frame, "directory selection opens its children")
+    screen.send(b"\r")
+    expected = r"  › Проверь @mention\ samples/данные\ 1.docx"
+    until(screen, lambda _: screen.vt.line(-4).rstrip() == expected and "данные 1.docx" not in body(screen),
+          "file selection retains the surrounding draft")
+    assert journals(root) == before
+    prompt = expected.removeprefix("  › ") + " сейчас"
+    screen.send("сейчас\r")
+    until(screen, lambda _: completed(root, prompt), "submitted workspace reference")
+    assert [event["text"] for event in records(root) if event["kind"] == "accepted"] == [prompt]
+    screen.send("/exit\r")
+    return "normal"
+
+
 def completion_and_help(screen, root, cwd):
     before = journals(root)
     screen.send("/mo")
@@ -1336,7 +1360,9 @@ def orchestration_direct(screen, root, cwd):
     report = cwd / "report.txt"
     report.write_text("before fixture\n")
     screen.send("TERMINAL_DEMO\r")
-    until(screen, lambda _: completed(root, "TERMINAL_DEMO"), "lead opened its workspace shell")
+    until(screen, lambda frame: completed(root, "TERMINAL_DEMO") and "Demo terminal opened" in frame
+          and ready(screen) and "Ctrl+C stop" not in screen.vt.line(-2),
+          "lead opened its workspace shell and the composer is ready")
     local(screen, "/orchestrate " + message)
     note = "I will ask a helper to work on this task."
     until(screen, lambda frame: note in frame and title in frame and "Agent gpt-" in frame and "/agents" in frame,
@@ -2519,7 +2545,7 @@ def main():
              ("split-source-scroll", split_source_scroll),
              ("markdown-source-preview", markdown_source_preview),
              ("inline-tool-details", inline_tool_details),
-             ("slash-completion-help", completion_and_help),
+             ("slash-completion-help", completion_and_help), ("file-mentions", file_mentions),
              ("new-resume-interrupt", new_resume_and_exit),
              ("native-terminal-panel", native_terminal_panel),
              ("model-effort-pair", model_effort_pair),
