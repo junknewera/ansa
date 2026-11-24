@@ -68,12 +68,37 @@ class QualityControls(unittest.TestCase):
             self.assertEqual(env['MIRIFLAGS'],'-Zmiri-strict-provenance')
 
     def test_missing_ignored_failed_and_filtered_tests_never_pass(self):
-        valid=b'test result: ok. 130 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;'
-        self.assertEqual(quality.executed_tests(valid,'address'),130)
-        for mutation in [b'',valid.replace(b'130 passed',b'0 passed'),valid.replace(b'0 ignored',b'1 ignored'),valid.replace(b'0 failed',b'1 failed'),valid.replace(b'0 filtered',b'1 filtered')]:
+        def events(*rows):
+            return '\n'.join(map(json.dumps, rows)).encode()
+
+        listing = events(
+            {'type': 'suite', 'event': 'discovery'},
+            {'type': 'test', 'event': 'discovered', 'name': 'expected', 'ignore': False},
+            {'type': 'suite', 'event': 'completed', 'tests': 1, 'benchmarks': 0, 'ignored': 0, 'total': 1},
+        )
+        reference = quality.test_inventory(listing, listing=True)
+        valid = events(
+            {'type': 'suite', 'event': 'started', 'test_count': 1},
+            {'type': 'test', 'event': 'started', 'name': 'expected'},
+            {'type': 'test', 'event': 'ok', 'name': 'expected'},
+            {'type': 'suite', 'event': 'ok', 'passed': 1, 'failed': 0, 'ignored': 0, 'measured': 0, 'filtered_out': 0},
+        )
+        self.assertEqual(quality.executed_tests(valid, reference), 1)
+        nested = b'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out;\n'
+        self.assertEqual(quality.executed_tests(nested + valid, reference), 1)
+        for mutation in [
+            b'', valid.rsplit(b'\n', 1)[0], valid.replace(b'expected', b'replacement'),
+            valid.replace(b'"passed": 1', b'"passed": 0'),
+            valid.replace(b'"ignored": 0', b'"ignored": 1'),
+            valid.replace(b'"failed": 0', b'"failed": 1'),
+            valid.replace(b'"filtered_out": 0', b'"filtered_out": 1'),
+            valid + b'\n' + valid,
+        ]:
             with self.subTest(mutation=mutation):
-                with self.assertRaises(ValueError):quality.executed_tests(mutation,'address')
-        with self.assertRaises(ValueError):quality.executed_tests(valid,'miri')
+                with self.assertRaises(ValueError):
+                    quality.executed_tests(mutation, reference)
+        with self.assertRaises(ValueError):
+            quality.test_inventory(listing.replace(b'"ignore": false', b'"ignore": true'), listing=True)
 
 class FixtureControls(unittest.TestCase):
     def test_scoped_aliases_and_stale_readiness_rejected(self):
