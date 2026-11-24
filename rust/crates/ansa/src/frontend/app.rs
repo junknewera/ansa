@@ -951,7 +951,10 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                         .is_some_and(|text| {
                             text.starts_with("Use the pinned local skill `inspect-picture`")
                         });
-                    let item = if name.is_none() && skill_fixture {
+                    let item = if trace.with_file_name("paged-search").is_file() {
+                        let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        search_fixture::item(&request, input, index)?
+                    } else if name.is_none() && skill_fixture {
                         json!({"type":"function_call","id":"fixture-skill-item","call_id":"fixture-skill-call","namespace":"omh","name":"read_skill","arguments":r#"{"name":"inspect-picture"}"#,"status":"completed"})
                     } else if name.is_none() && direct && last["type"] != "function_call_output" {
                         if !request["tools"][0]["tools"]
@@ -1059,6 +1062,8 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
 mod direct_edit_fixture;
 #[cfg(feature = "frontend-test-adapter")]
 mod plus_budget_fixture;
+#[cfg(feature = "frontend-test-adapter")]
+mod search_fixture;
 
 #[cfg(feature = "frontend-test-adapter")]
 fn plus_fixture_response(

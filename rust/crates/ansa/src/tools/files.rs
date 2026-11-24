@@ -403,6 +403,9 @@ fn local_argument_hint(name: &str, args: &Json) -> Option<&'static str> {
         {
             Some("query must contain 1..256 bytes.")
         }
+        "search_files" if super::search::cursor_argument(args).is_err() => {
+            Some("cursor must be empty on the first page or the previous next_cursor.")
+        }
         "search_files" if !matches!(args.text_field("mode"), Ok("name" | "content")) => {
             Some("mode must be name or content.")
         }
@@ -618,11 +621,15 @@ fn register_local_tools(
         let legacy = invoke.clone();
         registry.register_with_policy(
             Definition {
-                descriptor: Descriptor {
-                    name: name.into(),
-                    description: description.into(),
-                    revision: "ansa_local_v1".into(),
-                    schema: schema(&properties)?,
+                descriptor: if name == "search_files" {
+                    super::search::descriptor(false)?
+                } else {
+                    Descriptor {
+                        name: name.into(),
+                        description: description.into(),
+                        revision: "ansa_local_v1".into(),
+                        schema: schema(&properties)?,
+                    }
                 },
                 validator: Arc::new(move |args| local_argument_hint(name, args).is_none()),
                 executor: Arc::new(move |args| {

@@ -48,6 +48,8 @@ jobs:
         run: |
           python3 -B tests/carbon_skills_pty.py --binary rust/target/debug/ansa
           python3 -B -m unittest discover -s tests -p test_hooks.py
+      - name: Find and read a large log tail through Carbon Plan
+        run: python3 -B tests/carbon_search_pty.py --binary rust/target/debug/examples/frontend_adapter
       - name: Exercise benchmark modes through Carbon
         run: |
           python3 -B benchmarks/smoke.py --binary rust/target/debug/ansa \
