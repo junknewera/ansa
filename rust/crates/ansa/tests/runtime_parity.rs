@@ -318,6 +318,134 @@ async fn rejected_batch_replays_both_outputs_before_executing_a_corrected_call()
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn work_rereads_and_corrects_a_rejected_edit_in_the_same_turn() {
+    use ansa::{
+        config::{agent_epoch, load_agent_settings},
+        protocol::{json::Json, legacy_json_v1::sha256},
+        provider::{
+            native,
+            replay::{Effects, Execution},
+            request::Request,
+        },
+        runtime::*,
+        tools::files::local_tools,
+    };
+    use std::{fs, sync::Arc};
+
+    let root = fixture::Root::new();
+    let home = root.0.join("home");
+    let cwd = home.join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let file = cwd.join("report.txt");
+    fs::write(&file, "current\n").unwrap();
+    let settings = load_agent_settings(&cwd, &home).unwrap();
+    let epoch = agent_epoch(&settings).unwrap();
+    let token = sha256(
+        epoch
+            .exact_state
+            .field("instructions")
+            .unwrap()
+            .dump()
+            .as_bytes(),
+    );
+    let tools = local_tools(
+        settings,
+        epoch.clone(),
+        &root.journal(),
+        &home.join("auth"),
+        &std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    let configuration = Request::new(
+        fixture::configuration(&tools).binding,
+        epoch,
+        tools.advertisement().clone(),
+        vec![],
+    )
+    .unwrap();
+    let edited = file.clone();
+    let generate: Generate = Arc::new(move |request, _, _| {
+        let outputs = request
+            .input
+            .iter()
+            .filter(|item| item.text_field("type") == Ok("function_call_output"))
+            .collect::<Vec<_>>();
+        let edit = |old: &str| {
+            Json::object(vec![
+                ("path", Json::string("report.txt")?),
+                ("old_text", Json::string(old)?),
+                ("new_text", Json::string("corrected")?),
+                ("instruction_token", Json::string(&token)?),
+            ])
+        };
+        let (name, args) = match outputs.as_slice() {
+            [] => ("edit_file", edit("stale")?),
+            [rejected] => {
+                let outcome = Json::parse(rejected.text_field("output")?)?;
+                assert_eq!(outcome.text_field("error")?, "file_preimage_missing");
+                assert!(!outcome.field("applied")?.boolean()?);
+                assert_eq!(fs::read_to_string(&edited).unwrap(), "current\n");
+                (
+                    "read_file",
+                    Json::object(vec![
+                        ("path", Json::string("report.txt")?),
+                        ("offset", Json::parse("0")?),
+                        ("max_bytes", Json::parse("128")?),
+                        ("instruction_token", Json::string(&token)?),
+                    ])?,
+                )
+            }
+            [_, read] => {
+                let outcome = Json::parse(read.text_field("output")?)?;
+                assert_eq!(outcome.text_field("content")?, "current\n");
+                ("edit_file", edit("current")?)
+            }
+            [_, _, applied] => {
+                let outcome = Json::parse(applied.text_field("output")?)?;
+                assert!(outcome.field("applied")?.boolean()?);
+                return native::load(&fixture::saved_response(request, Some("Corrected"), 0));
+            }
+            _ => panic!("unexpected continuation"),
+        };
+        let response = fixture::response_with_offset(request, None, 1, outputs.len());
+        let call = response.field("items")?.elements()?[0]
+            .with("name", Json::string(name)?)?
+            .with("arguments", Json::string(&args.dump())?)?;
+        native::load(&response.with("items", Json::array(vec![call])?)?)
+    });
+    let mut runtime = Runtime::new(
+        "edit-recovery".into(),
+        configuration,
+        tools,
+        generate,
+        Limits::default(),
+        Options {
+            directory: Some(root.journal()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    runtime.ready().await.unwrap();
+    let handle = runtime.handle();
+    let request = fixture::submit(&handle, "submit", "Correct the report", "turn").await;
+    let event = fixture::until(&handle, |p| matches!(p, EventPayload::ToolFinished(_))).await;
+    assert_eq!(event.request.as_ref(), Some(&request));
+    let EventPayload::ToolFinished(rejected) = event.payload else {
+        unreachable!()
+    };
+    assert_eq!(rejected.call_id, "call0");
+    assert_eq!(rejected.execution, Execution::Failed);
+    assert_eq!(rejected.effects, Effects::KnownResult);
+    let event = fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    assert_eq!(event.request.as_ref(), Some(&request));
+    let completed = fixture::snapshot(&handle, "result").await;
+    assert_eq!(completed.text, "Corrected");
+    assert_eq!(completed.completed_tools, 3);
+    assert_eq!(fs::read_to_string(file).unwrap(), "corrected\n");
+    fixture::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn rejected_batch_reserves_response_room_using_the_measured_context_after_reopen() {
     use ansa::{protocol::json::Json, provider::native, runtime::*};
     use std::sync::{

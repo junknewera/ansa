@@ -1335,6 +1335,8 @@ def orchestration_direct(screen, root, cwd):
     title = "Direct fixture report edit"
     report = cwd / "report.txt"
     report.write_text("before fixture\n")
+    screen.send("TERMINAL_DEMO\r")
+    until(screen, lambda _: completed(root, "TERMINAL_DEMO"), "lead opened its workspace shell")
     local(screen, "/orchestrate " + message)
     note = "I will ask a helper to work on this task."
     until(screen, lambda frame: note in frame and title in frame and "Agent gpt-" in frame and "/agents" in frame,
@@ -2255,6 +2257,41 @@ def siwc_orchestration_direct(screen, root, cwd):
     return "normal"
 
 
+def siwc_direct_edit_check(screen, root, cwd):
+    report = cwd / "report.txt"
+    tail = "Unchanged fixture line.\n" * 7000
+    report.write_text("before fixture\n" + tail)
+    check = cwd / "check.sh"
+    script = 'set -eu\ngrep -qx "after fixture" report.txt\nprintf "%s\\n" DELEGATED_EDIT_PASS\n'
+    check.write_text(script)
+    subprocess.run(["git", "init", "-q"], cwd=cwd, check=True)
+    subprocess.run(["git", "add", "report.txt", "check.sh"], cwd=cwd, check=True)
+    subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost",
+                    "commit", "-qm", "original"], cwd=cwd, check=True)
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "lead ready")
+    prompt = "Update the report and test the change"
+    local(screen, "/orchestrate " + prompt)
+    until(screen, lambda frame: "DELEGATED_EDIT_VERIFIED" in frame and completed(root, prompt),
+          "lead saw the real diff and the passing check in its original shell", timeout=25)
+    assert check.read_text() == script and report.read_text() == "after fixture\n" + tail
+    rows = records(root)
+    child, = [row["configuration"]["epoch"]["exact_state"] for row in rows
+              if row["kind"] == "init" and "orchestration_parent" in row["configuration"]["epoch"]["exact_state"]]
+    assert child["orchestration_writes"] == ["report.txt"]
+    assert child["orchestration_reads"] == ["report.txt", "check.sh"] and "orchestration_git_snapshot" not in child
+    assert not any(row["kind"] in ("pause", "resume") for row in rows)
+    intents = [row["invocation"] for row in rows if row["kind"] == "intent"]
+    assert [op["name"] for op in intents].count("terminal_create") == 1
+    assert [op["name"] for op in intents].count("delegate_task") == 1
+    edits = [op["operation"] for op in intents if op["name"] == "edit_file"]
+    refused, applied = [json.loads(row["result"]["output"]) for row in rows
+                        if row["kind"] == "outcome" and row["result"]["operation"] in edits]
+    assert refused["error"] == "file_preimage_missing" and refused["applied"] is False
+    assert applied["applied"] and applied["change"]["after"] == "after fixture"
+    local(screen, "/exit")
+    return "normal"
+
+
 def siwc_orchestration(screen, root, cwd):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "GPT ready without a network call")
     screen.send(b"\t\t")
@@ -2505,6 +2542,7 @@ def main():
              ("openrouter-orchestration", openrouter_orchestration),
              ("siwc-orchestration", siwc_orchestration),
              ("siwc-orchestration-direct", siwc_orchestration_direct),
+             ("siwc-direct-edit-check", siwc_direct_edit_check),
              ("siwc-orchestrate-plus", siwc_orchestrate_plus),
              ("siwc-orchestrate-plus-budget", siwc_orchestrate_plus_budget),
              ("siwc-orchestrate-plus-budget-configured", lambda screen, root, cwd: siwc_orchestrate_plus_budget(screen, root, cwd, capped=True)),
@@ -2512,7 +2550,7 @@ def main():
              ("siwc-orchestrate-plus-plan-only", siwc_orchestrate_plus_plan_only),
              ("siwc-orchestrate-plus-blocked", siwc_orchestrate_plus_blocked),
              ("siwc-orchestrate-plus-blocked-rejected", lambda *args: siwc_orchestrate_plus_blocked(*args, reject=True))]
-    transport_cases = {"openrouter-orchestration", "siwc-orchestration", "siwc-orchestration-direct",
+    transport_cases = {"openrouter-orchestration", "siwc-orchestration", "siwc-orchestration-direct", "siwc-direct-edit-check",
                        *(name for name, _ in cases if name.startswith("siwc-orchestrate-plus"))}
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -2544,6 +2582,8 @@ def main():
                 cwd.chmod(0o700)
                 if name.startswith("siwc-"):
                     seed_siwc(home)
+                if name == "siwc-direct-edit-check":
+                    (root / "direct-edit-check").touch()
                 if name == "siwc-orchestration":
                     nested = home / "Workspace/pet/ansa"
                     nested.mkdir(parents=True)

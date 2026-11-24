@@ -1,11 +1,11 @@
-//! Explicit, bounded UTF-8 edits with exact before/after values for the UI.
+//! Explicit, bounded UTF-8 edits with exact file hashes and a bounded receipt.
 use super::{
     files::{Host, b, path_argument, schema},
     registry::{Definition, Outcome, Policy, Registry},
 };
 use crate::{
     auth::Cancel,
-    config::{Result, path_text, s},
+    config::{Result, n, path_text, s},
     protocol::{json::Json, legacy_json_v1::sha256},
     provider::{
         replay::{Effects, Execution},
@@ -16,14 +16,34 @@ use std::{path::Path, sync::Arc};
 
 const ARG_BYTES: usize = 16 * 1024;
 const OUTPUT_BYTES: usize = 120 * 1024;
+const LEGACY_FILE_BYTES: usize = 64 * 1024;
+const REVISION: &str = "ansa_edit_v2";
+const LEGACY_REVISION: &str = "ansa_edit_v1";
+const LEGACY_DESCRIPTION: &str = "Replace exactly one old_text occurrence in a regular UTF-8 file. To create a new file, use empty old_text; the path must not exist. Read the file first. Files are limited to 64 KiB, old_text/new_text to 16 KiB each; a complete before/after result must fit 120 KiB. Dotenv, credentials, links and ansa state are excluded. instruction_token identifies applicable AGENTS.md instructions.";
+
+pub(super) fn legacy_descriptor(current: &Descriptor) -> Option<Descriptor> {
+    (current.name == "edit_file" && current.revision == REVISION).then(|| Descriptor {
+        revision: LEGACY_REVISION.into(),
+        description: LEGACY_DESCRIPTION.into(),
+        ..current.clone()
+    })
+}
 
 fn rejection(code: &str) -> Outcome {
     // These preflight checks conclusively rejected the edit. Return the receipt
     // to the model so it can report the blocker or choose another allowed task.
     let effects = match code {
-        "terminal_workspace_quarantined" | "terminal_workspace_busy" | "task_path_scope" => {
-            Effects::KnownResult
-        }
+        "terminal_workspace_quarantined"
+        | "terminal_workspace_busy"
+        | "task_path_scope"
+        | "file_already_exists"
+        | "file_missing"
+        | "file_preimage_missing"
+        | "file_preimage_ambiguous"
+        | "file_edit_no_change"
+        | "file_changed"
+        | "file_edit_limit"
+        | "file_edit_output_limit" => Effects::KnownResult,
         _ => Effects::NotStarted,
     };
     let mut fields = vec![
@@ -53,18 +73,24 @@ fn unknown() -> Outcome {
 impl Host {
     #[cfg(test)]
     fn edit(&self, args: &Json, stop: &Cancel) -> Outcome {
-        self.edit_owned(args, stop, &sha256(args.dump().as_bytes()))
+        self.edit_owned(args, stop, &sha256(args.dump().as_bytes()), false)
     }
 
-    fn edit_owned(&self, args: &Json, stop: &Cancel, operation: &str) -> Outcome {
+    fn edit_owned(&self, args: &Json, stop: &Cancel, operation: &str, legacy: bool) -> Outcome {
         if stop.cancelled() {
             return Outcome::not_started();
         }
-        self.edit_checked(args, stop, operation)
+        self.edit_checked(args, stop, operation, legacy)
             .unwrap_or_else(rejection)
     }
 
-    fn edit_checked(&self, args: &Json, stop: &Cancel, operation: &str) -> Result<Outcome> {
+    fn edit_checked(
+        &self,
+        args: &Json,
+        stop: &Cancel,
+        operation: &str,
+        legacy: bool,
+    ) -> Result<Outcome> {
         let text = args.text_field("path")?;
         let path = Path::new(text);
         if !path_argument(args, "path")? {
@@ -109,20 +135,28 @@ impl Host {
         }
         let mut workspace = self.workspace_writer(path.parent().ok_or("file_path")?)?;
         let snapshot = ansa_linux::file_edit::Snapshot::open_in(&path, workspace.directory())?;
+        let maximum = if legacy {
+            LEGACY_FILE_BYTES
+        } else {
+            ansa_linux::file_edit::MAX_BYTES
+        };
         let existed = snapshot.before().is_some();
-        let before = std::str::from_utf8(snapshot.before().unwrap_or_default())
-            .map_err(|_| "file_not_utf8")?;
+        let bytes = snapshot.before().unwrap_or_default();
+        if bytes.len() > maximum {
+            return Err("file_edit_limit");
+        }
+        let before = std::str::from_utf8(bytes).map_err(|_| "file_not_utf8")?;
         if before.contains('\0') {
             return Err("binary_file");
         }
         if stop.cancelled() {
             return Ok(Outcome::not_started());
         }
-        let after = if old.is_empty() {
+        let start = if old.is_empty() {
             if existed {
                 return Err("file_already_exists");
             }
-            new.to_owned()
+            0
         } else {
             if !existed {
                 return Err("file_missing");
@@ -135,30 +169,17 @@ impl Host {
             if old == new {
                 return Err("file_edit_no_change");
             }
-            let mut after =
-                String::with_capacity(before.len().saturating_sub(old.len()) + new.len());
-            after.push_str(&before[..start]);
-            after.push_str(new);
-            after.push_str(&before[start + old.len()..]);
-            after
+            start
         };
-        if after.len() > ansa_linux::file_edit::MAX_BYTES {
+        let length = before.len() - old.len() + new.len();
+        if length > maximum {
             return Err("file_edit_limit");
         }
-        let output = Json::object(vec![
-            ("path", s(path_text(&path)?)?),
-            ("before", s(before)?),
-            ("after", s(&after)?),
-            ("before_hash", s(&sha256(before.as_bytes()))?),
-            ("after_hash", s(&sha256(after.as_bytes()))?),
-            ("applied", b(true)),
-        ])?
-        .dump();
-        // A successful edit must always have a complete, bounded result. This
-        // check precedes creation of the private staging file and publication.
-        if output.len() > OUTPUT_BYTES {
-            return Err("file_edit_output_limit");
-        }
+        let mut after = String::with_capacity(length);
+        after.push_str(&before[..start]);
+        after.push_str(new);
+        after.push_str(&before[start + old.len()..]);
+        let output = edit_receipt(&path, before, &after, start, old, new, legacy)?;
         workspace.begin(operation)?;
         let published = snapshot.publish(after.as_bytes(), || stop.cancelled());
         if published != Err(ansa_linux::file_edit::Failure::Unknown) {
@@ -173,12 +194,74 @@ impl Host {
     }
 }
 
+fn edit_receipt(
+    path: &Path,
+    before: &str,
+    after: &str,
+    offset: usize,
+    old: &str,
+    new: &str,
+    legacy: bool,
+) -> Result<String> {
+    let path = s(path_text(path)?)?;
+    let before_hash = s(&sha256(before.as_bytes()))?;
+    let after_hash = s(&sha256(after.as_bytes()))?;
+    if before.len().max(after.len()) <= LEGACY_FILE_BYTES {
+        let full = Json::object_with_limits(
+            vec![
+                ("path", path.clone()),
+                ("before", s(before)?),
+                ("after", s(after)?),
+                ("before_hash", before_hash.clone()),
+                ("after_hash", after_hash.clone()),
+                ("applied", b(true)),
+            ],
+            OUTPUT_BYTES,
+        );
+        match full {
+            Ok(full) => return Ok(full.dump()),
+            Err("json_build_limit") => {}
+            Err(code) => return Err(code),
+        }
+    }
+    if legacy {
+        return Err("file_edit_output_limit");
+    }
+    let line = 1 + before.as_bytes()[..offset]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let change = Json::object(vec![
+        ("offset", n(offset)),
+        ("line", n(line)),
+        ("before", s(old)?),
+        ("after", s(new)?),
+        ("before_hash", s(&sha256(old.as_bytes()))?),
+        ("after_hash", s(&sha256(new.as_bytes()))?),
+    ])?;
+    Json::object_with_limits(
+        vec![
+            ("path", path),
+            ("change", change),
+            ("before_hash", before_hash),
+            ("after_hash", after_hash),
+            ("applied", b(true)),
+        ],
+        OUTPUT_BYTES,
+    )
+    .map(|output| output.dump())
+    .map_err(|code| match code {
+        "json_build_limit" => "file_edit_output_limit",
+        _ => code,
+    })
+}
+
 pub(crate) fn register(registry: &mut Registry, host: Arc<Host>) -> Result<()> {
     registry.register_with_policy(Definition {
         descriptor: Descriptor {
             name: "edit_file".into(),
-            description: "Replace exactly one old_text occurrence in a regular UTF-8 file. To create a new file, use empty old_text; the path must not exist. Read the file first. Files are limited to 64 KiB, old_text/new_text to 16 KiB each; a complete before/after result must fit 120 KiB. Dotenv, credentials, links and ansa state are excluded. instruction_token identifies applicable AGENTS.md instructions.".into(),
-            revision: "ansa_edit_v1".into(),
+            description: "Replace exactly one old_text occurrence in a regular UTF-8 file up to 1 MiB. To create a new file, use empty old_text; the path must not exist. Read the file first. Keep old_text and new_text within 16 KiB each. Results include whole-file SHA-256 values and either complete before/after text or the changed fragment and its byte offset. Dotenv, credentials, links and ansa state are excluded. instruction_token identifies applicable AGENTS.md instructions.".into(),
+            revision: REVISION.into(),
             schema: schema(&[("path", "string"), ("old_text", "string"), ("new_text", "string")])?,
         },
         validator: Arc::new(|args| edit_argument_hint(args).is_none()),
@@ -189,7 +272,12 @@ pub(crate) fn register(registry: &mut Registry, host: Arc<Host>) -> Result<()> {
         requires_journal: true,
         read_only: false,
         invoke: Some(Arc::new(move |invocation, stop| match invocation.save() {
-            Ok(exact) => host.edit_owned(&invocation.arguments, stop, &sha256(exact.dump().as_bytes())),
+            Ok(exact) => host.edit_owned(
+                &invocation.arguments,
+                stop,
+                &sha256(exact.dump().as_bytes()),
+                invocation.revision == LEGACY_REVISION,
+            ),
             Err(code) => rejection(code),
         })),
         // An interrupted publication has no safely replayable external effect.
@@ -403,8 +491,11 @@ mod tests {
         Json::parse(std::str::from_utf8(value.output()).unwrap()).unwrap()
     }
     fn rejected(value: Outcome, error: &str) {
+        rejected_with_effect(value, error, Effects::NotStarted);
+    }
+    fn rejected_with_effect(value: Outcome, error: &str, effects: Effects) {
         assert_eq!(value.execution(), Execution::Failed);
-        assert_eq!(value.effects(), Effects::NotStarted);
+        assert_eq!(value.effects(), effects);
         let output = output(&value);
         assert_eq!(output.text_field("error").unwrap(), error);
         assert_eq!(*output.field("applied").unwrap(), b(false));
@@ -505,12 +596,13 @@ mod tests {
             ("", "", "new", "file_already_exists"),
         ] {
             std::fs::write(root.path(), before).unwrap();
-            rejected(
+            rejected_with_effect(
                 host.edit(
                     &root.args(&host, &root.path(), old, new),
                     &Cancel::default(),
                 ),
                 error,
+                Effects::KnownResult,
             );
             assert_eq!(std::fs::read_to_string(root.path()).unwrap(), before);
         }
@@ -520,12 +612,13 @@ mod tests {
     fn creation_and_cancel_are_explicit_and_creation_never_overwrites() {
         let root = Root::new();
         let host = root.host();
-        rejected(
+        rejected_with_effect(
             host.edit(
                 &root.args(&host, &root.path(), "old", "new"),
                 &Cancel::default(),
             ),
             "file_missing",
+            Effects::KnownResult,
         );
         let args = root.args(&host, &root.path(), "", "new file\n");
         let stop = Cancel::default();
@@ -539,7 +632,11 @@ mod tests {
         let applied = host.edit(&args, &Cancel::default());
         assert_eq!(applied.effects(), Effects::KnownResult);
         assert_eq!(output(&applied).text_field("before").unwrap(), "");
-        rejected(host.edit(&args, &Cancel::default()), "file_already_exists");
+        rejected_with_effect(
+            host.edit(&args, &Cancel::default()),
+            "file_already_exists",
+            Effects::KnownResult,
+        );
         assert_eq!(std::fs::read_to_string(root.path()).unwrap(), "new file\n");
     }
 
@@ -616,32 +713,83 @@ mod tests {
     }
 
     #[test]
+    fn large_edit_publishes_exact_bytes_and_returns_the_bounded_changed_fragment() {
+        let root = Root::new();
+        let host = root.host();
+        let prefix = "fn retained() {}\n".repeat(20_000) + "😀 ";
+        let before = format!("{prefix}before\nlast\n");
+        let after = format!("{prefix}after\nlast\n");
+        std::fs::write(root.path(), &before).unwrap();
+        let value = host.edit(
+            &root.args(&host, &root.path(), "before", "after"),
+            &Cancel::default(),
+        );
+        assert_eq!(
+            (value.execution(), value.effects()),
+            (Execution::Succeeded, Effects::KnownResult)
+        );
+        assert!(value.output().len() < 1024);
+        let receipt = output(&value);
+        assert!(!receipt.has("before"));
+        assert!(!receipt.has("after"));
+        assert_eq!(
+            receipt.text_field("before_hash"),
+            Ok(sha256(before.as_bytes()).as_str())
+        );
+        assert_eq!(
+            receipt.text_field("after_hash"),
+            Ok(sha256(after.as_bytes()).as_str())
+        );
+        let change = receipt.field("change").unwrap();
+        assert_eq!(change.usize_field("offset"), Ok(prefix.len()));
+        assert_eq!(change.usize_field("line"), Ok(20_001));
+        assert_eq!(change.text_field("before"), Ok("before"));
+        assert_eq!(change.text_field("after"), Ok("after"));
+        assert_eq!(
+            change.text_field("before_hash"),
+            Ok(sha256(b"before").as_str())
+        );
+        assert_eq!(
+            change.text_field("after_hash"),
+            Ok(sha256(b"after").as_str())
+        );
+        assert_eq!(std::fs::read_to_string(root.path()).unwrap(), after);
+    }
+
+    #[test]
     fn file_argument_output_and_utf8_limits_precede_publication() {
         let root = Root::new();
         let host = root.host();
-        let large = format!("x{}", "a".repeat(ansa_linux::file_edit::MAX_BYTES - 1));
-        std::fs::write(root.path(), &large).unwrap();
-        rejected(
+        let old = "\u{0001}".repeat(ARG_BYTES);
+        let new = "\u{0002}".repeat(ARG_BYTES);
+        std::fs::write(root.path(), &old).unwrap();
+        rejected_with_effect(
             host.edit(
-                &root.args(&host, &root.path(), "x", "y"),
+                &root.args(&host, &root.path(), &old, &new),
                 &Cancel::default(),
             ),
             "file_edit_output_limit",
+            Effects::KnownResult,
         );
-        rejected(
+        assert_eq!(std::fs::read_to_string(root.path()).unwrap(), old);
+        let large = format!("x{}", "a".repeat(ansa_linux::file_edit::MAX_BYTES - 1));
+        std::fs::write(root.path(), &large).unwrap();
+        rejected_with_effect(
             host.edit(
                 &root.args(&host, &root.path(), "x", "yy"),
                 &Cancel::default(),
             ),
             "file_edit_limit",
+            Effects::KnownResult,
         );
         assert_eq!(std::fs::read_to_string(root.path()).unwrap(), large);
-        rejected(
+        rejected_with_effect(
             host.edit(
                 &root.args(&host, &root.path(), "x", &"z".repeat(ARG_BYTES + 1)),
                 &Cancel::default(),
             ),
             "file_edit_limit",
+            Effects::KnownResult,
         );
         std::fs::write(root.path(), [0xff]).unwrap();
         rejected(
@@ -660,6 +808,59 @@ mod tests {
             "binary_file",
         );
         assert_eq!(std::fs::read(root.path()).unwrap(), b"nul\0file");
+    }
+
+    #[test]
+    fn prepublication_conflict_is_a_known_refusal() {
+        rejected_with_effect(
+            rejection("file_changed"),
+            "file_changed",
+            Effects::KnownResult,
+        );
+    }
+
+    #[test]
+    fn saved_v1_catalogue_keeps_full_receipts_and_its_original_limit() {
+        let root = Root::new();
+        let host = root.host();
+        let snapshot = root.snapshot(&host);
+        let mut definition = snapshot.definition("edit_file").unwrap().clone();
+        definition.descriptor = legacy_descriptor(&definition.descriptor).unwrap();
+        let mut legacy = Registry::new();
+        legacy
+            .register_with_policy(definition, snapshot.policy("edit_file").unwrap().clone())
+            .unwrap();
+        let legacy = legacy.snapshot();
+        let restored = snapshot.compatible(legacy.advertisement()).unwrap();
+        assert_eq!(restored.advertisement(), legacy.advertisement());
+        let invoke = restored
+            .policy("edit_file")
+            .unwrap()
+            .invoke
+            .as_ref()
+            .unwrap();
+        let invocation = Invocation {
+            operation: "fixture:op:1".into(),
+            call: "call".into(),
+            name: "edit_file".into(),
+            revision: LEGACY_REVISION.into(),
+            arguments: root.args(&host, &root.path(), "old", "new"),
+        };
+        std::fs::write(root.path(), "old").unwrap();
+        let result = invoke(&invocation, &Cancel::default());
+        assert_eq!(result.execution(), Execution::Succeeded);
+        assert_eq!(output(&result).text_field("before"), Ok("old"));
+        assert_eq!(output(&result).text_field("after"), Ok("new"));
+        assert!(!output(&result).has("change"));
+
+        let large = format!("old{}", "x".repeat(LEGACY_FILE_BYTES));
+        std::fs::write(root.path(), &large).unwrap();
+        rejected_with_effect(
+            invoke(&invocation, &Cancel::default()),
+            "file_edit_limit",
+            Effects::KnownResult,
+        );
+        assert_eq!(std::fs::read_to_string(root.path()).unwrap(), large);
     }
 
     #[test]

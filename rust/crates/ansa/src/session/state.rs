@@ -22,7 +22,10 @@ use crate::{
         request::{Advertisement, Binding, Epoch, Request},
         responses::AdmittedResponse,
     },
-    tools::admission::OperationIds,
+    tools::{
+        admission::OperationIds,
+        delegation::{self, Revision as DelegationRevision},
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -790,7 +793,7 @@ impl State {
         }
     }
     pub fn request_for(&self, text: &str, mode: AgentMode) -> Result<Request> {
-        self.request_for_input(text, mode, false, None, None)
+        self.request_for_input(text, mode, false, None, None, DelegationRevision::V2)
     }
 
     pub(crate) fn request_for_input(
@@ -800,6 +803,7 @@ impl State {
         internal: bool,
         draft: Option<&PlanDraft>,
         image_content: Option<&Json>,
+        delegate_revision: DelegationRevision,
     ) -> Result<Request> {
         let policy = PromptPolicy::resolve(&self.epoch.exact_state)?;
         let (epoch, tools) = if let Some(draft) = draft {
@@ -863,7 +867,7 @@ impl State {
                 empty.advertisement().clone(),
             )
         } else if mode.leads() {
-            let tools = crate::tools::delegation::advertise(&self.configuration.tools)?;
+            let tools = delegation::advertise(&self.configuration.tools, delegate_revision)?;
             let provenance = Json::object(vec![
                 ("base_epoch", Json::string(&self.epoch.id)?),
                 ("base_state", self.epoch.exact_state.clone()),
@@ -1468,8 +1472,19 @@ impl State {
             } else {
                 (Vec::new(), None)
             };
-            let mut expected =
-                self.request_for_input(text, mode, internal, draft.as_ref(), image_content)?;
+            let delegate_revision = if mode.leads() {
+                DelegationRevision::advertised(&next.tools)?
+            } else {
+                DelegationRevision::V2
+            };
+            let mut expected = self.request_for_input(
+                text,
+                mode,
+                internal,
+                draft.as_ref(),
+                image_content,
+                delegate_revision,
+            )?;
             if event.has("archived_images") {
                 expected.replay_archived_images(event.field("archived_images")?.elements()?)?;
             }
@@ -1625,6 +1640,11 @@ impl State {
                             .ok_or("session_request_conflict")?
                             .field("content")?,
                     )
+                },
+                if current.receipt.mode.leads() {
+                    DelegationRevision::advertised(&current.next.tools)?
+                } else {
+                    DelegationRevision::V2
                 },
             )?;
             // A settings change applies to future turns, never to Resume or
@@ -2080,10 +2100,15 @@ fn lead_replays_on_an_existing_journal_without_exporting_delegate_to_forks() {
         tools.read_only().advertisement().clone(),
     );
     let initialization = existing.initialization().unwrap();
-    for mode in [AgentMode::Lead, AgentMode::LeadPlus] {
+    for (mode, revision) in [
+        (AgentMode::Lead, DelegationRevision::V1),
+        (AgentMode::LeadPlus, DelegationRevision::V2),
+    ] {
         let mut state = existing.clone();
         state.apply(&initialization).unwrap();
-        let request = state.request_for("Implement the change", mode).unwrap();
+        let request = state
+            .request_for_input("Implement the change", mode, false, None, None, revision)
+            .unwrap();
         assert_eq!(request.final_format(), None);
         assert_eq!(
             request.tools.descriptors.last().unwrap().name,
@@ -2110,6 +2135,10 @@ fn lead_replays_on_an_existing_journal_without_exporting_delegate_to_forks() {
         }
         state.apply(&accepted).unwrap();
         assert_eq!(state.turn.as_ref().unwrap().receipt.mode, mode);
+        assert_eq!(
+            state.turn.as_ref().unwrap().next.save().unwrap(),
+            request.save().unwrap()
+        );
         let fork = state.fork_seed().unwrap().request().unwrap();
         assert_eq!(fork.tools, base.tools);
         assert_eq!(fork.epoch, base.epoch);

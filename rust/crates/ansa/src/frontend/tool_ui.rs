@@ -50,16 +50,43 @@ fn parsed_edit(tool: &Tool) -> Option<EditView> {
     if !value.field("applied").ok()?.boolean().ok()? {
         return None;
     }
-    let before = value.text_field("before").ok()?;
-    let after = value.text_field("after").ok()?;
-    if value.text_field("before_hash").ok()? != sha256(before.as_bytes())
-        || value.text_field("after_hash").ok()? != sha256(after.as_bytes())
+    let change = if value.has("change") {
+        if value.has("before") || value.has("after") {
+            return None;
+        }
+        // The whole-file hashes identify the revisions. The fragment has its
+        // own checksums because the surrounding file bytes are not in this receipt.
+        for key in ["before_hash", "after_hash"] {
+            let hash = value.text_field(key).ok()?;
+            if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return None;
+            }
+        }
+        Some(value.field("change").ok()?)
+    } else {
+        None
+    };
+    let text = change.unwrap_or(value);
+    let before = text.text_field("before").ok()?;
+    let after = text.text_field("after").ok()?;
+    if text.text_field("before_hash").ok()? != sha256(before.as_bytes())
+        || text.text_field("after_hash").ok()? != sha256(after.as_bytes())
     {
         return None;
     }
+    let diff = if let Some(change) = change {
+        let offset = change.usize_field("offset").ok()?;
+        let line = change.usize_field("line").ok()?;
+        if offset > ansa_linux::file_edit::MAX_BYTES || !(1..=offset + 1).contains(&line) {
+            return None;
+        }
+        super::diff::fragment(before, after, line, offset)?
+    } else {
+        super::diff::between(before, after)?
+    };
     Some(EditView {
         path: value.text_field("path").ok()?.into(),
-        diff: super::diff::between(before, after)?,
+        diff,
     })
 }
 #[cfg(test)]
@@ -1374,6 +1401,68 @@ mod tests {
                 .all(|row| !row.role.starts_with("tool_diff_"))
             );
         }
+    }
+    #[test]
+    fn compact_edit_shows_the_fragment_at_its_original_line() {
+        use crate::protocol::legacy_json_v1::sha256;
+        let prefix = "unchanged\n".repeat(9_000) + "😀 ";
+        let before = "old";
+        let after = "new";
+        let mut value = serde_json::json!({
+            "path": "large.rs",
+            "change": {
+                "offset": prefix.len(),
+                "line": 9_001,
+                "before": before,
+                "after": after,
+                "before_hash": sha256(before.as_bytes()),
+                "after_hash": sha256(after.as_bytes()),
+            },
+            "before_hash": sha256(format!("{prefix}{before} next\n").as_bytes()),
+            "after_hash": sha256(format!("{prefix}{after} next\n").as_bytes()),
+            "applied": true,
+        });
+        let result = |value: &serde_json::Value| {
+            row(
+                "edit",
+                "edit_file",
+                ToolPhase::Finished {
+                    execution: Execution::Succeeded,
+                    effects: Effects::KnownResult,
+                },
+                &value.to_string(),
+            )
+        };
+        let shown = edit_view(&[result(&value)], "request:edit").unwrap();
+        assert_eq!(shown.path, "large.rs");
+        assert_eq!((shown.diff.added, shown.diff.removed), (1, 1));
+        assert!(shown.diff.rows.iter().any(|row| {
+            row.kind == super::super::diff::Kind::Notice
+                && row.text == format!("Changed fragment at byte offset {}", prefix.len())
+        }));
+        assert!(
+            shown
+                .diff
+                .rows
+                .iter()
+                .any(|row| row.old == Some(9_001) && row.text == before)
+        );
+        assert!(
+            shown
+                .diff
+                .rows
+                .iter()
+                .any(|row| row.new == Some(9_001) && row.text == after)
+        );
+        assert!(
+            shown
+                .diff
+                .rows
+                .iter()
+                .all(|row| !row.text.contains("No newline at end of file"))
+        );
+        value["change"]["after"] = serde_json::json!("changed in transit");
+        assert!(edit_view(&[result(&value)], "request:edit").is_none());
     }
     #[test]
     fn displayed_edit_survives_snapshot_only_outcome_and_page_replacement() {

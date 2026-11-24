@@ -228,8 +228,12 @@ impl Registry {
     }
 }
 impl Snapshot {
-    pub(crate) fn for_lead(&self, invoke: ContextExecutor) -> Result<Arc<Self>, &'static str> {
-        let advertisement = super::delegation::advertise(&self.advertisement)?;
+    pub(crate) fn for_lead(
+        &self,
+        revision: super::delegation::Revision,
+        invoke: ContextExecutor,
+    ) -> Result<Arc<Self>, &'static str> {
+        let advertisement = super::delegation::advertise(&self.advertisement, revision)?;
         let base = self.advertisement.clone();
         let mut definitions = self.definitions.clone();
         definitions.push(Definition {
@@ -238,7 +242,9 @@ impl Snapshot {
                 .last()
                 .expect("added delegate")
                 .clone(),
-            validator: Arc::new(move |args| super::delegation::assignment(args, &base).is_ok()),
+            validator: Arc::new(move |args| {
+                super::delegation::assignment(args, &base, revision).is_ok()
+            }),
             executor: Arc::new(|_| Outcome::not_started()),
         });
         let mut policies = self.policies.clone();
@@ -273,6 +279,7 @@ impl Snapshot {
             if definition.descriptor != *descriptor {
                 let legacy =
                     crate::process::output_spool::legacy_descriptor(&definition.descriptor)
+                        .or_else(|| super::edit::legacy_descriptor(&definition.descriptor))
                         .filter(|legacy| legacy == descriptor)?;
                 definition.descriptor = legacy;
             }
@@ -420,7 +427,10 @@ mod tests {
                 names.push("edit_file");
             }
             let tools = registered(&names)
-                .for_lead(Arc::new(|_, _| panic!("admission dispatched a helper")))
+                .for_lead(
+                    super::super::delegation::Revision::V1,
+                    Arc::new(|_, _| panic!("admission dispatched a helper")),
+                )
                 .unwrap();
             let valid = &tools
                 .definition(super::super::delegation::NAME)
@@ -438,6 +448,42 @@ mod tests {
                 assert_eq!(valid(&args), allowed, "{paths}");
             }
         }
+    }
+    #[test]
+    fn delegation_revisions_keep_distinct_strict_arguments() {
+        use super::super::delegation::{self, Revision};
+        let parent = registered(&["list_directory", "read_file", "search_files", "edit_file"]);
+        let legacy = Json::parse(r#"{"task":"Fix report","paths":["src/report.rs"]}"#).unwrap();
+        let current = legacy
+            .with("read_paths", Json::parse(r#"["tests/report.rs"]"#).unwrap())
+            .unwrap();
+        for (revision, accepts, rejects) in [
+            (Revision::V1, &legacy, &current),
+            (Revision::V2, &current, &legacy),
+        ] {
+            let advertised = delegation::advertise(parent.advertisement(), revision).unwrap();
+            let descriptor = advertised.descriptors.last().unwrap();
+            super::super::schema::validate_schema(&descriptor.schema, 0).unwrap();
+            assert!(super::super::schema::matches(&descriptor.schema, accepts));
+            assert!(!super::super::schema::matches(&descriptor.schema, rejects));
+            let assignment = delegation::assignment(accepts, &advertised, revision).unwrap();
+            assert_eq!(assignment.writes, ["src/report.rs"]);
+            if matches!(revision, Revision::V2) {
+                assert_eq!(assignment.reads, ["src/report.rs", "tests/report.rs"]);
+            } else {
+                assert_eq!(assignment.reads, ["src/report.rs"]);
+            }
+        }
+        let readonly = registered(&["list_directory", "read_file", "search_files"]);
+        let args = current.with("paths", Json::parse("[]").unwrap()).unwrap();
+        let assignment =
+            delegation::assignment(&args, readonly.advertisement(), Revision::V2).unwrap();
+        assert!(assignment.writes.is_empty());
+        assert_eq!(assignment.reads, ["tests/report.rs"]);
+        let bad_path = args
+            .with("read_paths", Json::parse(r#"["../other"]"#).unwrap())
+            .unwrap();
+        assert!(delegation::assignment(&bad_path, readonly.advertisement(), Revision::V2).is_err());
     }
     #[test]
     fn compatible_subset_uses_compiled_executors_and_exact_saved_order_and_policies() {

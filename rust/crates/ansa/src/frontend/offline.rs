@@ -144,7 +144,7 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
             "ORCHESTRATION_DIRECT_FIXTURE" | "ORCHESTRATION_DIRECT_BLOCKED_FIXTURE"
         )
     {
-        let (arguments, call) = if user == "ORCHESTRATION_DIRECT_FIXTURE" {
+        let (mut arguments, call) = if user == "ORCHESTRATION_DIRECT_FIXTURE" {
             (
                 serde_json::json!({"task":"Direct fixture report edit","paths":["report.txt"]}),
                 "edit",
@@ -155,6 +155,12 @@ fn orchestration_fixture(request: &Request, stop: &Cancel) -> Result<Option<Admi
                 "blocked",
             )
         };
+        if matches!(
+            crate::tools::delegation::Revision::advertised(&request.tools)?,
+            crate::tools::delegation::Revision::V2
+        ) {
+            arguments["read_paths"] = serde_json::json!([]);
+        }
         let item = obj(vec![
             ("type", s("function_call")),
             ("id", s(&format!("item_{}", &id[..24]))),

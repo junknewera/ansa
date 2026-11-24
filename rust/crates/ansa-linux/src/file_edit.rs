@@ -11,7 +11,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub const MAX_BYTES: usize = 64 * 1024;
+pub const MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Failure {

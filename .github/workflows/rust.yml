@@ -60,6 +60,7 @@ jobs:
           python3 -B tests/carbon_workspace_pty.py \
             --binary rust/target/debug/examples/frontend_adapter \
             --case siwc-orchestration-direct \
+            --case siwc-direct-edit-check \
             --case siwc-orchestrate-plus \
             --case siwc-orchestrate-plus-budget \
             --case siwc-orchestrate-plus-budget-configured \
