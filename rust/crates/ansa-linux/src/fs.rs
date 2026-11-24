@@ -103,6 +103,73 @@ pub struct DirectoryEntry {
 pub struct DirectoryEntries {
     entries: rustix::fs::Dir,
     follow_link_directories: bool,
+    offset: i64,
+}
+
+impl DirectoryEntries {
+    /// Resume after a cookie returned by this directory's iterator.
+    pub fn seek(&mut self, offset: i64) -> io::Result<()> {
+        self.entries.seek(offset)?;
+        self.offset = offset;
+        Ok(())
+    }
+
+    pub fn offset(&self) -> i64 {
+        self.offset
+    }
+
+    pub fn open_child(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
+        let directory = self.open_entry(
+            name,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+        )?;
+        Ok(Self {
+            entries: rustix::fs::Dir::new(directory)?,
+            follow_link_directories: self.follow_link_directories,
+            offset: 0,
+        })
+    }
+
+    pub fn open_regular(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        let file = self.open_entry(name, crate::local::read_flags())?;
+        if !regular_single(&file)? {
+            return Err(io::Error::other("file_not_regular"));
+        }
+        Ok(file)
+    }
+
+    fn open_entry(&self, name: &std::ffi::OsStr, flags: rustix::fs::OFlags) -> io::Result<File> {
+        let name = Path::new(name);
+        if !matches!(name.components().next(), Some(Component::Normal(_)))
+            || name.as_os_str().as_encoded_bytes().contains(&b'/')
+        {
+            return Err(io::Error::other("workspace_relative_path"));
+        }
+        Ok(rustix::fs::openat(
+            self.entries.fd()?,
+            name,
+            flags | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?
+        .into())
+    }
+
+    pub fn has_instructions(&self) -> io::Result<bool> {
+        match rustix::fs::statat(
+            self.entries.fd()?,
+            "AGENTS.md",
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(_) => Ok(true),
+            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        let fd = self.entries.fd()?.try_clone_to_owned()?;
+        std::fs::File::from(fd).metadata()
+    }
 }
 
 pub fn read_directory(path: &Path, follow_link_directories: bool) -> io::Result<DirectoryEntries> {
@@ -112,6 +179,7 @@ pub fn read_directory(path: &Path, follow_link_directories: bool) -> io::Result<
     Ok(DirectoryEntries {
         entries,
         follow_link_directories,
+        offset: 0,
     })
 }
 
@@ -128,6 +196,7 @@ impl Iterator for DirectoryEntries {
                 Err(error) => return Some(Err(error.into())),
             }
         };
+        self.offset = entry.offset();
         let name = entry.file_name();
         let stat = |flags| self.entries.fd().and_then(|fd| statat(fd, name, flags));
         let kind = match entry.file_type() {

@@ -933,8 +933,10 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                     let direct = input
                         .iter()
                         .any(|item| item["content"] == "DIRECT_SIWC_FIXTURE");
-                    let item = if name.is_none() && direct && last["type"] != "function_call_output"
-                    {
+                    let item = if trace.with_file_name("paged-search").is_file() {
+                        let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        search_fixture::item(&request, input, index)?
+                    } else if name.is_none() && direct && last["type"] != "function_call_output" {
                         if !request["tools"][0]["tools"]
                             .as_array()
                             .is_some_and(|tools| {
@@ -1034,6 +1036,8 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
 mod direct_edit_fixture;
 #[cfg(feature = "frontend-test-adapter")]
 mod plus_budget_fixture;
+#[cfg(feature = "frontend-test-adapter")]
+mod search_fixture;
 
 #[cfg(feature = "frontend-test-adapter")]
 fn plus_fixture_response(

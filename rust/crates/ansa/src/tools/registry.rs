@@ -280,6 +280,7 @@ impl Snapshot {
                 let legacy =
                     crate::process::output_spool::legacy_descriptor(&definition.descriptor)
                         .or_else(|| super::edit::legacy_descriptor(&definition.descriptor))
+                        .or_else(|| super::search::legacy_descriptor(&definition.descriptor))
                         .filter(|legacy| legacy == descriptor)?;
                 definition.descriptor = legacy;
             }
