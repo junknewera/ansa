@@ -93,6 +93,18 @@ fn read_text(file: File) -> Result<String> {
     Ok(text)
 }
 
+pub(super) fn read_open_image(
+    file: File,
+    remaining: usize,
+    original_remaining: usize,
+) -> Result<ImageInput> {
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Err("image_regular_file_required");
+    }
+    let bytes = read_bounded(file, original_remaining, "image_original_bytes")?;
+    ImageInput::fit(&bytes, remaining)
+}
+
 fn load_attachment(
     cwd: &Path,
     state: &Path,
@@ -106,8 +118,7 @@ fn load_attachment(
     if text {
         read_text(file).map(Attachment::Text)
     } else {
-        let bytes = read_bounded(file, original_remaining, "image_original_bytes")?;
-        ImageInput::fit(&bytes, remaining).map(Attachment::Image)
+        read_open_image(file, remaining, original_remaining).map(Attachment::Image)
     }
 }
 

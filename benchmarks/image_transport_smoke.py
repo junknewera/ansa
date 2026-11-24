@@ -143,13 +143,22 @@ def check_composer(binary):
             command("/attach file with spaces.png", "smaller copy for model")
             image.unlink()
             turn("Describe the compressed attachment.")
+            image.write_bytes(PNG)
+            mention = r"Look at @file\ with\ spaces.png"
+            turn(mention)
+            turn("Only this message.")
             submit("/exit")
             result = screen.finish()
             assert result["exit"] == 0 and result["termios_restored"]
-            first, second, third = [json.loads(line) for line in wire.read_text().splitlines()]
+            first, second, third, mentioned, last = [json.loads(line) for line in wire.read_text().splitlines()]
             url = "data:image/png;base64," + base64.b64encode(PNG).decode()
             assert first[-1]["content"][1] == {"type": "input_image", "image_url": url}
             assert second[-1]["content"] == "Answer without an attachment."
+            assert mentioned[-1]["content"] == [
+                {"type": "input_text", "text": mention},
+                {"type": "input_image", "image_url": url},
+            ]
+            assert last[-1]["content"] == "Only this message."
             sent = third[-1]["content"][1]["image_url"]
             assert len(base64.b64decode(sent.split(",", 1)[1])) <= 2 * 1024 * 1024
             accepted, = [event for event in records(root) if event.get("text") == "Describe the compressed attachment." and event["kind"] == "accepted"]

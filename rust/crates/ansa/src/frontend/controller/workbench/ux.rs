@@ -531,28 +531,77 @@ impl Workbench {
         commands::available(true)
     }
     pub(super) fn refresh_completion(&mut self) {
-        if self.menu.is_some()
+        let editor = &self.slots[self.current].state.editor;
+        let suppressed = self.input_closed
+            || self.terminating
+            || self.menu.is_some()
             || self.focus != Focus::Chat
             || self.selection.as_ref().is_some_and(Selection::is_chat)
+            || self
+                .completion_closed
+                .as_ref()
+                .is_some_and(|(bytes, cursor)| *bytes == editor.bytes && *cursor == editor.cursor);
+        let token = (!suppressed)
+            .then(|| commands::mention::Mention::at(editor))
+            .flatten();
+        if let Some((directory, prefix, stop)) = &self.mention_listing_job
+            && token
+                .as_ref()
+                .is_none_or(|t| t.directory != *directory || t.prefix != *prefix)
         {
-            self.completion = None;
-            return;
+            stop.cancel();
         }
-        let editor = &self.slots[self.current].state.editor;
-        if self
-            .completion_closed
-            .as_ref()
-            .is_some_and(|(bytes, cursor)| *bytes == editor.bytes && *cursor == editor.cursor)
-        {
+        if suppressed {
             self.completion = None;
+            self.mention_listing = None;
             return;
         }
         self.completion_closed = None;
-        let mut next = Completion::at_with_skills(
-            editor,
-            self.available_commands(),
-            &self.slots[self.current].skill_commands,
-        );
+        let mut next = if let Some(token) = token {
+            let cached = self
+                .mention_listing
+                .as_ref()
+                .filter(|(dir, prefix, listing)| {
+                    dir == &token.directory
+                        && (prefix == &token.prefix
+                            || listing.as_ref().is_some_and(|l| !l.truncated)
+                                && token.prefix.starts_with(prefix))
+                });
+            if let Some((_, _, listing)) = cached {
+                listing.as_ref().and_then(|list| {
+                    let choices = token.choices(list);
+                    (!choices.is_empty()).then(|| Completion::paths(&token, choices))
+                })
+            } else {
+                if self.mention_listing_job.is_none()
+                    && self.jobs.len() + self.pending_context.len() < MAX_JOBS
+                {
+                    let host = self.files.clone();
+                    let stop = Cancel::linked(&self.stop);
+                    let directory = token.directory.clone();
+                    let prefix = token.prefix.clone();
+                    self.mention_listing_job =
+                        Some((directory.clone(), prefix.clone(), stop.clone()));
+                    let path = self.factory.settings.cwd.join(&directory);
+                    self.jobs.spawn_blocking(move || {
+                        let listing = host.list_matching(&path, &prefix, &stop).ok();
+                        Job::MentionFiles {
+                            directory,
+                            prefix,
+                            listing,
+                        }
+                    });
+                }
+                Some(Completion::paths(&token, Vec::new()))
+            }
+        } else {
+            self.mention_listing = None;
+            Completion::at_with_skills(
+                editor,
+                self.available_commands(),
+                &self.slots[self.current].skill_commands,
+            )
+        };
         if let (Some(old), Some(next)) = (&self.completion, &mut next)
             && old.begin == next.begin
             && old.query == next.query
@@ -562,10 +611,18 @@ impl Workbench {
         self.completion = next;
     }
     pub(super) fn complete_command(&mut self) {
+        if self.completion.as_ref().is_some_and(Completion::loading) {
+            return;
+        }
         if let Some(completion) = self.completion.take() {
             let slot = &mut self.slots[self.current];
+            let descend = completion.directory_selected();
             if completion.apply(&mut slot.state.editor) {
                 slot.state.input_history.edited(&slot.state.editor);
+                if descend {
+                    self.refresh_completion();
+                    return;
+                }
             }
         }
         let editor = &self.slots[self.current].state.editor;

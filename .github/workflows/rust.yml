@@ -76,6 +76,7 @@ jobs:
             --case orchestration-direct \
             --case mouse-history-send-child-escape \
             --case slash-completion-help \
+            --case file-mentions \
             --case session-agent-titles-restart \
             --case active-plan-clarification \
             --case orchestration-review-resume \
