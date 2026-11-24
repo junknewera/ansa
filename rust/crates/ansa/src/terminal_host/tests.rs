@@ -2,6 +2,7 @@ use super::{protocol::*, *};
 use std::{
     cell::RefCell,
     path::PathBuf,
+    process::{Command, Stdio},
     rc::Rc,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -398,7 +399,27 @@ fn bound_file_evidence_rejects_concurrent_or_corrupt_open() {
         host.execute(Writer::Agent, input, b"once\r"),
         Ok(OperationStatus::Durable(Effect::Delivered { count: 5 }))
     );
+    // The shell waits before its next exec while holding the same open file
+    // description. The pipe keeps this window open across both lock attempts.
+    let mut child = Command::new("sh")
+        .args(["-c", "IFS= read -r gate; exec true"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(host.journal.duplicate_lock().unwrap()))
+        .spawn()
+        .unwrap();
+    let competing_writer = Host::restore_file(&temp.0, binding(), Fixture::default());
     drop(host);
+    let restored = Host::restore_file(&temp.0, binding(), Fixture::default());
+    let child_was_waiting = child.try_wait().unwrap().is_none();
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    assert!(child_was_waiting);
+    assert!(matches!(competing_writer, Err("terminal_store_locked")));
+    assert_eq!(
+        restored.unwrap().terminals()[&terminal].lifecycle,
+        Lifecycle::Lost
+    );
     assert!(Host::create_file(&temp.0, binding(), Fixture::default()).is_err());
     let mut other = binding();
     other.host = id("another_host");
