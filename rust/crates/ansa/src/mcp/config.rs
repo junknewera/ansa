@@ -58,6 +58,16 @@ pub(super) struct Config {
     pub(super) servers: BTreeMap<String, Server>,
 }
 
+struct PolicyLock<'a>(&'a File);
+
+impl Drop for PolicyLock<'_> {
+    fn drop(&mut self) {
+        // A forked child can keep the directory descriptor open until exec.
+        // Release the lock as soon as the policy operation finishes.
+        let _ = self.0.unlock();
+    }
+}
+
 fn owned_regular(
     path: &Path,
     owner: u32,
@@ -170,10 +180,11 @@ impl Config {
         }
     }
 
-    fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+    fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<()> {
         // Serialize cooperating writers on the checked directory. The marker
         // is an ANSA-owned empty file; never rewrite the user's source config.
         self.directory.try_lock().map_err(|_| "mcp_policy_busy")?;
+        let _lock = PolicyLock(&self.directory);
         let marker = self.held_path.join(disable_marker(name));
         match (self.enabled(name)?, enabled) {
             (true, false) => OpenOptions::new()
@@ -206,7 +217,7 @@ pub(crate) fn cli(args: &[String], directory: &Path) -> Result<Json> {
     };
     let config = Config::load(directory)?;
     let result = if let Some(name) = name {
-        let config = config.ok_or("mcp_server_unknown")?;
+        let mut config = config.ok_or("mcp_server_unknown")?;
         let server = config.servers.get(name).ok_or("mcp_server_unknown")?;
         if action == "inspect" {
             json!({
@@ -236,4 +247,71 @@ pub(crate) fn cli(args: &[String], directory: &Path) -> Result<Json> {
         json!({"servers": servers})
     };
     Json::parse(&result.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::management_tests::{Fixture, stdio};
+    use serde_json::{Value, json};
+    use std::{
+        os::unix::fs::symlink,
+        process::{Command, Stdio},
+    };
+
+    #[test]
+    fn policy_toggle_releases_lock_while_child_waits_for_exec() {
+        let fixture = Fixture::new();
+        fixture.config(json!({"local": stdio()}));
+        let mut config = Config::load(&fixture.0).unwrap().unwrap();
+        // The pipe keeps the child alive across both operations. Its stdout
+        // holds a duplicate of the actual directory used by set_enabled.
+        let mut child = Command::new("sh")
+            .args(["-c", "IFS= read -r gate; exec true"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(config.directory.try_clone().unwrap()))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let disabled = config.set_enabled("local", false);
+        drop(config);
+        let disabled_state = fixture.cli(&["inspect", "local"]);
+        let enabled = fixture.cli(&["enable", "local"]);
+        let enabled_state = fixture.cli(&["inspect", "local"]);
+        let child_status = child.try_wait();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert!(child_status.unwrap().is_none());
+        assert_eq!(disabled, Ok(()));
+        assert_eq!(disabled_state.unwrap()["enabled"], Value::Bool(false));
+        assert_eq!(enabled.unwrap()["enabled"], Value::Bool(true));
+        assert_eq!(enabled_state.unwrap()["enabled"], Value::Bool(true));
+    }
+
+    #[test]
+    fn policy_error_releases_lock_and_live_writers_keep_exclusivity() {
+        let fixture = Fixture::new();
+        fixture.config(json!({"local": stdio()}));
+        let marker = fixture.0.join(disable_marker("local"));
+        let competitor = ansa_linux::fs::private_directory(&fixture.0).unwrap();
+        competitor.try_lock().unwrap();
+        assert_eq!(fixture.cli(&["disable", "local"]), Err("mcp_policy_busy"));
+        assert!(!marker.exists());
+        competitor.unlock().unwrap();
+
+        let source = fixture.0.join(CONFIG_FILE);
+        symlink(&source, &marker).unwrap();
+        let mut config = Config::load(&fixture.0).unwrap().unwrap();
+        let inherited = config.directory.try_clone().unwrap();
+        assert_eq!(config.set_enabled("local", false), Err("mcp_policy_file"));
+        drop(config);
+        assert_eq!(fs::read_link(&marker).unwrap(), source);
+        fs::remove_file(&marker).unwrap();
+        assert_eq!(
+            fixture.cli(&["disable", "local"]).unwrap()["enabled"],
+            Value::Bool(false)
+        );
+        drop(inherited);
+    }
 }

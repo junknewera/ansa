@@ -35,7 +35,7 @@ impl Fixture {
             .unwrap();
     }
 
-    fn cli(&self, args: &[&str]) -> Result<Value> {
+    pub(super) fn cli(&self, args: &[&str]) -> Result<Value> {
         let args: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
         cli(&args, &self.0).map(|value| serde_json::from_str(&value.dump()).unwrap())
     }
@@ -56,7 +56,7 @@ impl Drop for Fixture {
     }
 }
 
-fn stdio() -> Value {
+pub(super) fn stdio() -> Value {
     // This relative command is rejected before any process can be spawned,
     // so an unexpected registration fails without running any executable.
     json!({
