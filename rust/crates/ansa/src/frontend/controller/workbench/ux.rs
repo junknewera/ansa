@@ -548,7 +548,11 @@ impl Workbench {
             return;
         }
         self.completion_closed = None;
-        let mut next = Completion::at_with_commands(editor, self.available_commands());
+        let mut next = Completion::at_with_skills(
+            editor,
+            self.available_commands(),
+            &self.slots[self.current].skill_commands,
+        );
         if let (Some(old), Some(next)) = (&self.completion, &mut next)
             && old.begin == next.begin
             && old.query == next.query

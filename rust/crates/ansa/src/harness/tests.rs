@@ -7,6 +7,7 @@ use crate::{
 use serde_json::json;
 use std::{
     fs,
+    os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -64,6 +65,8 @@ fn skills_reload_exact_content_and_policy_after_wrapped_epoch_and_new_revision()
         directory: dir.try_clone().unwrap(),
         revision: newer.clone(),
         manifest: load_manifest(&dir, &scope, &newer).unwrap(),
+        legacy_revision: None,
+        directory_skills: Default::default(),
         trial: None,
     });
     let mut epoch = agent_epoch(&settings).unwrap();
@@ -178,4 +181,126 @@ fn malformed_skill_catalogue_writes_no_blobs() {
         Err("harness_profile_format")
     );
     assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+}
+
+fn install_skill(settings: &AgentSettings, name: &str, description: &str, body: &str) -> PathBuf {
+    let path = settings.directory.join("skills").join(name);
+    create_private(&path).unwrap();
+    let file = path.join("SKILL.md");
+    fs::write(
+        &file,
+        format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    file
+}
+
+#[test]
+fn missing_or_empty_skills_do_not_create_a_pin() {
+    let home = Project::new();
+    let settings = AgentSettings::defaults(&home.0, &home.0);
+    assert!(select(&settings, None, None).unwrap().is_none());
+    assert!(!settings.directory.exists());
+
+    fs::create_dir(&settings.directory).unwrap();
+    fs::set_permissions(&settings.directory, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(select(&settings, None, None).unwrap().is_none());
+    assert_eq!(fs::read_dir(&settings.directory).unwrap().count(), 0);
+
+    fs::set_permissions(&settings.directory, fs::Permissions::from_mode(0o700)).unwrap();
+    create_private(&settings.directory.join("skills")).unwrap();
+    assert!(select(&settings, None, None).unwrap().is_none());
+    assert!(!settings.directory.join("harness-profiles").exists());
+}
+
+#[test]
+fn legacy_skill_wins_name_collision_and_keeps_its_profile_revision() {
+    use crate::tools::skills::Catalog;
+
+    let home = Project::new();
+    let settings = AgentSettings::defaults(&home.0, &home.0);
+    let scope = scope(&settings.cwd);
+    let path = settings.directory.join("harness-profiles").join(&scope);
+    create_private(&path).unwrap();
+    let dir = private_directory(&path).unwrap();
+    let active = adoption::command(
+        &dir,
+        &scope,
+        &["baseline".into()],
+        &revision("legacy body", "handoff-v1"),
+    )
+    .unwrap();
+    let legacy = active["activation"]["revision"].as_str().unwrap();
+    let shadow = install_skill(&settings, "build", "Shadow description", "shadow body");
+    assert_eq!(
+        select(&settings, None, None).unwrap().unwrap().revision,
+        legacy
+    );
+    assert!(!path.join("catalogs").exists());
+
+    install_skill(&settings, "audit", "Audit a release", "directory body");
+    let pin = select(&settings, None, None).unwrap().unwrap();
+    assert_ne!(pin.revision, legacy);
+    assert_eq!(
+        pin.complete(""),
+        vec![("audit", "Audit a release"), ("build", "Before a release")]
+    );
+    assert_eq!(pin.complete("bu"), vec![("build", "Before a release")]);
+    assert_eq!(pin.list()["revision"].as_str(), Some(pin.revision.as_str()));
+    assert_eq!(pin.list()["skills"].as_array().unwrap().len(), 2);
+    assert_eq!(pin.read("build").unwrap()["profile_revision"], legacy);
+    assert_eq!(pin.read("build").unwrap()["body"], "legacy body");
+    assert_eq!(pin.read("audit").unwrap()["body"], "directory body");
+    let mut epoch = agent_epoch(&settings).unwrap();
+    pin.attach(&mut epoch).unwrap();
+    assert_eq!(
+        PromptPolicy::resolve(&epoch.exact_state),
+        Ok(PromptPolicy::HandoffV1)
+    );
+    assert!(!epoch.instructions.contains("Shadow description"));
+    assert!(!epoch.instructions.contains("directory body"));
+    assert_eq!(
+        adoption::active(&dir, &scope).unwrap().as_deref(),
+        Some(legacy)
+    );
+
+    fs::remove_file(shadow).unwrap();
+    assert_eq!(
+        select(&settings, None, None).unwrap().unwrap().revision,
+        pin.revision
+    );
+}
+
+#[test]
+fn discovery_accepts_only_bounded_owned_skill_documents() {
+    let home = Project::new();
+    let settings = AgentSettings::defaults(&home.0, &home.0);
+    let file = install_skill(&settings, "good", "original", "body");
+    let root = settings.directory.join("skills");
+    for name in ["bad-name", "linked", "oversized", "public"] {
+        let path = install_skill(&settings, name, "not available", "body");
+        match name {
+            "bad-name" => {
+                fs::write(path, "---\nname: other\ndescription: invalid\n---\nbody").unwrap()
+            }
+            "linked" => {
+                fs::remove_file(&path).unwrap();
+                symlink(&file, path).unwrap();
+            }
+            "oversized" => fs::write(path, vec![b'x'; 16385]).unwrap(),
+            _ => fs::set_permissions(path, fs::Permissions::from_mode(0o666)).unwrap(),
+        }
+    }
+    symlink(root.join("good"), root.join("linked-folder")).unwrap();
+    let profile = select(&settings, None, None).unwrap().unwrap();
+    assert_eq!(profile.complete(""), [("good", "original")]);
+    let mut epoch = agent_epoch(&settings).unwrap();
+    profile.attach(&mut epoch).unwrap();
+    assert!(
+        epoch
+            .instructions
+            .contains("When a description matches the task, call read_skill")
+    );
+    assert!(epoch.instructions.contains("original"));
 }

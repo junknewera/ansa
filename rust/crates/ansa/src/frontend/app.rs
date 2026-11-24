@@ -624,34 +624,41 @@ fn text_with_providers(
             }
         });
     }
-    let (mut runtime, root_kind, parent) = if parsed.resume || !parsed.session.is_empty() {
-        let restored = factory.resume(&selected.id)?;
-        (restored.runtime, restored.kind, restored.parent)
-    } else {
-        (
-            Runtime::new(
-                SessionId(selected.id.clone()),
-                configuration,
-                tools,
-                generate,
-                Limits {
-                    tool_rounds: settings.tool_rounds,
-                    tool_calls: settings.tool_calls,
-                    ..Limits::default()
-                },
-                options,
-            )?,
-            super::sessions::Kind::Main,
-            None,
-        )
-    };
+    let (mut runtime, root_kind, parent, skill_commands) =
+        if parsed.resume || !parsed.session.is_empty() {
+            let restored = factory.resume(&selected.id)?;
+            (
+                restored.runtime,
+                restored.kind,
+                restored.parent,
+                restored.skill_commands,
+            )
+        } else {
+            (
+                Runtime::new(
+                    SessionId(selected.id.clone()),
+                    configuration,
+                    tools,
+                    generate,
+                    Limits {
+                        tool_rounds: settings.tool_rounds,
+                        tool_calls: settings.tool_calls,
+                        ..Limits::default()
+                    },
+                    options,
+                )?,
+                super::sessions::Kind::Main,
+                None,
+                super::commands::skill_choices(profile.as_deref()),
+            )
+        };
     factory.retain_terminal_owner(&selected.id, terminal)?;
     io.status(&format!(
         "ansa session {} (full access, sudo disabled)\n",
         selected.id
     ));
     if io.raw.is_some() {
-        return reactor()?.block_on(controller::workbench::run_attached(
+        return reactor()?.block_on(controller::workbench::run_session(
             runtime,
             &mut io,
             &settings.cwd.to_string_lossy(),
@@ -659,6 +666,7 @@ fn text_with_providers(
             selected.id,
             root_kind,
             parent,
+            skill_commands,
             parsed
                 .workspace
                 .map(|directory| -> Result<_> {
@@ -1504,6 +1512,10 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
             let fixture = pure_tools()?;
             let export = crate::session::evidence::export(path, &catalog, &fixture)?;
             write_json(&export)?;
+            Ok(0)
+        }
+        "--mcp" => {
+            write_json(&crate::mcp::cli(&args[1..], &home()?.join(".ansa"))?)?;
             Ok(0)
         }
         "--harness" => {

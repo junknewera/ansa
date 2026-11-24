@@ -142,6 +142,24 @@ pub(super) fn store_manifest(dir: &File, scope: &str, input: &[u8]) -> Result<St
     Ok(revision)
 }
 
+pub(super) fn empty_manifest(scope: &str) -> Manifest {
+    Manifest {
+        version: 1,
+        prompt_policy: PromptPolicy::default(),
+        scope: scope.into(),
+        guidance: String::new(),
+        skills: Vec::new(),
+        memory: Vec::new(),
+    }
+}
+
+pub(super) fn load_or_empty(dir: &File, scope: &str, revision: Option<&str>) -> Result<Manifest> {
+    match revision {
+        Some(revision) => load_manifest(dir, scope, revision),
+        None => Ok(empty_manifest(scope)),
+    }
+}
+
 pub(super) fn load_manifest(dir: &File, scope: &str, revision: &str) -> Result<Manifest> {
     if !digest_ok(revision) {
         return Err("harness_revision");

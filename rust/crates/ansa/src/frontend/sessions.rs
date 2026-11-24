@@ -94,6 +94,7 @@ pub struct Factory {
     pilot: Option<Arc<super::orchestration_pilot::Pilot>>,
 }
 pub struct Created {
+    pub(super) skill_commands: Vec<super::commands::SkillCommand>,
     pub runtime: Runtime,
     pub selected: Selected,
     pub kind: Kind,
@@ -999,6 +1000,7 @@ impl Factory {
             runtime,
             selected,
             kind: Kind::Agent,
+            skill_commands: Vec::new(),
             parent: Some(parent.into()),
         })
     }
@@ -1109,6 +1111,7 @@ impl Factory {
             runtime,
             selected,
             kind: Kind::Agent,
+            skill_commands: Vec::new(),
             parent: Some(parent),
         })
     }
@@ -1418,6 +1421,7 @@ impl Factory {
         )?;
         self.retain_terminal_owner(&selected.id, terminal)?;
         Ok(Created {
+            skill_commands: super::commands::skill_choices(profile.as_deref()),
             runtime,
             selected,
             kind,

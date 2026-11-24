@@ -110,7 +110,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/attach",
-        description: "Attach a PNG or JPEG to the next Work or Plan message",
+        description: "Attach a screenshot/image, or use --text PATH for a UTF-8 file",
     },
     Command {
         name: "/terminals",
@@ -165,21 +165,69 @@ pub(super) fn skill_request(text: &str) -> Option<(&str, &str)> {
     .then(|| (name, task.trim()))
 }
 
+pub(super) struct SkillCommand {
+    choice: Choice,
+    body: Option<String>,
+}
+
+/// Derived from the catalogue attached to this conversation, never a fresh disk scan.
+pub(super) fn skill_choices(profile: Option<&crate::harness::Pinned>) -> Vec<SkillCommand> {
+    profile
+        .into_iter()
+        .flat_map(|p| p.complete(""))
+        .filter_map(|(name, description)| {
+            let label = format!("/{name}");
+            let built_in = COMMANDS.iter().any(|cmd| cmd.name == canonical(&label))
+                || matches!(
+                    label.as_str(),
+                    "/basic" | "/status" | "/cancel" | "/quit" | "/agent" | "/run" | "/send"
+                );
+            (!built_in).then(|| SkillCommand {
+                choice: Choice {
+                    label,
+                    detail: description.into(),
+                },
+                body: profile
+                    .and_then(|p| p.directory_body(name))
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+pub(super) fn invoke_skill(
+    skills: &[SkillCommand],
+    command: &str,
+    argument: &str,
+) -> Option<String> {
+    let skill = skills.iter().find(|skill| skill.choice.label == command)?;
+    let name = skill.choice.label.strip_prefix('/')?;
+    if let Some(body) = &skill.body {
+        return Some(format!(
+            "Use the pinned local skill `{name}` for this request within the current tool permissions.\nProcedure (quoted Markdown): {}\nUser task: {argument}",
+            serde_json::json!(body)
+        ));
+    }
+    Some(format!(
+        "Use the pinned local skill `{name}` for this request. First call read_skill with name `{name}` and use the returned procedure within the current tool permissions.\nUser task: {argument}"
+    ))
+}
+
 #[derive(Clone)]
 pub struct Completion {
     pub begin: usize,
     pub end: usize,
     pub query: String,
     pub selected: usize,
-    matches: Vec<usize>,
+    matches: Vec<Choice>,
 }
 impl Completion {
     pub fn exact_command(&self, editor: &Editor) -> bool {
         self.end == editor.cursor
-            && self.matches.get(self.selected).is_some_and(|&index| {
+            && self.matches.get(self.selected).is_some_and(|choice| {
                 editor
                     .text()
-                    .is_ok_and(|text| COMMANDS[index].name == canonical(text.trim()))
+                    .is_ok_and(|text| choice.label == canonical(text.trim()))
             })
     }
     pub fn at(editor: &Editor) -> Option<Self> {
@@ -187,6 +235,14 @@ impl Completion {
     }
 
     pub(crate) fn at_with_commands(editor: &Editor, commands: &[Command]) -> Option<Self> {
+        Self::at_with_skills(editor, commands, &[])
+    }
+
+    pub(super) fn at_with_skills(
+        editor: &Editor,
+        commands: &[Command],
+        skills: &[SkillCommand],
+    ) -> Option<Self> {
         if editor.pasting() || editor.overflow {
             return None;
         }
@@ -211,17 +267,28 @@ impl Completion {
         let end = text[editor.cursor..]
             .find(char::is_whitespace)
             .map_or(text.len(), |offset| editor.cursor + offset);
-        let matches: Vec<_> = commands
+        let mut matches: Vec<_> = commands
             .iter()
-            .enumerate()
-            .filter_map(|(i, command)| {
+            .filter_map(|command| {
                 let matches = command.name.starts_with(query)
                     || ALIASES
                         .iter()
                         .any(|(alias, target)| *target == command.name && alias.starts_with(query));
-                matches.then_some(i)
+                matches.then(|| Choice {
+                    label: command.name.into(),
+                    detail: command.description.into(),
+                })
             })
             .collect();
+        if text[..begin].trim().is_empty() {
+            matches.extend(
+                skills
+                    .iter()
+                    .map(|skill| &skill.choice)
+                    .filter(|skill| skill.label.starts_with(query))
+                    .cloned(),
+            );
+        }
         if matches.is_empty() {
             return None;
         }
@@ -229,7 +296,10 @@ impl Completion {
             begin,
             end,
             query: query.into(),
-            selected: 0,
+            selected: matches
+                .iter()
+                .position(|choice| choice.label == canonical(query))
+                .unwrap_or(0),
             matches,
         })
     }
@@ -241,23 +311,16 @@ impl Completion {
         };
     }
     pub fn apply(&self, editor: &mut Editor) -> bool {
-        let Some(command) = self.matches.get(self.selected).map(|&i| &COMMANDS[i]) else {
+        let Some(command) = self.matches.get(self.selected) else {
             return false;
         };
-        editor.replace(self.begin, self.end, command.name.as_bytes())
+        editor.replace(self.begin, self.end, command.label.as_bytes())
     }
     pub fn popup(&self, exact_command: bool) -> Popup {
         Popup {
             title: "Commands".into(),
             subtitle: String::new(),
-            items: self
-                .matches
-                .iter()
-                .map(|&i| Choice {
-                    label: COMMANDS[i].name.into(),
-                    detail: COMMANDS[i].description.into(),
-                })
-                .collect(),
+            items: self.matches.clone(),
             selected: self.selected,
             footer: if exact_command {
                 "Enter run · Tab/→ complete · Esc close"
@@ -316,6 +379,29 @@ mod tests {
         assert!(completion.apply(&mut input));
         assert_eq!(input.text().unwrap(), "Ж Проверь /model потом файл");
         assert_eq!(input.cursor, "Ж Проверь /model".len());
+    }
+    #[test]
+    fn exact_skill_wins_over_a_longer_prefix_without_shadowing_a_builtin() {
+        let skill = SkillCommand {
+            choice: Choice {
+                label: "/mod".into(),
+                detail: "test".into(),
+            },
+            body: Some("Only this selected procedure".into()),
+        };
+        let input = editor("/mod");
+        let skills = [skill];
+        let completion = Completion::at_with_skills(&input, available(true), &skills).unwrap();
+        assert!(completion.exact_command(&input));
+        assert!(
+            invoke_skill(&skills, "/mod", "preserve аргументы")
+                .unwrap()
+                .contains("Only this selected procedure")
+        );
+        assert!(invoke_skill(&skills, "/model", "").is_none());
+        assert!(
+            Completion::at_with_skills(&editor("path/mod"), available(true), &skills).is_none()
+        );
     }
     #[test]
     fn paths_urls_and_paste_are_not_commands() {
