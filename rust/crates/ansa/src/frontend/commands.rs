@@ -1,6 +1,7 @@
 //! Command discovery and completion for the chat composer.
 use super::carbon::{Choice, Popup};
 use super::input::Editor;
+pub(crate) mod mention;
 
 pub struct Command {
     pub name: &'static str,
@@ -171,15 +172,16 @@ pub struct Completion {
     pub end: usize,
     pub query: String,
     pub selected: usize,
-    matches: Vec<usize>,
+    matches: Vec<Choice>,
 }
 impl Completion {
     pub fn exact_command(&self, editor: &Editor) -> bool {
-        self.end == editor.cursor
-            && self.matches.get(self.selected).is_some_and(|&index| {
+        self.query.starts_with('/')
+            && self.end == editor.cursor
+            && self.matches.get(self.selected).is_some_and(|choice| {
                 editor
                     .text()
-                    .is_ok_and(|text| COMMANDS[index].name == canonical(text.trim()))
+                    .is_ok_and(|text| choice.label == canonical(text.trim()))
             })
     }
     pub fn at(editor: &Editor) -> Option<Self> {
@@ -213,13 +215,15 @@ impl Completion {
             .map_or(text.len(), |offset| editor.cursor + offset);
         let matches: Vec<_> = commands
             .iter()
-            .enumerate()
-            .filter_map(|(i, command)| {
+            .filter_map(|command| {
                 let matches = command.name.starts_with(query)
                     || ALIASES
                         .iter()
                         .any(|(alias, target)| *target == command.name && alias.starts_with(query));
-                matches.then_some(i)
+                matches.then(|| Choice {
+                    label: command.name.to_owned(),
+                    detail: command.description.to_owned(),
+                })
             })
             .collect();
         if matches.is_empty() {
@@ -233,6 +237,25 @@ impl Completion {
             matches,
         })
     }
+    pub(crate) fn paths(token: &mention::Mention<'_>, choices: Vec<Choice>) -> Self {
+        Self {
+            begin: token.begin,
+            end: token.end,
+            query: token.query.into(),
+            selected: 0,
+            matches: choices,
+        }
+    }
+    pub(crate) fn loading(&self) -> bool {
+        self.matches.is_empty()
+    }
+    pub(crate) fn directory_selected(&self) -> bool {
+        self.query.starts_with('@')
+            && self
+                .matches
+                .get(self.selected)
+                .is_some_and(|choice| choice.label.ends_with('/'))
+    }
     pub fn navigate(&mut self, older: bool) {
         self.selected = if older {
             self.selected.saturating_sub(1)
@@ -241,25 +264,33 @@ impl Completion {
         };
     }
     pub fn apply(&self, editor: &mut Editor) -> bool {
-        let Some(command) = self.matches.get(self.selected).map(|&i| &COMMANDS[i]) else {
+        let Some(choice) = self.matches.get(self.selected) else {
             return false;
         };
-        editor.replace(self.begin, self.end, command.name.as_bytes())
+        if self.query.starts_with('@') {
+            let mut inserted = mention::insert(&self.query, &choice.label);
+            if !self.directory_selected() && self.end == editor.bytes.len() {
+                inserted.push(' ');
+            }
+            editor.replace(self.begin, self.end, inserted.as_bytes())
+        } else {
+            editor.replace(self.begin, self.end, choice.label.as_bytes())
+        }
     }
     pub fn popup(&self, exact_command: bool) -> Popup {
         Popup {
-            title: "Commands".into(),
+            title: if self.query.starts_with('@') {
+                "Files"
+            } else {
+                "Commands"
+            }
+            .into(),
             subtitle: String::new(),
-            items: self
-                .matches
-                .iter()
-                .map(|&i| Choice {
-                    label: COMMANDS[i].name.into(),
-                    detail: COMMANDS[i].description.into(),
-                })
-                .collect(),
+            items: self.matches.clone(),
             selected: self.selected,
-            footer: if exact_command {
+            footer: if self.loading() {
+                "Reading directory…"
+            } else if exact_command {
                 "Enter run · Tab/→ complete · Esc close"
             } else {
                 "↑/↓ select · Enter/Tab/→ complete · Esc close"
@@ -275,7 +306,7 @@ pub fn help(selected: usize) -> Popup {
 pub(crate) fn help_with_commands(selected: usize, commands: &[Command]) -> Popup {
     Popup {
         title: "ANSA commands".into(),
-        subtitle: "Ctrl+F files · Ctrl+T agents · Ctrl+O tool details".into(),
+        subtitle: "@ mention a file · Ctrl+F files · Ctrl+T agents · Ctrl+O tool details".into(),
         items: commands
             .iter()
             .map(|command| Choice {
