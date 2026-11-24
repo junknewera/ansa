@@ -2089,7 +2089,7 @@ impl Owner {
             {
                 self.finish_preview("committed", false);
             }
-            Kind::Response | Kind::Continued | Kind::Compacted => {}
+            Kind::Response | Kind::RejectBatch | Kind::Continued | Kind::Compacted => {}
         }
         Ok(())
     }
@@ -2098,6 +2098,10 @@ impl Owner {
             && matches!(
                 &done,
                 Completion::Provider { .. }
+                    | Completion::Tool {
+                        result: Ok(ToolValue::InvalidArguments { .. }),
+                        ..
+                    }
                     | Completion::Plan { .. }
                     | Completion::Auth {
                         task: AuthTask::BeforeIntent | AuthTask::SelectGeneration,
@@ -2275,6 +2279,25 @@ impl Owner {
                     Ok(ToolValue::Recovered(value)) => {
                         if let Some(value) = value {
                             self.pending_outcome = Some(value);
+                        }
+                    }
+                    Ok(ToolValue::InvalidArguments {
+                        response_id,
+                        call_id,
+                        message,
+                    }) => {
+                        self.plan = None;
+                        if self.can_act() {
+                            self.record(
+                                workers,
+                                Kind::RejectBatch,
+                                "tool_batch_rejected",
+                                vec![
+                                    ("response_id", Json::string(&response_id)?),
+                                    ("call_id", Json::string(&call_id)?),
+                                    ("message", Json::string(&message)?),
+                                ],
+                            )?;
                         }
                     }
                     Ok(ToolValue::Plan(values)) => {

@@ -481,6 +481,21 @@ pub(crate) fn read(
                     paused = false;
                     summary.status = SummaryStatus::Interrupted;
                 }
+                "tool_batch_rejected" => {
+                    // The canonical reducer checked the call identity and the empty batch prefix.
+                    expected = Some(
+                        canonical
+                            .as_ref()
+                            .and_then(|state| state.turn.as_ref())
+                            .ok_or("session_tool_rejection")?
+                            .next
+                            .clone(),
+                    );
+                    response = None;
+                    results.clear();
+                    final_text = None;
+                    stage = Stage::Generating;
+                }
                 "continued" => {
                     let admitted = response.as_ref().ok_or("session_continuation")?;
                     need(

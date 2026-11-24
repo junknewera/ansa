@@ -263,6 +263,7 @@ pub struct NativeBackend {
     workers: BTreeMap<Id, Worker>,
     stop: Arc<Stop>,
     workspace_registry: PathBuf,
+    evidence: Option<PathBuf>,
     workspace_claim: Option<super::workspace::Claim>,
 }
 
@@ -315,8 +316,14 @@ impl NativeBackend {
             workers: BTreeMap::new(),
             stop: Arc::new(Stop::default()),
             workspace_registry,
+            evidence: None,
             workspace_claim: None,
         }
+    }
+
+    pub(super) fn with_evidence(mut self, path: &Path) -> Self {
+        self.evidence = Some(path.to_owned());
+        self
     }
 
     pub(super) fn write_descendant(
@@ -341,6 +348,7 @@ impl Backend for NativeBackend {
                 self.workspace_claim = match super::workspace::Claim::acquire(
                     &self.workspace_registry,
                     &intent.binding,
+                    self.evidence.as_deref(),
                 ) {
                     Ok(claim) => Some(claim),
                     Err("terminal_workspace_busy" | "terminal_workspace_quarantined") => {

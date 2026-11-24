@@ -96,7 +96,7 @@ impl Host {
         {
             return Ok(workspace);
         }
-        ansa_linux::local::WorkspaceWrite::acquire(
+        crate::terminal_host::acquire_workspace_writer(
             &self.settings.directory.join("terminal-workspaces"),
             &self.settings.cwd,
             target,
@@ -240,8 +240,8 @@ impl Host {
             return Ok(value);
         }
         let offset = args.usize_field("offset")?;
-        let limit = args.usize_field("max_bytes")?;
-        if offset > 64 * 1024 * 1024 || !(1..=8192).contains(&limit) {
+        let limit = args.usize_field("max_bytes")?.min(READ_PAGE_BYTES);
+        if offset > MAX_READ_OFFSET || limit == 0 {
             return Err("file_read_limit");
         }
         let file = regular(&path).map_err(|_| "file_not_regular")?;
@@ -258,6 +258,20 @@ impl Host {
         };
         let truncated = count > limit;
         content.truncate(count.min(limit));
+        // Keep the next page on a character boundary when the file is UTF-8.
+        // A tiny explicit window still has to advance by at least one byte.
+        if truncated {
+            let tail = content.len().saturating_sub(3);
+            if let Some(lead) = content[tail..].iter().rposition(|byte| byte & 0xc0 != 0x80) {
+                let start = tail + lead;
+                if start > 0
+                    && std::str::from_utf8(&content[start..])
+                        .is_err_and(|error| error.error_len().is_none())
+                {
+                    content.truncate(start);
+                }
+            }
+        }
         if content.contains(&0) {
             return Ok(error("binary_file"));
         }
@@ -296,7 +310,7 @@ impl Host {
             timeout_ms,
             output_bytes: self.settings.process_output_bytes,
         };
-        let workspace = ansa_linux::local::WorkspaceWrite::acquire(
+        let workspace = crate::terminal_host::acquire_workspace_writer(
             &self.settings.directory.join("terminal-workspaces"),
             &self.settings.cwd,
             &options.cwd,
@@ -352,6 +366,52 @@ pub(super) fn path_argument(args: &Json, key: &str) -> Result<bool> {
         && !text.contains('\0')
         && !ansa_linux::fs::protected_path(Path::new(text))
         && args.text_field("instruction_token")?.len() <= 64)
+}
+const READ_PAGE_BYTES: usize = 8192;
+const MAX_READ_OFFSET: usize = 64 * 1024 * 1024;
+
+fn local_argument_hint(name: &str, args: &Json) -> Option<&'static str> {
+    if !args
+        .text_field("instruction_token")
+        .is_ok_and(|token| token.len() <= 64)
+    {
+        return Some("instruction_token must be a string of at most 64 bytes.");
+    }
+    if !path_argument(args, "path").unwrap_or(false) {
+        return Some(
+            "path must name an allowed workspace file or directory (1..4096 bytes, no NUL).",
+        );
+    }
+    match name {
+        "read_file"
+            if !args
+                .usize_field("offset")
+                .is_ok_and(|n| n <= MAX_READ_OFFSET) =>
+        {
+            Some("offset must be an integer from 0 through 67108864.")
+        }
+        "read_file" if !args.usize_field("max_bytes").is_ok_and(|n| n > 0) => {
+            Some("max_bytes must be a positive byte count. Use next_offset to read the next page.")
+        }
+        "search_files"
+            if !args
+                .text_field("query")
+                .is_ok_and(|q| (1..=256).contains(&q.len())) =>
+        {
+            Some("query must contain 1..256 bytes.")
+        }
+        "search_files" if !matches!(args.text_field("mode"), Ok("name" | "content")) => {
+            Some("mode must be name or content.")
+        }
+        "search_files"
+            if !args
+                .usize_field("max_results")
+                .is_ok_and(|n| (1..=50).contains(&n)) =>
+        {
+            Some("max_results must be an integer from 1 through 50.")
+        }
+        _ => None,
+    }
 }
 pub fn local_tools(
     settings: AgentSettings,
@@ -537,33 +597,14 @@ fn register_local_tools(
                     revision: "ansa_local_v1".into(),
                     schema: schema(&properties)?,
                 },
-                validator: Arc::new(move |args| {
-                    (|| -> Result<bool> {
-                        if !path_argument(args, "path")? {
-                            return Ok(false);
-                        }
-                        Ok(match name {
-                            "read_file" => {
-                                args.usize_field("offset")? <= 64 * 1024 * 1024
-                                    && (1..=8192).contains(&args.usize_field("max_bytes")?)
-                            }
-                            "search_files" => {
-                                !args.text_field("query")?.is_empty()
-                                    && args.text_field("query")?.len() <= 256
-                                    && matches!(args.text_field("mode")?, "name" | "content")
-                                    && (1..=50).contains(&args.usize_field("max_results")?)
-                            }
-                            _ => true,
-                        })
-                    })()
-                    .unwrap_or(false)
-                }),
+                validator: Arc::new(move |args| local_argument_hint(name, args).is_none()),
                 executor: Arc::new(move |args| {
                     let _ = &first;
                     legacy(args, &Cancel::default())
                 }),
             },
             Policy {
+                argument_hint: Some(Arc::new(move |args| local_argument_hint(name, args))),
                 read_only: true,
                 invoke: Some(Arc::new(move |invocation, stop| {
                     invoke(&invocation.arguments, stop)

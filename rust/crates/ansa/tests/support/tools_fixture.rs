@@ -236,6 +236,30 @@ pub fn files() {
             .unwrap(),
         "line one\nneedle line\n"
     );
+    let contents = "x".repeat(8191) + "конец";
+    write(&root.cwd().join("paged.txt"), &contents);
+    let read_page = |offset, requested| {
+        let args = Json::object(vec![
+            ("path", s("paged.txt")),
+            ("offset", n(offset)),
+            ("max_bytes", n(requested)),
+            ("instruction_token", s(&token(&root))),
+        ])
+        .unwrap();
+        invoke(&root, "read_file", args)
+    };
+    let first_page = read_page(0, 8800);
+    assert!(first_page.field("truncated").unwrap().boolean().unwrap());
+    assert_eq!(first_page.text_field("content").unwrap(), &contents[..8191]);
+    let next = first_page.usize_field("next_offset").unwrap();
+    assert_eq!(next, 8191);
+    let last_page = read_page(next, 8200);
+    assert!(!last_page.field("truncated").unwrap().boolean().unwrap());
+    assert_eq!(last_page.text_field("content").unwrap(), "конец");
+    assert_eq!(
+        last_page.usize_field("next_offset").unwrap(),
+        contents.len()
+    );
     let mut args = read_args(&root, "nested/hidden.txt");
     let first = invoke(&root, "read_file", args.clone());
     assert_eq!(first.text_field("status").unwrap(), "instructions_required");

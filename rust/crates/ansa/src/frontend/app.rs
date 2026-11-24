@@ -906,8 +906,21 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                         .and_then(|output| serde_json::from_str(output).ok())
                         .unwrap_or_default();
                     let needs_instructions = output["status"] == "instructions_required";
+                    let direct_child = name == Some("ansa_child_result_v1")
+                        && input.iter().any(|item| {
+                            item["role"] == "user"
+                                && item["content"].as_str().is_some_and(|text| {
+                                    text.contains("Inspect the synthetic SIWC workspace")
+                                })
+                        });
+                    let correct_directory = direct_child
+                        && last["call_id"] == "fixture-rejected-directory"
+                        && output["error"] == "tool_arguments_rejected"
+                        && output["applied"] == false;
                     let call = name == Some("ansa_child_result_v1")
-                        && (last["type"] != "function_call_output" || needs_instructions);
+                        && (last["type"] != "function_call_output"
+                            || needs_instructions
+                            || correct_directory);
                     let nested = input.iter().any(|item| {
                         item["content"].as_str().is_some_and(|content| {
                             content.starts_with("Inspect nested project instructions")
@@ -930,6 +943,8 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                             json!({"task":"Inspect the synthetic SIWC workspace","paths":[]})
                                 .to_string();
                         json!({"type":"function_call","id":"fixture-direct-item","call_id":"fixture-direct-call","namespace":"omh","name":"delegate_task","arguments":arguments,"status":"completed"})
+                    } else if direct_child && last["type"] != "function_call_output" {
+                        json!({"type":"function_call","id":"fixture-invalid-directory","call_id":"fixture-rejected-directory","namespace":"omh","name":"list_directory","arguments":r#"{"path":"."}"#,"status":"completed"})
                     } else if call {
                         if !request["tools"].to_string().contains("list_directory") {
                             return Err("fixture_tools");
@@ -1466,6 +1481,11 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         "--live-jsonl" => live_jsonl(&args[1..]),
+        "--workspace-lease" => {
+            let message = crate::terminal_host::workspace::cli(&args[1..], &home()?)?;
+            writeln!(std::io::stdout(), "{message}").map_err(|_| "cli_output")?;
+            Ok(0)
+        }
         "--export-evidence" => {
             let [_, directory] = args else {
                 return Err("evidence_export_options");

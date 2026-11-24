@@ -162,6 +162,46 @@ fn legacy_replay_preserves_the_original_per_response_call_bound() {
 }
 
 #[test]
+fn a_rejection_cannot_supersede_an_intent_outcome_or_saved_pause() {
+    let events = events("completed");
+    let mut state = state();
+    for event in &events[..3] {
+        state.apply(event).unwrap();
+    }
+    let rejection = Json::parse(r#"{"kind":"tool_batch_rejected","turn":"t1","response_id":"fixture_response1","call_id":"fixture_call","message":"Invalid fixture arguments"}"#).unwrap();
+    for (field, wrong) in [
+        ("response_id", "unrelated"),
+        ("call_id", "unknown"),
+        ("message", ""),
+    ] {
+        assert_eq!(
+            state.apply(&rejection.with(field, Json::string(wrong).unwrap()).unwrap()),
+            Err("session_tool_rejection")
+        );
+    }
+    let mut paused = state.clone();
+    paused
+        .apply(
+            &Json::parse(r#"{"kind":"pause","turn":"t1","diagnostic":"tool_arguments_rejected"}"#)
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(paused.apply(&rejection), Err("session_tool_rejection"));
+    paused
+        .apply(&Json::parse(r#"{"kind":"resume","turn":"t1","command":"retry"}"#).unwrap())
+        .unwrap();
+    paused.apply(&rejection).unwrap();
+    assert_eq!(paused.apply(&rejection), Err("session_tool_rejection"));
+    for event in &events[3..5] {
+        state.apply(event).unwrap();
+        assert_eq!(state.apply(&rejection), Err("session_tool_rejection"));
+    }
+    for event in &events[5..] {
+        state.apply(event).unwrap();
+    }
+}
+
+#[test]
 fn exact_cpp_frame_and_chain() {
     let root = Root::new();
     let mut journal = Journal::open(&root.journal(), |_| Ok(()), None).unwrap();

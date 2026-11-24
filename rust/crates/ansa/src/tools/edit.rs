@@ -26,16 +26,20 @@ fn rejection(code: &str) -> Outcome {
         }
         _ => Effects::NotStarted,
     };
+    let mut fields = vec![
+        ("error", s(code).expect("error code")),
+        ("applied", b(false)),
+    ];
+    if code == "terminal_workspace_quarantined" {
+        fields.push(("message", s("Inspect the terminal lease with ansa --workspace-lease from this workspace. The command identifies its owning session.").expect("lease hint")));
+    }
     Outcome::from_bytes(
         Execution::Failed,
         effects,
-        Json::object(vec![
-            ("error", s(code).expect("error code")),
-            ("applied", b(false)),
-        ])
-        .expect("edit rejection")
-        .dump()
-        .into_bytes(),
+        Json::object(fields)
+            .expect("edit rejection")
+            .dump()
+            .into_bytes(),
     )
 }
 fn unknown() -> Outcome {
@@ -177,15 +181,11 @@ pub(crate) fn register(registry: &mut Registry, host: Arc<Host>) -> Result<()> {
             revision: "ansa_edit_v1".into(),
             schema: schema(&[("path", "string"), ("old_text", "string"), ("new_text", "string")])?,
         },
-        validator: Arc::new(|args| (|| -> Result<bool> {
-            let old = args.text_field("old_text")?;
-            let new = args.text_field("new_text")?;
-            Ok(path_argument(args, "path")? && old.len() <= ARG_BYTES && new.len() <= ARG_BYTES
-                && !old.contains('\0') && !new.contains('\0'))
-        })().unwrap_or(false)),
+        validator: Arc::new(|args| edit_argument_hint(args).is_none()),
         // The legacy no-journal executor cannot publish a file.
         executor: Arc::new(|_| rejection("durable_checkpoint_required")),
     }, Policy {
+        argument_hint: Some(Arc::new(edit_argument_hint)),
         requires_journal: true,
         read_only: false,
         invoke: Some(Arc::new(move |invocation, stop| match invocation.save() {
@@ -196,6 +196,32 @@ pub(crate) fn register(registry: &mut Registry, host: Arc<Host>) -> Result<()> {
         // The canonical pending intent remains unknown until reconciliation.
         recover: Some(Arc::new(|_| Ok(None))),
     })
+}
+
+fn edit_argument_hint(args: &Json) -> Option<&'static str> {
+    if !path_argument(args, "path").unwrap_or(false) {
+        return Some(
+            "Use an allowed workspace path (1..4096 bytes, no NUL) and an instruction_token of at most 64 bytes.",
+        );
+    }
+    for (field, hint) in [
+        (
+            "old_text",
+            "old_text must contain at most 16384 bytes and no NUL. Match a smaller section.",
+        ),
+        (
+            "new_text",
+            "new_text must contain at most 16384 bytes and no NUL. Split the change into smaller edits.",
+        ),
+    ] {
+        if !args
+            .text_field(field)
+            .is_ok_and(|text| text.len() <= ARG_BYTES && !text.contains('\0'))
+        {
+            return Some(hint);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

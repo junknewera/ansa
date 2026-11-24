@@ -27,7 +27,7 @@ pub(crate) mod output_spool;
 mod process {
     pub(crate) use super::{git, output_spool};
 }
-pub use ansa::{auth, orchestration};
+pub use ansa::{auth, orchestration, terminal_host};
 #[path = "../src/config/mod.rs"]
 #[allow(dead_code)]
 pub mod config;

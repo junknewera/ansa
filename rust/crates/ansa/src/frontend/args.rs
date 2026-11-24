@@ -1,6 +1,6 @@
 //! Legacy command-line grammar. Help is dispatched before option parsing.
 use std::{collections::BTreeSet, path::PathBuf};
-pub const HELP: &str = "Usage: ansa [--continue | --session ID] [--cwd PATH] [--model SLUG] [PROMPT]\n       ansa --openrouter [--continue | --session ID] [--cwd PATH]\n       ansa --openrouter-login [--auth-dir PATH] < KEY_FILE\n       ansa --offline [PROMPT]\n       ansa --login | --auth-status | --models | --logout\n       ansa --print-config\n       ansa --harness ACTION --cwd PROJECT [ARGS...]\n       ansa [--offline] --harness-trial PROPOSAL:ARM [--cwd PATH] [PROMPT]\n       ansa --export-evidence JOURNAL_DIR\nCommands: /status /cancel /resume /exit. Ctrl+C cancels; Ctrl+D finishes accepted work.\n";
+pub const HELP: &str = "Usage: ansa [--continue | --session ID] [--cwd PATH] [--model SLUG] [PROMPT]\n       ansa --openrouter [--continue | --session ID] [--cwd PATH]\n       ansa --openrouter-login [--auth-dir PATH] < KEY_FILE\n       ansa --offline [PROMPT]\n       ansa --login | --auth-status | --models | --logout\n       ansa --print-config\n       ansa --harness ACTION --cwd PROJECT [ARGS...]\n       ansa [--offline] --harness-trial PROPOSAL:ARM [--cwd PATH] [PROMPT]\n       ansa --workspace-lease [release-after-reboot TOKEN] (run in affected workspace)\n       ansa --export-evidence JOURNAL_DIR\nCommands: /status /cancel /resume /exit. Ctrl+C cancels; Ctrl+D finishes accepted work.\n";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub offline: bool,

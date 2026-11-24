@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 pub type Validator = Arc<dyn Fn(&Json) -> bool + Send + Sync>;
+pub type ArgumentHint = Arc<dyn Fn(&Json) -> Option<&'static str> + Send + Sync>;
 pub type Executor = Arc<dyn Fn(&Json) -> Outcome + Send + Sync>;
 pub type ContextExecutor =
     Arc<dyn Fn(&super::invocation::Invocation, &crate::auth::Cancel) -> Outcome + Send + Sync>;
@@ -19,6 +20,7 @@ pub type Recovery = Arc<
 >;
 #[derive(Clone, Default)]
 pub struct Policy {
+    pub argument_hint: Option<ArgumentHint>,
     pub invoke: Option<ContextExecutor>,
     pub recover: Option<Recovery>,
     pub requires_journal: bool,

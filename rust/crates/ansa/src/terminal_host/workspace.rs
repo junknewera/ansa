@@ -1,13 +1,29 @@
-use super::protocol::{Binding, VERSION};
-use ansa_linux::local::{self, ACTIVE_TERMINAL_SCOPE as MARKER};
-use std::{fs::File, os::unix::fs::MetadataExt, path::Path, sync::Arc};
+use super::protocol::Binding;
+use ansa_linux::local;
+use std::{os::unix::fs::MetadataExt, path::Path, sync::Arc};
+mod recovery;
+pub(crate) use recovery::cli;
+
+/// Acquire write access, reconciling an old terminal lease when its evidence permits it.
+pub fn writer(
+    registry: &Path,
+    workspace: &Path,
+    target: &Path,
+) -> Result<local::WorkspaceWrite, &'static str> {
+    recovery::admit(registry, workspace, target, || {
+        local::WorkspaceWrite::acquire(registry, workspace, target)
+    })
+}
 
 pub(crate) fn plan_guard(settings: &crate::config::AgentSettings) -> crate::runtime::PlanGuard {
     let workspace = settings.cwd.clone();
     let registry = settings.directory.join("terminal-workspaces");
     Arc::new(move || {
-        Ok(Box::new(local::workspace_participant(
-            &registry, &workspace,
+        Ok(Box::new(recovery::admit(
+            &registry,
+            &workspace,
+            &workspace,
+            || local::workspace_participant(&registry, &workspace),
         )?))
     })
 }
@@ -18,34 +34,30 @@ pub(crate) fn plan_guard(settings: &crate::config::AgentSettings) -> crate::runt
 pub(super) struct Claim {
     workspace: local::WorkspaceWrite,
     pub identity: (u64, u64),
-    directory: File,
     marker: Vec<u8>,
 }
 
 impl Claim {
-    pub(super) fn acquire(registry: &Path, binding: &Binding) -> Result<Self, &'static str> {
+    pub(super) fn acquire(
+        registry: &Path,
+        binding: &Binding,
+        evidence: Option<&Path>,
+    ) -> Result<Self, &'static str> {
         let path = Path::new(&binding.workspace);
-        let mut workspace = local::WorkspaceWrite::acquire(registry, path, path)?;
-        let (_, directory, identity) =
-            local::workspace_records(registry, path).map_err(|_| "terminal_workspace_registry")?;
+        let mut workspace = writer(registry, path, path)?;
+        if registry.starts_with(path) {
+            return Err("terminal_workspace_registry");
+        }
         let admitted = workspace
             .directory()
             .metadata()
             .map_err(|_| "terminal_workspace_identity")?;
-        if (admitted.dev(), admitted.ino()) != identity {
-            return Err("terminal_workspace_identity");
-        }
-        let marker = serde_json::to_vec(&serde_json::json!({"version":VERSION,"binding":binding}))
-            .map_err(|_| "terminal_workspace_evidence")?;
-        local::create(&directory, MARKER, &marker).map_err(|_| "terminal_workspace_evidence")?;
-        if let Err(error) = workspace.begin(&crate::protocol::legacy_json_v1::sha256(&marker)) {
-            let _ = local::unlink(&directory, MARKER);
-            return Err(error);
-        }
+        let identity = (admitted.dev(), admitted.ino());
+        let marker = recovery::new_marker(binding, identity, evidence)?;
+        workspace.start_terminal(&marker, &crate::protocol::legacy_json_v1::sha256(&marker))?;
         Ok(Self {
             workspace,
             identity,
-            directory,
             marker,
         })
     }
@@ -66,14 +78,6 @@ impl Claim {
     }
 
     pub(super) fn release(self) -> Result<(), &'static str> {
-        if local::read(&self.directory, MARKER, 8192)
-            .map_err(|_| "terminal_workspace_evidence")?
-            .as_deref()
-            != Some(&self.marker)
-        {
-            return Err("terminal_workspace_evidence");
-        }
-        local::unlink(&self.directory, MARKER).map_err(|_| "terminal_workspace_evidence")?;
-        self.workspace.finish()
+        self.workspace.finish_terminal(&self.marker)
     }
 }

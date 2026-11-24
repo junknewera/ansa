@@ -76,6 +76,11 @@ pub struct FileJournal {
 }
 
 impl FileJournal {
+    pub(super) fn identity(&self) -> Result<(u64, u64), &'static str> {
+        use std::os::unix::fs::MetadataExt;
+        let m = self.directory.metadata().map_err(|_| "terminal_store")?;
+        Ok((m.dev(), m.ino()))
+    }
     /// Reserve a fresh private store. Existing headers and remnants require an
     /// explicit open and never become permission to start a replacement host.
     pub(super) fn create(
