@@ -241,15 +241,21 @@ impl Host {
         }
         let offset = args.usize_field("offset")?;
         let limit = args.usize_field("max_bytes")?.min(READ_PAGE_BYTES);
-        if offset > MAX_READ_OFFSET || limit == 0 {
+        let native_offset = i64::try_from(offset).map_err(|_| "file_read_limit")?;
+        if limit == 0 {
             return Err("file_read_limit");
         }
         let file = regular(&path).map_err(|_| "file_not_regular")?;
         if stop.cancelled() {
             return Ok(error("cancelled"));
         }
-        let mut content = vec![0; limit + 1];
+        // Linux rejects reads whose offset and byte count overflow loff_t.
+        let available = (i64::MAX - native_offset) as u64;
+        let mut content = vec![0; ((limit + 1) as u64).min(available) as usize];
         let count = loop {
+            if content.is_empty() {
+                break 0;
+            }
             match file.read_at(&mut content, offset as u64) {
                 Ok(n) => break n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -364,7 +370,6 @@ pub(super) fn path_argument(args: &Json, key: &str) -> Result<bool> {
         && args.text_field("instruction_token")?.len() <= 64)
 }
 const READ_PAGE_BYTES: usize = 8192;
-const MAX_READ_OFFSET: usize = 64 * 1024 * 1024;
 
 fn local_argument_hint(name: &str, args: &Json) -> Option<&'static str> {
     if !args
@@ -382,9 +387,11 @@ fn local_argument_hint(name: &str, args: &Json) -> Option<&'static str> {
         "read_file"
             if !args
                 .usize_field("offset")
-                .is_ok_and(|n| n <= MAX_READ_OFFSET) =>
+                .is_ok_and(|offset| i64::try_from(offset).is_ok()) =>
         {
-            Some("offset must be an integer from 0 through 67108864.")
+            Some(
+                "offset must be a non-negative signed 64-bit byte offset. Use next_offset to read the next page.",
+            )
         }
         "read_file" if !args.usize_field("max_bytes").is_ok_and(|n| n > 0) => {
             Some("max_bytes must be a positive byte count. Use next_offset to read the next page.")
@@ -736,6 +743,77 @@ fn register_local_tools(
 mod tests {
     use super::*;
     use ansa_linux::local::WorkspaceWrite;
+
+    #[test]
+    fn read_file_pages_through_the_tail_of_a_large_local_file() {
+        struct Root(PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(std::env::temp_dir().join(format!(
+            "ansa-read-tail-{}",
+            crate::auth::pkce::random_token(16).unwrap()
+        )));
+        ansa_linux::fs::create_private_leaf(&root.0).unwrap();
+        let cwd = root.0.join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let settings = crate::config::load_agent_settings(&cwd, &root.0).unwrap();
+        let epoch = crate::config::agent_epoch(&settings).unwrap();
+        let token = sha256(
+            epoch
+                .exact_state
+                .field("instructions")
+                .unwrap()
+                .dump()
+                .as_bytes(),
+        );
+        let host = local_host(
+            settings,
+            epoch,
+            &root.0.join("session"),
+            &root.0.join("auth"),
+            &std::env::current_exe().unwrap(),
+            None,
+        )
+        .unwrap();
+        let offset = 100 * 1024 * 1024;
+        File::create(cwd.join("build.log"))
+            .unwrap()
+            .write_all_at(b"failed\nafter\n", offset as u64)
+            .unwrap();
+        let tools = register_local_tools(Arc::new(host), |_| Ok(())).unwrap();
+        let read = tools
+            .definitions
+            .iter()
+            .find(|tool| tool.descriptor.name == "read_file")
+            .unwrap();
+        let page = |offset, limit| {
+            let args = Json::object(vec![
+                ("path", s("build.log").unwrap()),
+                ("instruction_token", s(&token).unwrap()),
+                ("offset", n(offset)),
+                ("max_bytes", n(limit)),
+            ])
+            .unwrap();
+            assert!((read.validator)(&args));
+            let result = (read.executor)(&args);
+            Json::parse(std::str::from_utf8(result.output()).unwrap()).unwrap()
+        };
+        let first = page(offset, 7);
+        assert_eq!(first.text_field("content"), Ok("failed\n"));
+        assert_eq!(first.field("truncated").unwrap().boolean(), Ok(true));
+        let last = page(first.usize_field("next_offset").unwrap(), 8192);
+        assert_eq!(last.text_field("content"), Ok("after\n"));
+        assert_eq!(last.usize_field("next_offset"), Ok(offset + 13));
+        assert_eq!(last.field("truncated").unwrap().boolean(), Ok(false));
+        assert_eq!(page(offset + 500, 8192).text_field("content"), Ok(""));
+        if let Ok(last_offset) = usize::try_from(i64::MAX) {
+            assert_eq!(page(last_offset, 8192).text_field("content"), Ok(""));
+            assert_eq!(page(last_offset - 8191, 8192).text_field("content"), Ok(""));
+        }
+    }
 
     #[test]
     fn legacy_run_command_uses_its_own_terminal_writer_but_not_a_peer_writer() {
