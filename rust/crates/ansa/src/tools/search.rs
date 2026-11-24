@@ -425,7 +425,7 @@ impl Host {
                 {
                     if !append(
                         &mut page.scopes,
-                        s(&path_string(&child.path))?,
+                        s(crate::config::path_text(&child.path)?)?,
                         &mut page.encoded,
                     ) {
                         directory.cookie = previous_cookie;

@@ -287,6 +287,7 @@ pub fn files() {
             ("query", s("needle")),
             ("mode", s("content")),
             ("max_results", n(10)),
+            ("cursor", s("")),
             ("instruction_token", s(&token(&root))),
         ])
         .unwrap(),
@@ -360,6 +361,7 @@ pub fn raw_names() {
                 ("query", s(if mode == "name" { "match" } else { "needle" })),
                 ("mode", s(mode)),
                 ("max_results", n(10)),
+                ("cursor", s("")),
                 ("instruction_token", s(&token(&root))),
             ])
             .unwrap(),
@@ -385,6 +387,7 @@ pub fn raw_names() {
             ("query", s("needle")),
             ("mode", s("content")),
             ("max_results", n(10)),
+            ("cursor", s("")),
             ("instruction_token", s(&token(&root))),
         ])
         .unwrap(),
@@ -420,6 +423,7 @@ pub fn future_auth_root() {
             ("query", s("synthetic must not escape")),
             ("mode", s("content")),
             ("max_results", n(10)),
+            ("cursor", s("")),
             ("instruction_token", s(&token(&root))),
         ])
         .unwrap();
