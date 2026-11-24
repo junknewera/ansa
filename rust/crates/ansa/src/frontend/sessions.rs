@@ -95,6 +95,7 @@ pub struct Factory {
 }
 pub struct Created {
     pub(super) skill_commands: Vec<super::commands::SkillCommand>,
+    pub(super) skill_notice: Option<&'static str>,
     pub runtime: Runtime,
     pub selected: Selected,
     pub kind: Kind,
@@ -1001,6 +1002,7 @@ impl Factory {
             selected,
             kind: Kind::Agent,
             skill_commands: Vec::new(),
+            skill_notice: None,
             parent: Some(parent.into()),
         })
     }
@@ -1112,6 +1114,7 @@ impl Factory {
             selected,
             kind: Kind::Agent,
             skill_commands: Vec::new(),
+            skill_notice: None,
             parent: Some(parent),
         })
     }
@@ -1209,10 +1212,10 @@ impl Factory {
         {
             return Err("session_configuration_mismatch");
         }
-        let profile = if kind == Kind::Console {
-            None
+        let (profile, skill_notice) = if kind == Kind::Console {
+            (None, None)
         } else {
-            crate::harness::select(
+            crate::harness::select_with_notice(
                 &self.settings,
                 source_configuration.as_ref(),
                 self.harness_trial.as_deref(),
@@ -1422,6 +1425,7 @@ impl Factory {
         self.retain_terminal_owner(&selected.id, terminal)?;
         Ok(Created {
             skill_commands: super::commands::skill_choices(profile.as_deref()),
+            skill_notice,
             runtime,
             selected,
             kind,

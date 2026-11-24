@@ -533,10 +533,10 @@ fn text_with_providers(
     if parsed.resume && !parsed.session.is_empty() {
         return Err("session_selection_conflict");
     }
-    let profile = if parsed.resume || !parsed.session.is_empty() {
-        None
+    let (profile, skill_notice) = if parsed.resume || !parsed.session.is_empty() {
+        (None, None)
     } else {
-        crate::harness::select(&settings, None, factory.harness_trial.as_deref())?
+        crate::harness::select_with_notice(&settings, None, factory.harness_trial.as_deref())?
     };
     if let Some(profile) = &profile {
         profile.attach(&mut epoch)?;
@@ -667,6 +667,7 @@ fn text_with_providers(
             root_kind,
             parent,
             skill_commands,
+            skill_notice,
             parsed
                 .workspace
                 .map(|directory| -> Result<_> {
@@ -683,6 +684,9 @@ fn text_with_providers(
     }
     if parsed.workspace.is_some() {
         return Err("workspace_requires_tty");
+    }
+    if let Some(code) = skill_notice {
+        io.status(&format!("Local skills unavailable ({code})\n"));
     }
     let context = format!("{}  {}", settings.cwd.display(), settings.model);
     let result = reactor()?.block_on(controller::run(
@@ -941,8 +945,15 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                     let direct = input
                         .iter()
                         .any(|item| item["content"] == "DIRECT_SIWC_FIXTURE");
-                    let item = if name.is_none() && direct && last["type"] != "function_call_output"
-                    {
+                    let skill_fixture = last["content"]
+                        .as_str()
+                        .or_else(|| last["content"][0]["text"].as_str())
+                        .is_some_and(|text| {
+                            text.starts_with("Use the pinned local skill `inspect-picture`")
+                        });
+                    let item = if name.is_none() && skill_fixture {
+                        json!({"type":"function_call","id":"fixture-skill-item","call_id":"fixture-skill-call","namespace":"omh","name":"read_skill","arguments":r#"{"name":"inspect-picture"}"#,"status":"completed"})
+                    } else if name.is_none() && direct && last["type"] != "function_call_output" {
                         if !request["tools"][0]["tools"]
                             .as_array()
                             .is_some_and(|tools| {
@@ -1001,6 +1012,12 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                                 return Err("fixture_delegate_result");
                             }
                             "DIRECT_SIWC_DONE".into()
+                        }
+                        None if last["call_id"] == "fixture-skill-call" => {
+                            if output["body"] != "Locate the subject.\n" {
+                                return Err("fixture_skill_body");
+                            }
+                            "SIWC_CARBON_DONE".into()
                         }
                         None => "SIWC_CARBON_DONE".into(),
                         _ => return Err("fixture_format"),

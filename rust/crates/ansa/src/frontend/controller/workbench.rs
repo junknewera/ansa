@@ -4296,6 +4296,10 @@ impl Workbench {
                     let mut slot =
                         Slot::new(created.runtime, id, created.kind, created.parent, prompt);
                     slot.skill_commands = created.skill_commands;
+                    if let Some(code) = created.skill_notice {
+                        slot.state
+                            .report(io, &format!("Local skills unavailable ({code})"));
+                    }
                     if plan_only {
                         slot.state.mode = AgentMode::Plan;
                         slot.state.mode_ready = true;
@@ -6493,6 +6497,7 @@ pub async fn run_attached(
         kind,
         parent,
         Vec::new(),
+        None,
         bridge_options,
     )
     .await
@@ -6508,6 +6513,7 @@ pub(in crate::frontend) async fn run_session(
     kind: Kind,
     parent: Option<String>,
     skill_commands: Vec<commands::SkillCommand>,
+    skill_notice: Option<&'static str>,
     bridge_options: Option<super::super::bridge::BridgeOptions>,
 ) -> Result<i32> {
     if io.raw.is_none() {
@@ -6529,6 +6535,9 @@ pub(in crate::frontend) async fn run_session(
         .transpose()?;
     let mut work = Workbench::new(runtime, factory, root_id, kind, parent)?;
     work.slots[work.current].skill_commands = skill_commands;
+    if let Some(code) = skill_notice {
+        work.report(io, &format!("Local skills unavailable ({code})"));
+    }
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let input_events = readiness_source(io.input.duplicate().map_err(|_| "cli_input_poll")?).ok();
@@ -6863,7 +6872,7 @@ pub(in crate::frontend) async fn run_session(
                                 let was_pasting = slot.state.editor.pasting();
                                 slot.state.editor.set_completion(complete);
                                 let action = slot.state.editor.feed(byte, true);
-                                if was_pasting && !slot.state.editor.pasting() && commands::mention::Mention::at(&slot.state.editor).is_some() {
+                                if was_pasting && !slot.state.editor.pasting() && commands::mention::Mention::at_with_skills(&slot.state.editor, &slot.skill_commands).is_some() {
                                     work.completion_closed = Some((slot.state.editor.bytes.clone(), slot.state.editor.cursor));
                                 }
                                 if before != (slot.state.editor.bytes.len(), slot.state.editor.cursor) {

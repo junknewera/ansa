@@ -88,10 +88,6 @@ impl Pinned {
 }
 
 impl Pinned {
-    pub(crate) fn directory_body(&self, name: &str) -> Option<&str> {
-        self.directory_skills.body(name)
-    }
-
     /// Sorted `(name, description)` pairs. Pass the prefix without `/`.
     /// Legacy trigger text serves as the description of a profile skill.
     pub(crate) fn complete(&self, prefix: &str) -> Vec<(&str, &str)> {
@@ -179,11 +175,20 @@ pub(crate) fn saved_identity(state: &Json) -> Result<Option<(&Json, &Json)>> {
     Ok(Some((id, settings)))
 }
 
+#[cfg(test)]
 pub(crate) fn select(
     settings: &AgentSettings,
     saved: Option<&Request>,
     trial: Option<&str>,
 ) -> Result<Option<Arc<Pinned>>> {
+    select_with_notice(settings, saved, trial).map(|(profile, _)| profile)
+}
+
+pub(crate) fn select_with_notice(
+    settings: &AgentSettings,
+    saved: Option<&Request>,
+    trial: Option<&str>,
+) -> Result<(Option<Arc<Pinned>>, Option<&'static str>)> {
     let scope = scope(&settings.cwd);
     let trial = if saved.is_none() {
         trial.map(trial_parts).transpose()?
@@ -195,14 +200,15 @@ pub(crate) fn select(
             Some((id, _)) if id.text_field("scope")? == scope => Some(id.text_field("revision")?),
             Some(_) => return Err("harness_profile_identity"),
             None if PromptPolicy::resolve(&request.epoch.exact_state)?.is_legacy() => {
-                return Ok(None);
+                return Ok((None, None));
             }
             None => return Err("harness_profile_identity"),
         },
         None => None,
     };
-    use directory_skills::{DirectorySkills, Snapshot};
-    let path = settings.directory.join("harness-profiles").join(&scope);
+    use directory_skills::DirectorySkills;
+    let profiles = settings.directory.join("harness-profiles");
+    let path = profiles.join(&scope);
     // Keep a growing set of session pins out of the adoption store's entry quota.
     let catalogs = path.join("catalogs");
     let directory = match private_directory(&path) {
@@ -211,6 +217,9 @@ pub(crate) fn select(
             if error.kind() == io::ErrorKind::NotFound && selected.is_none() && trial.is_none() =>
         {
             None
+        }
+        Err(_) if saved.is_none() && trial.is_none() => {
+            return Ok((None, Some("harness_store_unavailable")));
         }
         Err(_) => return Err("harness_store_unavailable"),
     };
@@ -227,10 +236,8 @@ pub(crate) fn select(
                     }
                     Err(_) => return Err("skill_snapshot_read"),
                 };
-                let snapshot =
-                    Snapshot::load(&catalogs, &scope, pin)?.ok_or("harness_revision_missing")?;
-                legacy_revision = snapshot.profile;
-                directory_skills = snapshot.skills;
+                (legacy_revision, directory_skills) = DirectorySkills::load(catalogs, &scope, pin)?
+                    .ok_or("harness_revision_missing")?;
                 load_or_empty(dir, &scope, legacy_revision.as_deref())?
             }
             result => result?,
@@ -243,9 +250,12 @@ pub(crate) fn select(
         let manifest = load_manifest(dir, &scope, &revision)?;
         (Some(revision), manifest)
     } else if let Some(dir) = &directory {
-        let revision = adoption::active(dir, &scope)?;
-        let manifest = load_or_empty(dir, &scope, revision.as_deref())?;
-        (revision, manifest)
+        match adoption::active(dir, &scope).and_then(|revision| {
+            load_or_empty(dir, &scope, revision.as_deref()).map(|manifest| (revision, manifest))
+        }) {
+            Ok(pinned) => pinned,
+            Err(code) => return Ok((None, Some(code))),
+        }
     } else {
         (None, empty_manifest(&scope))
     };
@@ -258,55 +268,74 @@ pub(crate) fn select(
     }
     // Only a new ordinary conversation discovers files. Resume and fork rely
     // exclusively on the pinned digest, even after deletion of the source tree.
-    let (directory, revision) = if saved.is_none() && trial.is_none() {
-        let discovered = DirectorySkills::discover(&settings.directory, legacy_name)?;
-        if discovered.is_empty() {
-            match (directory, revision) {
-                (Some(dir), Some(rev)) => (dir, rev),
-                _ => return Ok(None),
-            }
-        } else {
-            let dir = match directory {
-                Some(dir) => dir,
-                None => {
-                    create_private(&path).map_err(|_| "harness_store_unavailable")?;
-                    private_directory(&path).map_err(|_| "harness_store_unavailable")?
-                }
+    let mut notice = None;
+    let mut directory = directory;
+    let mut revision = revision;
+    if saved.is_none() && trial.is_none() {
+        let discover_and_pin = || {
+            let mut storage = None;
+            let discovered =
+                DirectorySkills::discover(&settings.directory, legacy_name, |digest, body| {
+                    if storage.is_none() {
+                        create_private(&catalogs).map_err(|_| "skill_snapshot_publish")?;
+                        storage = Some(
+                            private_directory(&catalogs).map_err(|_| "skill_snapshot_publish")?,
+                        );
+                    }
+                    let storage = storage.as_ref().ok_or("skill_snapshot_publish")?;
+                    DirectorySkills::pin_body(storage, digest, body)
+                })?;
+            let Some(storage) = storage else {
+                return Ok(None);
             };
-            create_private(&catalogs).map_err(|_| "skill_snapshot_publish")?;
-            let catalogs = private_directory(&catalogs).map_err(|_| "skill_snapshot_publish")?;
-            let snapshot = Snapshot::new(&scope, revision, discovered);
-            let pin = snapshot.publish(&catalogs)?;
-            legacy_revision = snapshot.profile;
-            directory_skills = snapshot.skills;
-            (dir, pin)
+            let dir = private_directory(&path).map_err(|_| "harness_store_unavailable")?;
+            // A competing creator can make a directory visible before syncing
+            // its parent. Make the path to the pin durable before returning it.
+            for parent in [&settings.directory, &profiles] {
+                private_directory(parent)
+                    .and_then(|parent| parent.sync_all())
+                    .map_err(|_| "skill_snapshot_publish")?;
+            }
+            dir.sync_all().map_err(|_| "skill_snapshot_publish")?;
+            let (pin, skills) = discovered.pin(storage, &scope, revision.as_deref())?;
+            Ok(Some((dir, pin, skills)))
+        };
+        match discover_and_pin() {
+            Ok(Some((dir, pin, skills))) => {
+                directory = Some(dir);
+                legacy_revision = revision.replace(pin);
+                directory_skills = skills;
+            }
+            Ok(None) => {}
+            Err(code) => notice = Some(code),
         }
-    } else {
-        (
-            directory.ok_or("harness_store_unavailable")?,
-            revision.ok_or("harness_revision_missing")?,
-        )
+    }
+    let (Some(directory), Some(revision)) = (directory, revision) else {
+        return Ok((None, notice));
     };
     if let Some(request) = saved
         && PromptPolicy::resolve(&request.epoch.exact_state)? != manifest.prompt_policy
     {
         return Err("harness_prompt_policy_mismatch");
     }
-    Ok(Some(Arc::new(Pinned {
-        directory,
-        revision,
-        manifest,
-        legacy_revision,
-        directory_skills,
-        trial: trial
-            .map(|(proposal, arm)| {
-                Json::object(vec![
-                    ("proposal", Json::string(proposal)?),
-                    ("arm", Json::string(arm)?),
-                ])
-            })
-            .transpose()?,
-    })))
+    Ok((
+        Some(Arc::new(Pinned {
+            directory,
+            revision,
+            manifest,
+            legacy_revision,
+            directory_skills,
+            trial: trial
+                .map(|(proposal, arm)| {
+                    Json::object(vec![
+                        ("proposal", Json::string(proposal)?),
+                        ("arm", Json::string(arm)?),
+                    ])
+                })
+                .transpose()?,
+        })),
+        notice,
+    ))
 }
 
 pub(crate) fn cli(args: &[String], home: &Path) -> Result<serde_json::Value> {

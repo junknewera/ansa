@@ -59,15 +59,15 @@ fn text_is_explicit_utf8_and_bounded() {
     );
     assert_eq!(parse_source("--text"), None);
     assert_eq!(parse_source("--screenshot"), None);
-    let at_limit = "я".repeat(MAX_TEXT_BYTES / 2);
+    let at_limit = "я".repeat(INLINE_TEXT_BYTES / 2);
     fixture.write("note 1.md", &at_limit);
     assert!(matches!(fixture.load(Path::new("note 1.md"), true),
-        Ok(Attachment::Text(text)) if text == at_limit));
-    fixture.write("big.txt", vec![b'x'; MAX_TEXT_BYTES + 1]);
-    assert_eq!(
-        fixture.load(Path::new("big.txt"), true).err(),
-        Some("attachment_text_size")
-    );
+        Ok(Attachment::Text(TextAttachment::Inline(text))) if text == at_limit));
+    fixture.write("big.txt", vec![b'x'; INLINE_TEXT_BYTES + 1]);
+    assert!(matches!(
+        fixture.load(Path::new("big.txt"), true),
+        Ok(Attachment::Text(TextAttachment::File(path))) if path == "big.txt"
+    ));
     for bytes in [b"\xff".as_slice(), b"a\0b", b"\x1b[31m", b"\r\n\t"] {
         fixture.write("bad.txt", bytes);
         assert_eq!(

@@ -304,3 +304,101 @@ fn discovery_accepts_only_bounded_owned_skill_documents() {
     );
     assert!(epoch.instructions.contains("original"));
 }
+
+#[test]
+fn concurrent_catalog_pins_share_an_index_and_keep_exact_bodies() {
+    use crate::tools::skills::Catalog;
+
+    let home = Project::new();
+    let settings = AgentSettings::defaults(&home.0, &home.0);
+    let first = format!("{} saved version", "x".repeat(14_000));
+    let files: Vec<_> = (0..5)
+        .map(|i| install_skill(&settings, &format!("skill-{i}"), "Review a draft", &first))
+        .collect();
+    let barrier = std::sync::Barrier::new(8);
+    let profiles = std::thread::scope(|thread| {
+        let jobs = (0..8)
+            .map(|_| {
+                thread.spawn(|| {
+                    barrier.wait();
+                    let (pin, notice) = select_with_notice(&settings, None, None).unwrap();
+                    assert_eq!(notice, None);
+                    pin.unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        jobs.into_iter()
+            .map(|job| job.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let pin = &profiles[0];
+    assert!(profiles.iter().all(|other| other.revision == pin.revision));
+    assert_eq!(pin.complete("").len(), 5);
+
+    let catalogs = settings
+        .directory
+        .join("harness-profiles")
+        .join(scope(&settings.cwd))
+        .join("catalogs");
+    let stored_index =
+        fs::read_to_string(catalogs.join(format!("catalog-{}", pin.revision))).unwrap();
+    assert!(!stored_index.contains("saved version"));
+    assert_eq!(fs::read_dir(&catalogs).unwrap().count(), 2);
+
+    fs::write(
+        &files[0],
+        "---\nname: skill-0\ndescription: Changed\n---\nnew text",
+    )
+    .unwrap();
+    assert_eq!(pin.read("skill-0").unwrap()["body"], first);
+    let mut epoch = agent_epoch(&settings).unwrap();
+    pin.attach(&mut epoch).unwrap();
+    let request = Request::new(
+        crate::frontend::app::binding(),
+        epoch,
+        Registry::new().snapshot().advertisement().clone(),
+        vec![],
+    )
+    .unwrap();
+    let reopened = select(&settings, Some(&request), None).unwrap().unwrap();
+    assert_eq!(reopened.read("skill-0").unwrap()["body"], first);
+    let digest = sha256(first.as_bytes());
+    fs::remove_file(catalogs.join(format!("body-{digest}"))).unwrap();
+    assert_eq!(reopened.read("skill-0"), Err("harness_skill_missing"));
+}
+
+#[test]
+fn unavailable_local_skills_allow_unrelated_chat() {
+    let home = Project::new();
+    let settings = AgentSettings::defaults(&home.0, &home.0);
+    let _ = install_skill(&settings, "skill", "Review a draft", "body");
+    fs::set_permissions(
+        settings.directory.join("skills"),
+        fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let (pin, notice) = select_with_notice(&settings, None, None).unwrap();
+    assert!(pin.is_none());
+    assert_eq!(notice, Some("skill_directory_unavailable"));
+}
+
+#[test]
+fn legacy_inline_catalog_still_reads_the_exact_body() {
+    let home = Project::new();
+    let dir = private_directory(&home.0).unwrap();
+    let scope = scope(&home.0);
+    let bytes = serde_json::to_vec(&json!({
+        "version": 1,
+        "scope": scope,
+        "profile": null,
+        "skills": [{"name":"review","description":"Review a draft","body":"legacy body\n"}]
+    }))
+    .unwrap();
+    let digest = sha256(&bytes);
+    ansa_linux::local::create(&dir, &format!("catalog-{digest}"), &bytes).unwrap();
+    let (profile, skills) = directory_skills::DirectorySkills::load(dir, &scope, &digest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(profile, None);
+    assert_eq!(skills.read("review").unwrap()["body"], "legacy body\n");
+}

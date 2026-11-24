@@ -4,14 +4,14 @@ use crate::provider::contracts::image::MAX_ORIGINAL_IMAGE_BYTES;
 use crate::provider::contracts::{MAX_IMAGE_BYTES, MAX_IMAGES};
 use std::{fs::File, io::Read, path::Component};
 
-const MAX_TEXT_BYTES: usize = 8 * 1024;
+const INLINE_TEXT_BYTES: usize = 8 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const USAGE: &str =
-    "Use /attach PATH (PNG/JPEG), /attach --text PATH (UTF-8, 8 KiB), or /attach --clear";
+    "Use /attach PATH (PNG/JPEG), /attach --text PATH (local text), or /attach --clear";
 
 pub(super) enum Attachment {
     Image(ImageInput),
-    Text(String),
+    Text(TextAttachment),
 }
 
 fn parse_source(argument: &str) -> Option<(bool, &Path)> {
@@ -81,7 +81,7 @@ fn read_bounded(file: File, limit: usize, size_error: &'static str) -> Result<Ve
 }
 
 fn read_text(file: File) -> Result<String> {
-    let bytes = read_bounded(file, MAX_TEXT_BYTES, "attachment_text_size")?;
+    let bytes = read_bounded(file, INLINE_TEXT_BYTES, "attachment_text_size")?;
     let text = String::from_utf8(bytes).map_err(|_| "attachment_text_encoding")?;
     if text.trim().is_empty()
         || text
@@ -116,7 +116,18 @@ fn load_attachment(
 ) -> Result<Attachment> {
     let file = open_selected(cwd, state, auth, path, text)?;
     if text {
-        read_text(file).map(Attachment::Text)
+        let attachment = match read_text(file) {
+            Ok(text) => TextAttachment::Inline(text),
+            Err("attachment_text_size") => {
+                let absolute = cwd.join(path);
+                let relative = absolute
+                    .strip_prefix(cwd)
+                    .map_err(|_| "attachment_outside_workspace")?;
+                TextAttachment::File(relative.to_str().ok_or("attachment_path")?.into())
+            }
+            Err(code) => return Err(code),
+        };
+        Ok(Attachment::Text(attachment))
     } else {
         read_open_image(file, remaining, original_remaining).map(Attachment::Image)
     }
@@ -127,11 +138,16 @@ impl Slot {
         self.state.attachment_loading = false;
         match result {
             Ok(Attachment::Text(text)) => {
+                let status = match &text {
+                    TextAttachment::Inline(_) => {
+                        "Text attached · contents saved with the next Work/Plan message"
+                    }
+                    TextAttachment::File(_) => {
+                        "Text attached · agent will read the local file as needed"
+                    }
+                };
                 self.state.text_attachment = Some(text);
-                self.state.report(
-                    io,
-                    "Text attached · sent and saved with the next Work/Plan message",
-                );
+                self.state.report(io, status);
             }
             Ok(Attachment::Image(image)) => {
                 let reduced = image.original_byte_len() > image.byte_len();
@@ -150,11 +166,13 @@ impl Slot {
                 io,
                 "Use a direct path (no '..'); text files must be in the workspace",
             ),
-            Err("attachment_open" | "attachment_regular_file_required") => self.state.report(
+            Err("attachment_open") => self.state.report(
                 io,
-                "Could not attach file · use a readable regular file without links",
+                "Could not open attachment · use a readable file without symlinks",
             ),
-            Err("attachment_text_size") => self.state.report(io, "Text attachment exceeds 8 KiB"),
+            Err("attachment_regular_file_required") => self
+                .state
+                .report(io, "Attachment must be a regular file without hard links"),
             Err("attachment_text_encoding") => {
                 self.state.report(io, "Use a non-empty UTF-8 text file");
             }

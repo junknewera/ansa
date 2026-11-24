@@ -241,6 +241,35 @@ fn replace_preference(directory: &File, name: &str, bytes: &[u8], suffix: &str) 
     // Validate any existing destination before publication, including its link
     // count and owner. This never follows a substituted symlink.
     let _ = read_regular(directory, name, 4096)?;
+    write_pending(directory, name, bytes, suffix, false)
+}
+
+/// Publish a private record without replacing a concurrent writer's record.
+/// The caller verifies an existing destination on AlreadyExists.
+pub fn create_immutable(
+    directory: &File,
+    name: &str,
+    bytes: &[u8],
+    suffix: &str,
+) -> io::Result<()> {
+    if [name, suffix].into_iter().any(|value| {
+        value.is_empty()
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return Err(io::Error::other("local_file_name"));
+    }
+    write_pending(directory, name, bytes, suffix, true)
+}
+
+fn write_pending(
+    directory: &File,
+    name: &str,
+    bytes: &[u8],
+    suffix: &str,
+    immutable: bool,
+) -> io::Result<()> {
     let pending = format!(".{name}.pending-{suffix}");
     let fd = rustix::fs::openat(
         directory,
@@ -258,7 +287,17 @@ fn replace_preference(directory: &File, name: &str, bytes: &[u8], suffix: &str) 
     let mut file = File::from(fd);
     file.write_all(bytes)?;
     file.sync_all()?;
-    rustix::fs::renameat(directory, pending.as_str(), directory, name)?;
+    if immutable {
+        rustix::fs::renameat_with(
+            directory,
+            pending.as_str(),
+            directory,
+            name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?;
+    } else {
+        rustix::fs::renameat(directory, pending.as_str(), directory, name)?;
+    }
     directory.sync_all()
 }
 pub fn lock(directory: &File) -> io::Result<File> {

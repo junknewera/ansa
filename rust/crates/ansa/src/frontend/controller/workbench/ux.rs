@@ -542,7 +542,12 @@ impl Workbench {
                 .as_ref()
                 .is_some_and(|(bytes, cursor)| *bytes == editor.bytes && *cursor == editor.cursor);
         let token = (!suppressed)
-            .then(|| commands::mention::Mention::at(editor))
+            .then(|| {
+                commands::mention::Mention::at_with_skills(
+                    editor,
+                    &self.slots[self.current].skill_commands,
+                )
+            })
             .flatten();
         if let Some((directory, prefix, stop)) = &self.mention_listing_job
             && token

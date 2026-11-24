@@ -166,10 +166,7 @@ pub(super) fn skill_request(text: &str) -> Option<(&str, &str)> {
     .then(|| (name, task.trim()))
 }
 
-pub(super) struct SkillCommand {
-    choice: Choice,
-    body: Option<String>,
-}
+pub(super) type SkillCommand = Choice;
 
 /// Derived from the catalogue attached to this conversation, never a fresh disk scan.
 pub(super) fn skill_choices(profile: Option<&crate::harness::Pinned>) -> Vec<SkillCommand> {
@@ -183,14 +180,9 @@ pub(super) fn skill_choices(profile: Option<&crate::harness::Pinned>) -> Vec<Ski
                     label.as_str(),
                     "/basic" | "/status" | "/cancel" | "/quit" | "/agent" | "/run" | "/send"
                 );
-            (!built_in).then(|| SkillCommand {
-                choice: Choice {
-                    label,
-                    detail: description.into(),
-                },
-                body: profile
-                    .and_then(|p| p.directory_body(name))
-                    .map(str::to_owned),
+            (!built_in).then(|| Choice {
+                label,
+                detail: description.into(),
             })
         })
         .collect()
@@ -201,17 +193,20 @@ pub(super) fn invoke_skill(
     command: &str,
     argument: &str,
 ) -> Option<String> {
-    let skill = skills.iter().find(|skill| skill.choice.label == command)?;
-    let name = skill.choice.label.strip_prefix('/')?;
-    if let Some(body) = &skill.body {
-        return Some(format!(
-            "Use the pinned local skill `{name}` for this request within the current tool permissions.\nProcedure (quoted Markdown): {}\nUser task: {argument}",
-            serde_json::json!(body)
-        ));
-    }
+    let skill = skills.iter().find(|skill| skill.label == command)?;
+    let name = skill.label.strip_prefix('/')?;
     Some(format!(
         "Use the pinned local skill `{name}` for this request. First call read_skill with name `{name}` and use the returned procedure within the current tool permissions.\nUser task: {argument}"
     ))
+}
+
+/// Only installed slash skills accept free-form composer text after the command.
+pub(super) fn skill_argument<'a>(skills: &[SkillCommand], text: &'a str) -> Option<&'a str> {
+    let (command, argument) = text.trim_start().split_once(char::is_whitespace)?;
+    skills
+        .iter()
+        .any(|skill| skill.label == command)
+        .then_some(argument)
 }
 
 #[derive(Clone)]
@@ -286,7 +281,6 @@ impl Completion {
             matches.extend(
                 skills
                     .iter()
-                    .map(|skill| &skill.choice)
                     .filter(|skill| skill.label.starts_with(query))
                     .cloned(),
             );
@@ -419,11 +413,8 @@ mod tests {
     #[test]
     fn exact_skill_wins_over_a_longer_prefix_without_shadowing_a_builtin() {
         let skill = SkillCommand {
-            choice: Choice {
-                label: "/mod".into(),
-                detail: "test".into(),
-            },
-            body: Some("Only this selected procedure".into()),
+            label: "/mod".into(),
+            detail: "test".into(),
         };
         let input = editor("/mod");
         let skills = [skill];
@@ -432,7 +423,7 @@ mod tests {
         assert!(
             invoke_skill(&skills, "/mod", "preserve аргументы")
                 .unwrap()
-                .contains("Only this selected procedure")
+                .contains("call read_skill with name `mod`")
         );
         assert!(invoke_skill(&skills, "/model", "").is_none());
         assert!(

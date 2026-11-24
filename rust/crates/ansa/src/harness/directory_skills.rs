@@ -11,59 +11,88 @@ const MAX_SKILLS: usize = 32;
 const MAX_FILE: usize = 16 * 1024;
 const MAX_HEADER: usize = 4 * 1024;
 const MAX_DESCRIPTION: usize = 512;
-const MAX_SNAPSHOT: usize = 64 * 1024;
+// Even the maximum number of fully escaped metadata records fits this bound.
+const MAX_INDEX: usize = 512 + MAX_SKILLS * (6 * MAX_DESCRIPTION + 256);
+const MAX_LEGACY_SNAPSHOT: usize = 64 * 1024;
 
-#[derive(Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(super) struct DirectorySkills(Vec<Skill>);
+#[derive(Default)]
+pub(super) struct DirectorySkills {
+    entries: Vec<Skill>,
+    directory: Option<File>,
+    legacy_bodies: std::collections::BTreeMap<String, String>,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Skill {
     name: String,
     description: String,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySkill {
+    name: String,
+    description: String,
     body: String,
 }
 
-/// A private immutable input referenced by the existing harness epoch pin.
-/// Kept separate from adoptable profile manifests and never an active revision.
+/// Immutable input referenced by the existing harness epoch pin.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Snapshot {
+struct Snapshot<T> {
     version: u8,
     scope: String,
-    pub(super) profile: Option<String>,
-    pub(super) skills: DirectorySkills,
+    profile: Option<String>,
+    skills: T,
 }
 
-impl Snapshot {
-    pub(super) fn new(scope: &str, profile: Option<String>, skills: DirectorySkills) -> Self {
-        Self {
-            version: 1,
-            scope: scope.into(),
-            profile,
-            skills,
-        }
-    }
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedCatalog {
+    Index(Snapshot<Vec<Skill>>),
+    Legacy(Snapshot<Vec<LegacySkill>>),
+}
 
-    pub(super) fn publish(&self, dir: &File) -> Result<String> {
-        self.skills.validate()?;
-        let bytes = serde_json::to_vec(self).map_err(|_| "skill_snapshot_invalid")?;
-        if bytes.len() > MAX_SNAPSHOT {
-            return Err("skill_snapshot_size_limit");
+fn publish(dir: &File, name: &str, data: &[u8]) -> Result<()> {
+    let existing = || {
+        let bytes = local::read(dir, name, data.len()).map_err(|_| "skill_snapshot_read")?;
+        match bytes {
+            Some(bytes) if bytes == data => Ok(true),
+            Some(_) => Err("skill_snapshot_digest"),
+            None => Ok(false),
         }
-        let revision = sha256(&bytes);
-        let _lock = local::lock(dir).map_err(|_| "skill_snapshot_busy")?;
-        local::publish_recovered(dir, &format!("catalog-{revision}"), &bytes)
-            .map_err(|_| "skill_snapshot_publish")?;
-        Ok(revision)
+    };
+    if existing()? {
+        return Ok(());
     }
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut random = [0; 16];
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| "skill_snapshot_publish")?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    match local::create_immutable(dir, name, data, &suffix) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && existing()? => Ok(()),
+        Err(_) => Err("skill_snapshot_publish"),
+    }
+}
 
-    pub(super) fn load(dir: &File, scope: &str, revision: &str) -> Result<Option<Self>> {
+impl DirectorySkills {
+    pub(super) fn load(
+        dir: File,
+        scope: &str,
+        revision: &str,
+    ) -> Result<Option<(Option<String>, Self)>> {
         if !digest_ok(revision) {
             return Err("harness_revision");
         }
-        let Some(bytes) = local::read(dir, &format!("catalog-{revision}"), MAX_SNAPSHOT)
+        let Some(bytes) = local::read(&dir, &format!("catalog-{revision}"), MAX_INDEX)
             .map_err(|_| "skill_snapshot_read")?
         else {
             return Ok(None);
@@ -71,20 +100,74 @@ impl Snapshot {
         if sha256(&bytes) != revision {
             return Err("skill_snapshot_digest");
         }
-        let snapshot: Self =
+        let saved: SavedCatalog =
             serde_json::from_slice(&bytes).map_err(|_| "skill_snapshot_invalid")?;
-        if snapshot.version != 1
-            || snapshot.scope != scope
-            || snapshot
-                .profile
-                .as_deref()
-                .is_some_and(|profile| !digest_ok(profile))
-        {
+        let mut skills = Self::default();
+        let (saved_scope, profile, entries) = match saved {
+            SavedCatalog::Index(snapshot) if snapshot.version == 2 => {
+                skills.directory = Some(dir);
+                (snapshot.scope, snapshot.profile, snapshot.skills)
+            }
+            SavedCatalog::Legacy(snapshot)
+                if snapshot.version == 1 && bytes.len() <= MAX_LEGACY_SNAPSHOT =>
+            {
+                let mut entries = Vec::new();
+                for skill in snapshot.skills {
+                    if !valid_body(&skill.body) {
+                        return Err("skill_snapshot_invalid");
+                    }
+                    let digest = sha256(skill.body.as_bytes());
+                    skills.legacy_bodies.insert(digest.clone(), skill.body);
+                    entries.push(Skill {
+                        name: skill.name,
+                        description: skill.description,
+                        sha256: digest,
+                    });
+                }
+                (snapshot.scope, snapshot.profile, entries)
+            }
+            _ => return Err("skill_snapshot_invalid"),
+        };
+        if saved_scope != scope || profile.as_deref().is_some_and(|pin| !digest_ok(pin)) {
             return Err("skill_snapshot_invalid");
         }
-        snapshot.skills.validate()?;
-        Ok(Some(snapshot))
+        skills.entries = entries;
+        skills.validate()?;
+        Ok(Some((profile, skills)))
     }
+
+    pub(super) fn pin(
+        mut self,
+        dir: File,
+        scope: &str,
+        profile: Option<&str>,
+    ) -> Result<(String, Self)> {
+        self.validate()?;
+        let index = Snapshot {
+            version: 2,
+            scope: scope.to_owned(),
+            profile: profile.map(str::to_owned),
+            skills: &self.entries,
+        };
+        let bytes = serde_json::to_vec(&index).map_err(|_| "skill_snapshot_invalid")?;
+        let revision = sha256(&bytes);
+        publish(&dir, &format!("catalog-{revision}"), &bytes)?;
+        dir.sync_all().map_err(|_| "skill_snapshot_publish")?;
+        self.directory = Some(dir);
+        Ok((revision, self))
+    }
+
+    pub(super) fn pin_body(dir: &File, digest: &str, body: &str) -> Result<()> {
+        publish(dir, &format!("body-{digest}"), body.as_bytes())
+    }
+}
+
+fn valid_body(body: &str) -> bool {
+    !body.trim().is_empty()
+        && body.len() <= MAX_FILE
+        && body
+            .chars()
+            .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
 }
 
 impl Skill {
@@ -93,12 +176,7 @@ impl Skill {
             && !self.description.trim().is_empty()
             && self.description.len() <= MAX_DESCRIPTION
             && !self.description.chars().any(char::is_control)
-            && !self.body.trim().is_empty()
-            && self.body.len() <= MAX_FILE
-            && self
-                .body
-                .chars()
-                .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+            && digest_ok(&self.sha256)
     }
 }
 
@@ -136,7 +214,7 @@ fn scalar(value: &str) -> Option<String> {
     }
 }
 
-fn parse(folder: &str, source: &str) -> Option<Skill> {
+fn parse<'a>(folder: &str, source: &'a str) -> Option<(Skill, &'a str)> {
     let mut lines = source.split_inclusive('\n');
     if !matches!(lines.next(), Some("---\n" | "---\r\n")) {
         return None;
@@ -197,13 +275,17 @@ fn parse(folder: &str, source: &str) -> Option<Skill> {
     let skill = Skill {
         name: name?,
         description: description?,
-        body: body.to_owned(),
+        sha256: sha256(body.as_bytes()),
     };
-    (skill.name == folder && skill.valid()).then_some(skill)
+    (skill.name == folder && skill.valid() && valid_body(body)).then_some((skill, body))
 }
 
 impl DirectorySkills {
-    pub(super) fn discover(directory: &Path, excluded: impl Fn(&str) -> bool) -> Result<Self> {
+    pub(super) fn discover(
+        directory: &Path,
+        excluded: impl Fn(&str) -> bool,
+        mut pin: impl FnMut(&str, &str) -> Result<()>,
+    ) -> Result<Self> {
         let config = match fs::private_directory(directory) {
             Ok(dir) => dir,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
@@ -256,62 +338,80 @@ impl DirectorySkills {
                 continue;
             };
             if let Ok(text) = std::str::from_utf8(&bytes)
-                && let Some(skill) = parse(name, text)
+                && let Some((skill, body)) = parse(name, text)
             {
-                skills.push(skill);
-                if skills.len() > MAX_SKILLS {
+                if skills.len() == MAX_SKILLS {
                     return Err("skill_directory_count_limit");
                 }
+                pin(&skill.sha256, body)?;
+                skills.push(skill);
             }
         }
         skills.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        Ok(Self(skills))
+        Ok(Self {
+            entries: skills,
+            ..Self::default()
+        })
     }
 
     pub(super) fn validate(&self) -> Result<()> {
         if self.is_empty()
-            || self.0.len() > MAX_SKILLS
-            || self.0.iter().any(|skill| !skill.valid())
-            || self.0.windows(2).any(|pair| pair[0].name >= pair[1].name)
+            || self.entries.len() > MAX_SKILLS
+            || self.entries.iter().any(|skill| !skill.valid())
+            || self
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].name >= pair[1].name)
         {
             return Err("skill_snapshot_invalid");
         }
         Ok(())
     }
 
-    pub(super) fn body(&self, name: &str) -> Option<&str> {
-        self.0
-            .iter()
-            .find(|skill| skill.name == name)
-            .map(|skill| skill.body.as_str())
-    }
-
     pub(super) fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.0
+        self.entries
             .iter()
             .map(|skill| (skill.name.as_str(), skill.description.as_str()))
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
     }
 
     pub(super) fn list(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
-        self.0.iter().map(|skill| {
+        self.entries.iter().map(|skill| {
             serde_json::json!({"name":skill.name,"description":skill.description,
-                "sha256":sha256(skill.body.as_bytes())})
+                "sha256":skill.sha256})
         })
     }
 
     pub(super) fn read(&self, name: &str) -> Result<serde_json::Value> {
         let skill = self
-            .0
+            .entries
             .iter()
             .find(|skill| skill.name == name)
             .ok_or("harness_skill_unknown")?;
+        let text;
+        let body = if let Some(dir) = &self.directory {
+            let bytes = local::read(dir, &format!("body-{}", skill.sha256), MAX_FILE)
+                .map_err(|_| "harness_skill_blob")?
+                .ok_or("harness_skill_missing")?;
+            if sha256(&bytes) != skill.sha256 {
+                return Err("harness_skill_digest");
+            }
+            text = String::from_utf8(bytes).map_err(|_| "harness_skill_body")?;
+            if !valid_body(&text) {
+                return Err("harness_skill_body");
+            }
+            &text
+        } else {
+            self.legacy_bodies
+                .get(&skill.sha256)
+                .ok_or("harness_skill_missing")?
+        };
         Ok(
             serde_json::json!({"name":skill.name,"description":skill.description,
-            "sha256":sha256(skill.body.as_bytes()),"body":skill.body}),
+            "sha256":skill.sha256,"body":body}),
         )
     }
 }

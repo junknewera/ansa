@@ -4,17 +4,22 @@ use crate::provider::contracts::{MAX_IMAGE_BYTES, MAX_IMAGES, image::MAX_ORIGINA
 
 impl Workbench {
     pub(super) fn prepare_mention_images(&mut self, text: &str, io: &Io) -> bool {
-        if text.trim_start().starts_with('/')
-            || self.orchestration_mode.is_some()
-            || self.refinement.is_some()
-        {
-            return false;
-        }
-        let paths = commands::mention::image_paths(text, MAX_IMAGES);
-        if paths.is_empty() {
+        if self.orchestration_mode.is_some() || self.refinement.is_some() {
             return false;
         }
         let slot = &self.slots[self.current];
+        let argument = if text.trim_start().starts_with('/') {
+            let Some(argument) = commands::skill_argument(&slot.skill_commands, text) else {
+                return false;
+            };
+            argument
+        } else {
+            text
+        };
+        let paths = commands::mention::image_paths(argument, MAX_IMAGES);
+        if paths.is_empty() {
+            return false;
+        }
         if self.factory.offline {
             return false;
         }
