@@ -542,7 +542,12 @@ impl Workbench {
                 .as_ref()
                 .is_some_and(|(bytes, cursor)| *bytes == editor.bytes && *cursor == editor.cursor);
         let token = (!suppressed)
-            .then(|| commands::mention::Mention::at(editor))
+            .then(|| {
+                commands::mention::Mention::at_with_skills(
+                    editor,
+                    &self.slots[self.current].skill_commands,
+                )
+            })
             .flatten();
         if let Some((directory, prefix, stop)) = &self.mention_listing_job
             && token
@@ -596,7 +601,11 @@ impl Workbench {
             }
         } else {
             self.mention_listing = None;
-            Completion::at_with_commands(editor, self.available_commands())
+            Completion::at_with_skills(
+                editor,
+                self.available_commands(),
+                &self.slots[self.current].skill_commands,
+            )
         };
         if let (Some(old), Some(next)) = (&self.completion, &mut next)
             && old.begin == next.begin

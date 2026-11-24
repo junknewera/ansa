@@ -111,7 +111,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/attach",
-        description: "Attach a PNG or JPEG to the next Work or Plan message",
+        description: "Attach a screenshot/image, or use --text PATH for a UTF-8 file",
     },
     Command {
         name: "/terminals",
@@ -166,6 +166,49 @@ pub(super) fn skill_request(text: &str) -> Option<(&str, &str)> {
     .then(|| (name, task.trim()))
 }
 
+pub(super) type SkillCommand = Choice;
+
+/// Derived from the catalogue attached to this conversation, never a fresh disk scan.
+pub(super) fn skill_choices(profile: Option<&crate::harness::Pinned>) -> Vec<SkillCommand> {
+    profile
+        .into_iter()
+        .flat_map(|p| p.complete(""))
+        .filter_map(|(name, description)| {
+            let label = format!("/{name}");
+            let built_in = COMMANDS.iter().any(|cmd| cmd.name == canonical(&label))
+                || matches!(
+                    label.as_str(),
+                    "/basic" | "/status" | "/cancel" | "/quit" | "/agent" | "/run" | "/send"
+                );
+            (!built_in).then(|| Choice {
+                label,
+                detail: description.into(),
+            })
+        })
+        .collect()
+}
+
+pub(super) fn invoke_skill(
+    skills: &[SkillCommand],
+    command: &str,
+    argument: &str,
+) -> Option<String> {
+    let skill = skills.iter().find(|skill| skill.label == command)?;
+    let name = skill.label.strip_prefix('/')?;
+    Some(format!(
+        "Use the pinned local skill `{name}` for this request. First call read_skill with name `{name}` and use the returned procedure within the current tool permissions.\nUser task: {argument}"
+    ))
+}
+
+/// Only installed slash skills accept free-form composer text after the command.
+pub(super) fn skill_argument<'a>(skills: &[SkillCommand], text: &'a str) -> Option<&'a str> {
+    let (command, argument) = text.trim_start().split_once(char::is_whitespace)?;
+    skills
+        .iter()
+        .any(|skill| skill.label == command)
+        .then_some(argument)
+}
+
 #[derive(Clone)]
 pub struct Completion {
     pub begin: usize,
@@ -189,6 +232,14 @@ impl Completion {
     }
 
     pub(crate) fn at_with_commands(editor: &Editor, commands: &[Command]) -> Option<Self> {
+        Self::at_with_skills(editor, commands, &[])
+    }
+
+    pub(super) fn at_with_skills(
+        editor: &Editor,
+        commands: &[Command],
+        skills: &[SkillCommand],
+    ) -> Option<Self> {
         if editor.pasting() || editor.overflow {
             return None;
         }
@@ -213,7 +264,7 @@ impl Completion {
         let end = text[editor.cursor..]
             .find(char::is_whitespace)
             .map_or(text.len(), |offset| editor.cursor + offset);
-        let matches: Vec<_> = commands
+        let mut matches: Vec<_> = commands
             .iter()
             .filter_map(|command| {
                 let matches = command.name.starts_with(query)
@@ -226,6 +277,14 @@ impl Completion {
                 })
             })
             .collect();
+        if text[..begin].trim().is_empty() {
+            matches.extend(
+                skills
+                    .iter()
+                    .filter(|skill| skill.label.starts_with(query))
+                    .cloned(),
+            );
+        }
         if matches.is_empty() {
             return None;
         }
@@ -233,7 +292,10 @@ impl Completion {
             begin,
             end,
             query: query.into(),
-            selected: 0,
+            selected: matches
+                .iter()
+                .position(|choice| choice.label == canonical(query))
+                .unwrap_or(0),
             matches,
         })
     }
@@ -347,6 +409,26 @@ mod tests {
         assert!(completion.apply(&mut input));
         assert_eq!(input.text().unwrap(), "Ж Проверь /model потом файл");
         assert_eq!(input.cursor, "Ж Проверь /model".len());
+    }
+    #[test]
+    fn exact_skill_wins_over_a_longer_prefix_without_shadowing_a_builtin() {
+        let skill = SkillCommand {
+            label: "/mod".into(),
+            detail: "test".into(),
+        };
+        let input = editor("/mod");
+        let skills = [skill];
+        let completion = Completion::at_with_skills(&input, available(true), &skills).unwrap();
+        assert!(completion.exact_command(&input));
+        assert!(
+            invoke_skill(&skills, "/mod", "preserve аргументы")
+                .unwrap()
+                .contains("call read_skill with name `mod`")
+        );
+        assert!(invoke_skill(&skills, "/model", "").is_none());
+        assert!(
+            Completion::at_with_skills(&editor("path/mod"), available(true), &skills).is_none()
+        );
     }
     #[test]
     fn paths_urls_and_paste_are_not_commands() {

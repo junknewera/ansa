@@ -97,6 +97,21 @@ def check_composer(binary):
         workspace.chmod(0o700)
         (root / "tmp").mkdir()
         seed_siwc(home)
+        skills = home / ".ansa" / "skills"
+        skills.mkdir(mode=0o700)
+        skill = skills / "inspect-picture"
+        skill.mkdir(mode=0o700)
+        document = skill / "SKILL.md"
+        skill_body = "Locate the subject.\n" + "Review framing and lighting.\n" * 800
+        document.write_text("---\nname: inspect-picture\ndescription: Review an image\n---\n" + skill_body)
+        document.chmod(0o600)
+        for number in range(32):
+            name = f"example-{number:02d}"
+            extra = skills / name
+            extra.mkdir(mode=0o700)
+            item = extra / "SKILL.md"
+            item.write_text(f"---\nname: {name}\ndescription: Example procedure\n---\nExample.\n")
+            item.chmod(0o600)
         (root / "fixture-image-model").touch(mode=0o600)
         wire = root / "outbound-messages.jsonl"
         wire.touch(mode=0o600)
@@ -122,11 +137,11 @@ def check_composer(binary):
             image.write_bytes(PNG)
             (workspace / "link").symlink_to(image)
             os.mkfifo(workspace / "fifo")
-            command("/attach fifo", "image_regular_file_required")
-            command("/attach link", "image_open")
+            command("/attach fifo", "Attachment must be a regular file")
+            command("/attach link", "Could not open attachment")
             command("/attach file with spaces.png", "Image attached (1)")
             image.unlink()
-            command("/propose Verify the fixture", "Send or clear attached images")
+            command("/propose Verify the fixture", "Send or clear attachments")
             screen.send(b"\x15")  # Rejected command stays editable.
             submit("/orchestrate")
             until(screen, lambda _: screen.vt.line(-2).strip().startswith("Orchestrate ·"),
@@ -134,7 +149,7 @@ def check_composer(binary):
             turn("Describe the attached image.")
             image.write_bytes(PNG)
             command("/attach file with spaces.png", "Image attached (1)")
-            command("/attach --clear", "Image attachments cleared")
+            command("/attach --clear", "Attachments cleared")
             turn("Answer without an attachment.")
             content = b"Description\0" + b"x" * (3 * 1024 * 1024)
             chunk = b"tEXt" + content
@@ -147,10 +162,22 @@ def check_composer(binary):
             mention = r"Look at @file\ with\ spaces.png"
             turn(mention)
             turn("Only this message.")
+            submit("/basic")
+            until(screen, lambda _: screen.vt.line(-2).strip().startswith(MODELS["siwc"]),
+                  "switch to Work to invoke a skill")
+            submit("/inspect-picture " + mention)
+            skill_prompt = (
+                "Use the pinned local skill `inspect-picture` for this request. First call "
+                "read_skill with name `inspect-picture` and use the returned procedure "
+                "within the current tool permissions.\nUser task: " + mention
+            )
+            until(screen, lambda _: completed(root, skill_prompt), "send image within a slash skill")
             submit("/exit")
             result = screen.finish()
             assert result["exit"] == 0 and result["termios_restored"]
-            first, second, third, mentioned, last = [json.loads(line) for line in wire.read_text().splitlines()]
+            first, second, third, mentioned, last, skill_turn, *skill_results = [
+                json.loads(line) for line in wire.read_text().splitlines()
+            ]
             url = "data:image/png;base64," + base64.b64encode(PNG).decode()
             assert first[-1]["content"][1] == {"type": "input_image", "image_url": url}
             assert second[-1]["content"] == "Answer without an attachment."
@@ -159,6 +186,22 @@ def check_composer(binary):
                 {"type": "input_image", "image_url": url},
             ]
             assert last[-1]["content"] == "Only this message."
+            assert skill_turn[-1]["content"] == [
+                {"type": "input_text", "text": skill_prompt},
+                {"type": "input_image", "image_url": url},
+            ]
+            assert len(skill_results) >= 3
+            assert skill_results[0][-1]["call_id"] == "fixture-skill-call"
+            reconstructed = ""
+            for request in skill_results:
+                page = json.loads(request[-1]["output"])
+                assert page["offset"] == len(reconstructed.encode())
+                assert len(page["body"].encode()) <= 8192
+                reconstructed += page["body"]
+                assert page["next_offset"] == (
+                    None if reconstructed == skill_body else len(reconstructed.encode())
+                )
+            assert reconstructed == skill_body
             sent = third[-1]["content"][1]["image_url"]
             assert len(base64.b64decode(sent.split(",", 1)[1])) <= 2 * 1024 * 1024
             accepted, = [event for event in records(root) if event.get("text") == "Describe the compressed attachment." and event["kind"] == "accepted"]

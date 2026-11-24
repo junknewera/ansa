@@ -68,14 +68,29 @@ struct Entry {
 
 pub struct FileJournal {
     directory: File,
-    _lock: File,
+    _lock: JournalLock,
     sequence: usize,
     previous: String,
     failed: bool,
     record_limit: usize,
 }
 
+struct JournalLock(File);
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        // A forked child can still hold a duplicate until exec. Release the
+        // lock when the journal owner finishes, including on a failed open.
+        let _ = self.0.unlock();
+    }
+}
+
 impl FileJournal {
+    #[cfg(test)]
+    pub(super) fn duplicate_lock(&self) -> std::io::Result<File> {
+        self._lock.0.try_clone()
+    }
+
     pub(super) fn identity(&self) -> Result<(u64, u64), &'static str> {
         use std::os::unix::fs::MetadataExt;
         let m = self.directory.metadata().map_err(|_| "terminal_store")?;
@@ -93,7 +108,7 @@ impl FileJournal {
         }
         let directory =
             fs::create_private_leaf(path).map_err(|_| "terminal_store_exists_or_unavailable")?;
-        let lock = local::lock_new(&directory).map_err(|_| "terminal_store_locked")?;
+        let lock = JournalLock(local::lock_new(&directory).map_err(|_| "terminal_store_locked")?);
         let header = encode(&Header {
             version: VERSION,
             binding: binding.clone(),
@@ -208,9 +223,10 @@ impl FileJournal {
         local::create(&self.directory, SEALED, &data).map_err(|_| "terminal_store_publish")
     }
 
-    fn lock(path: &Path) -> Result<(File, File), &'static str> {
+    fn lock(path: &Path) -> Result<(File, JournalLock), &'static str> {
         let directory = fs::private_directory(path).map_err(|_| "terminal_store")?;
-        let lock = local::lock_existing(&directory).map_err(|_| "terminal_store_locked")?;
+        let lock =
+            JournalLock(local::lock_existing(&directory).map_err(|_| "terminal_store_locked")?);
         Ok((directory, lock))
     }
 }

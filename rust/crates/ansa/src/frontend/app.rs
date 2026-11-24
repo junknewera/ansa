@@ -533,10 +533,10 @@ fn text_with_providers(
     if parsed.resume && !parsed.session.is_empty() {
         return Err("session_selection_conflict");
     }
-    let profile = if parsed.resume || !parsed.session.is_empty() {
-        None
+    let (profile, skill_notice) = if parsed.resume || !parsed.session.is_empty() {
+        (None, None)
     } else {
-        crate::harness::select(&settings, None, factory.harness_trial.as_deref())?
+        crate::harness::select_with_notice(&settings, None, factory.harness_trial.as_deref())?
     };
     if let Some(profile) = &profile {
         profile.attach(&mut epoch)?;
@@ -624,34 +624,41 @@ fn text_with_providers(
             }
         });
     }
-    let (mut runtime, root_kind, parent) = if parsed.resume || !parsed.session.is_empty() {
-        let restored = factory.resume(&selected.id)?;
-        (restored.runtime, restored.kind, restored.parent)
-    } else {
-        (
-            Runtime::new(
-                SessionId(selected.id.clone()),
-                configuration,
-                tools,
-                generate,
-                Limits {
-                    tool_rounds: settings.tool_rounds,
-                    tool_calls: settings.tool_calls,
-                    ..Limits::default()
-                },
-                options,
-            )?,
-            super::sessions::Kind::Main,
-            None,
-        )
-    };
+    let (mut runtime, root_kind, parent, skill_commands) =
+        if parsed.resume || !parsed.session.is_empty() {
+            let restored = factory.resume(&selected.id)?;
+            (
+                restored.runtime,
+                restored.kind,
+                restored.parent,
+                restored.skill_commands,
+            )
+        } else {
+            (
+                Runtime::new(
+                    SessionId(selected.id.clone()),
+                    configuration,
+                    tools,
+                    generate,
+                    Limits {
+                        tool_rounds: settings.tool_rounds,
+                        tool_calls: settings.tool_calls,
+                        ..Limits::default()
+                    },
+                    options,
+                )?,
+                super::sessions::Kind::Main,
+                None,
+                super::commands::skill_choices(profile.as_deref()),
+            )
+        };
     factory.retain_terminal_owner(&selected.id, terminal)?;
     io.status(&format!(
         "ansa session {} (full access, sudo disabled)\n",
         selected.id
     ));
     if io.raw.is_some() {
-        return reactor()?.block_on(controller::workbench::run_attached(
+        return reactor()?.block_on(controller::workbench::run_session(
             runtime,
             &mut io,
             &settings.cwd.to_string_lossy(),
@@ -659,6 +666,8 @@ fn text_with_providers(
             selected.id,
             root_kind,
             parent,
+            skill_commands,
+            skill_notice,
             parsed
                 .workspace
                 .map(|directory| -> Result<_> {
@@ -675,6 +684,9 @@ fn text_with_providers(
     }
     if parsed.workspace.is_some() {
         return Err("workspace_requires_tty");
+    }
+    if let Some(code) = skill_notice {
+        io.status(&format!("Local skills ({code})\n"));
     }
     let context = format!("{}  {}", settings.cwd.display(), settings.model);
     let result = reactor()?.block_on(controller::run(
@@ -933,9 +945,27 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                     let direct = input
                         .iter()
                         .any(|item| item["content"] == "DIRECT_SIWC_FIXTURE");
+                    let skill_fixture = last["content"]
+                        .as_str()
+                        .or_else(|| last["content"][0]["text"].as_str())
+                        .is_some_and(|text| {
+                            text.starts_with("Use the pinned local skill `inspect-picture`")
+                        });
+                    let skill_result = last["call_id"].as_str().is_some_and(|id| {
+                        id == "fixture-skill-call" || id.starts_with("fixture-skill-page-")
+                    });
                     let item = if trace.with_file_name("paged-search").is_file() {
                         let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         search_fixture::item(&request, input, index)?
+                    } else if name.is_none() && skill_fixture {
+                        json!({"type":"function_call","id":"fixture-skill-item","call_id":"fixture-skill-call","namespace":"omh","name":"read_skill","arguments":r#"{"name":"inspect-picture"}"#,"status":"completed"})
+                    } else if name.is_none()
+                        && skill_result
+                        && let Some(offset) = output["next_offset"].as_u64()
+                    {
+                        let arguments =
+                            json!({"name":"inspect-picture","offset":offset}).to_string();
+                        json!({"type":"function_call","id":format!("fixture-skill-page-item-{offset}"),"call_id":format!("fixture-skill-page-{offset}"),"namespace":"omh","name":"read_skill_page","arguments":arguments,"status":"completed"})
                     } else if name.is_none() && direct && last["type"] != "function_call_output" {
                         if !request["tools"][0]["tools"]
                             .as_array()
@@ -995,6 +1025,12 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                                 return Err("fixture_delegate_result");
                             }
                             "DIRECT_SIWC_DONE".into()
+                        }
+                        None if skill_result => {
+                            if !output["body"].is_string() {
+                                return Err("fixture_skill_body");
+                            }
+                            "SIWC_CARBON_DONE".into()
                         }
                         None => "SIWC_CARBON_DONE".into(),
                         _ => return Err("fixture_format"),
@@ -1508,6 +1544,10 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
             let fixture = pure_tools()?;
             let export = crate::session::evidence::export(path, &catalog, &fixture)?;
             write_json(&export)?;
+            Ok(0)
+        }
+        "--mcp" => {
+            write_json(&crate::mcp::cli(&args[1..], &home()?.join(".ansa"))?)?;
             Ok(0)
         }
         "--harness" => {

@@ -49,6 +49,7 @@ fn display_title(text: &str) -> String {
 }
 
 struct Slot {
+    skill_commands: Vec<commands::SkillCommand>,
     id: String,
     kind: Kind,
     parent: Option<String>,
@@ -98,6 +99,7 @@ impl Slot {
         }
         let title = prompt.as_deref().map(display_title);
         Self {
+            skill_commands: Vec::new(),
             id,
             kind,
             parent,
@@ -317,9 +319,7 @@ impl Slot {
                 }
             }
             if let Some(code) = code {
-                if self.state.image_submission.as_ref() == Some(&id) {
-                    self.state.image_submission = None;
-                }
+                self.state.reject_attachments(&id);
                 self.chat_priority.take_if(|(pending, _)| *pending == id);
                 if self.follow_accepted_submit.as_ref() == Some(&id) {
                     self.follow_accepted_submit = None;
@@ -727,8 +727,8 @@ enum Job {
         listing: Option<FileListing>,
     },
     Attachment {
-        owner: String,
-        result: Result<ImageInput>,
+        owner: RuntimeIncarnation,
+        result: Result<attachments::Attachment>,
     },
     ManualAccepted {
         owner: String,
@@ -2418,10 +2418,9 @@ impl Workbench {
         repair: bool,
         io: &Io,
     ) -> bool {
-        if self.slots[self.current].state.image_loading
-            || !self.slots[self.current].state.images.is_empty()
-        {
-            self.report(io, "Send or clear attached images before delegating a task");
+        let state = &self.slots[self.current].state;
+        if state.attachment_loading || state.has_attachments() {
+            self.report(io, "Send or clear attachments before delegating a task");
             return false;
         }
         if self.slots[self.current]
@@ -2956,15 +2955,28 @@ impl Workbench {
             .split_once(char::is_whitespace)
             .unwrap_or((text.trim_start(), ""));
         let argument = raw_argument.trim();
+        if let Some(prompt) =
+            commands::invoke_skill(&self.slots[self.current].skill_commands, command, argument)
+        {
+            if !matches!(mode, AgentMode::Basic | AgentMode::Plan)
+                || self.orchestration_mode.is_some()
+                || self.refinement.is_some()
+                || self.orchestration_stop.is_some()
+            {
+                self.report(io, "Invoke a skill in Work or Plan");
+                return (false, false);
+            }
+            return self.text(&prompt, io);
+        }
         match commands::canonical(command) {
             "/attach" => (self.attach(argument, io), false),
             "/propose" | "/propose+"
-                if self.slots[self.current].state.image_loading
-                    || !self.slots[self.current].state.images.is_empty() =>
+                if self.slots[self.current].state.attachment_loading
+                    || self.slots[self.current].state.has_attachments() =>
             {
                 self.report(
                     io,
-                    "Send or clear attached images before switching to Orchestrate",
+                    "Send or clear attachments before switching to Orchestrate",
                 );
                 (false, false)
             }
@@ -3799,32 +3811,10 @@ impl Workbench {
                 self.refresh_completion();
             }
             Job::Attachment { owner, result } => {
-                if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
-                    slot.state.image_loading = false;
-                    match result {
-                        Ok(image) => {
-                            let reduced = image.original_byte_len() > image.byte_len();
-                            slot.state.images.push(image);
-                            let count = slot.state.images.len();
-                            let notice = if reduced {
-                                " · smaller copy for model"
-                            } else {
-                                ""
-                            };
-                            slot.state
-                                .report(io, &format!("Image attached ({count}){notice}"));
-                        }
-                        Err("image_original_bytes") if slot.state.images.is_empty() => slot
-                            .state
-                            .report(io, "Image exceeds 8 MiB. Attach a smaller copy."),
-                        Err("image_original_bytes" | "image_batch_bytes") => slot.state.report(
-                            io,
-                            "Send the current attachments first, then add this image.",
-                        ),
-                        Err(code) => slot
-                            .state
-                            .report(io, &format!("Could not attach image ({code})")),
-                    }
+                if let Some(slot) = self.slots.iter_mut().find(|slot| {
+                    slot.handle.incarnation() == &owner && !slot.closed && !slot.closing
+                }) {
+                    slot.attachment_loaded(result, io);
                 }
             }
             Job::ManualAccepted { run, result, .. } => {
@@ -4305,6 +4295,10 @@ impl Workbench {
                     let id = created.selected.id.clone();
                     let mut slot =
                         Slot::new(created.runtime, id, created.kind, created.parent, prompt);
+                    slot.skill_commands = created.skill_commands;
+                    if let Some(code) = created.skill_notice {
+                        slot.state.report(io, &format!("Local skills ({code})"));
+                    }
                     if plan_only {
                         slot.state.mode = AgentMode::Plan;
                         slot.state.mode_ready = true;
@@ -6484,6 +6478,32 @@ pub async fn run(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_attached(
+    runtime: Runtime,
+    io: &mut Io,
+    context: &str,
+    factory: Factory,
+    root_id: String,
+    kind: Kind,
+    parent: Option<String>,
+    bridge_options: Option<super::super::bridge::BridgeOptions>,
+) -> Result<i32> {
+    run_session(
+        runtime,
+        io,
+        context,
+        factory,
+        root_id,
+        kind,
+        parent,
+        Vec::new(),
+        None,
+        bridge_options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::frontend) async fn run_session(
     mut runtime: Runtime,
     io: &mut Io,
     context: &str,
@@ -6491,6 +6511,8 @@ pub async fn run_attached(
     root_id: String,
     kind: Kind,
     parent: Option<String>,
+    skill_commands: Vec<commands::SkillCommand>,
+    skill_notice: Option<String>,
     bridge_options: Option<super::super::bridge::BridgeOptions>,
 ) -> Result<i32> {
     if io.raw.is_none() {
@@ -6511,6 +6533,10 @@ pub async fn run_attached(
         })
         .transpose()?;
     let mut work = Workbench::new(runtime, factory, root_id, kind, parent)?;
+    work.slots[work.current].skill_commands = skill_commands;
+    if let Some(code) = skill_notice {
+        work.report(io, &format!("Local skills ({code})"));
+    }
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let input_events = readiness_source(io.input.duplicate().map_err(|_| "cli_input_poll")?).ok();
@@ -6845,7 +6871,7 @@ pub async fn run_attached(
                                 let was_pasting = slot.state.editor.pasting();
                                 slot.state.editor.set_completion(complete);
                                 let action = slot.state.editor.feed(byte, true);
-                                if was_pasting && !slot.state.editor.pasting() && commands::mention::Mention::at(&slot.state.editor).is_some() {
+                                if was_pasting && !slot.state.editor.pasting() && commands::mention::Mention::at_with_skills(&slot.state.editor, &slot.skill_commands).is_some() {
                                     work.completion_closed = Some((slot.state.editor.bytes.clone(), slot.state.editor.cursor));
                                 }
                                 if before != (slot.state.editor.bytes.len(), slot.state.editor.cursor) {

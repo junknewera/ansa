@@ -55,6 +55,30 @@ struct EvaluationRef {
     archive: String,
 }
 
+struct ProfileLock(File);
+
+impl ProfileLock {
+    fn shared(dir: &File) -> Result<Self> {
+        local::lock_shared(dir)
+            .map(Self)
+            .map_err(|_| "harness_adoption_busy")
+    }
+
+    fn exclusive(dir: &File) -> Result<Self> {
+        local::lock(dir)
+            .map(Self)
+            .map_err(|_| "harness_adoption_busy")
+    }
+}
+
+impl Drop for ProfileLock {
+    fn drop(&mut self) {
+        // The profile operation has finished even if a forked child still
+        // holds a copy of this descriptor before exec.
+        let _ = self.0.unlock();
+    }
+}
+
 pub(super) fn active(dir: &File, scope: &str) -> Result<Option<String>> {
     let history = committed_history(dir, scope)?;
     if let Some(latest) = history.last() {
@@ -66,7 +90,7 @@ pub(super) fn active(dir: &File, scope: &str) -> Result<Option<String>> {
 }
 
 pub(super) fn trial_revision(dir: &File, scope: &str, id: &str, arm: &str) -> Result<String> {
-    let _lock = local::lock_shared(dir).map_err(|_| "harness_adoption_busy")?;
+    let _lock = ProfileLock::shared(dir)?;
     let history = history(dir, scope)?;
     let (proposal, frozen) = proposal(dir, scope, id)?;
     require_current(history.last(), &frozen)?;
@@ -87,7 +111,7 @@ pub(super) fn command(dir: &File, scope: &str, args: &[String], input: &[u8]) ->
         let history = committed_history(dir, scope)?;
         return Ok(json!({ "active": history.last(), "history": &history }));
     }
-    let _lock = local::lock(dir).map_err(|_| "harness_adoption_busy")?;
+    let _lock = ProfileLock::exclusive(dir)?;
     let (entries, more) = local::names(dir, STORE_ENTRIES).map_err(|_| "harness_adoption_store")?;
     let reservation = match verb.as_str() {
         "baseline" | "stage" => 34,
@@ -259,7 +283,7 @@ fn evaluation_result(receipt: grading::Evaluation) -> Value {
 }
 
 fn committed_history(dir: &File, scope: &str) -> Result<Vec<Activation>> {
-    let _lock = local::lock_shared(dir).map_err(|_| "harness_adoption_busy")?;
+    let _lock = ProfileLock::shared(dir)?;
     let history = history(dir, scope)?;
     sync_history(dir, &history)?;
     Ok(history)

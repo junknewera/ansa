@@ -38,6 +38,30 @@ impl Drop for Temp {
     }
 }
 
+#[test]
+fn profile_locks_end_at_owner_drop_with_duplicated_descriptors() {
+    let root = Temp::new();
+    let dir = ansa_linux::fs::private_directory(&root.0).unwrap();
+    let scope = crate::harness::scope(&root.0);
+
+    let writer = ProfileLock::exclusive(&dir).unwrap();
+    let inherited_writer = writer.0.try_clone().unwrap();
+    assert_eq!(active(&dir, &scope), Err("harness_adoption_busy"));
+    drop(writer);
+    assert_eq!(active(&dir, &scope), Ok(None));
+    drop(inherited_writer);
+
+    let reader = ProfileLock::shared(&dir).unwrap();
+    let inherited_reader = reader.0.try_clone().unwrap();
+    assert!(matches!(
+        ProfileLock::exclusive(&dir),
+        Err("harness_adoption_busy")
+    ));
+    drop(reader);
+    let _next_writer = ProfileLock::exclusive(&dir).unwrap();
+    drop(inherited_reader);
+}
+
 fn profile(guidance: &str, policy: &str) -> Vec<u8> {
     encode(&json!({
         "version": 1,

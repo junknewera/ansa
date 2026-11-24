@@ -4,23 +4,28 @@ use crate::provider::contracts::{MAX_IMAGE_BYTES, MAX_IMAGES, image::MAX_ORIGINA
 
 impl Workbench {
     pub(super) fn prepare_mention_images(&mut self, text: &str, io: &Io) -> bool {
-        if text.trim_start().starts_with('/')
-            || self.orchestration_mode.is_some()
-            || self.refinement.is_some()
-        {
-            return false;
-        }
-        let paths = commands::mention::image_paths(text, MAX_IMAGES);
-        if paths.is_empty() {
+        if self.orchestration_mode.is_some() || self.refinement.is_some() {
             return false;
         }
         let slot = &self.slots[self.current];
+        let argument = if text.trim_start().starts_with('/') {
+            let Some(argument) = commands::skill_argument(&slot.skill_commands, text) else {
+                return false;
+            };
+            argument
+        } else {
+            text
+        };
+        let paths = commands::mention::image_paths(argument, MAX_IMAGES);
+        if paths.is_empty() {
+            return false;
+        }
         if self.factory.offline {
             return false;
         }
         if !slot.state.available()
-            || slot.state.image_loading
-            || slot.state.image_submission.is_some()
+            || slot.state.attachment_loading
+            || slot.state.attachment_submission.is_some()
             || self.collecting_orchestration()
         {
             self.report(io, "Wait for the current turn before sending images");
@@ -56,7 +61,7 @@ impl Workbench {
                 .sum::<usize>();
         let host = self.files.clone();
         let stop = Cancel::linked(&self.stop);
-        slot.state.image_loading = true;
+        slot.state.attachment_loading = true;
         slot.sending_mention = true;
         slot.state.report(io, "Reading mentioned images…");
         self.jobs.spawn_blocking(move || {
@@ -93,7 +98,7 @@ impl Workbench {
             return;
         };
         let slot = &mut self.slots[index];
-        slot.state.image_loading = false;
+        slot.state.attachment_loading = false;
         if !std::mem::take(&mut slot.sending_mention)
             || index != self.current
             || slot.state.editor.text() != Ok(text)
