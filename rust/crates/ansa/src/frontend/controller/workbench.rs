@@ -4432,6 +4432,7 @@ impl Workbench {
                             Err(error) => {
                                 *scroll = 0;
                                 *history = 0;
+                                *page_height = 0;
                                 carbon::OutputView {
                                     title: "Agent terminal".into(),
                                     text: if error == "terminal_not_open" {
@@ -6212,11 +6213,18 @@ impl Workbench {
                 view,
                 scroll,
                 history,
+                page_height,
                 ..
             } => Some(Inspector {
                 tabs: activity::tabs(),
                 selected_tab: 2,
-                kind: InspectorKind::Shell,
+                kind: if *page_height != 0
+                    && (*history != 0 || view.as_ref().is_some_and(|v| !v.text.trim().is_empty()))
+                {
+                    InspectorKind::Shell
+                } else {
+                    InspectorKind::Agents
+                },
                 title: view
                     .as_ref()
                     .map_or_else(|| "Agent terminal".into(), |view| view.title.clone()),
