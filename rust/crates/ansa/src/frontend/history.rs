@@ -5,6 +5,8 @@ pub(super) struct Draft {
     bytes: Vec<u8>,
     cursor: usize,
     pasted_ranges: Vec<std::ops::Range<usize>>,
+    images: Vec<super::input::DraftImage>,
+    images_before: usize,
 }
 impl Draft {
     pub(super) fn capture(editor: &Editor) -> Self {
@@ -12,6 +14,8 @@ impl Draft {
             bytes: editor.bytes.clone(),
             cursor: editor.cursor,
             pasted_ranges: editor.pasted_ranges.clone(),
+            images: editor.images.clone(),
+            images_before: editor.images_before,
         }
     }
 
@@ -20,6 +24,8 @@ impl Draft {
         editor.bytes = self.bytes;
         editor.cursor = self.cursor;
         editor.pasted_ranges = self.pasted_ranges;
+        editor.images = self.images;
+        editor.images_before = self.images_before;
     }
 }
 struct Pending {

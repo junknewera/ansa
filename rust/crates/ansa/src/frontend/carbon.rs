@@ -40,7 +40,6 @@ pub struct Frame {
     viewport: Option<(usize, usize)>,
     cursor_row: usize,
     status_rows: Vec<usize>,
-    image_buttons: Vec<ImageButton>,
     panes: Vec<Option<PaneRow>>,
     themed: bool,
     selection_style: Option<String>,
@@ -50,23 +49,6 @@ pub struct Frame {
     terminal_rows: std::collections::BTreeSet<usize>,
     pub(super) image: Option<super::graphics::Placement>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ImageButton {
-    row: usize,
-    columns: std::ops::Range<usize>,
-    pub owner: String,
-    pub index: usize,
-    pub digest: String,
-}
-
-impl Frame {
-    pub(super) fn image_button(&self, column: usize, row: usize) -> Option<&ImageButton> {
-        self.image_buttons
-            .iter()
-            .find(|button| button.row == row && button.columns.contains(&column))
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ChatRows {
     wrapped: std::sync::Arc<[ChatRow]>,
@@ -218,7 +200,6 @@ impl Frame {
                 }
             }
             self.status_rows.clone_from(&live.status_rows);
-            self.image_buttons.clone_from(&live.image_buttons);
         }
     }
     pub fn paint(&self, previous: usize) -> String {
@@ -987,7 +968,6 @@ fn layout_impl(
         inspector_content_rows: 0,
         viewport: full.then_some(size),
         cursor_row,
-        image_buttons: Vec::new(),
         status_rows: if full {
             vec![max_rows - 4, max_rows - 3, max_rows - 1]
         } else {
@@ -1011,6 +991,7 @@ pub enum InspectorKind {
     #[default]
     Plain,
     Agents,
+    Shell,
     Plan,
     Source,
     Diff,
@@ -1174,7 +1155,6 @@ pub struct Workspace {
     pub result_selected: Option<String>,
     pub wide_diff: bool,
     pub terminal_shortcut: bool,
-    pub draft_images: Option<(String, Vec<String>)>,
     pub side_chat: Option<SideChat>,
 }
 
@@ -1495,6 +1475,31 @@ fn editor_rows(
 ) -> (Vec<String>, usize, usize) {
     let original = input;
     let (input, cursor, start) = visible_composer(input, cursor, columns, maximum);
+    let mut file_ranges = if color && original.contains(&b'@') {
+        let mut from = start.saturating_sub(4096);
+        let mut to = (start + input.len())
+            .saturating_add(4096)
+            .min(original.len());
+        while from > 0 && original[from] & 0xc0 == 0x80 {
+            from -= 1;
+        }
+        while to < original.len() && original[to] & 0xc0 == 0x80 {
+            to += 1;
+        }
+        std::str::from_utf8(&original[from..to]).map_or_else(
+            |_| Vec::new(),
+            |text| {
+                super::commands::mention::tokens(text)
+                    .map(|(offset, token)| from + offset..from + offset + token.len())
+                    .filter(|range| range.end > start && range.start < start + input.len())
+                    .collect()
+            },
+        )
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .peekable();
     let mut skill_ranges = if color && !skills.is_empty() {
         let (head, _, _) = visible_composer(original, 0, columns, maximum);
         composer_skill_ranges(original, head, start..start + input.len(), skills)
@@ -1508,7 +1513,7 @@ fn editor_rows(
     let mut used = 2;
     let mut cursor_at = (0, 2);
     let mut consumed = 0;
-    let mut highlighted = false;
+    let mut paint = TEXT;
     for glyph in glyphs(input) {
         let contains_cursor = consumed <= cursor && cursor < glyph.source_end;
         if contains_cursor {
@@ -1518,13 +1523,13 @@ fn editor_rows(
             logical.push(String::new());
             row += 1;
             used = 2;
-            highlighted = false;
+            paint = TEXT;
         } else {
             if used + glyph.width > columns && used > 2 {
                 logical.push(String::new());
                 row += 1;
                 used = 2;
-                highlighted = false;
+                paint = TEXT;
                 if contains_cursor {
                     cursor_at = (row, used);
                 }
@@ -1533,10 +1538,19 @@ fn editor_rows(
             while skill_ranges.peek().is_some_and(|range| range.end <= at) {
                 skill_ranges.next();
             }
-            let skill = skill_ranges.peek().is_some_and(|range| range.contains(&at));
-            if skill != highlighted {
-                logical[row].push_str(if skill { MINT } else { TEXT });
-                highlighted = skill;
+            while file_ranges.peek().is_some_and(|range| range.end <= at) {
+                file_ranges.next();
+            }
+            let style = if file_ranges.peek().is_some_and(|range| range.contains(&at)) {
+                VIOLET
+            } else if skill_ranges.peek().is_some_and(|range| range.contains(&at)) {
+                MINT
+            } else {
+                TEXT
+            };
+            if style != paint {
+                logical[row].push_str(style);
+                paint = style;
             }
             logical[row].push_str(&glyph.text);
             used += glyph.width;
@@ -1836,12 +1850,18 @@ pub fn layout_workspace(
     let agents_panel = ui
         .inspector
         .as_ref()
-        .is_some_and(|p| p.kind == InspectorKind::Agents);
+        .is_some_and(|p| matches!(p.kind, InspectorKind::Agents | InspectorKind::Shell));
+    let wide_panel = ui.wide_diff
+        || ui.focus == Focus::Inspector
+            && ui
+                .inspector
+                .as_ref()
+                .is_some_and(|p| p.kind == InspectorKind::Shell);
     let has_panel = ui.inspector.is_some() || side.is_some();
     let side_by_side = has_panel
         && !plan
         && (!activity_panel || agents_panel)
-        && !ui.wide_diff
+        && !wide_panel
         && (width >= 100 || (agents_panel || picture || side.is_some()) && width >= 63);
     let panel_width = if side_by_side {
         if picture || side.is_some() {
@@ -1879,7 +1899,7 @@ pub fn layout_workspace(
     );
     let body_height = height.saturating_sub(7 + editor.len()).max(1);
     let stacked = has_panel && !side_by_side;
-    let chat_height = if ui.wide_diff || activity_panel && !agents_panel {
+    let chat_height = if wide_panel || activity_panel && !agents_panel {
         0
     } else if plan {
         1
@@ -2215,49 +2235,7 @@ pub fn layout_workspace(
     } else {
         notice
     };
-    let mut image_buttons = Vec::new();
-    let notice_line = if let Some((owner, images)) = &ui.draft_images
-        && ui.focus == Focus::Chat
-        && ui.popup.is_none()
-        && !ui.exit_confirmation
-        && !ui.drafting_plan
-        && height > rows.len()
-    {
-        let mut line = String::new();
-        let mut used = 0;
-        if !notice.is_empty() {
-            let summary = clipped(notice, inner_width / 2);
-            used = cells(&summary) + 1;
-            line.push_str(&styled(&summary, MUTED, color));
-            line.push(' ');
-        }
-        for (index, digest) in images.iter().enumerate() {
-            let chip = if images.len() == 1 {
-                "[Image ×]".to_owned()
-            } else {
-                format!("[Image {} ×]", index + 1)
-            };
-            let end = used + cells(&chip);
-            if end > inner_width {
-                break;
-            }
-            image_buttons.push(ImageButton {
-                row: rows.len(),
-                columns: inset.len() + used..inset.len() + end,
-                owner: owner.clone(),
-                index,
-                digest: digest.clone(),
-            });
-            line.push_str(&styled(&chip, AMBER, color));
-            line.push(' ');
-            used = end + 1;
-        }
-        if image_buttons.is_empty() {
-            styled(&clipped(notice, inner_width), MUTED, color)
-        } else {
-            line
-        }
-    } else if notice.is_empty()
+    let notice_line = if notice.is_empty()
         && ui.focus == Focus::Chat
         && ui.popup.is_none()
         && ui.suggestions.is_none()
@@ -2326,7 +2304,6 @@ pub fn layout_workspace(
     Some(Frame {
         lines: rows,
         status_rows: vec![height - 2, height - 1],
-        image_buttons,
         image: None,
         panes,
         themed: false,
@@ -3229,6 +3206,18 @@ mod tests {
         assert!(rows[y - 1].contains(&format!("{MINT}/grill")));
         assert!(rows[y].contains(&format!("{MINT}-me{TEXT} rest")));
         assert_eq!(x, 5);
+    }
+
+    #[test]
+    fn composer_distinguishes_parent_paths_from_skills_and_text() {
+        let skill = Choice {
+            label: "/route".into(),
+            detail: String::new(),
+        };
+        let text = r"/route См. @../my\ notes.md user@example.org";
+        let (rows, _, _) = editor_rows(text.as_bytes(), text.len(), 80, 3, MINT, true, &[skill]);
+        assert!(rows[0].contains(&format!("{VIOLET}@../my\\ notes.md{TEXT} user@example.org")));
+        assert!(rows[0].contains(&format!("{MINT}/route{TEXT}")));
     }
 
     #[test]

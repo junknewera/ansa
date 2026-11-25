@@ -74,6 +74,14 @@ const COMMANDS: &[Command] = &[
         description: "Browse skills available in this conversation",
     },
     Command {
+        name: "/mcp",
+        description: "Show configured MCP servers",
+    },
+    Command {
+        name: "/hooks",
+        description: "Show JSONL hook events and setup",
+    },
+    Command {
         name: "/help",
         description: "Commands and shortcuts",
     },

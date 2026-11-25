@@ -126,6 +126,9 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
         "TEST_EXEC_SET" => "trap - URG; declare -x ANSA_EXEC_FIXTURE=remembered",
         "TEST_EXEC_STATE" => r#"printf '%s:%s\n' "${PWD##*/}" "$ANSA_EXEC_FIXTURE""#,
         "TEST_EXEC_LONG" => r#"printf 'START\n'; sleep 0.8; printf 'END\n'"#,
+        "TEST_EXEC_HISTORY" => {
+            r#"for ((i=1; i<=60; i++)); do printf 'SHELL_HISTORY_%02d\n' "$i"; done"#
+        }
         "TEST_EXEC_FAIL" => "sh check-fixture.sh",
         "TEST_EXEC_BACKGROUND" => {
             r#"(sleep 0.05; printf '%064000d\n' 0; printf 'alive\n' > child-marker) & printf 'now\n'"#

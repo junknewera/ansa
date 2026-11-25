@@ -12,7 +12,7 @@ import sys
 import tempfile
 import zlib
 
-from carbon_visual_pty import StyledTerminal, click_text, completed, finish, records, roots, until, visible
+from carbon_visual_pty import StyledTerminal, completed, finish, records, roots, until, visible
 from parity.frontend_io import Pty
 
 
@@ -46,7 +46,7 @@ def main(adapter):
         tool.chmod(0o700)
         env = {'PATH': f'{root}:{os.environ.get("PATH", os.defpath)}', 'WAYLAND_DISPLAY': 'test-clipboard'}
         screen = None
-        label = '[Image ×]'
+        label = '[Image #1]'
         try:
             size = (112, 40)
             env.update(HOME=str(home), XDG_STATE_HOME=str(root / 'xdg'), TERM='xterm', LC_ALL='C')
@@ -63,16 +63,23 @@ def main(adapter):
             visible(screen)
             assert 'BUFFER' not in screen.vt.line(-4), 'cancelled paste reappeared in the draft'
             text.unlink()
-            screen.send(b'\x16')
-            until(screen, lambda text: label in text
-                  and screen.vt.line(-1).strip().startswith('Image attached (1)'),
-                  'Ctrl+V stages a PNG attachment and shows the confirmation')
+            screen.send(b'A\x16B')
+            until(screen, lambda frame: f'A{label}B' in frame,
+                  'Ctrl+V stages a PNG at the cursor while typing')
+            assert label not in screen.vt.line(-1)
             assert not any(row['kind'] == 'accepted' for row in records(root))
-            click_text(screen, label)
-            until(screen, lambda text: label not in text, 'click removes the attachment')
+            screen.send(b'\x1b[D\x7f')
+            until(screen, lambda frame: label not in frame and 'AB' in screen.vt.line(-4),
+                  'Backspace removes only the attachment')
             assert not any(row['kind'] == 'accepted' for row in records(root))
-            screen.send(b'\x16')
-            until(screen, lambda text: label in text, 'PNG stages again')
+            screen.send(b'\x03')
+            for number in range(1, 7):
+                screen.send(b'\x16')
+                until(screen, lambda frame: f'[Image #{number}]' in frame, f'PNG {number} stages')
+            screen.send(b'\x01\x1b[3~')
+            until(screen, lambda frame: '[Image #5]' in frame and '[Image #6]' not in frame,
+                  'Delete removes only the first attachment')
+            screen.send(b'\x05')
             payload = 'я' * 1001
             screen.send(f'start \x1b[200~{payload}\x1b[201~ end')
             until(screen, lambda text: 'start [pasted text · 1001 chars] end' in text,
@@ -82,7 +89,8 @@ def main(adapter):
             until(screen, lambda text: completed(root, f'start {payload} end') and label not in text,
                   'Enter submits original text and consumes the attachment')
             captured = (root / 'outbound-messages.jsonl').read_bytes()
-            assert captured.count(b'data:image/png;base64,' + base64.b64encode(image.read_bytes())) == 1
+            assert b'[Image #' not in captured
+            assert captured.count(b'data:image/png;base64,' + base64.b64encode(image.read_bytes())) == 5
             finish(screen)
         finally:
             if screen is not None and not getattr(screen, 'closed', False):

@@ -446,8 +446,8 @@ impl Slot {
                 .state
                 .text(&prompt, &self.handle, io, &mut self.replies);
             if !accepted {
-                self.state.editor.bytes = prompt.into_bytes();
-                self.state.editor.cursor = self.state.editor.bytes.len();
+                self.state.editor.clear_text();
+                self.state.editor.replace(0, 0, prompt.as_bytes());
             }
         }
     }
@@ -745,6 +745,11 @@ enum ClarificationDraft {
 }
 
 enum Job {
+    McpInfo {
+        owner: String,
+        token: u64,
+        result: Result<Vec<Choice>>,
+    },
     MentionImages {
         owner: String,
         text: String,
@@ -888,7 +893,8 @@ enum Job {
     },
     TerminalScreen {
         token: u64,
-        result: Result<carbon::OutputView>,
+        requested_scroll: usize,
+        result: Result<(String, crate::terminal_host::native::Viewport)>,
     },
     Preview {
         token: u64,
@@ -950,6 +956,7 @@ enum Menu {
         selected: usize,
     },
     CommandPicker(Popup),
+    Info(Popup),
     Clarify {
         run: String,
     },
@@ -1069,7 +1076,12 @@ enum Panel {
         name: String,
         view: Option<carbon::OutputView>,
         pending: bool,
-        next: Instant,
+        next: Option<Instant>,
+        scroll: usize,
+        history: usize,
+        live_top: usize,
+        requested_height: usize,
+        page_height: usize,
     },
     Image {
         token: u64,
@@ -1363,7 +1375,7 @@ impl Workbench {
         }
         let slot = &mut self.slots[self.current];
         slot.sending_mention = false;
-        if !slot.state.editor.bytes.is_empty()
+        if !slot.state.editor.is_empty()
             || slot.state.editor.clipboard_anchor.is_some()
             || slot.state.editor.overflow
             || slot.state.editor.pasting()
@@ -1822,7 +1834,12 @@ impl Workbench {
                     text: "The agent has no terminal in this conversation".into(),
                 }),
             pending: false,
-            next: Instant::now(),
+            next: Some(Instant::now()),
+            scroll: 0,
+            history: 0,
+            live_top: 0,
+            requested_height: 0,
+            page_height: 0,
         });
         self.focus = Focus::Inspector;
         self.selection = None;
@@ -1833,28 +1850,40 @@ impl Workbench {
         if self.input_closed || self.terminating || self.jobs.len() >= 6 {
             return;
         }
+        let height = self
+            .displayed
+            .as_ref()
+            .map(|frame| frame.inspector_content_rows)
+            .filter(|height| *height != 0)
+            .unwrap_or(12);
         let Some(Panel::NativeTerminal {
             token,
             name,
             pending,
             next,
+            scroll,
+            live_top,
+            requested_height,
             ..
         }) = &mut self.panel
         else {
             return;
         };
-        if *pending || now < *next {
+        if *pending || *requested_height == height && next.is_none_or(|next| now < next) {
             return;
         }
         let Some(owner) = self.factory.terminal_owner(&self.slots[self.current].id) else {
             return;
         };
         *pending = true;
-        *next = now + Duration::from_millis(300);
+        let requested_scroll = *scroll;
+        *next = (requested_scroll == 0).then(|| now + Duration::from_millis(300));
         let token = *token;
         let name = name.clone();
+        let top = (requested_scroll != 0).then(|| live_top.saturating_sub(requested_scroll));
+        *requested_height = height;
         self.jobs.spawn_blocking(move || {
-            use crate::terminal_host::{Lifecycle, protocol::Writer};
+            use crate::terminal_host::Lifecycle;
             let result = (|| {
                 let mut host = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
                 let (id, terminal) = host
@@ -1868,23 +1897,38 @@ impl Workbench {
                     })
                     .ok_or("terminal_not_open")?;
                 let (id, epoch) = (id.clone(), terminal.epoch);
-                let mut title = terminal.launch.label.clone();
-                let screen = host.capture(Writer::Human, &id, epoch, 0)?;
-                if let Some(exit) = &screen.exit {
-                    title.push_str(if exit.cleanup_known {
-                        " · exited"
-                    } else {
-                        " · stop unconfirmed"
-                    });
-                }
-                let mut text = screen.text;
-                if screen.truncated {
-                    text.push_str("\nScreen truncated");
-                }
-                Ok(carbon::OutputView { title, text })
+                let title = terminal.launch.label.clone();
+                let page = host.human_viewport(&id, epoch, top, height)?;
+                Ok((title, page))
             })();
-            Job::TerminalScreen { token, result }
+            Job::TerminalScreen {
+                token,
+                requested_scroll,
+                result,
+            }
         });
+    }
+
+    fn scroll_terminal(&mut self, older: bool, step: usize) {
+        let Some(Panel::NativeTerminal {
+            scroll,
+            history,
+            next,
+            ..
+        }) = &mut self.panel
+        else {
+            return;
+        };
+        let target = if older {
+            scroll.saturating_add(step).min(*history)
+        } else {
+            scroll.saturating_sub(step)
+        };
+        if target != *scroll {
+            *scroll = target;
+            *next = Some(Instant::now());
+            self.selection = None;
+        }
     }
     fn copy_image_path(&mut self, io: &Io) {
         let Some(Panel::Image {
@@ -2291,6 +2335,64 @@ impl Workbench {
             .and_then(resumable_request)
             .cloned()
     }
+    fn open_mcp(&mut self, io: &Io) -> bool {
+        if !self.can_job(io) {
+            return false;
+        }
+        self.cancel_modal();
+        let token = self.modal_token;
+        let owner = self.slots[self.current].id.clone();
+        let directory = self.factory.settings.directory.clone();
+        self.menu = Some(Menu::Loading("MCP servers".into()));
+        self.jobs.spawn_blocking(move || Job::McpInfo {
+            owner,
+            token,
+            result: (|| {
+                let config = crate::mcp::cli(&["list".into()], &directory)?;
+                config
+                    .field("servers")?
+                    .elements()?
+                    .iter()
+                    .map(|server| {
+                        Ok(Choice {
+                            label: server.text_field("name")?.into(),
+                            detail: if server.field("enabled")?.boolean()? {
+                                "Enabled"
+                            } else {
+                                "Disabled"
+                            }
+                            .into(),
+                        })
+                    })
+                    .collect()
+            })(),
+        });
+        true
+    }
+
+    fn open_hooks(&mut self) {
+        self.menu = Some(Menu::Info(Popup {
+            title: "Hooks".into(),
+            subtitle: "External JSONL adapter".into(),
+            items: [
+                "session_opened",
+                "command_accepted",
+                "done",
+                "cancelled",
+                "tool_started",
+                "tool_finished",
+            ]
+            .into_iter()
+            .map(|event| Choice {
+                label: event.into(),
+                detail: String::new(),
+            })
+            .collect(),
+            selected: 0,
+            footer: "Setup · integrations/HOOKS.md · Esc close".into(),
+        }));
+    }
+
     fn resume_request(&mut self, target: RequestId) {
         let slot = &mut self.slots[self.current];
         let draft = slot
@@ -3310,6 +3412,11 @@ impl Workbench {
                 )));
                 (true, false)
             }
+            "/mcp" if argument.is_empty() => (self.open_mcp(io), false),
+            "/hooks" if argument.is_empty() => {
+                self.open_hooks();
+                (true, false)
+            }
             "/basic" if self.slots[self.current].kind == Kind::Btw => {
                 self.report(io, "/btw is read-only");
                 (true, false)
@@ -3877,6 +3984,35 @@ impl Workbench {
             self.modal_stop = None;
         }
         match job {
+            Job::McpInfo {
+                owner,
+                token,
+                result,
+            } => {
+                if token != self.modal_token || self.slots[self.current].id != owner {
+                    return;
+                }
+                self.menu = None;
+                match result {
+                    Ok(items) => {
+                        let subtitle = if items.is_empty() {
+                            "No servers configured"
+                        } else {
+                            "Configuration for new sessions"
+                        };
+                        self.menu = Some(Menu::Info(Popup {
+                            title: "MCP servers".into(),
+                            subtitle: subtitle.into(),
+                            items,
+                            selected: 0,
+                            footer: "Esc close".into(),
+                        }));
+                    }
+                    Err(code) => {
+                        self.report(io, &format!("Could not load MCP configuration ({code})"))
+                    }
+                }
+            }
             Job::MentionImages {
                 owner,
                 text,
@@ -4255,24 +4391,62 @@ impl Workbench {
                     }
                 }
             }
-            Job::TerminalScreen { token, result } => {
+            Job::TerminalScreen {
+                token,
+                requested_scroll,
+                result,
+            } => {
                 if let Some(Panel::NativeTerminal {
                     token: expected,
                     view,
                     pending,
+                    next,
+                    scroll,
+                    history,
+                    live_top,
+                    page_height,
                     ..
                 }) = &mut self.panel
                     && *expected == token
                 {
                     *pending = false;
-                    *view = Some(result.unwrap_or_else(|error| carbon::OutputView {
-                        title: "Agent terminal".into(),
-                        text: if error == "terminal_not_open" {
-                            "The agent has not opened a terminal yet".into()
-                        } else {
-                            diagnostics::error(error)
-                        },
-                    }));
+                    if *scroll == requested_scroll {
+                        *view = Some(match result {
+                            Ok((mut title, page)) => {
+                                *scroll = page.scroll;
+                                *history = page.history;
+                                *live_top = page.live_top;
+                                *page_height = page.height;
+                                if let Some(exit) = page.exit {
+                                    title.push_str(if exit.cleanup_known {
+                                        " · exited"
+                                    } else {
+                                        " · stop unconfirmed"
+                                    });
+                                }
+                                carbon::OutputView {
+                                    title,
+                                    text: page.text,
+                                }
+                            }
+                            Err(error) => {
+                                *scroll = 0;
+                                *history = 0;
+                                *page_height = 0;
+                                carbon::OutputView {
+                                    title: "Agent terminal".into(),
+                                    text: if error == "terminal_not_open" {
+                                        "The agent has not opened a terminal yet".into()
+                                    } else {
+                                        diagnostics::error(error)
+                                    },
+                                }
+                            }
+                        });
+                        if *scroll == 0 && next.is_none() {
+                            *next = Some(Instant::now() + Duration::from_millis(300));
+                        }
+                    }
                 }
             }
             Job::Themes { request, result } => match result {
@@ -4725,6 +4899,15 @@ impl Workbench {
         }
     }
     fn page(&mut self, older: bool) {
+        if self.focus == Focus::Inspector
+            && let Some(Panel::NativeTerminal { page_height, .. }) = &self.panel
+        {
+            let height = self.displayed.as_ref().map_or(*page_height, |frame| {
+                frame.inspector_content_rows.min(*page_height)
+            });
+            self.scroll_terminal(older, height.saturating_sub(1).max(1));
+            return;
+        }
         if self.focus == Focus::Inspector && matches!(self.panel, Some(Panel::Activity(_))) {
             self.scroll_activity(
                 older,
@@ -5034,7 +5217,9 @@ impl Workbench {
             Some(Menu::Efforts {
                 values, selected, ..
             }) => delta(selected, values.len()),
-            Some(Menu::CommandPicker(picker)) => delta(&mut picker.selected, picker.items.len()),
+            Some(Menu::CommandPicker(picker) | Menu::Info(picker)) => {
+                delta(&mut picker.selected, picker.items.len())
+            }
             None if self.focus == Focus::Inspector => match &mut self.panel {
                 Some(Panel::EditDiff { rows, offset, .. }) => delta(offset, rows.len()),
                 Some(Panel::Files(files)) if files.document.is_none() => delta(
@@ -5228,6 +5413,7 @@ impl Workbench {
                             Some((slot.state.editor.bytes.clone(), slot.state.editor.cursor));
                     }
                 }
+                Menu::Info(_) => {}
                 Menu::Clarify { run } => {
                     let owner = &self.slots[self.current].id;
                     if !self.collecting_orchestration()
@@ -5327,7 +5513,7 @@ impl Workbench {
         }
         if matches!(
             &self.menu,
-            Some(Menu::Themes(_) | Menu::Palette { .. } | Menu::CommandPicker(_))
+            Some(Menu::Themes(_) | Menu::Palette { .. } | Menu::CommandPicker(_) | Menu::Info(_))
         ) || matches!(&self.menu, Some(Menu::Loading(title)) if title == "/theme")
         {
             if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
@@ -5439,6 +5625,12 @@ impl Workbench {
                 self.drag_scroll(mouse.kind == MouseKind::WheelUp, 3, io);
                 return;
             }
+            if hovered == Focus::Inspector
+                && matches!(self.panel, Some(Panel::NativeTerminal { .. }))
+            {
+                self.scroll_terminal(mouse.kind == MouseKind::WheelUp, 3);
+                return;
+            }
             let focus = self.focus;
             self.focus = hovered;
             self.page(mouse.kind == MouseKind::WheelUp);
@@ -5475,29 +5667,8 @@ impl Workbench {
                     self.tool_press = Some((mouse.column, mouse.row, key.clone(), None, None));
                     return;
                 }
-                // Attachment chips and selection use a complete paint.
+                // Text selection uses a complete paint.
                 if !self.frames.is_empty() {
-                    return;
-                }
-                if self.menu.is_none()
-                    && let Some(button) = self
-                        .displayed
-                        .as_ref()
-                        .and_then(|frame| frame.image_button(mouse.column, mouse.row))
-                {
-                    let slot = &mut self.slots[self.current];
-                    if slot.id == button.owner
-                        && !slot.state.attachment_loading
-                        && slot.state.attachment_submission.is_none()
-                        && slot
-                            .state
-                            .images
-                            .get(button.index)
-                            .is_some_and(|image| image.sha256() == button.digest)
-                    {
-                        slot.state.images.remove(button.index);
-                        slot.state.status.clear();
-                    }
                     return;
                 }
                 let tab = self
@@ -5898,7 +6069,7 @@ impl Workbench {
                 }
                 .into(),
             },
-            Menu::CommandPicker(picker) => picker.clone(),
+            Menu::CommandPicker(picker) | Menu::Info(picker) => picker.clone(),
             Menu::Clarify { .. } => Popup {
                 title: "Clarify plan".into(),
                 subtitle: if self.clarification_pending {
@@ -6038,17 +6209,35 @@ impl Workbench {
                 ..Inspector::default()
             }),
             Panel::Activity(navigation) => Some(self.activity_inspector(navigation)),
-            Panel::NativeTerminal { view, .. } => Some(Inspector {
+            Panel::NativeTerminal {
+                view,
+                scroll,
+                history,
+                page_height,
+                ..
+            } => Some(Inspector {
                 tabs: activity::tabs(),
                 selected_tab: 2,
-                kind: InspectorKind::Agents,
+                kind: if *page_height != 0
+                    && (*history != 0 || view.as_ref().is_some_and(|v| !v.text.trim().is_empty()))
+                {
+                    InspectorKind::Shell
+                } else {
+                    InspectorKind::Agents
+                },
                 title: view
                     .as_ref()
                     .map_or_else(|| "Agent terminal".into(), |view| view.title.clone()),
                 lines: view.as_ref().map_or_else(Vec::new, |view| {
                     view.text.lines().map(str::to_owned).collect()
                 }),
-                footer: "a activity · Esc back".into(),
+                footer: if *history == 0 {
+                    "a activity · Esc back".into()
+                } else if *scroll == 0 {
+                    "PgUp or wheel to scroll · Live".into()
+                } else {
+                    format!("PgUp/PgDn or wheel · {scroll} lines back")
+                },
                 ..Inspector::default()
             }),
             Panel::EditDiff {
@@ -6343,12 +6532,12 @@ impl Workbench {
             orchestration_notice: self
                 .orchestration_notice()
                 .map(|notice| format!("{notice} · Ctrl+T Agents")),
-            draft_notice: !slot.state.editor.bytes.is_empty()
+            draft_notice: !slot.state.editor.is_empty()
                 && (slot.pending_summary.is_some()
                     || self.orchestration_summary.contains_key(&slot.id)),
             interrupt_hint: if matches!(self.menu, Some(Menu::DraftingPlan)) {
                 ""
-            } else if !slot.state.editor.bytes.is_empty() {
+            } else if !slot.state.editor.is_empty() {
                 "Ctrl+C clear draft"
             } else if self.collecting_orchestration() || slot.interruptible() {
                 "Ctrl+C stop"
@@ -6364,19 +6553,6 @@ impl Workbench {
                 && (matches!(&self.panel, Some(Panel::EditDiff { .. }))
                     || matches!(&self.panel, Some(Panel::Files(files)) if files.tab == 1)),
             terminal_shortcut: true,
-            draft_images: (!slot.state.images.is_empty()
-                && !slot.state.attachment_loading
-                && slot.state.attachment_submission.is_none())
-            .then(|| {
-                (
-                    slot.id.clone(),
-                    slot.state
-                        .images
-                        .iter()
-                        .map(|image| image.sha256().to_owned())
-                        .collect(),
-                )
-            }),
             side_chat: parent.map(|parent| carbon::SideChat {
                 parent_history: parent
                     .state
@@ -7107,7 +7283,7 @@ pub(in crate::frontend) async fn run_session(
                                     if byte == b'q' { work.open_terminal(io); deferred_input.extend(&bytes[position + 1..count]); break; }
                                     if byte >= 32 && byte != 127 { continue; }
                                 }
-                                if work.focus == Focus::Chat && work.menu.is_none() && byte == b'?' && work.slots[work.current].state.editor.bytes.is_empty() {
+                                if work.focus == Focus::Chat && work.menu.is_none() && byte == b'?' && work.slots[work.current].state.editor.is_empty() {
                                     work.menu = Some(Menu::CommandPicker(commands::help_with_commands(0, work.available_commands()))); work.completion = None; continue;
                                 }
                                 if work.menu.is_some() && !matches!(byte, 27 | b'\r' | b'\n' | 9) { continue; }
@@ -7129,14 +7305,14 @@ pub(in crate::frontend) async fn run_session(
                                 action.filter(|action| !matches!(action, Action::Overflow))
                             } else {
                                 let slot = &mut work.slots[work.current];
-                                let before = (slot.state.editor.bytes.len(), slot.state.editor.cursor);
+                                let before = (slot.state.editor.bytes.len(), slot.state.editor.caret(), slot.state.editor.images.len());
                                 let was_pasting = slot.state.editor.pasting();
                                 slot.state.editor.set_completion(complete);
                                 let action = slot.state.editor.feed(byte, true);
                                 if was_pasting && !slot.state.editor.pasting() && commands::mention::Mention::at_with_skills(&slot.state.editor, &slot.skill_commands).is_some() {
                                     work.completion_closed = Some((slot.state.editor.bytes.clone(), slot.state.editor.cursor));
                                 }
-                                if before != (slot.state.editor.bytes.len(), slot.state.editor.cursor) {
+                                if before != (slot.state.editor.bytes.len(), slot.state.editor.caret(), slot.state.editor.images.len()) {
                                     slot.state.input_history.edited(&slot.state.editor); slot.state.status.clear();
                                 }
                                 action
