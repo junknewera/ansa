@@ -2400,7 +2400,7 @@ def siwc_terminal_exec(screen, root, cwd):
     screen.observations.append({"terminal_exec": direct, "legacy_terminal_tools": legacy})
 
     calls, _, _ = submit("TEST_EXEC_SPLIT")
-    assert calls == ["terminal_input", "terminal_input"]
+    assert calls == ["terminal_input"] * 4
     _, [changed], _ = submit("TEST_EXEC_SET")
     _, [state], _ = submit("TEST_EXEC_STATE")
     _, [long], _ = submit("TEST_EXEC_LONG", running=True)

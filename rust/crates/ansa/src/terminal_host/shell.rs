@@ -103,6 +103,7 @@ __ansa_finish() {
 readonly __ansa_dispatch='if __ansa_begin; then builtin eval -- "$__ansa_source" </dev/null > "$__ansa_directory/out-$__ansa_operation" 2>&1; __ansa_finish "$?"; fi'
 builtin trap "$__ansa_dispatch" URG
 PROMPT_COMMAND+=('builtin trap "$__ansa_dispatch" URG; builtin printf "ready\n" > "$__ansa_directory/status"')
+PS2='$(builtin printf "continue\n" > "$__ansa_directory/status")'"${PS2-> }"
 "#,
             );
             let init = directory.join("bashrc");
@@ -304,9 +305,9 @@ PROMPT_COMMAND+=('builtin trap "$__ansa_dispatch" URG; builtin printf "ready\n" 
     }
 
     fn accept_report(&mut self) {
-        if self.report == b"ready" && !self.running() {
+        if matches!(self.report.as_slice(), b"ready" | b"continue") && !self.running() {
             self.raw_pending = self.raw_pending.saturating_sub(1);
-            self.ready = self.raw_pending == 0 && !self.raw_unstable;
+            self.ready = self.report == b"ready" && self.raw_pending == 0 && !self.raw_unstable;
         } else if let Some(run) = self.run.as_mut().filter(|run| run.pipe.is_some())
             && let Ok(report) = std::str::from_utf8(&self.report)
             && let Some((operation, exit_code)) = report.split_once(' ')
@@ -345,6 +346,19 @@ mod tests {
         shell.raw_input(b"wait $!\r", true);
         shell.accept_report();
         assert!(matches!(shell.state(None), State::Busy));
+        shell.accept_report();
+        assert!(matches!(shell.state(None), State::Ready));
+    }
+
+    #[test]
+    fn continuation_prompt_consumes_input_without_releasing_bash() {
+        let mut shell = Shell::prepare(&mut Command::new("bash"), false).unwrap();
+        shell.raw_input(b"if true; then\r", true);
+        shell.raw_input(b"fi\r", true);
+        shell.report = b"continue".to_vec();
+        shell.accept_report();
+        assert!(matches!(shell.state(None), State::Busy));
+        shell.report = b"ready".to_vec();
         shell.accept_report();
         assert!(matches!(shell.state(None), State::Ready));
     }

@@ -75,9 +75,10 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
         });
     }
     if prompt == "TEST_EXEC_SPLIT" {
-        if results.len() >= 2 {
+        let lines = ["if true; then\r", "cd ke", "pt\r", "fi\r"];
+        let Some(data) = lines.get(results.len()) else {
             return Ok(done());
-        }
+        };
         let terminal = input[..start]
             .iter()
             .rev()
@@ -85,7 +86,6 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
             .filter_map(|row| serde_json::from_str::<Value>(row["output"].as_str()?).ok())
             .find_map(|row| row["terminal"].as_str().map(str::to_owned))
             .ok_or("fixture_exec_terminal")?;
-        let data = if results.is_empty() { "cd ke" } else { "pt\r" };
         return Ok(call(
             "terminal_input",
             json!({

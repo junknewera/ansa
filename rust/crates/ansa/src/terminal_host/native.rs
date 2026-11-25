@@ -947,10 +947,10 @@ fn worker_loop(
                         .then(|| (started + lifetime).min(last_input + idle_duration));
                     let at_shell = terminal.shell.is_some() && pty.foreground_is_shell();
                     let effect = deliver(pty, &bytes, deadline);
-                    if effect != Effect::NotStarted
+                    if let Effect::Delivered { count } | Effect::Partial { count } = effect
                         && let Some(shell) = &mut terminal.shell
                     {
-                        shell.raw_input(&bytes, at_shell);
+                        shell.raw_input(&bytes[..count], at_shell);
                     }
                     effect
                 }
