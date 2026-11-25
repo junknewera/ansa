@@ -156,6 +156,10 @@ pub enum Action {
         count: usize,
         digest: Option<String>,
     },
+    Exec {
+        count: usize,
+        digest: String,
+    },
     Resize {
         size: Size,
     },
@@ -176,6 +180,20 @@ impl Action {
         })
     }
 
+    pub(super) fn exec(bytes: &[u8]) -> Option<Self> {
+        let command = std::str::from_utf8(bytes).ok()?;
+        // Managed source shares the existing bound for terminal input.
+        (!command.trim().is_empty()
+            && bytes.len() <= MAX_INPUT
+            && command
+                .chars()
+                .all(|c| !c.is_control() || matches!(c, '\n' | '\t')))
+        .then(|| Self::Exec {
+            count: bytes.len(),
+            digest: sha256(bytes),
+        })
+    }
+
     pub(crate) fn validate(&self, writer: Writer) -> bool {
         match self {
             Self::Create { launch } => launch.validate(),
@@ -185,6 +203,9 @@ impl Action {
                         Writer::Agent => digest.as_deref().is_some_and(valid_digest),
                         Writer::Human => digest.is_none(),
                     }
+            }
+            Self::Exec { count, digest } => {
+                writer == Writer::Agent && (1..=MAX_INPUT).contains(count) && valid_digest(digest)
             }
             Self::Resize { size } => size.validate(),
             Self::Handback { screen } => valid_digest(&screen.digest),
@@ -230,6 +251,7 @@ impl Intent {
             Action::Input { .. } => {
                 Action::input(self.writer, input).as_ref() == Some(&self.action)
             }
+            Action::Exec { .. } => Action::exec(input).as_ref() == Some(&self.action),
             _ => input.is_empty(),
         }
     }
@@ -253,6 +275,9 @@ impl Effect {
                 Self::Delivered { count },
                 Action::Input {
                     count: expected, ..
+                }
+                | Action::Exec {
+                    count: expected, ..
                 },
             ) => count == *expected,
             (
@@ -261,7 +286,7 @@ impl Effect {
                     count: expected, ..
                 },
             ) => count > 0 && count < *expected,
-            (Self::Applied, Action::Input { .. }) => false,
+            (Self::Applied, Action::Input { .. } | Action::Exec { .. }) => false,
             (Self::Applied, _) => true,
             _ => false,
         }

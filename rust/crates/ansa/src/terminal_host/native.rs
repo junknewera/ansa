@@ -6,6 +6,7 @@ use super::{
         Action, ApprovedScreen, Binding, Effect, Id, Intent, Launch, MAX_INPUT, Size, Writer,
         sha256,
     },
+    shell::{self, Shell},
     wire,
 };
 use crate::frontend::terminal_pane::EscapeFilter;
@@ -54,6 +55,13 @@ enum Request {
     Input {
         bytes: Vec<u8>,
     },
+    Exec {
+        operation: Id,
+        command: String,
+    },
+    ShellStatus {
+        operation: Option<Id>,
+    },
     Resize {
         size: Size,
     },
@@ -77,6 +85,7 @@ enum Response {
     Capture { screen: Screen },
     Status { exit: Option<Exit> },
     Read { output: Output },
+    ShellStatus { state: shell::State },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,26 +155,29 @@ impl Retained {
             .take(limit)
             .copied()
             .collect();
-        let text = ansa_linux::fs::utf8_text(&bytes)
-            .chars()
-            .map(|c| {
-                if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
-                    '\u{fffd}'
-                } else {
-                    c
-                }
-            })
-            .collect();
         Some(Output {
             retained_from,
             from,
             through: from + bytes.len() as u64,
             available_through: self.through,
             gap: from > after,
-            text,
+            text: output_text(&bytes),
             exit: None,
         })
     }
+}
+
+pub(super) fn output_text(bytes: &[u8]) -> String {
+    fs::utf8_text(bytes)
+        .chars()
+        .map(|c| {
+            if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 impl Screen {
@@ -392,6 +404,10 @@ impl Backend for NativeBackend {
             Action::Input { .. } => Request::Input {
                 bytes: input.to_vec(),
             },
+            Action::Exec { .. } => Request::Exec {
+                operation: intent.operation.clone(),
+                command: String::from_utf8(input.to_vec()).expect("admitted shell command"),
+            },
             Action::Resize { size } => Request::Resize { size: *size },
             Action::Interrupt => Request::Interrupt,
             Action::Close => Request::Close,
@@ -450,6 +466,29 @@ impl Backend for NativeBackend {
 impl<J: Journal> Host<J, NativeBackend> {
     pub(crate) fn stop_handle(&self) -> Arc<Stop> {
         self.backend.stop.clone()
+    }
+
+    pub(super) fn shell_status(
+        &mut self,
+        terminal: &Id,
+        epoch: u64,
+        operation: Option<Id>,
+    ) -> Result<shell::State, &'static str> {
+        let after = self
+            .terminals
+            .get(terminal)
+            .ok_or("terminal_unknown")?
+            .visible_after;
+        self.read_permit(Writer::Agent, terminal, epoch, after)?;
+        let worker = self
+            .backend
+            .workers
+            .get_mut(terminal)
+            .ok_or("terminal_worker_lost")?;
+        match worker.call(Request::ShellStatus { operation }) {
+            Some(Response::ShellStatus { state }) => Ok(state),
+            _ => Err("terminal_worker_lost"),
+        }
     }
 
     pub fn worker_status(&mut self, terminal: &Id) -> Result<Option<Exit>, &'static str> {
@@ -585,9 +624,24 @@ fn worker() -> io::Result<()> {
         );
     };
     let mut command = Command::new(&launch.argv[0]);
-    command
-        .args(&launch.argv[1..])
-        .env("TERM", "xterm-256color");
+    command.env("TERM", "xterm-256color");
+    let shell = if launch.session_lifetime() && shell::supported(&launch.argv) {
+        match Shell::prepare(&mut command, launch.argv.len() <= 2) {
+            Ok(shell) => Some(shell),
+            Err(_) => {
+                return wire::write(
+                    &mut socket,
+                    0,
+                    Response::Effect {
+                        value: Effect::NotStarted,
+                    },
+                );
+            }
+        }
+    } else {
+        command.args(&launch.argv[1..]);
+        None
+    };
     let mut pty = match PtySession::launch_in(
         command,
         launch.size.rows,
@@ -618,6 +672,7 @@ fn worker() -> io::Result<()> {
     };
     drop(directory);
     let mut terminal = WorkerTerminal::new(reader, launch.size, launch.session_lifetime());
+    terminal.shell = shell;
     let handling = (|| {
         wire::write(
             &mut socket,
@@ -717,6 +772,7 @@ struct WorkerTerminal {
     sequence: u64,
     exit: Option<Exit>,
     continuous: bool,
+    shell: Option<Shell>,
 }
 
 impl WorkerTerminal {
@@ -729,6 +785,7 @@ impl WorkerTerminal {
             sequence: 1,
             exit: None,
             continuous,
+            shell: None,
         }
     }
 
@@ -757,6 +814,27 @@ impl WorkerTerminal {
         Ok(Drain::Busy)
     }
 
+    fn poll_shell(&mut self) -> io::Result<()> {
+        if let Some(shell) = &mut self.shell {
+            shell.poll(|bytes| {
+                let display: Vec<_> = bytes
+                    .iter()
+                    .flat_map(|byte| {
+                        if *byte == b'\n' {
+                            [Some(b'\r'), Some(*byte)]
+                        } else {
+                            [None, Some(*byte)]
+                        }
+                    })
+                    .flatten()
+                    .collect();
+                self.filter.process(&display, &mut self.parser);
+                self.output.push(&display);
+            })?;
+        }
+        Ok(())
+    }
+
     fn capture(&self) -> Screen {
         let mut screen = snapshot(self.parser.screen(), self.output.through);
         screen.exit = self.exit.clone();
@@ -770,6 +848,19 @@ impl WorkerTerminal {
             },
             Request::Status => Response::Status {
                 exit: self.exit.clone(),
+            },
+            Request::ShellStatus { operation } => Response::ShellStatus {
+                state: self
+                    .shell
+                    .as_ref()
+                    .map_or(shell::State::Unavailable, |shell| {
+                        let state = shell.state(operation.as_ref());
+                        if self.exit.is_some() && !matches!(state, shell::State::Finished { .. }) {
+                            shell::State::Unavailable
+                        } else {
+                            state
+                        }
+                    }),
             },
             Request::Read { after, limit } => self.output.read(after, limit).map_or(
                 Response::Effect {
@@ -805,6 +896,7 @@ fn worker_loop(
     let idle_duration = Duration::from_secs(u64::from(launch.idle_seconds));
     let mut last_input = started;
     loop {
+        terminal.poll_shell()?;
         let drain = terminal.drain(pty)?;
         if matches!(drain, Drain::Limit) {
             return Ok(End::Automatic(EndReason::OutputLimit));
@@ -824,7 +916,10 @@ fn worker_loop(
         let value = match request {
             Request::Open { .. } => return Err(io::Error::other("terminal_already_open")),
             Request::Close => return Ok(End::Requested),
-            Request::Capture | Request::Read { .. } | Request::Status => {
+            Request::Capture
+            | Request::Read { .. }
+            | Request::Status
+            | Request::ShellStatus { .. } => {
                 terminal.reply(socket, terminal.observe(request))?;
                 continue;
             }
@@ -840,6 +935,7 @@ fn worker_loop(
             Request::Input { bytes } => {
                 if bytes.is_empty()
                     || bytes.len() > MAX_INPUT
+                    || terminal.shell.as_ref().is_some_and(Shell::running)
                     || !launch.session_lifetime()
                         && input_bytes + bytes.len() > super::MAX_TERMINAL_INPUT
                 {
@@ -849,7 +945,37 @@ fn worker_loop(
                     last_input = Instant::now();
                     let deadline = (!launch.session_lifetime())
                         .then(|| (started + lifetime).min(last_input + idle_duration));
-                    deliver(pty, &bytes, deadline)
+                    let at_shell = terminal.shell.is_some() && pty.foreground_is_shell();
+                    let effect = deliver(pty, &bytes, deadline);
+                    if effect != Effect::NotStarted
+                        && let Some(shell) = &mut terminal.shell
+                    {
+                        shell.raw_input(&bytes, at_shell);
+                    }
+                    effect
+                }
+            }
+            Request::Exec { operation, command } => {
+                if Action::exec(command.as_bytes()).is_none() || !pty.foreground_is_shell() {
+                    Effect::NotStarted
+                } else if let Some(shell) = &mut terminal.shell
+                    && shell.begin(operation, &command).is_ok()
+                {
+                    if pty.notify_foreground_shell().is_ok() {
+                        let line = format!("$ {}\r\n", command.replace('\n', "\r\n"));
+                        terminal
+                            .filter
+                            .process(line.as_bytes(), &mut terminal.parser);
+                        terminal.output.push(line.as_bytes());
+                        Effect::Delivered {
+                            count: command.len(),
+                        }
+                    } else {
+                        shell.not_delivered();
+                        Effect::NotStarted
+                    }
+                } else {
+                    Effect::NotStarted
                 }
             }
             Request::Resize { size } => {

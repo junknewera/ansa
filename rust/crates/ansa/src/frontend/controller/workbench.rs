@@ -7751,6 +7751,7 @@ mod tests {
             operation: "op".into(),
             call_id: "call".into(),
             name: "get_test_value".into(),
+            target: String::new(),
         })];
         let mut slot = Slot::new(runtime, "offline".into(), Kind::Main, None, None);
         slot.state.snapshot = Some(view);

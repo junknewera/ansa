@@ -7,17 +7,34 @@ use rustix::{
 
 /// A private shell integration notifier, separate from terminal stdin.
 pub fn notification_fifo(path: &Path) -> io::Result<File> {
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
-        path,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-    )?;
+    make_private_fifo(path)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)?;
     crate::managed::nonblocking(&file)?;
     Ok(file)
+}
+
+fn make_private_fifo(path: &Path) -> io::Result<()> {
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )?;
+    Ok(())
+}
+
+/// A nonblocking reader with no inherited write end, so EOF certifies that
+/// the foreground command and any descendants have relinquished the writer.
+pub fn output_fifo(path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+    make_private_fifo(path)?;
+    Ok(File::from(open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?))
 }
 use std::{
     cell::Cell,
@@ -234,6 +251,19 @@ impl PtySession {
     pub fn foreground_is_shell(&self) -> bool {
         self.wait_owned().is_ok()
             && rustix::termios::tcgetpgrp(&self.master).ok() == Some(self.leader)
+    }
+
+    /// Notify the managed shell while it owns the foreground. The launcher
+    /// must have installed its SIGURG handler before using this path.
+    /// The kernel's default disposition is harmless if the hook was removed.
+    pub fn notify_foreground_shell(&self) -> io::Result<()> {
+        if self.wait_owned()? || !self.foreground_is_shell() {
+            return Err(io::Error::other("pty_shell_not_foreground"));
+        }
+        // This owner has not reaped the leader. Its PID remains pinned.
+        let fd = rustix::process::pidfd_open(self.leader, rustix::process::PidfdFlags::empty())?;
+        rustix::process::pidfd_send_signal(&fd, Signal::URG)?;
+        Ok(())
     }
 
     pub fn cwd(&self) -> io::Result<PathBuf> {

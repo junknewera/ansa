@@ -73,6 +73,7 @@ jobs:
             --binary rust/target/debug/examples/frontend_adapter \
             --case siwc-orchestration-direct \
             --case siwc-direct-edit-check \
+            --case siwc-terminal-exec \
             --case siwc-orchestrate-plus \
             --case siwc-orchestrate-plus-budget \
             --case siwc-orchestrate-plus-budget-configured \

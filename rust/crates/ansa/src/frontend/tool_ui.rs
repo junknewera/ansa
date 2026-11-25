@@ -136,7 +136,7 @@ fn label(name: &str) -> &str {
         "list_directory" => "List",
         "read_file" => "Read",
         "search_files" => "Search",
-        "run_command" => "Run",
+        "run_command" | crate::terminal_host::tools::EXEC => "Run",
         "edit_file" => "Edit",
         "workspace_describe" => "Workspace",
         "editor_get_context" => "Selection",
@@ -177,10 +177,12 @@ fn output_notice(tool: &Tool) -> Option<&'static str> {
     } else if value.text_field("status") == Ok("instructions_required") {
         Some("not run · instructions required")
     } else if value.has("error")
-        || (tool.detail.name == "run_command"
-            && value
-                .field("exit_code")
-                .is_ok_and(|code| code.dump() != "0"))
+        || (matches!(
+            tool.detail.name.as_str(),
+            "run_command" | crate::terminal_host::tools::EXEC
+        ) && value
+            .field("exit_code")
+            .is_ok_and(|code| code.dump() != "0"))
     {
         Some("error")
     } else if tool.detail.name == "run_command" && !value.has("exit_code") {
@@ -550,12 +552,25 @@ fn tool_header(tool: &Tool, arrow: &str, edit: Option<&EditView>, elapsed: &str)
         title.push_str(&format!("(+{} -{}) · ", edit.diff.added, edit.diff.removed));
     }
     let start = title.len();
-    title.push_str(status(tool));
-    title.push_str(if status(tool).contains("unknown") {
+    let status = status(tool);
+    let exit = (tool.detail.name == crate::terminal_host::tools::EXEC && !tool.volatile_outcome)
+        .then(|| {
+            tool.output_json
+                .as_ref()?
+                .field("exit_code")
+                .ok()?
+                .dump()
+                .parse::<u8>()
+                .ok()
+        })
+        .flatten();
+    let status_text = exit.map_or_else(|| status.to_owned(), |code| format!("exit {code}"));
+    title.push_str(&status_text);
+    title.push_str(if status.contains("unknown") {
         " ?"
-    } else if status(tool).starts_with("stopped") {
+    } else if status.starts_with("stopped") {
         " ■"
-    } else if status(tool).starts_with("denied") {
+    } else if status.starts_with("denied") {
         " ⊘"
     } else {
         match presentation_role(tool) {
@@ -566,8 +581,17 @@ fn tool_header(tool: &Tool, arrow: &str, edit: Option<&EditView>, elapsed: &str)
             _ => "",
         }
     });
-    let end = start + status(tool).len();
+    let end = start + status_text.len();
     title.push_str(elapsed);
+    if exit.is_some_and(|code| code != 0)
+        && let Some(diagnostic) = tool
+            .output_json
+            .as_ref()
+            .and_then(|output| output.text_field("diagnostic").ok())
+    {
+        title.push_str(" · ");
+        title.push_str(&preview(diagnostic, 72));
+    }
     let mut header = entry(title, None, presentation_role(tool));
     header.status = Some(start..end);
     header
@@ -723,7 +747,10 @@ enum Surface {
 fn group_label(surface: Surface, name: &str) -> Option<&'static str> {
     if read(name) {
         Some("Read and search")
-    } else if matches!(surface, Surface::Chat { .. }) && name.starts_with("terminal_") {
+    } else if matches!(surface, Surface::Chat { .. })
+        && name.starts_with("terminal_")
+        && name != crate::terminal_host::tools::EXEC
+    {
         Some("Terminal")
     } else {
         None
@@ -940,9 +967,15 @@ fn project_rows(
         }
         let index = *indices.entry(key.clone()).or_insert_with(|| {
             let index = tools.len();
-            let (name, call) = match activity {
-                Activity::Started(start) => (start.name.clone(), start.call_id.clone()),
-                Activity::Finished(finish) => ("Tool".into(), finish.call_id.clone()),
+            let (name, call, target) = match activity {
+                Activity::Started(start) => (
+                    start.name.clone(),
+                    start.call_id.clone(),
+                    start.target.clone(),
+                ),
+                Activity::Finished(finish) => {
+                    ("Tool".into(), finish.call_id.clone(), String::new())
+                }
             };
             tools.push(Tool {
                 key,
@@ -952,7 +985,7 @@ fn project_rows(
                     name,
                     call,
                     purpose: "".into(),
-                    target: String::new(),
+                    target,
                     phase: ToolPhase::Prepared,
                     content_start: 0,
                     continued: false,
@@ -1696,6 +1729,7 @@ mod tests {
             operation: "op".into(),
             call_id: "call-op".into(),
             name: "run_command".into(),
+            target: String::new(),
         }));
         let shown = project(
             std::slice::from_ref(&intent),
@@ -1815,6 +1849,7 @@ mod tests {
             operation: "unrelated".into(),
             call_id: "call".into(),
             name: "run_command".into(),
+            target: String::new(),
         }));
         let shown = project(&[outcome], &live, &BTreeSet::new(), true, false, |_| {
             String::new()
