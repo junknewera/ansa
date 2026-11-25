@@ -2225,11 +2225,12 @@ pub fn layout_workspace(
     {
         let mut line = String::new();
         let mut used = 0;
-        let chip_width = if notice.is_empty() {
-            inner_width
-        } else {
-            inner_width.saturating_sub(cells(notice).min(inner_width / 2) + 1)
-        };
+        if !notice.is_empty() {
+            let summary = clipped(notice, inner_width / 2);
+            used = cells(&summary) + 1;
+            line.push_str(&styled(&summary, MUTED, color));
+            line.push(' ');
+        }
         for (index, digest) in images.iter().enumerate() {
             let chip = if images.len() == 1 {
                 "[Image ×]".to_owned()
@@ -2237,7 +2238,7 @@ pub fn layout_workspace(
                 format!("[Image {} ×]", index + 1)
             };
             let end = used + cells(&chip);
-            if end > chip_width {
+            if end > inner_width {
                 break;
             }
             image_buttons.push(ImageButton {
@@ -2251,12 +2252,11 @@ pub fn layout_workspace(
             line.push(' ');
             used = end + 1;
         }
-        line.push_str(&styled(
-            &clipped(notice, inner_width.saturating_sub(used)),
-            MUTED,
-            color,
-        ));
-        line
+        if image_buttons.is_empty() {
+            styled(&clipped(notice, inner_width), MUTED, color)
+        } else {
+            line
+        }
     } else if notice.is_empty()
         && ui.focus == Focus::Chat
         && ui.popup.is_none()

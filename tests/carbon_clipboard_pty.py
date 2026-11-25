@@ -64,7 +64,9 @@ def main(adapter):
             assert 'BUFFER' not in screen.vt.line(-4), 'cancelled paste reappeared in the draft'
             text.unlink()
             screen.send(b'\x16')
-            until(screen, lambda text: label in text, 'Ctrl+V stages a PNG attachment')
+            until(screen, lambda text: label in text
+                  and screen.vt.line(-1).strip().startswith('Image attached (1)'),
+                  'Ctrl+V stages a PNG attachment and shows the confirmation')
             assert not any(row['kind'] == 'accepted' for row in records(root))
             click_text(screen, label)
             until(screen, lambda text: label not in text, 'click removes the attachment')
