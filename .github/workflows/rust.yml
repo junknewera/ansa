@@ -47,6 +47,7 @@ jobs:
       - name: Check pinned skill completion, attachments, and event hooks
         run: |
           python3 -B tests/carbon_skills_pty.py --binary rust/target/debug/ansa
+          python3 -B tests/carbon_clipboard_pty.py rust/target/debug/examples/frontend_adapter
           python3 -B -m unittest discover -s tests -p test_hooks.py
       - name: Find and read a large log tail through Carbon Plan
         run: python3 -B tests/carbon_search_pty.py --binary rust/target/debug/examples/frontend_adapter

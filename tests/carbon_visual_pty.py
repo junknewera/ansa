@@ -637,7 +637,7 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         paused.send('FAILED_TURN\r')
         until(paused, lambda text: 'terminal_item_count' in text and 'paused' in paused.vt.line(-2),
               'provider failure paused the request')
-        assert '/sessions' in paused.vt.line(-1) and 'Ctrl+C' in paused.vt.line(-1)
+        assert 'Continue' in paused.vt.line(-1) and 'Ctrl+C' in paused.vt.line(-1)
         paused.send('NEXT_TURN Ж\r')
         until(paused, lambda text: paused.vt.line(-4) == '  › NEXT_TURN Ж', 'paused draft preserved')
         assert sum(row['kind'] == 'accepted' for row in records(failed_root)) == 1
@@ -844,13 +844,13 @@ def retry_after_edit(binary, adapter, root, home, cwd, screens):
     marker.touch()
     screen = start(adapter, root, home, cwd, screens, 'retry', adapter=True)
     screen.send('EDIT_AND_REPLY\r')
-    until(screen, lambda _: 'http_transfer' in screen.vt.line(-1) and '/retry' in screen.vt.line(-1),
-          'interrupted reply offers a retry in chat')
-    until(screen, lambda text: 'Work paused' in text and '/retry to continue' in text,
-          'the main conversation explains the pause above the composer')
+    until(screen, lambda _: 'http_transfer' in screen.vt.line(-1),
+          'interrupted reply explains the transport failure')
+    until(screen, lambda text: 'Work paused' in text and '[Continue]' in text,
+          'the main conversation offers a Continue action below the cause')
     assert (cwd / 'edit-target.rs').read_text() == 'fn main() {\n    new();\n}\n'
     marker.unlink()
-    local(screen, '/retry')
+    click_text(screen, '[Continue]')
     until(screen, lambda text: completed(root, 'EDIT_AND_REPLY') and 'EDIT_DONE' in text,
           'retry delivers the reply after the saved edit')
     rows = records(root)

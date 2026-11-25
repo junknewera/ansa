@@ -50,10 +50,6 @@ const COMMANDS: &[Command] = &[
         description: "Open a saved conversation, or search with /sessions search QUERY",
     },
     Command {
-        name: "/retry",
-        description: "Continue the paused request in this chat",
-    },
-    Command {
         name: "/new",
         description: "Start a new conversation",
     },
@@ -97,18 +93,10 @@ const COMMANDS: &[Command] = &[
         name: "/orchestrate+",
         description: "Configure role models or give the lead a task",
     },
-    Command {
-        name: "/attach",
-        description: "Attach a screenshot/image, or use --text PATH for a UTF-8 file",
-    },
-    Command {
-        name: "/terminals",
-        description: "View activity and the agent shell",
-    },
 ];
 
-pub fn available(native_terminals: bool) -> &'static [Command] {
-    &COMMANDS[..COMMANDS.len() - usize::from(!native_terminals)]
+pub fn available() -> &'static [Command] {
+    COMMANDS
 }
 
 pub(super) fn autocompact_percent(argument: &str) -> Result<Option<u8>, &'static str> {
@@ -173,6 +161,9 @@ fn is_system_command(name: &str) -> bool {
                 | "/propose+"
                 | "/clarify"
                 | "/accept"
+                | "/retry"
+                | "/attach"
+                | "/terminals"
         )
 }
 
@@ -324,7 +315,7 @@ impl Completion {
             })
     }
     pub fn at(editor: &Editor) -> Option<Self> {
-        Self::at_with_commands(editor, available(false))
+        Self::at_with_commands(editor, available())
     }
 
     pub(crate) fn at_with_commands(editor: &Editor, commands: &[Command]) -> Option<Self> {
@@ -465,7 +456,7 @@ impl Completion {
     }
 }
 pub fn help(selected: usize) -> Popup {
-    help_with_commands(selected, available(false))
+    help_with_commands(selected, available())
 }
 
 pub(super) fn skills(items: &[SkillCommand]) -> Popup {
@@ -533,16 +524,14 @@ mod tests {
             label: "/route".into(),
             detail: "Choose a workflow".into(),
         }];
-        let completion = Completion::at_with_skills(&input, available(true), &skills).unwrap();
+        let completion = Completion::at_with_skills(&input, available(), &skills).unwrap();
         assert!(completion.apply(&mut input));
         assert_eq!(input.text().unwrap(), "Ж Проверь /route потом файл");
         assert_eq!(input.cursor, "Ж Проверь /route".len());
         let mut path = editor("Ж Проверь /route/file");
         path.cursor = "Ж Проверь /ro".len();
-        assert!(Completion::at_with_skills(&path, available(true), &skills).is_none());
-        assert!(
-            Completion::at_with_skills(&editor("/help /ro"), available(true), &skills).is_none()
-        );
+        assert!(Completion::at_with_skills(&path, available(), &skills).is_none());
+        assert!(Completion::at_with_skills(&editor("/help /ro"), available(), &skills).is_none());
     }
     #[test]
     fn exact_skill_wins_over_a_longer_prefix_without_shadowing_a_builtin() {
@@ -552,7 +541,7 @@ mod tests {
         };
         let input = editor("/mod");
         let skills = [skill];
-        let completion = Completion::at_with_skills(&input, available(true), &skills).unwrap();
+        let completion = Completion::at_with_skills(&input, available(), &skills).unwrap();
         assert!(completion.exact_command(&input));
         assert!(
             invoke_skills(&skills, "/mod preserve аргументы")
@@ -560,9 +549,7 @@ mod tests {
                 .contains("call read_skill with name `mod`")
         );
         assert!(invoke_skills(&skills, "/model /mod").is_none());
-        assert!(
-            Completion::at_with_skills(&editor("path/mod"), available(true), &skills).is_none()
-        );
+        assert!(Completion::at_with_skills(&editor("path/mod"), available(), &skills).is_none());
     }
 
     #[test]
@@ -581,7 +568,7 @@ mod tests {
         assert!(invoke_skills(&skills, "Запусти субагента: проверь /route").is_none());
         let draft = editor("Проверь /grill-me");
         assert!(
-            Completion::at_with_skills(&draft, available(true), &skills)
+            Completion::at_with_skills(&draft, available(), &skills)
                 .unwrap()
                 .exact_command(&draft)
         );
@@ -618,8 +605,18 @@ mod tests {
             assert_eq!(popup.items.len(), 1);
             assert_eq!(popup.items[0].label, *canonical);
         }
-        let input = editor("/term");
-        assert!(Completion::at(&input).is_none());
-        assert!(Completion::at_with_commands(&input, available(true)).is_some());
+    }
+
+    #[test]
+    fn contextual_commands_are_reserved_but_not_suggested() {
+        for (name, prefix) in [
+            ("/terminals", "/term"),
+            ("/retry", "/ret"),
+            ("/attach", "/att"),
+        ] {
+            assert!(is_system_command(name));
+            assert!(Completion::at(&editor(prefix)).is_none());
+            assert!(!help(0).items.iter().any(|item| item.label == name));
+        }
     }
 }

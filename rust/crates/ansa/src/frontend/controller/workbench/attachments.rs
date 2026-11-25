@@ -4,6 +4,8 @@ use crate::provider::contracts::image::MAX_ORIGINAL_IMAGE_BYTES;
 use crate::provider::contracts::{MAX_IMAGE_BYTES, MAX_IMAGES};
 use std::{fs::File, io::Read, path::Component};
 
+mod clipboard;
+
 const INLINE_TEXT_BYTES: usize = 8 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const USAGE: &str =
@@ -12,6 +14,7 @@ const USAGE: &str =
 pub(super) enum Attachment {
     Image(ImageInput),
     Text(TextAttachment),
+    ClipboardText(String),
 }
 
 fn parse_source(argument: &str) -> Option<(bool, &Path)> {
@@ -134,8 +137,19 @@ fn load_attachment(
 }
 
 impl Slot {
-    pub(super) fn attachment_loaded(&mut self, result: Result<Attachment>, io: &Io) {
+    pub(super) fn attachment_loaded(
+        &mut self,
+        result: Result<Attachment>,
+        from_clipboard: bool,
+        io: &Io,
+    ) {
         self.state.attachment_loading = false;
+        let anchor = from_clipboard
+            .then(|| self.state.editor.clipboard_anchor.take())
+            .flatten();
+        if from_clipboard && anchor.is_none() {
+            return;
+        }
         match result {
             Ok(Attachment::Text(text)) => {
                 let status = match &text {
@@ -149,6 +163,16 @@ impl Slot {
                 self.state.text_attachment = Some(text);
                 self.state.report(io, status);
             }
+            Ok(Attachment::ClipboardText(text)) => {
+                if self.state.editor.pasting()
+                    || !anchor.is_some_and(|at| self.state.editor.insert_clipboard_text(at, &text))
+                {
+                    self.state.report(io, "Clipboard text could not fit in the draft");
+                } else {
+                    self.state.input_history.edited(&self.state.editor);
+                    self.state.status.clear();
+                }
+            }
             Ok(Attachment::Image(image)) => {
                 let reduced = image.original_byte_len() > image.byte_len();
                 self.state.images.push(image);
@@ -161,6 +185,9 @@ impl Slot {
                 self.state
                     .report(io, &format!("Image attached ({count}){notice}"));
             }
+            Err("clipboard_unavailable") => self.state.report(io, "No clipboard image or text available"),
+            Err("clipboard_size") => self.state.report(io, "Clipboard exceeds the attachment or draft size limit"),
+            Err("clipboard_image_unavailable") => self.state.report(io, "Images require a free attachment slot and an idle conversation with vision support"),
             Err("protected_file") => self.state.report(io, "Protected files cannot be attached"),
             Err("attachment_outside_workspace" | "attachment_path") => self.state.report(
                 io,
@@ -191,6 +218,47 @@ impl Slot {
 }
 
 impl Workbench {
+    pub(super) fn paste_clipboard(&mut self, io: &Io) {
+        let slot = &self.slots[self.current];
+        if slot.state.attachment_loading || slot.state.attachment_submission.is_some() {
+            self.report(io, "Wait for the attachment or submission");
+            return;
+        }
+        if !self.can_job(io) {
+            return;
+        }
+        let slot = &mut self.slots[self.current];
+        let images_allowed = !self.factory.offline
+            && matches!(slot.kind, Kind::Main | Kind::Fork | Kind::Btw)
+            && self.orchestration_mode.is_none()
+            && self.orchestration_stop.is_none()
+            && self.refinement.is_none()
+            && slot.state.available()
+            && slot.state.images.len() < MAX_IMAGES;
+        let remaining = MAX_IMAGE_BYTES
+            - slot
+                .state
+                .images
+                .iter()
+                .map(ImageInput::byte_len)
+                .sum::<usize>();
+        let original_remaining = MAX_ORIGINAL_IMAGE_BYTES
+            - slot
+                .state
+                .images
+                .iter()
+                .map(ImageInput::original_byte_len)
+                .sum::<usize>();
+        let owner = slot.handle.incarnation().clone();
+        slot.state.editor.clipboard_anchor = Some(slot.state.editor.cursor);
+        slot.state.attachment_loading = true;
+        self.jobs.spawn_blocking(move || Job::Attachment {
+            owner,
+            from_clipboard: true,
+            result: clipboard::load(images_allowed, remaining, original_remaining),
+        });
+    }
+
     pub(super) fn attach(&mut self, argument: &str, io: &Io) -> bool {
         let slot = &mut self.slots[self.current];
         if slot.state.attachment_loading || slot.state.attachment_submission.is_some() {
@@ -276,7 +344,11 @@ impl Workbench {
                         original_remaining,
                     )
                 });
-            Job::Attachment { owner, result }
+            Job::Attachment {
+                owner,
+                result,
+                from_clipboard: false,
+            }
         });
         true
     }

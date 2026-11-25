@@ -48,6 +48,9 @@ pub struct Editor {
     pub cursor: usize,
     escape: Vec<u8>,
     paste: bool,
+    paste_start: usize,
+    pub(super) pasted_ranges: Vec<std::ops::Range<usize>>,
+    pub(super) clipboard_anchor: Option<usize>,
     paste_end: Vec<u8>,
     paste_cr: bool,
     pub overflow: bool,
@@ -75,6 +78,7 @@ impl Editor {
         {
             return false;
         }
+        self.adjust_pasted_ranges(begin, end, value.len());
         self.bytes.splice(begin..end, value.iter().copied());
         self.cursor = begin + value.len();
         true
@@ -85,6 +89,9 @@ impl Editor {
         self.overflow = false;
         self.escape.clear();
         self.paste = false;
+        self.paste_start = 0;
+        self.pasted_ranges.clear();
+        self.clipboard_anchor = None;
         self.paste_end.clear();
         self.paste_cr = false;
         self.complete_right = false;
@@ -105,9 +112,93 @@ impl Editor {
     pub fn pasting(&self) -> bool {
         self.paste
     }
+    fn adjust_pasted_ranges(&mut self, begin: usize, end: usize, replacement: usize) {
+        if let Some(anchor) = &mut self.clipboard_anchor
+            && begin < *anchor
+        {
+            *anchor = begin + replacement + anchor.saturating_sub(end);
+        }
+        let first = self.pasted_ranges.partition_point(|r| r.end <= begin);
+        let after = first + self.pasted_ranges[first..].partition_point(|r| r.start < end);
+        self.pasted_ranges.drain(first..after);
+        for range in &mut self.pasted_ranges[first..] {
+            range.start = range.start - (end - begin) + replacement;
+            range.end = range.end - (end - begin) + replacement;
+        }
+    }
+    fn erase(&mut self, begin: usize, end: usize) {
+        if begin != end {
+            self.adjust_pasted_ranges(begin, end, 0);
+            self.bytes.drain(begin..end);
+        }
+    }
+    fn mark_paste(&mut self, start: usize) {
+        let end = self.cursor;
+        if !self.overflow
+            && let Some(text) = self
+                .bytes
+                .get(start..end)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            && (text.chars().nth(1_000).is_some()
+                || text.bytes().filter(|&b| b == b'\n').nth(9).is_some())
+        {
+            let index = self.pasted_ranges.partition_point(|r| r.start < start);
+            self.pasted_ranges.insert(index, start..end);
+        }
+    }
+    pub(super) fn insert_clipboard_text(&mut self, start: usize, text: &str) -> bool {
+        let clean: String = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|&ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+            .collect();
+        let cursor = self.cursor;
+        if !self.replace(start, start, clean.as_bytes()) {
+            return false;
+        }
+        self.mark_paste(start);
+        self.cursor = if cursor < start {
+            cursor
+        } else {
+            cursor + clean.len()
+        };
+        true
+    }
+    /// Only presentation changes. Moving inside a paste reveals it for editing.
+    pub(super) fn composer_view(&self) -> (std::borrow::Cow<'_, [u8]>, usize) {
+        if self.pasted_ranges.is_empty() {
+            return (std::borrow::Cow::Borrowed(&self.bytes), self.cursor);
+        }
+        let mut display = Vec::new();
+        let mut cursor = self.cursor;
+        let mut after = 0;
+        for range in &self.pasted_ranges {
+            if range.start < self.cursor && self.cursor < range.end {
+                continue;
+            }
+            let Some(text) = self
+                .bytes
+                .get(range.clone())
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            else {
+                continue;
+            };
+            display.extend_from_slice(&self.bytes[after..range.start]);
+            let marker = format!("[pasted text · {} chars]", text.chars().count());
+            display.extend_from_slice(marker.as_bytes());
+            if range.end <= self.cursor {
+                cursor = cursor - range.len() + marker.len();
+            }
+            after = range.end;
+        }
+        display.extend_from_slice(&self.bytes[after..]);
+        (std::borrow::Cow::Owned(display), cursor)
+    }
     fn insert(&mut self, ch: u8) {
         if !self.overflow && self.bytes.len() < MAX_COMPOSER_BYTES {
             self.cursor = self.cursor.min(self.bytes.len());
+            self.adjust_pasted_ranges(self.cursor, self.cursor, 1);
             self.bytes.insert(self.cursor, ch);
             self.cursor += 1;
         } else {
@@ -143,13 +234,13 @@ impl Editor {
     fn backspace(&mut self) {
         if !self.overflow && self.cursor > 0 {
             let previous = self.previous(self.cursor);
-            self.bytes.drain(previous..self.cursor);
+            self.erase(previous, self.cursor);
             self.cursor = previous;
         }
     }
     fn delete(&mut self) {
         if !self.overflow && self.cursor < self.bytes.len() {
-            self.bytes.drain(self.cursor..self.next(self.cursor));
+            self.erase(self.cursor, self.next(self.cursor));
         }
     }
     fn word_left(&self) -> usize {
@@ -192,6 +283,7 @@ impl Editor {
             self.paste = false;
             self.paste_end.clear();
             self.paste_cr = false;
+            self.mark_paste(self.paste_start);
             return;
         }
         while !PASTE_END.starts_with(&self.paste_end) {
@@ -252,6 +344,7 @@ impl Editor {
             }
             b"\x1b[200~" => {
                 self.paste = true;
+                self.paste_start = self.cursor;
                 None
             }
             value if value.starts_with(b"\x1b[<") => parse_mouse(value).map(Action::Mouse),
@@ -282,7 +375,7 @@ impl Editor {
                     b'f' => self.cursor = self.word_right(),
                     8 | 127 if !self.overflow => {
                         let begin = self.word_left();
-                        self.bytes.drain(begin..self.cursor);
+                        self.erase(begin, self.cursor);
                         self.cursor = begin;
                     }
                     0xc2..=0xdf => self.alt_utf8 = 1,
@@ -318,16 +411,16 @@ impl Editor {
                 1 => self.cursor = self.line_start(),
                 5 => self.cursor = self.line_end(),
                 11 if !self.overflow => {
-                    self.bytes.drain(self.cursor..self.line_end());
+                    self.erase(self.cursor, self.line_end());
                 }
                 21 if !self.overflow => {
                     let begin = self.line_start();
-                    self.bytes.drain(begin..self.cursor);
+                    self.erase(begin, self.cursor);
                     self.cursor = begin;
                 }
                 23 if !self.overflow => {
                     let begin = self.word_left();
-                    self.bytes.drain(begin..self.cursor);
+                    self.erase(begin, self.cursor);
                     self.cursor = begin;
                 }
                 127 | 8 => self.backspace(),
@@ -366,4 +459,52 @@ fn parse_mouse(bytes: &[u8]) -> Option<MouseEvent> {
         _ => return None,
     };
     Some(MouseEvent { column, row, kind })
+}
+
+#[cfg(test)]
+mod paste_display_tests {
+    use super::*;
+
+    #[test]
+    fn long_bracketed_paste_projects_in_place_without_replacing_the_text() {
+        let mut editor = Editor::default();
+        assert!(editor.replace(0, 0, b"leftright"));
+        editor.cursor = 4;
+        let text = "я".repeat(1001);
+        for byte in format!("\x1b[200~{text}\x1b[201~").bytes() {
+            assert!(editor.feed(byte, true).is_none());
+        }
+        let (display, cursor) = editor.composer_view();
+        let prefix = "left[pasted text · 1001 chars]";
+        assert_eq!(display.as_ref(), format!("{prefix}right").as_bytes());
+        assert_eq!(cursor, prefix.len());
+        assert_eq!(editor.text().unwrap(), format!("left{text}right"));
+        assert_eq!(editor.feed(b'\r', true), Some(Action::Submit));
+        assert!(editor.replace(0, 4, b">"));
+        assert_eq!(
+            editor.composer_view().0.as_ref(),
+            format!(">{}right", &prefix[4..]).as_bytes()
+        );
+        assert!(editor.replace(1, 3, b"x"));
+        assert_eq!(editor.composer_view().0.as_ref(), editor.bytes);
+    }
+
+    #[test]
+    fn clipboard_text_uses_character_and_line_thresholds() {
+        let mut editor = Editor::default();
+        assert!(editor.insert_clipboard_text(editor.cursor, &"я".repeat(1000)));
+        assert!(editor.pasted_ranges.is_empty());
+        editor.clear();
+        let ten = ["a"; 10].join("\r\n");
+        assert!(editor.insert_clipboard_text(editor.cursor, &ten));
+        assert!(editor.pasted_ranges.is_empty());
+        editor.clear();
+        let eleven = ["a"; 11].join("\r\n");
+        assert!(editor.insert_clipboard_text(editor.cursor, &eleven));
+        assert_eq!(
+            editor.composer_view().0.as_ref(),
+            "[pasted text · 21 chars]".as_bytes()
+        );
+        assert_eq!(editor.text().unwrap(), ["a"; 11].join("\n"));
+    }
 }

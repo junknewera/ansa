@@ -893,9 +893,11 @@ def native_terminal_panel(screen, root, cwd):
     local(started_from_home, "/exit")
     started_from_home.result = started_from_home.finish()
     assert started_from_home.result["exit"] == 0 and started_from_home.result["termios_restored"]
-    screen.send("/term")
-    until(screen, lambda frame: "/terminals" in body(screen), "native terminal command completion")
-    screen.send(b"\t\r")
+    local(screen, "/agents")
+    until(screen, lambda frame: agents_open(screen) and "Agents  Activity  Shell" in frame,
+          "Agents exposes the terminal tabs")
+    row = next(row for row in range(screen.vt.rows) if "Agents  Activity  Shell" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index("Activity"), row)
     until(screen, lambda _: activity_open(screen), "Activity works before the agent has opened a shell")
     row = next(row for row in range(screen.vt.rows) if "Agents  Activity  Shell" in screen.vt.line(row))
     click(screen, screen.vt.line(row).index("Shell"), row)
@@ -1075,8 +1077,8 @@ def completion_and_help(screen, root, cwd):
                     if (match := re.match(r"^[\s─]*│(?:› |  )(/[a-z]+\+?)\s+(.*?)\s*│", screen.vt.line(row)))]
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
-                "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact", "/retry",
-                "/orchestrate", "/orchestrate+", "/skills", "/terminals", "/attach"}
+                "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
+                "/orchestrate", "/orchestrate+", "/skills"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"

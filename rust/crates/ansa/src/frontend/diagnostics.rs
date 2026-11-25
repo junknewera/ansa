@@ -195,7 +195,7 @@ pub(crate) fn pause_notice(view: &Snapshot, workspace: bool) -> String {
     }
     if view.recovery_operation.is_some() {
         if workspace && view.state == "paused" {
-            return "Paused · Tool outcome is unknown · /terminals for details · effect_unknown"
+            return "Paused · Tool outcome is unknown · /agents for details · effect_unknown"
                 .into();
         }
         return "effect_unknown: Tool outcome is unknown".into();
@@ -205,13 +205,7 @@ pub(crate) fn pause_notice(view: &Snapshot, workspace: bool) -> String {
     }
     let code = safe_code(&view.diagnostic);
     if view.resume_available && view.request.is_some() {
-        let command = match (workspace, code) {
-            (false, _) => "/resume",
-            (true, "http_connect" | "http_handshake" | "http_transfer" | "http_timeout") => {
-                "/retry"
-            }
-            (true, _) => "/sessions",
-        };
+        let command = if workspace { "Continue" } else { "/resume" };
         if code == "siwc_structured_format_unconfirmed" {
             format!("{} · {command} · Ctrl+C · {code}", explanation(code))
         } else {

@@ -121,7 +121,7 @@ impl Workbench {
         if accepted {
             self.selection = None;
             let slot = &mut self.slots[origin];
-            if let Some((id, _, _)) = &slot.state.pending_draft
+            if let Some((id, _)) = &slot.state.pending_draft
                 && slot.state.pending.as_ref() == Some(id)
             {
                 slot.follow_accepted_submit = Some(id.clone());
