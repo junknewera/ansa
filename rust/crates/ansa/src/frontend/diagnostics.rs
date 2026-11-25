@@ -174,6 +174,7 @@ fn explanation(code: &str) -> &'static str {
         "followup_frame_limit" => {
             "Clarifications exceed the request frame and were kept in history"
         }
+        "message_target_changed" => "The target turn changed. Your draft is still here",
         "session_interrupted" => "Restored an unfinished request after restart",
         "opaque_conflict" => "An encrypted response item changed while streaming",
         "terminal_item_count" => "Response items do not match",

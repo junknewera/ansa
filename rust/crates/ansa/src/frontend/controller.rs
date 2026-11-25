@@ -401,8 +401,18 @@ impl State {
     fn available(&self) -> bool {
         !self.awaiting()
             && self.snapshot.as_ref().is_some_and(|v| {
-                !v.worker_busy && matches!(v.state.as_str(), "idle" | "completed" | "cancelled")
+                !v.worker_busy
+                    && v.recovery_operation.is_none()
+                    && matches!(v.state.as_str(), "idle" | "completed" | "cancelled")
             })
+    }
+    fn followup_target(&self) -> Option<&RequestId> {
+        let view = self.snapshot.as_ref()?;
+        match view.state.as_str() {
+            "idle" | "completed" => None,
+            "cancelled" if view.recovery_operation.is_none() => None,
+            _ => view.request.as_ref(),
+        }
     }
     fn start_copy(&mut self, io: &Io) {
         let result = if io.raw.is_some() {
@@ -598,14 +608,12 @@ impl State {
         io: &Io,
         replies: &mut Replies,
     ) -> (bool, bool) {
-        if let Some(view) = self.snapshot.as_ref().filter(|v| v.state == "paused") {
-            let message = format!("ansa: {}\n", diagnostics::pause(view));
-            if io.raw.is_none() {
-                self.report(io, &message);
-                self.exit = 1;
-            } else {
-                self.status.clear();
-            }
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|view| view.storage_failed)
+        {
+            self.report(io, "Session storage is read-only · draft kept");
             return (false, false);
         }
         if self.attachment_loading || self.attachment_submission.is_some() {
@@ -617,18 +625,7 @@ impl State {
                 self.report(io, "Wait for the current turn before sending attachments");
                 return (false, false);
             }
-            if let Some(target) = self
-                .snapshot
-                .as_ref()
-                .filter(|v| {
-                    !v.storage_failed
-                        && !matches!(
-                            v.state.as_str(),
-                            "paused" | "cancelled" | "completed" | "idle"
-                        )
-                })
-                .and_then(|v| v.request.clone())
-            {
+            if let Some(target) = self.followup_target().cloned() {
                 let id = CommandId(format!("c_{}_{}", self.prefix, self.sequence + 1));
                 let posted = self.post(
                     handle,
