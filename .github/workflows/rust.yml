@@ -91,6 +91,7 @@ jobs:
             --case file-mentions \
             --case session-agent-titles-restart \
             --case active-plan-clarification \
+            --case orchestration-candidate \
             --case orchestration-review-resume \
             --case orchestration-review-resume-multiple \
             --output "${RUNNER_TEMP}/carbon-agent-navigation"

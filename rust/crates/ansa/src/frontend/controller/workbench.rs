@@ -677,6 +677,7 @@ struct CreateIntent {
 enum OrchestrationMode {
     Standard,
     Plus,
+    Review,
 }
 
 struct PlanningContext {
@@ -712,6 +713,11 @@ enum SummaryDispatch {
     Ready(Instant),
     SelectingGeneration,
     Sending,
+}
+
+enum ClarificationDraft {
+    Composer(String),
+    Popup(Vec<u8>),
 }
 
 enum Job {
@@ -768,7 +774,7 @@ enum Job {
     },
     ClarificationSaved {
         owner: String,
-        draft: String,
+        draft: ClarificationDraft,
         result: Result<()>,
     },
     OrchestrationReceipt {
@@ -917,9 +923,13 @@ enum Menu {
         values: Vec<Option<String>>,
         selected: usize,
     },
-    Help {
-        selected: usize,
-        entries: &'static [commands::Command],
+    CommandPicker(Popup),
+    Clarify {
+        run: String,
+    },
+    ConfirmChecks {
+        run: String,
+        commit: String,
     },
 }
 enum PaletteStage {
@@ -1311,8 +1321,15 @@ impl Workbench {
         self.exit_deadline.take().is_some()
     }
     fn interrupt(&mut self, io: &Io, now: Instant) -> bool {
-        if matches!(self.menu, Some(Menu::DraftingPlan | Menu::Roles(_)))
-            || matches!(&self.menu, Some(Menu::Loading(title)) if matches!(title.as_str(), "Orchestrate+ role models" | "ChatGPT sign-in"))
+        if matches!(
+            self.menu,
+            Some(
+                Menu::DraftingPlan
+                    | Menu::Roles(_)
+                    | Menu::Clarify { .. }
+                    | Menu::ConfirmChecks { .. }
+            )
+        ) || matches!(&self.menu, Some(Menu::Loading(title)) if matches!(title.as_str(), "Orchestrate+ role models" | "ChatGPT sign-in"))
         {
             self.disarm_exit();
             self.escape(io);
@@ -2012,6 +2029,7 @@ impl Workbench {
                 self.set_theme(original.clone());
                 self.navigation_editor.clear();
             }
+            Some(Menu::Clarify { .. }) => self.navigation_editor.clear(),
             _ => {}
         }
         self.modal_token = self.modal_token.wrapping_add(1);
@@ -2363,20 +2381,30 @@ impl Workbench {
             self.report(io, "Mode can change after the current request finishes");
             return;
         }
-        self.orchestration_mode = None;
+        let review = self.orchestration_mode == Some(OrchestrationMode::Review);
+        let can_orchestrate = self.factory.orchestration_route().is_ok();
+        self.orchestration_mode = (slot.state.mode == AgentMode::LeadPlus && can_orchestrate)
+            .then_some(OrchestrationMode::Review);
         self.refinement = None;
         slot.state.mode = match slot.state.mode {
+            _ if review => AgentMode::Basic,
             AgentMode::Basic | AgentMode::OrchestrationChat => AgentMode::Plan,
-            AgentMode::Plan if self.factory.orchestration_route().is_ok() => AgentMode::Lead,
+            AgentMode::Plan if can_orchestrate => AgentMode::Lead,
             AgentMode::Lead => AgentMode::LeadPlus,
             AgentMode::Plan | AgentMode::LeadPlus => AgentMode::Basic,
         };
         slot.state.mode_ready = true;
-        self.factory.set_editor_mode(slot.state.mode);
+        self.factory
+            .set_editor_mode(if self.orchestration_mode.is_some() {
+                AgentMode::Plan
+            } else {
+                slot.state.mode
+            });
         let mode = match slot.state.mode {
             AgentMode::Lead => "Orchestrate",
             AgentMode::LeadPlus => "Orchestrate+",
             AgentMode::Plan => "Planning",
+            _ if self.orchestration_mode.is_some() => "Review plan",
             _ => "Work",
         };
         self.report(io, mode);
@@ -2456,9 +2484,13 @@ impl Workbench {
         if !self.can_job(io) {
             return false;
         }
-        let profile = if self.orchestration_mode == Some(OrchestrationMode::Plus) {
+        let profile = if matches!(
+            self.orchestration_mode,
+            Some(OrchestrationMode::Plus | OrchestrationMode::Review)
+        ) {
             match self.factory.role_profile() {
                 Ok(Some(profile)) => Some(profile),
+                Ok(None) if self.orchestration_mode == Some(OrchestrationMode::Review) => None,
                 Ok(None) => {
                     if self.open_role_picker(io) {
                         self.plan_after_roles = Some((text.into(), skill, repair));
@@ -2846,9 +2878,13 @@ impl Workbench {
         changed
     }
 
-    fn clarify_orchestration(&mut self, draft: &str, text: &str, io: &Io) {
-        if text.is_empty() || !self.collecting_orchestration() {
-            self.report(io, "Use /clarify TEXT during an approved plan");
+    fn clarify_orchestration(&mut self, draft: ClarificationDraft, text: &str, io: &Io) {
+        if text.is_empty() {
+            self.report(io, "Enter a clarification");
+            return;
+        }
+        if !self.collecting_orchestration() {
+            self.report(io, "The plan is no longer running");
             return;
         }
         if self.clarification_pending || !self.can_job(io) {
@@ -2872,7 +2908,6 @@ impl Workbench {
         }
         self.clarification_pending = true;
         let owner = self.slots[self.current].id.clone();
-        let draft = draft.to_owned();
         self.jobs.spawn(async move {
             Job::ClarificationSaved {
                 owner,
@@ -2882,6 +2917,38 @@ impl Workbench {
                     .unwrap_or(Err("orchestration_clarification_closed")),
             }
         });
+    }
+
+    fn accept_checks(&mut self, run: String, commit: String, io: &Io) -> bool {
+        let slot = &self.slots[self.current];
+        if !matches!(slot.kind, Kind::Main | Kind::Fork) || slot.state.mode == AgentMode::Plan {
+            self.report(
+                io,
+                "Open the original conversation in Work mode to accept the candidate",
+            );
+            return false;
+        }
+        if slot.active() || self.orchestration_stop.is_some() {
+            self.report(io, "Wait for the current task to finish");
+            return false;
+        }
+        if !self.can_job(io) {
+            return false;
+        }
+        self.cancel_modal();
+        let owner = self.slots[self.current].id.clone();
+        let token = self.modal_token;
+        let stop = Cancel::linked(&self.stop);
+        self.modal_stop = Some(stop.clone());
+        self.menu = Some(Menu::Loading("Confirming manual checks".into()));
+        let factory = self.factory.clone();
+        self.jobs.spawn_blocking(move || Job::ManualAccepted {
+            result: orchestration::accept_manual_checks(&factory, &owner, &run, &commit, &stop),
+            owner,
+            token,
+            run,
+        });
+        true
     }
 
     fn lead_message(&mut self, text: &str, mode: AgentMode, io: &Io) -> (bool, bool) {
@@ -2981,7 +3048,7 @@ impl Workbench {
                 (false, false)
             }
             "/clarify" => {
-                self.clarify_orchestration(text, argument, io);
+                self.clarify_orchestration(ClarificationDraft::Composer(text.into()), argument, io);
                 (false, false)
             }
             "/cancel"
@@ -2997,49 +3064,10 @@ impl Workbench {
                 let mut words = argument.split_whitespace();
                 let (Some(run), Some(commit), None) = (words.next(), words.next(), words.next())
                 else {
-                    self.report(
-                        io,
-                        "Use /accept RUN COMMIT after completing the manual checks",
-                    );
+                    self.report(io, "Open Activity to confirm checks on the candidate");
                     return (false, false);
                 };
-                let slot = &self.slots[self.current];
-                if !matches!(slot.kind, Kind::Main | Kind::Fork)
-                    || slot.state.mode == AgentMode::Plan
-                {
-                    self.report(
-                        io,
-                        "Open the original conversation in Work mode to accept the candidate",
-                    );
-                    return (false, false);
-                }
-                if self.slots[self.current].active()
-                    || self.orchestration_stop.is_some()
-                    || !self.can_job(io)
-                {
-                    self.report(io, "Wait for the current task to finish");
-                    return (false, false);
-                }
-                self.cancel_modal();
-                let owner = self.slots[self.current].id.clone();
-                let token = self.modal_token;
-                let run = run.to_owned();
-                let commit = commit.to_owned();
-                let stop = Cancel::linked(&self.stop);
-                self.modal_stop = Some(stop.clone());
-                self.menu = Some(Menu::Loading("Confirming manual checks".into()));
-                let factory = self.factory.clone();
-                self.jobs.spawn_blocking(move || {
-                    let result =
-                        orchestration::accept_manual_checks(&factory, &owner, &run, &commit, &stop);
-                    Job::ManualAccepted {
-                        owner,
-                        token,
-                        run,
-                        result,
-                    }
-                });
-                (true, false)
+                (self.accept_checks(run.into(), commit.into(), io), false)
             }
             "/login" if argument.is_empty() => (self.open_login(io), false),
             "/login" => {
@@ -3236,10 +3264,16 @@ impl Workbench {
                 )
             }
             "/help" | "/" | "?" => {
-                self.menu = Some(Menu::Help {
-                    selected: 0,
-                    entries: self.available_commands(),
-                });
+                self.menu = Some(Menu::CommandPicker(commands::help_with_commands(
+                    0,
+                    self.available_commands(),
+                )));
+                (true, false)
+            }
+            "/skills" => {
+                self.menu = Some(Menu::CommandPicker(commands::skills(
+                    &self.slots[self.current].skill_commands,
+                )));
                 (true, false)
             }
             "/basic" if self.slots[self.current].kind == Kind::Btw => {
@@ -3247,6 +3281,23 @@ impl Workbench {
                 (true, false)
             }
             _ => {
+                if (self.orchestration_mode.is_some() || self.refinement.is_some())
+                    && !text.trim().is_empty()
+                    && !(argument.is_empty()
+                        && matches!(
+                            command,
+                            "/basic"
+                                | "/plan"
+                                | "/status"
+                                | "/copy"
+                                | "/cancel"
+                                | "/exit"
+                                | "/quit"
+                                | "/autocompact"
+                        ))
+                {
+                    return (self.start_orchestration_plan(text, None, false, io), false);
+                }
                 if !text.starts_with('/')
                     && self
                         .orchestration_stop
@@ -3280,7 +3331,7 @@ impl Workbench {
                 } else if argument.is_empty()
                     && matches!(
                         command,
-                        "/basic" | "/plan" | "/status" | "/copy" | "/cancel" | "/exit"
+                        "/basic" | "/plan" | "/status" | "/copy" | "/cancel" | "/exit" | "/quit"
                     )
                 {
                     command
@@ -3817,13 +3868,15 @@ impl Workbench {
                     slot.attachment_loaded(result, io);
                 }
             }
-            Job::ManualAccepted { run, result, .. } => {
+            Job::ManualAccepted {
+                owner, run, result, ..
+            } => {
                 self.menu = None;
                 self.modal_stop = None;
                 match result {
                     Ok(candidate) => {
                         self.slots[self.current]
-                            .remember_candidate(ux::CandidateView::new(run, candidate));
+                            .remember_candidate(ux::CandidateView::new(owner, run, candidate));
                         self.report(io, "Manual checks recorded · ansa-result is ready");
                     }
                     Err(code) => {
@@ -3896,7 +3949,11 @@ impl Workbench {
                             );
                             match archive.candidate {
                                 Ok(Some(candidate)) => {
-                                    let view = ux::CandidateView::new(archive.run, candidate);
+                                    let view = ux::CandidateView::new(
+                                        archive.owner,
+                                        archive.run,
+                                        candidate,
+                                    );
                                     self.slots[self.current].remember_candidate(view);
                                     self.review_redraw = true;
                                 }
@@ -3944,7 +4001,7 @@ impl Workbench {
                         let blocked = proposal.plan.execution_ready().err();
                         if blocked == Some("orchestration_implementation_required")
                             && !proposal.read_only
-                            && self.orchestration_mode == Some(OrchestrationMode::Plus)
+                            && proposal.profile.is_some()
                             && !proposal.seed.source_turn().0.starts_with("draft-revise-")
                         {
                             self.refinement = None;
@@ -4023,10 +4080,19 @@ impl Workbench {
                 result,
             } => {
                 self.clarification_pending = false;
+                if result.is_ok()
+                    && self.slots[self.current].id == owner
+                    && matches!(self.menu, Some(Menu::Clarify { .. }))
+                    && matches!(&draft, ClarificationDraft::Popup(bytes) if &self.navigation_editor.bytes == bytes)
+                {
+                    self.navigation_editor.clear();
+                    self.menu = None;
+                }
                 if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == owner) {
                     match result {
                         Ok(()) => {
-                            if slot.state.editor.bytes == draft.as_bytes() {
+                            if matches!(&draft, ClarificationDraft::Composer(text) if slot.state.editor.bytes == text.as_bytes())
+                            {
                                 slot.state.editor.clear();
                                 slot.state.input_history.reset();
                             }
@@ -4066,7 +4132,7 @@ impl Workbench {
                 match result {
                     Ok(completed) => {
                         if let Some(candidate) = completed.candidate {
-                            let review = ux::CandidateView::new(completed.id.clone(), candidate);
+                            let review = ux::CandidateView::new(owner.clone(), completed.id.clone(), candidate);
                             parent.remember_candidate(review);
                         }
                         if self.input_closed || cancelled || parent.closed || parent.closing {
@@ -4887,7 +4953,12 @@ impl Workbench {
                 delta(selected, theme::MATUGEN_SCHEMES.len());
             }
             Some(Menu::Palette { .. }) => {}
-            Some(Menu::Loading(_) | Menu::DraftingPlan) => {}
+            Some(
+                Menu::Loading(_)
+                | Menu::DraftingPlan
+                | Menu::Clarify { .. }
+                | Menu::ConfirmChecks { .. },
+            ) => {}
             Some(Menu::Sessions {
                 entries,
                 selected,
@@ -4909,7 +4980,7 @@ impl Workbench {
             Some(Menu::Efforts {
                 values, selected, ..
             }) => delta(selected, values.len()),
-            Some(Menu::Help { selected, entries }) => delta(selected, entries.len()),
+            Some(Menu::CommandPicker(picker)) => delta(&mut picker.selected, picker.items.len()),
             None if self.focus == Focus::Inspector => match &mut self.panel {
                 Some(Panel::EditDiff { rows, offset, .. }) => delta(offset, rows.len()),
                 Some(Panel::Files(files)) if files.document.is_none() => delta(
@@ -5094,13 +5165,57 @@ impl Workbench {
                         self.apply_generation(model, effort.clone(), io);
                     }
                 }
-                Menu::Help { selected, entries } => {
-                    if let Some(command) = entries.get(selected) {
+                Menu::CommandPicker(picker) => {
+                    if let Some(choice) = picker.items.get(picker.selected) {
                         let slot = &mut self.slots[self.current];
                         let end = slot.state.editor.bytes.len();
-                        slot.state.editor.replace(0, end, command.name.as_bytes());
+                        slot.state.editor.replace(0, end, choice.label.as_bytes());
                         self.completion_closed =
                             Some((slot.state.editor.bytes.clone(), slot.state.editor.cursor));
+                    }
+                }
+                Menu::Clarify { run } => {
+                    let owner = &self.slots[self.current].id;
+                    if !self.collecting_orchestration()
+                        || self
+                            .orchestration_views
+                            .get(owner)
+                            .is_none_or(|view| view.id != run)
+                    {
+                        self.navigation_editor.clear();
+                        self.report(io, "The plan is no longer running");
+                    } else {
+                        self.menu = Some(Menu::Clarify { run });
+                        match self
+                            .navigation_editor
+                            .text()
+                            .map(str::trim)
+                            .map(str::to_owned)
+                        {
+                            Ok(text) if !self.navigation_editor.overflow => {
+                                let draft =
+                                    ClarificationDraft::Popup(self.navigation_editor.bytes.clone());
+                                self.clarify_orchestration(draft, &text, io);
+                            }
+                            _ => self.report(io, "Invalid clarification text"),
+                        }
+                    }
+                }
+                Menu::ConfirmChecks { run, commit } => {
+                    // Carbon reserves one workspace column and six popup
+                    // columns. The full commit must be visible.
+                    let fits = io.size.1 >= 8 && io.size.0.saturating_sub(7) >= commit.len();
+                    if fits
+                        && self
+                            .operational_frame
+                            .is_some_and(|frame| io.writer.displayed(frame))
+                    {
+                        self.accept_checks(run, commit, io);
+                    } else {
+                        if !fits {
+                            self.report(io, "Enlarge the terminal to review the full commit");
+                        }
+                        self.menu = Some(Menu::ConfirmChecks { run, commit });
                     }
                 }
             }
@@ -5153,8 +5268,13 @@ impl Workbench {
         }
     }
     fn mouse(&mut self, mouse: MouseEvent, io: &Io) {
-        if matches!(&self.menu, Some(Menu::Themes(_) | Menu::Palette { .. }))
-            || matches!(&self.menu, Some(Menu::Loading(title)) if title == "/theme")
+        if matches!(self.menu, Some(Menu::ConfirmChecks { .. })) {
+            return;
+        }
+        if matches!(
+            &self.menu,
+            Some(Menu::Themes(_) | Menu::Palette { .. } | Menu::CommandPicker(_))
+        ) || matches!(&self.menu, Some(Menu::Loading(title)) if title == "/theme")
         {
             if matches!(mouse.kind, MouseKind::WheelUp | MouseKind::WheelDown) {
                 self.navigate(mouse.kind == MouseKind::WheelUp);
@@ -5687,7 +5807,39 @@ impl Workbench {
                 }
                 .into(),
             },
-            Menu::Help { selected, entries } => commands::help_with_commands(*selected, entries),
+            Menu::CommandPicker(picker) => picker.clone(),
+            Menu::Clarify { .. } => Popup {
+                title: "Clarify plan".into(),
+                subtitle: if self.clarification_pending {
+                    "Saving…"
+                } else {
+                    "Send an instruction for the remaining steps"
+                }
+                .into(),
+                items: vec![Choice {
+                    label: self
+                        .navigation_editor
+                        .text()
+                        .unwrap_or_default()
+                        .lines()
+                        .last()
+                        .unwrap_or_default()
+                        .into(),
+                    detail: String::new(),
+                }],
+                footer: "Enter send · Esc cancel".into(),
+                ..Popup::default()
+            },
+            Menu::ConfirmChecks { commit, .. } => Popup {
+                title: "Confirm manual checks".into(),
+                subtitle: commit.clone(),
+                items: vec![Choice {
+                    label: "Confirm checks".into(),
+                    detail: String::new(),
+                }],
+                footer: "Enter confirm · Esc cancel".into(),
+                ..Popup::default()
+            },
         })
     }
     fn inspector(&self) -> Option<Inspector> {
@@ -6074,6 +6226,7 @@ impl Workbench {
             activity: match self.orchestration_mode {
                 Some(OrchestrationMode::Standard) => "Orchestrate".into(),
                 Some(OrchestrationMode::Plus) => "Orchestrate+".into(),
+                Some(OrchestrationMode::Review) => "Review plan".into(),
                 None if slot.state.mode == AgentMode::Lead => "Orchestrate".into(),
                 None if slot.state.mode == AgentMode::LeadPlus => "Orchestrate+".into(),
                 None => String::new(),
@@ -6611,6 +6764,7 @@ pub(in crate::frontend) async fn run_session(
                     }
                     SIGCONT => { io.resume_terminal()?; work.last_frame = None; }
                     SIGWINCH => { io.resize(); work.last_frame = None;
+                        if matches!(work.menu, Some(Menu::ConfirmChecks { .. })) { work.operational_frame = None; }
                         if (io.size.0 < 12 || io.size.1 < 8) && work.focus == Focus::Inspector && work.editor.is_none() {
                             let pending = work.terminal_decoder.take_pending();
                             if !pending.is_empty() { work.terminal_bytes(&pending, io); }
@@ -6773,10 +6927,12 @@ pub(in crate::frontend) async fn run_session(
                                 work.slots[work.current].sending_mention = false;
                             }
                             work.disarm_exit();
-                            if matches!(&work.menu, Some(Menu::Palette { stage, .. }) if stage.editing()) {
+                            if matches!(&work.menu, Some(Menu::Palette { stage, .. }) if stage.editing())
+                                || matches!(&work.menu, Some(Menu::Clarify { .. })) {
                                 match work.navigation_editor.feed(byte, true) {
                                     Some(Action::Submit | Action::QueueSubmit) => { work.enter(io); }
                                     Some(Action::Escape) => work.escape(io),
+                                    Some(Action::Overflow) if matches!(work.menu, Some(Menu::Clarify { .. })) => work.report(io, "Clarification exceeds the input limit"),
                                     _ => {}
                                 }
                                 continue;
@@ -6846,7 +7002,7 @@ pub(in crate::frontend) async fn run_session(
                                     if byte >= 32 && byte != 127 { continue; }
                                 }
                                 if work.focus == Focus::Chat && work.menu.is_none() && byte == b'?' && work.slots[work.current].state.editor.bytes.is_empty() {
-                                    work.menu = Some(Menu::Help { selected: 0, entries: work.available_commands() }); work.completion = None; continue;
+                                    work.menu = Some(Menu::CommandPicker(commands::help_with_commands(0, work.available_commands()))); work.completion = None; continue;
                                 }
                                 if work.menu.is_some() && !matches!(byte, 27 | b'\r' | b'\n' | 9) { continue; }
                             }
@@ -6855,7 +7011,7 @@ pub(in crate::frontend) async fn run_session(
                                 work.tool_press = None;
                             }
                             let navigating = work.navigating();
-                            let complete = (work.completion.is_some() && work.menu.is_none()) || matches!(work.menu, Some(Menu::Help { .. }));
+                            let complete = (work.completion.is_some() && work.menu.is_none()) || matches!(work.menu, Some(Menu::CommandPicker(_)));
                             let action = if navigating {
                                 work.navigation_editor.set_completion(complete);
                                 let action = work.navigation_editor.feed(byte, true);
@@ -6888,7 +7044,7 @@ pub(in crate::frontend) async fn run_session(
                                             finished |= work.submit_composer(&text, io);
                                         }
                                     }
-                                    Action::Complete => { if matches!(work.menu, Some(Menu::Help { .. })) { work.enter(io); } else { work.complete_command(); } }
+                                    Action::Complete => { if matches!(work.menu, Some(Menu::CommandPicker(_))) { work.enter(io); } else { work.complete_command(); } }
                                     Action::Escape => work.escape(io),
                                     Action::FocusNext if work.completion.is_some() && work.menu.is_none() && work.focus == Focus::Chat => work.complete_command(),
                                     Action::FocusNext if work.panel.is_none() && work.menu.is_none() => work.cycle_mode(io),

@@ -1071,12 +1071,17 @@ def completion_and_help(screen, root, cwd):
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
                 "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact", "/retry",
-                "/orchestrate", "/orchestrate+", "/propose", "/propose+", "/terminals", "/accept", "/clarify", "/attach"}
+                "/orchestrate", "/orchestrate+", "/skills", "/terminals", "/attach"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"
     screen.send(b"\x1b[B\r")
     until(screen, lambda frame: screen.vt.line(-4) == "  › /effort" and "ANSA commands" not in frame, "help arrows select and Enter only inserts")
+    assert journals(root) == before
+    screen.send(b"\x15")
+    local(screen, "/skills")
+    until(screen, lambda frame: "No skills in this conversation" in frame, "empty skills picker")
+    escape(screen)
     assert journals(root) == before
     screen.send(b"\x15")
     screen.send("text?")
@@ -1599,19 +1604,45 @@ def orchestration_candidate(screen, root, cwd):
     local(restarted, f"/accept {manual_run.name} {'0' * len(sha)}")
     until(restarted, lambda frame: "manual_checks_candidate_mismatch" in frame, "reject another commit")
     assert not (manual_run / "release.json").exists()
+    open_activity(restarted)
+
+    def confirm_checks(keys=b"\r"):
+        select_result(restarted, "Confirm checks")
+        restarted.send(keys)
+        until(restarted, lambda frame: "Confirm manual checks" in frame and sha in popup_text(restarted),
+              "confirmation shows the candidate from Activity")
+
+    confirm_checks(b"\r\r")
+    assert not (manual_run / "release.json").exists(), "buffered Enter approved an unseen candidate"
+    narrow = len(sha) + 6
+    restarted.resize(narrow, 18)
+    restarted.vt = Terminal(narrow, 18)
+    until(restarted, lambda frame: "Confirm manual checks" in frame and sha not in frame,
+          "confirmation commit is clipped in the narrow terminal")
+    restarted.send(b"\r")
+    until(restarted, lambda frame: "Enlarge the terminal" in frame, "confirmation requires the full commit")
+    assert not (manual_run / "release.json").exists()
+    restarted.resize(100, 32)
+    restarted.vt = Terminal(100, 32)
+    until(restarted, lambda _: sha in popup_text(restarted), "full commit appears after resize")
+    escape(restarted)
+    assert not (manual_run / "release.json").exists()
     manual_report = manual_run / "verification-0/checkout/report.txt"
     manual_report.write_text("different snapshot\n")
-    local(restarted, f"/accept {manual_run.name} {sha}")
+    confirm_checks()
+    restarted.send(b"\r")
     until(restarted, lambda frame: "candidate_view_changed" in frame, "reject an altered verification snapshot")
     assert not (manual_run / "release.json").exists()
     manual_report.write_text("after fixture\n")
     saved_view = manual_run / "saved-verification-0"
     (manual_run / "verification-0").rename(saved_view)
-    local(restarted, f"/accept {manual_run.name} {sha}")
+    confirm_checks()
+    restarted.send(b"\r")
     until(restarted, lambda frame: "candidate_view_missing" in frame, "reject a missing verification snapshot")
     assert not (manual_run / "verification-0").exists()
     saved_view.rename(manual_run / "verification-0")
-    local(restarted, f"/accept {manual_run.name} {sha}")
+    confirm_checks()
+    restarted.send(b"\r")
     until(restarted, lambda frame: "Manual checks recorded" in frame
           and (manual_run / "release.json").exists(), "explicit approval releases the exact reviewed commit")
     assert json.loads((manual_run / "release.json").read_text())["candidate"] == sha
@@ -2105,7 +2136,9 @@ def siwc_orchestrate_plus_budget(screen, root, cwd, *, capped=False):
 
 def siwc_orchestrate_plus_plan_only(screen, root, cwd):
     configure_plus_roles(screen)
-    local(screen, "/propose+ PLUS_PLAN_ONLY")
+    screen.send(b"\t" * 4)
+    until(screen, lambda _: "Review plan" in screen.vt.line(-2), "Tab selects review with role models")
+    screen.send("PLUS_PLAN_ONLY\r")
     until(screen, lambda frame: "Put a sock on the table" in body(screen)
           and "Ctrl+C stop" not in screen.vt.line(-2), "plan-only goes straight to the conversation")
     assert "[Start]" not in visible(screen) and "Refine" not in visible(screen)
@@ -2507,9 +2540,16 @@ def matugen_palette(screen, root, cwd):
 def active_plan_clarification(screen, root, cwd):
     (cwd / "first.txt").write_text("first\n")
     (cwd / "second.txt").write_text("second\n")
-    screen.send(b"\t\t")
-    until(screen, lambda frame: "Orchestrate" in screen.vt.line(-2), "orchestration mode")
-    local(screen, "/propose ORCHESTRATION_CLARIFICATION_FIXTURE")
+    screen.send(b"\t" * 4)
+    until(screen, lambda _: "Review plan" in screen.vt.line(-2), "Tab selects plan approval mode")
+    path_prompt = "/tmp/fixture Inspect this path"
+    screen.send(path_prompt + "\r")
+    until(screen, lambda frame: "[Start]" in frame and "Refine" in frame, "absolute path stays in Review plan")
+    accepted, = [row for row in records(root) if row["kind"] == "accepted" and row["text"] == path_prompt]
+    assert accepted["command"].startswith("draft-")
+    assert not any(row["kind"] == "intent" for row in records(root))
+    escape(screen)
+    screen.send("ORCHESTRATION_CLARIFICATION_FIXTURE\r")
     until(screen, lambda frame: "Start" in frame and "Refine" in frame, "clarification plan")
     screen.send(b"\r")
     ledgers = root / "home/.ansa/orchestration"
@@ -2517,21 +2557,26 @@ def active_plan_clarification(screen, root, cwd):
         return [json.loads(path.read_text())["body"]["event"] for path in sorted(ledgers.glob("*/*/ledger/event-*.json"))]
 
     until(screen, lambda _: any(event.get("event") == "post" and event["step"] == "first" for event in events()), "first step running")
+    chat_draft = "Keep this draft in the main chat"
+    screen.send(chat_draft)
     open_activity(screen)
-    screen.send(b"\t")
-    until(screen, lambda _: "Tab → panel" in screen.vt.line(-2), "composer focus beside Activity")
+    select_result(screen, "Clarify plan")
+    screen.send(b"\r")
+    until(screen, lambda _: "Enter send" in popup_text(screen), "clarification editor")
     clarification = "Focus the comparison on the first line"
-    screen.send("/clarify " + clarification + "\r")
+    screen.send(clarification + "\r")
     until(screen, lambda _: "Coordinator receives the clarification" in " ".join(activity_body(screen).split()),
           "clarification status in Activity")
     close_activity(screen)
     until(screen, lambda frame: "Оба помощника завершили проверку" in frame, "parent summary")
+    assert chat_draft in screen.vt.line(-4)
+    screen.send(b"\x15")
     assert "Coordinator receives the clarification" not in body(screen) and "Work plan" not in body(screen)
-    records = events()
-    accepted, = [i for i, event in enumerate(records) if event.get("event") == "clarification" and event["text"] == clarification]
-    finished, = [i for i, event in enumerate(records) if event.get("event") == "finished" and event["step"] == "first"]
-    decided, = [i for i, event in enumerate(records) if event.get("event") == "coordinator_decision"]
-    second, = [i for i, event in enumerate(records) if event.get("event") == "bound" and event["step"] == "second"]
+    ledger = events()
+    accepted, = [i for i, event in enumerate(ledger) if event.get("event") == "clarification" and event["text"] == clarification]
+    finished, = [i for i, event in enumerate(ledger) if event.get("event") == "finished" and event["step"] == "first"]
+    decided, = [i for i, event in enumerate(ledger) if event.get("event") == "coordinator_decision"]
+    second, = [i for i, event in enumerate(ledger) if event.get("event") == "bound" and event["step"] == "second"]
     assert accepted < finished < decided < second
     local(screen, "/exit")
     return "normal"
