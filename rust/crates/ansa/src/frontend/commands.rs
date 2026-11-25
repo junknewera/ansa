@@ -156,6 +156,77 @@ pub(super) fn skill_request(text: &str) -> Option<(&str, &str)> {
 
 pub(super) type SkillCommand = Choice;
 
+fn is_system_command(name: &str) -> bool {
+    COMMANDS.iter().any(|cmd| cmd.name == canonical(name))
+        || matches!(
+            name,
+            "/" | "?"
+                | "/basic"
+                | "/status"
+                | "/cancel"
+                | "/quit"
+                | "/agent"
+                | "/pr"
+                | "/run"
+                | "/send"
+                | "/propose"
+                | "/propose+"
+                | "/clarify"
+                | "/accept"
+        )
+}
+
+fn is_skill_prompt(text: &str) -> bool {
+    !text
+        .split_whitespace()
+        .next()
+        .is_some_and(is_system_command)
+        && skill_request(text).is_none()
+        && agent_task(text).is_none()
+}
+
+// Painting only needs the leading command context. Consult the rest of a
+// long draft only when the bounded prefix cuts through that context.
+pub(super) fn skill_prompt_prefix(prefix: &str, input: &[u8]) -> bool {
+    if prefix.len() == input.len() {
+        return is_skill_prompt(prefix);
+    }
+    let prefix = prefix.trim_start();
+    if let Some((first, _)) = prefix.split_once(char::is_whitespace) {
+        if is_system_command(first) {
+            return false;
+        }
+        if !first.starts_with('$')
+            && !matches!(
+                first.to_lowercase().as_str(),
+                "запусти" | "попроси" | "поручи" | "spawn" | "launch"
+            )
+        {
+            return true;
+        }
+        if !is_skill_prompt(prefix) {
+            return false;
+        }
+    } else if prefix.len() > 65 {
+        // No built-in command or delegation name can fill this first word.
+        return true;
+    }
+    std::str::from_utf8(input).is_ok_and(is_skill_prompt)
+}
+
+fn slash_boundary(text: &str, begin: usize) -> bool {
+    let Some((at, previous)) = text[..begin].char_indices().next_back() else {
+        return true;
+    };
+    previous.is_whitespace()
+        && text[..at]
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\\')
+            .count()
+            .is_multiple_of(2)
+}
+
 /// Derived from the catalogue attached to this conversation, never a fresh disk scan.
 pub(super) fn skill_choices(profile: Option<&crate::harness::Pinned>) -> Vec<SkillCommand> {
     profile
@@ -163,22 +234,7 @@ pub(super) fn skill_choices(profile: Option<&crate::harness::Pinned>) -> Vec<Ski
         .flat_map(|p| p.complete(""))
         .filter_map(|(name, description)| {
             let label = format!("/{name}");
-            let built_in = COMMANDS.iter().any(|cmd| cmd.name == canonical(&label))
-                || matches!(
-                    label.as_str(),
-                    "/basic"
-                        | "/status"
-                        | "/cancel"
-                        | "/quit"
-                        | "/agent"
-                        | "/run"
-                        | "/send"
-                        | "/propose"
-                        | "/propose+"
-                        | "/clarify"
-                        | "/accept"
-                );
-            (!built_in).then(|| Choice {
+            (!is_system_command(&label)).then(|| Choice {
                 label,
                 detail: description.into(),
             })
@@ -186,25 +242,63 @@ pub(super) fn skill_choices(profile: Option<&crate::harness::Pinned>) -> Vec<Ski
         .collect()
 }
 
-pub(super) fn invoke_skill(
-    skills: &[SkillCommand],
-    command: &str,
-    argument: &str,
-) -> Option<String> {
-    let skill = skills.iter().find(|skill| skill.label == command)?;
-    let name = skill.label.strip_prefix('/')?;
-    Some(format!(
-        "Use the pinned local skill `{name}` for this request. First call read_skill with name `{name}` and use the returned procedure within the current tool permissions.\nUser task: {argument}"
-    ))
+pub(super) fn skill_tokens<'a>(
+    text: &'a str,
+    skills: &'a [SkillCommand],
+) -> impl Iterator<Item = (usize, &'a str)> {
+    text.match_indices('/').filter_map(move |(begin, _)| {
+        if !slash_boundary(text, begin) {
+            return None;
+        }
+        let token = text[begin..].split_whitespace().next()?;
+        // The pinned catalogue is sorted by name in harness::Pinned.
+        skills
+            .binary_search_by_key(&token, |skill| skill.label.as_str())
+            .ok()?;
+        Some((begin, token))
+    })
 }
 
-/// Only installed slash skills accept free-form composer text after the command.
-pub(super) fn skill_argument<'a>(skills: &[SkillCommand], text: &'a str) -> Option<&'a str> {
-    let (command, argument) = text.trim_start().split_once(char::is_whitespace)?;
-    skills
-        .iter()
-        .any(|skill| skill.label == command)
-        .then_some(argument)
+pub(super) fn invoke_skills(skills: &[SkillCommand], text: &str) -> Option<String> {
+    if skills.is_empty() || !is_skill_prompt(text) {
+        return None;
+    }
+    let text = text.trim();
+    let mut seen = std::collections::HashSet::new();
+    let selected: Vec<_> = skill_tokens(text, skills)
+        .filter(|(_, token)| seen.insert(*token))
+        .collect();
+    match selected.as_slice() {
+        [] => None,
+        &[(begin, token)] => {
+            let name = &token[1..];
+            let task = if begin == 0 {
+                text[token.len()..].trim_start()
+            } else {
+                text
+            };
+            Some(format!(
+                "Use the pinned local skill `{name}` for this request. First call read_skill with name `{name}` and use the returned procedure within the current tool permissions.\nUser task: {task}"
+            ))
+        }
+        _ => {
+            let names = selected
+                .iter()
+                .map(|(_, token)| format!("`{}`", &token[1..]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!(
+                "Use the pinned local skills {names} for this request. First call read_skill for each name in the listed order and use the returned procedures within the current tool permissions.\nUser task: {text}"
+            ))
+        }
+    }
+}
+
+pub(super) fn accepts_file_mentions(text: &str, skills: &[SkillCommand]) -> bool {
+    !text.trim_start().starts_with('/')
+        || (!skills.is_empty()
+            && is_skill_prompt(text)
+            && skill_tokens(text, skills).next().is_some())
 }
 
 #[derive(Clone)]
@@ -220,9 +314,13 @@ impl Completion {
         self.query.starts_with('/')
             && self.end == editor.cursor
             && self.matches.get(self.selected).is_some_and(|choice| {
-                editor
-                    .text()
-                    .is_ok_and(|text| choice.label == canonical(text.trim()))
+                if is_system_command(&choice.label) {
+                    editor
+                        .text()
+                        .is_ok_and(|text| choice.label == canonical(text.trim()))
+                } else {
+                    choice.label == self.query
+                }
             })
     }
     pub fn at(editor: &Editor) -> Option<Self> {
@@ -244,15 +342,11 @@ impl Completion {
         let text = editor.text().ok()?;
         let prefix = text.get(..editor.cursor)?;
         let begin = prefix.rfind('/')?;
-        // A slash inside a path/URL is ordinary text. A command token may
-        // occur at any word boundary, including in the middle of a message.
-        if begin > 0 && !text[..begin].chars().next_back()?.is_whitespace() {
+        if !slash_boundary(text, begin) {
             return None;
         }
-        if matches!(
-            text[..begin].split_whitespace().next(),
-            Some("/orchestrate" | "/orchestrate+" | "/propose" | "/propose+" | "/attach")
-        ) {
+        let leading = text[..begin].trim().is_empty();
+        if !leading && (skills.is_empty() || !is_skill_prompt(text)) {
             return None;
         }
         let query = prefix.get(begin..)?;
@@ -262,8 +356,15 @@ impl Completion {
         let end = text[editor.cursor..]
             .find(char::is_whitespace)
             .map_or(text.len(), |offset| editor.cursor + offset);
+        if !text[begin + 1..end]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+'))
+        {
+            return None;
+        }
         let mut matches: Vec<_> = commands
             .iter()
+            .filter(|_| leading)
             .filter_map(|command| {
                 let matches = command.name.starts_with(query)
                     || ALIASES
@@ -275,14 +376,12 @@ impl Completion {
                 })
             })
             .collect();
-        if text[..begin].trim().is_empty() {
-            matches.extend(
-                skills
-                    .iter()
-                    .filter(|skill| skill.label.starts_with(query))
-                    .cloned(),
-            );
-        }
+        matches.extend(
+            skills
+                .iter()
+                .filter(|skill| skill.label.starts_with(query))
+                .cloned(),
+        );
         if matches.is_empty() {
             return None;
         }
@@ -341,6 +440,12 @@ impl Completion {
         Popup {
             title: if self.query.starts_with('@') {
                 "Files"
+            } else if self
+                .matches
+                .iter()
+                .all(|choice| !is_system_command(&choice.label))
+            {
+                "Skills"
             } else {
                 "Commands"
             }
@@ -420,13 +525,24 @@ mod tests {
         editor
     }
     #[test]
-    fn mid_message_completion_replaces_only_the_token() {
-        let mut input = editor("Ж Проверь /mo потом файл");
-        input.cursor = "Ж Проверь /mo".len();
-        let completion = Completion::at(&input).unwrap();
+    fn mid_message_completion_lists_skills_and_replaces_only_the_token() {
+        let mut input = editor("Ж Проверь /ro потом файл");
+        input.cursor = "Ж Проверь /ro".len();
+        assert!(Completion::at(&input).is_none());
+        let skills = [SkillCommand {
+            label: "/route".into(),
+            detail: "Choose a workflow".into(),
+        }];
+        let completion = Completion::at_with_skills(&input, available(true), &skills).unwrap();
         assert!(completion.apply(&mut input));
-        assert_eq!(input.text().unwrap(), "Ж Проверь /model потом файл");
-        assert_eq!(input.cursor, "Ж Проверь /model".len());
+        assert_eq!(input.text().unwrap(), "Ж Проверь /route потом файл");
+        assert_eq!(input.cursor, "Ж Проверь /route".len());
+        let mut path = editor("Ж Проверь /route/file");
+        path.cursor = "Ж Проверь /ro".len();
+        assert!(Completion::at_with_skills(&path, available(true), &skills).is_none());
+        assert!(
+            Completion::at_with_skills(&editor("/help /ro"), available(true), &skills).is_none()
+        );
     }
     #[test]
     fn exact_skill_wins_over_a_longer_prefix_without_shadowing_a_builtin() {
@@ -439,13 +555,35 @@ mod tests {
         let completion = Completion::at_with_skills(&input, available(true), &skills).unwrap();
         assert!(completion.exact_command(&input));
         assert!(
-            invoke_skill(&skills, "/mod", "preserve аргументы")
+            invoke_skills(&skills, "/mod preserve аргументы")
                 .unwrap()
                 .contains("call read_skill with name `mod`")
         );
-        assert!(invoke_skill(&skills, "/model", "").is_none());
+        assert!(invoke_skills(&skills, "/model /mod").is_none());
         assert!(
             Completion::at_with_skills(&editor("path/mod"), available(true), &skills).is_none()
+        );
+    }
+
+    #[test]
+    fn inline_skills_keep_order_and_skip_paths_and_escaped_mentions() {
+        let skills = ["/grill-me", "/route"].map(|label| SkillCommand {
+            label: label.into(),
+            detail: String::new(),
+        });
+        let text = r"Проверь @some\ /route https://example.test/grill-me /route/dir /grill-me /route /grill-me";
+        let prompt = invoke_skills(&skills, text).unwrap();
+        assert!(
+            prompt.starts_with("Use the pinned local skills `grill-me`, `route` for this request.")
+        );
+        assert!(prompt.ends_with(text));
+        assert!(invoke_skills(&skills, r"@some\ /route \/grill-me /route.txt").is_none());
+        assert!(invoke_skills(&skills, "Запусти субагента: проверь /route").is_none());
+        let draft = editor("Проверь /grill-me");
+        assert!(
+            Completion::at_with_skills(&draft, available(true), &skills)
+                .unwrap()
+                .exact_command(&draft)
         );
     }
     #[test]

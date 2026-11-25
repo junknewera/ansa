@@ -890,7 +890,7 @@ fn layout_impl(
             lines.push(line);
         }
     }
-    let (input, cursor) = visible_composer(input, cursor, cols, 1);
+    let (input, cursor, _) = visible_composer(input, cursor, cols, 1);
     let input_glyphs = compact_input_glyphs(input);
     let split = input_glyphs.partition_point(|glyph| glyph.source_end <= cursor);
     let (before, after) = input_glyphs.split_at(split);
@@ -1132,6 +1132,7 @@ pub struct Popup {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Workspace {
+    pub skill_commands: std::sync::Arc<[Choice]>,
     pub breadcrumb: String,
     pub model: String,
     pub effort: String,
@@ -1401,7 +1402,12 @@ fn shortcuts(terminals: bool, color: bool) -> String {
     text
 }
 
-fn visible_composer(input: &[u8], cursor: usize, columns: usize, rows: usize) -> (&[u8], usize) {
+fn visible_composer(
+    input: &[u8],
+    cursor: usize,
+    columns: usize,
+    rows: usize,
+) -> (&[u8], usize, usize) {
     let cursor = cursor.min(input.len());
     let margin = columns
         .saturating_mul(rows.saturating_add(1))
@@ -1415,7 +1421,46 @@ fn visible_composer(input: &[u8], cursor: usize, columns: usize, rows: usize) ->
     while end > cursor && input.get(end).is_some_and(|byte| byte & 0xc0 == 0x80) {
         end -= 1;
     }
-    (&input[start..end], cursor - start)
+    (&input[start..end], cursor - start, start)
+}
+
+fn composer_skill_ranges(
+    input: &[u8],
+    head: &[u8],
+    visible: std::ops::Range<usize>,
+    skills: &[Choice],
+) -> Vec<std::ops::Range<usize>> {
+    let Some(longest) = skills.iter().map(|skill| skill.label.len()).max() else {
+        return Vec::new();
+    };
+    // Read enough context on both sides to recognize a clipped skill token
+    // and its adjacent UTF-8 delimiter without parsing off-screen words.
+    let context = longest + 4;
+    let mut from = visible.start.saturating_sub(context);
+    let mut to = visible.end.saturating_add(context).min(input.len());
+    while from > 0 && input[from] & 0xc0 == 0x80 {
+        from -= 1;
+    }
+    while from > 0 && input[from - 1] == b'\\' {
+        from -= 1;
+    }
+    while to < input.len() && input[to] & 0xc0 == 0x80 {
+        to += 1;
+    }
+    let area = &input[from..to];
+    if !area.contains(&b'/')
+        || !std::str::from_utf8(head)
+            .is_ok_and(|head| super::commands::skill_prompt_prefix(head, input))
+    {
+        return Vec::new();
+    }
+    let Ok(text) = std::str::from_utf8(area) else {
+        return Vec::new();
+    };
+    super::commands::skill_tokens(text, skills)
+        .map(|(at, token)| from + at..from + at + token.len())
+        .filter(|range| range.end > visible.start && range.start < visible.end)
+        .collect()
 }
 
 fn editor_rows(
@@ -1425,13 +1470,24 @@ fn editor_rows(
     maximum: usize,
     accent: &str,
     color: bool,
+    skills: &[Choice],
 ) -> (Vec<String>, usize, usize) {
-    let (input, cursor) = visible_composer(input, cursor, columns, maximum);
+    let original = input;
+    let (input, cursor, start) = visible_composer(input, cursor, columns, maximum);
+    let mut skill_ranges = if color && !skills.is_empty() {
+        let (head, _, _) = visible_composer(original, 0, columns, maximum);
+        composer_skill_ranges(original, head, start..start + input.len(), skills)
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .peekable();
     let mut logical = vec![String::new()];
     let mut row = 0;
     let mut used = 2;
     let mut cursor_at = (0, 2);
     let mut consumed = 0;
+    let mut highlighted = false;
     for glyph in glyphs(input) {
         let contains_cursor = consumed <= cursor && cursor < glyph.source_end;
         if contains_cursor {
@@ -1441,14 +1497,25 @@ fn editor_rows(
             logical.push(String::new());
             row += 1;
             used = 2;
+            highlighted = false;
         } else {
             if used + glyph.width > columns && used > 2 {
                 logical.push(String::new());
                 row += 1;
                 used = 2;
+                highlighted = false;
                 if contains_cursor {
                     cursor_at = (row, used);
                 }
+            }
+            let at = start + consumed;
+            while skill_ranges.peek().is_some_and(|range| range.end <= at) {
+                skill_ranges.next();
+            }
+            let skill = skill_ranges.peek().is_some_and(|range| range.contains(&at));
+            if skill != highlighted {
+                logical[row].push_str(if skill { MINT } else { TEXT });
+                highlighted = skill;
             }
             logical[row].push_str(&glyph.text);
             used += glyph.width;
@@ -1787,6 +1854,7 @@ pub fn layout_workspace(
         editor_maximum,
         prompt_accent,
         color,
+        &ui.skill_commands,
     );
     let body_height = height.saturating_sub(7 + editor.len()).max(1);
     let stacked = has_panel && !side_by_side;
@@ -3084,6 +3152,20 @@ fn source_line(text: &str, color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_highlights_wrapped_skills_with_the_cursor_in_byte_order() {
+        let skills = [Choice {
+            label: "/grill-me".into(),
+            detail: String::new(),
+        }];
+        let text = format!("{}Ж /grill-me rest", "old /unknown\n".repeat(1024));
+        let cursor = text.len() - " rest".len();
+        let (rows, y, x) = editor_rows(text.as_bytes(), cursor, 10, 4, VIOLET, true, &skills);
+        assert!(rows[y - 1].contains(&format!("{MINT}/grill")));
+        assert!(rows[y].contains(&format!("{MINT}-me{TEXT} rest")));
+        assert_eq!(x, 5);
+    }
 
     #[test]
     fn activity_model_row_has_the_same_action_as_the_agent_card() {

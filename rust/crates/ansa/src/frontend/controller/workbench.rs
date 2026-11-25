@@ -26,6 +26,7 @@ use crate::{
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 use tokio::sync::mpsc;
@@ -49,7 +50,7 @@ fn display_title(text: &str) -> String {
 }
 
 struct Slot {
-    skill_commands: Vec<commands::SkillCommand>,
+    skill_commands: Arc<[commands::SkillCommand]>,
     id: String,
     kind: Kind,
     parent: Option<String>,
@@ -99,7 +100,7 @@ impl Slot {
         }
         let title = prompt.as_deref().map(display_title);
         Self {
-            skill_commands: Vec::new(),
+            skill_commands: Arc::default(),
             id,
             kind,
             parent,
@@ -2974,6 +2975,23 @@ impl Workbench {
     }
 
     fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
+        let slot = &self.slots[self.current];
+        if let Some(prompt) = commands::invoke_skills(&slot.skill_commands, text) {
+            if !matches!(slot.state.mode, AgentMode::Basic | AgentMode::Plan)
+                || self.orchestration_mode.is_some()
+                || self.refinement.is_some()
+                || self.orchestration_stop.is_some()
+            {
+                self.report(io, "Invoke skills in Work or Plan");
+                return (false, false);
+            }
+            self.route_text(&prompt, io)
+        } else {
+            self.route_text(text, io)
+        }
+    }
+
+    fn route_text(&mut self, text: &str, io: &Io) -> (bool, bool) {
         if !text.trim_start().starts_with('/')
             && !text.trim().is_empty()
             && self.collecting_orchestration()
@@ -3022,19 +3040,6 @@ impl Workbench {
             .split_once(char::is_whitespace)
             .unwrap_or((text.trim_start(), ""));
         let argument = raw_argument.trim();
-        if let Some(prompt) =
-            commands::invoke_skill(&self.slots[self.current].skill_commands, command, argument)
-        {
-            if !matches!(mode, AgentMode::Basic | AgentMode::Plan)
-                || self.orchestration_mode.is_some()
-                || self.refinement.is_some()
-                || self.orchestration_stop.is_some()
-            {
-                self.report(io, "Invoke a skill in Work or Plan");
-                return (false, false);
-            }
-            return self.text(&prompt, io);
-        }
         match commands::canonical(command) {
             "/attach" => (self.attach(argument, io), false),
             "/propose" | "/propose+"
@@ -4361,7 +4366,7 @@ impl Workbench {
                     let id = created.selected.id.clone();
                     let mut slot =
                         Slot::new(created.runtime, id, created.kind, created.parent, prompt);
-                    slot.skill_commands = created.skill_commands;
+                    slot.skill_commands = created.skill_commands.into();
                     if let Some(code) = created.skill_notice {
                         slot.state.report(io, &format!("Local skills ({code})"));
                     }
@@ -6214,6 +6219,7 @@ impl Workbench {
         }
         .or_else(|| self.paused_orchestration_notice());
         Workspace {
+            skill_commands: slot.skill_commands.clone(),
             breadcrumb: breadcrumb.join(" / "),
             model: if slot.kind == Kind::Console {
                 "Local console".into()
@@ -6686,7 +6692,7 @@ pub(in crate::frontend) async fn run_session(
         })
         .transpose()?;
     let mut work = Workbench::new(runtime, factory, root_id, kind, parent)?;
-    work.slots[work.current].skill_commands = skill_commands;
+    work.slots[work.current].skill_commands = skill_commands.into();
     if let Some(code) = skill_notice {
         work.report(io, &format!("Local skills ({code})"));
     }
