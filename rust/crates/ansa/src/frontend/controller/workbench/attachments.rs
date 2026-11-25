@@ -1,7 +1,7 @@
 //! Snapshot a user-selected file once, off the Carbon input loop.
 use super::*;
+use crate::provider::contracts::MAX_IMAGE_BYTES;
 use crate::provider::contracts::image::MAX_ORIGINAL_IMAGE_BYTES;
-use crate::provider::contracts::{MAX_IMAGE_BYTES, MAX_IMAGES};
 use std::{fs::File, io::Read, path::Component};
 
 mod clipboard;
@@ -167,7 +167,8 @@ impl Slot {
                 if self.state.editor.pasting()
                     || !anchor.is_some_and(|at| self.state.editor.insert_clipboard_text(at, &text))
                 {
-                    self.state.report(io, "Clipboard text could not fit in the draft");
+                    self.state
+                        .report(io, "Clipboard text could not fit in the draft");
                 } else {
                     self.state.input_history.edited(&self.state.editor);
                     self.state.status.clear();
@@ -175,19 +176,32 @@ impl Slot {
             }
             Ok(Attachment::Image(image)) => {
                 let reduced = image.original_byte_len() > image.byte_len();
-                self.state.images.push(image);
-                let count = self.state.images.len();
+                let editor = &mut self.state.editor;
+                editor.attach_image(anchor.unwrap_or_else(|| editor.caret()), image);
+                self.state.input_history.edited(editor);
+                let count = editor.images.len();
                 let notice = if reduced {
                     " · smaller copy for model"
                 } else {
                     ""
                 };
-                self.state
-                    .report(io, &format!("Image attached ({count}){notice}"));
+                if from_clipboard && !reduced {
+                    self.state.status.clear();
+                } else {
+                    self.state
+                        .report(io, &format!("Image attached ({count}){notice}"));
+                }
             }
-            Err("clipboard_unavailable") => self.state.report(io, "No clipboard image or text available"),
-            Err("clipboard_size") => self.state.report(io, "Clipboard exceeds the attachment or draft size limit"),
-            Err("clipboard_image_unavailable") => self.state.report(io, "Images require a free attachment slot and an idle conversation with vision support"),
+            Err("clipboard_unavailable") => self
+                .state
+                .report(io, "No clipboard image or text available"),
+            Err("clipboard_size") => self
+                .state
+                .report(io, "Clipboard exceeds the attachment or draft size limit"),
+            Err("clipboard_image_unavailable") => self.state.report(
+                io,
+                "Attach photos in an idle conversation with vision support",
+            ),
             Err("protected_file") => self.state.report(io, "Protected files cannot be attached"),
             Err("attachment_outside_workspace" | "attachment_path") => self.state.report(
                 io,
@@ -203,7 +217,7 @@ impl Slot {
             Err("attachment_text_encoding") => {
                 self.state.report(io, "Use a non-empty UTF-8 text file");
             }
-            Err("image_original_bytes") if self.state.images.is_empty() => self
+            Err("image_original_bytes") if self.state.editor.images.is_empty() => self
                 .state
                 .report(io, "Image exceeds 8 MiB. Attach a smaller copy."),
             Err("image_original_bytes" | "image_batch_bytes") => self.state.report(
@@ -233,24 +247,23 @@ impl Workbench {
             && self.orchestration_mode.is_none()
             && self.orchestration_stop.is_none()
             && self.refinement.is_none()
-            && slot.state.available()
-            && slot.state.images.len() < MAX_IMAGES;
+            && slot.state.available();
         let remaining = MAX_IMAGE_BYTES
             - slot
                 .state
-                .images
-                .iter()
+                .editor
+                .attached_images()
                 .map(ImageInput::byte_len)
                 .sum::<usize>();
         let original_remaining = MAX_ORIGINAL_IMAGE_BYTES
             - slot
                 .state
-                .images
-                .iter()
+                .editor
+                .attached_images()
                 .map(ImageInput::original_byte_len)
                 .sum::<usize>();
         let owner = slot.handle.incarnation().clone();
-        slot.state.editor.clipboard_anchor = Some(slot.state.editor.cursor);
+        slot.state.editor.clipboard_anchor = Some(slot.state.editor.caret());
         slot.state.attachment_loading = true;
         self.jobs.spawn_blocking(move || Job::Attachment {
             owner,
@@ -298,13 +311,6 @@ impl Workbench {
             );
             return false;
         }
-        if !text && slot.state.images.len() >= MAX_IMAGES {
-            self.report(
-                io,
-                &format!("At most {MAX_IMAGES} images fit in one message"),
-            );
-            return false;
-        }
         if !self.can_job(io) {
             return false;
         }
@@ -317,15 +323,15 @@ impl Workbench {
         let remaining = MAX_IMAGE_BYTES
             - slot
                 .state
-                .images
-                .iter()
+                .editor
+                .attached_images()
                 .map(ImageInput::byte_len)
                 .sum::<usize>();
         let original_remaining = MAX_ORIGINAL_IMAGE_BYTES
             - slot
                 .state
-                .images
-                .iter()
+                .editor
+                .attached_images()
                 .map(ImageInput::original_byte_len)
                 .sum::<usize>();
         slot.state.attachment_loading = true;

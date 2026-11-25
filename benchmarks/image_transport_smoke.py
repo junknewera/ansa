@@ -141,8 +141,9 @@ def check_composer(binary):
             command("/attach link", "Could not open attachment")
             command("/attach file with spaces.png", "Image attached (1)")
             image.unlink()
-            command("/propose Verify the fixture", "Send or clear attachments")
-            screen.send(b"\x15")  # Rejected command stays editable.
+            rejected = "/propose Verify the fixture"
+            command(rejected, "Send or clear attachments")
+            screen.send(b"\x7f" * len(rejected))  # Keep the photo before the rejected command.
             submit("/orchestrate")
             until(screen, lambda _: screen.vt.line(-2).strip().startswith("Orchestrate ·"),
                   "switch to Orchestrate with a pending image")

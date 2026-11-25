@@ -13,13 +13,22 @@ struct Envelope<T> {
 }
 
 pub(super) fn write<T: Serialize>(out: &mut impl Write, sequence: u64, value: T) -> io::Result<()> {
+    write_limited(out, sequence, value, MAX_FRAME)
+}
+
+pub(super) fn write_limited<T: Serialize>(
+    out: &mut impl Write,
+    sequence: u64,
+    value: T,
+    limit: usize,
+) -> io::Result<()> {
     let envelope = Envelope {
         version: VERSION,
         sequence,
         value,
     };
     let body = serde_json::to_vec(&envelope).map_err(io::Error::other)?;
-    if body.len() > MAX_FRAME {
+    if body.len() > limit {
         return Err(io::Error::other("terminal_frame_size"));
     }
     out.write_all(&(body.len() as u32).to_be_bytes())?;
@@ -28,9 +37,17 @@ pub(super) fn write<T: Serialize>(out: &mut impl Write, sequence: u64, value: T)
 }
 
 pub(super) fn read<T: DeserializeOwned>(input: &mut impl Read, sequence: u64) -> io::Result<T> {
+    read_limited(input, sequence, MAX_FRAME)
+}
+
+pub(super) fn read_limited<T: DeserializeOwned>(
+    input: &mut impl Read,
+    sequence: u64,
+    limit: usize,
+) -> io::Result<T> {
     let mut header = [0; 4];
     input.read_exact(&mut header)?;
-    let mut body = vec![0; length(header)?];
+    let mut body = vec![0; length(header, limit)?];
     input.read_exact(&mut body)?;
     decode(&body, sequence)
 }
@@ -52,7 +69,10 @@ impl Reader {
         let next = if self.bytes.len() < 4 {
             4
         } else {
-            4 + length(self.bytes[..4].try_into().expect("length prefix"))?
+            4 + length(
+                self.bytes[..4].try_into().expect("length prefix"),
+                MAX_FRAME,
+            )?
         };
         let capacity = (next - self.bytes.len()).min(chunk.len());
         match input.read(&mut chunk[..capacity]) {
@@ -71,7 +91,10 @@ impl Reader {
         if self.bytes.len() < 4 {
             return Ok(None);
         }
-        let len = length(self.bytes[..4].try_into().expect("length prefix"))?;
+        let len = length(
+            self.bytes[..4].try_into().expect("length prefix"),
+            MAX_FRAME,
+        )?;
         if self.bytes.len() < len + 4 {
             return Ok(None);
         }
@@ -81,9 +104,9 @@ impl Reader {
     }
 }
 
-fn length(header: [u8; 4]) -> io::Result<usize> {
+fn length(header: [u8; 4], limit: usize) -> io::Result<usize> {
     let size = u32::from_be_bytes(header) as usize;
-    if size == 0 || size > MAX_FRAME {
+    if size == 0 || size > limit {
         return Err(io::Error::other("terminal_frame_size"));
     }
     Ok(size)

@@ -1037,6 +1037,17 @@ def file_mentions(screen, root, cwd):
     screen.send("сейчас\r")
     until(screen, lambda _: completed(root, prompt), "submitted workspace reference")
     assert [event["text"] for event in records(root) if event["kind"] == "accepted"] == [prompt]
+    shared = cwd.parent / "shared-notes"
+    shared.mkdir()
+    (shared / "notes.md").write_text("Outside the workspace")
+    screen.send("Проверь @../shared-")
+    until(screen, lambda frame: "shared-notes/" in frame, "relative parent paths at the cursor")
+    screen.send(b"\t")
+    until(screen, lambda frame: "notes.md" in body(screen), "parent directory selection opens its children")
+    screen.send(b"\t")
+    until(screen, lambda _: screen.vt.line(-4).rstrip() == "  › Проверь @../shared-notes/notes.md",
+          "parent-relative path inserted in the draft")
+    screen.send(b"\x15")
     screen.send("/exit\r")
     return "normal"
 
@@ -1078,7 +1089,7 @@ def completion_and_help(screen, root, cwd):
     labels = [row[1] for row in command_rows]
     expected = {"/model", "/effort", "/login", "/theme", "/files", "/agents", "/sessions",
                 "/new", "/fork", "/btw", "/plan", "/copy", "/help", "/exit", "/autocompact",
-                "/orchestrate", "/orchestrate+", "/skills"}
+                "/orchestrate", "/orchestrate+", "/skills", "/mcp", "/hooks"}
     assert set(labels) == expected and len(labels) == len(expected), "help does not give each command its own row"
     assert all(not re.search(r"\s{2,}/[a-z]+", row[2]) for row in command_rows), "help packed another command column into a row"
     assert not {"/run", "/pr"} & set(labels), "a removed command remains advertised"
@@ -1088,6 +1099,13 @@ def completion_and_help(screen, root, cwd):
     screen.send(b"\x15")
     local(screen, "/skills")
     until(screen, lambda frame: "No skills in this conversation" in frame, "empty skills picker")
+    escape(screen)
+    local(screen, "/mcp")
+    until(screen, lambda frame: "No servers configured" in frame, "MCP configuration opened")
+    escape(screen)
+    local(screen, "/hooks")
+    until(screen, lambda frame: "External JSONL adapter" in frame and "tool_started" in frame,
+          "available external hooks opened")
     escape(screen)
     assert journals(root) == before
     screen.send(b"\x15")
@@ -2389,6 +2407,35 @@ def siwc_terminal_exec(screen, root, cwd):
         rounds = sum(row["kind"] == "response" for row in rows)
         return calls, results, {"provider_rounds": rounds, "wall_seconds": elapsed}
 
+    _, [history], _ = submit("TEST_EXEC_HISTORY")
+    assert history["exit_code"] == 0 and "SHELL_HISTORY_01\n" in history["output"]
+    open_activity(screen)
+    screen.send("s")
+    until(screen, lambda frame: "SHELL_HISTORY_60" in body(screen) and "wheel to scroll" in frame,
+          "Shell follows the latest output")
+    assert "SHELL_HISTORY_01" not in body(screen)
+    mouse(screen, 64, 3, 10)
+    until(screen, lambda frame: "3 lines back" in frame, "wheel scrolls three lines")
+    at = len(screen.raw)
+    screen.resize(100, 58)
+    screen.vt = Terminal(100, 58)
+    screen.wait(b"\x1b[H\x1b[2J", since=at)
+    until(screen, lambda frame: "lines back" in frame, "resize while reading Shell history")
+    for _ in range(6):
+        if "SHELL_HISTORY_01" in body(screen):
+            break
+        last_page = body(screen)
+        screen.send(b"\x1b[5~")
+        until(screen, lambda _: body(screen) != last_page, "PageUp shows older output")
+    assert "SHELL_HISTORY_01" in body(screen)
+    screen.send(b"\x1b[6~" * 8)
+    until(screen, lambda frame: "SHELL_HISTORY_60" in body(screen) and "wheel to scroll" in frame,
+          "PageDown restores the live tail")
+    screen.send("a")
+    until(screen, lambda _: activity_open(screen), "Shell tabs remain accessible")
+    close_activity(screen)
+    screen.resize(100, 32)
+    screen.vt = Terminal(100, 32)
     calls, [cold], _ = submit("TEST_EXEC_DIFF", "Run git diff --stat · exit 0")
     assert calls == ["terminal_exec"]
     calls, [diff], direct = submit("TEST_EXEC_DIFF_WARM", "Run git diff --stat · exit 0")

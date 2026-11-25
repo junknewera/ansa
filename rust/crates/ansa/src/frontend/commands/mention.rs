@@ -38,7 +38,7 @@ fn decode(path: &str) -> String {
     decoded
 }
 
-fn tokens(text: &str) -> impl Iterator<Item = (usize, &str)> {
+pub(in crate::frontend) fn tokens(text: &str) -> impl Iterator<Item = (usize, &str)> {
     let mut cursor = 0;
     std::iter::from_fn(move || {
         while cursor < text.len() {
@@ -56,9 +56,12 @@ fn tokens(text: &str) -> impl Iterator<Item = (usize, &str)> {
 
 fn workspace_path(path: &str) -> bool {
     !path.chars().any(char::is_control)
-        && Path::new(path)
-            .components()
-            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+        && Path::new(path).components().all(|part| {
+            matches!(
+                part,
+                Component::Normal(_) | Component::CurDir | Component::ParentDir
+            )
+        })
 }
 
 impl<'a> Mention<'a> {
@@ -135,8 +138,9 @@ pub(super) fn insert(query: &str, label: &str) -> String {
     path
 }
 
-pub(crate) fn image_paths(text: &str, max_images: usize) -> Vec<String> {
+pub(crate) fn image_paths(text: &str) -> Vec<String> {
     let mut files = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for (_, token) in tokens(text) {
         let path = decode(&token[1..]);
         if workspace_path(&path)
@@ -148,12 +152,9 @@ pub(crate) fn image_paths(text: &str, max_images: usize) -> Vec<String> {
                         .iter()
                         .any(|known| e.eq_ignore_ascii_case(known))
                 })
-            && !files.contains(&path)
+            && seen.insert(path.clone())
         {
             files.push(path);
-            if files.len() > max_images {
-                break;
-            }
         }
     }
     files
@@ -166,10 +167,13 @@ mod tests {
     #[test]
     fn image_references_handle_spaces_duplicates_and_literal_at_signs() {
         let text = r"Ignore user@example.png and \@literal.png, compare @photos/my\ photo.PNG @photos/my\ photo.PNG @../outside.jpg @a.jpeg";
-        assert_eq!(image_paths(text, 4), ["photos/my photo.PNG", "a.jpeg"]);
         assert_eq!(
-            image_paths("@1.jpg @2.jpg @3.jpg @4.jpg", 1),
-            ["1.jpg", "2.jpg"]
+            image_paths(text),
+            ["photos/my photo.PNG", "../outside.jpg", "a.jpeg"]
+        );
+        assert_eq!(
+            image_paths("@1.jpg @2.jpg @3.jpg @4.jpg @5.jpg"),
+            ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "5.jpg"]
         );
     }
 
@@ -185,5 +189,18 @@ mod tests {
         let value = insert(token.query, "новый файл.txt");
         assert!(editor.replace(token.begin, token.end, value.as_bytes()));
         assert_eq!(editor.text().unwrap(), r"См. @src/новый\ файл.txt в отчёте");
+    }
+
+    #[test]
+    fn completion_accepts_parent_directories() {
+        let mut editor = Editor::default();
+        let draft = "См. @../../shared/";
+        assert!(editor.replace(0, 0, draft.as_bytes()));
+        let token = Mention::at(&editor).unwrap();
+        assert_eq!(token.directory, "../../shared");
+        assert_eq!(
+            insert(token.query, "file name.txt"),
+            r"@../../shared/file\ name.txt"
+        );
     }
 }

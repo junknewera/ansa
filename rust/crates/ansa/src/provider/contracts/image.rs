@@ -4,7 +4,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, imageops::FilterType};
 use std::{io::Cursor, sync::Arc};
 
-pub const MAX_IMAGES: usize = 4;
 /// Aggregate image bytes sent to the provider per submitted turn.
 pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Raw originals live with the accepted request in the 32 MiB journal record.
@@ -212,7 +211,6 @@ fn image_mime_with_limit(bytes: &[u8], limit: usize) -> Result<&'static str, &'s
 
 pub(crate) fn validate_images(images: &[ImageInput]) -> Result<(), &'static str> {
     if images.is_empty()
-        || images.len() > MAX_IMAGES
         || images.iter().map(ImageInput::byte_len).sum::<usize>() > MAX_IMAGE_BYTES
         || images
             .iter()
@@ -367,7 +365,6 @@ pub(crate) fn validate_content(content: &Json) -> Result<(&str, Vec<ImageInput>)
         .split_first()
         .ok_or("image_submit_content")?;
     if images.is_empty()
-        || images.len() > MAX_IMAGES
         || caption.keys()?.len() != 2
         || caption.text_field("type")? != "input_text"
     {
@@ -421,7 +418,10 @@ mod tests {
             .is_err()
         );
         assert!(ImageInput::from_bytes(&bytes[..bytes.len() - 1]).is_err());
-        assert!(validate_images(&vec![image; MAX_IMAGES + 1]).is_err());
+        let images = vec![image; 5];
+        assert!(validate_images(&images).is_ok());
+        let encoded = content("inspect", &images).unwrap();
+        assert_eq!(validate_content(&encoded).unwrap().1, images);
     }
 
     #[test]

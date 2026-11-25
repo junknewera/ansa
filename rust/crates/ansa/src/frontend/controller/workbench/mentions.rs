@@ -1,6 +1,6 @@
 //! Resolve image references in the submitted draft without blocking the input loop.
 use super::*;
-use crate::provider::contracts::{MAX_IMAGE_BYTES, MAX_IMAGES, image::MAX_ORIGINAL_IMAGE_BYTES};
+use crate::provider::contracts::{MAX_IMAGE_BYTES, image::MAX_ORIGINAL_IMAGE_BYTES};
 
 impl Workbench {
     pub(super) fn prepare_mention_images(&mut self, text: &str, io: &Io) -> bool {
@@ -11,7 +11,7 @@ impl Workbench {
         if !commands::accepts_file_mentions(text, &slot.skill_commands) {
             return false;
         }
-        let paths = commands::mention::image_paths(text, MAX_IMAGES);
+        let paths = commands::mention::image_paths(text);
         if paths.is_empty() {
             return false;
         }
@@ -26,13 +26,6 @@ impl Workbench {
             self.report(io, "Wait for the current turn before sending images");
             return true;
         }
-        if paths.len() + slot.state.images.len() > MAX_IMAGES {
-            self.report(
-                io,
-                &format!("At most {MAX_IMAGES} images fit in one message"),
-            );
-            return true;
-        }
         if !self.can_job(io) {
             return true;
         }
@@ -43,15 +36,15 @@ impl Workbench {
         let mut remaining = MAX_IMAGE_BYTES
             - slot
                 .state
-                .images
-                .iter()
+                .editor
+                .attached_images()
                 .map(ImageInput::byte_len)
                 .sum::<usize>();
         let mut originals = MAX_ORIGINAL_IMAGE_BYTES
             - slot
                 .state
-                .images
-                .iter()
+                .editor
+                .attached_images()
                 .map(ImageInput::original_byte_len)
                 .sum::<usize>();
         let host = self.files.clone();
@@ -104,10 +97,9 @@ impl Workbench {
         }
         match result {
             Ok(images) => {
-                let explicit = slot.state.images.len();
-                slot.state.images.extend(images);
+                slot.state.mentioned_images = images;
                 self.submit_composer(text, io);
-                self.slots[index].state.images.truncate(explicit);
+                self.slots[index].state.mentioned_images.clear();
             }
             Err(code) => slot
                 .state
@@ -117,6 +109,10 @@ impl Workbench {
 
     pub(super) fn submit_composer(&mut self, text: &str, io: &Io) -> bool {
         let origin = self.current;
+        if text.trim().is_empty() && !self.slots[origin].state.editor.images.is_empty() {
+            self.report(io, "Add a message to send the photo");
+            return false;
+        }
         let (accepted, done) = self.text(text, io);
         if accepted {
             self.selection = None;
@@ -127,7 +123,11 @@ impl Workbench {
                 slot.follow_accepted_submit = Some(id.clone());
             }
             if !matches!(self.menu, Some(Menu::DraftingPlan)) {
-                slot.state.editor.clear();
+                if slot.state.attachment_submission.is_some() {
+                    slot.state.editor.clear();
+                } else {
+                    slot.state.editor.clear_text();
+                }
                 slot.state.input_history.reset();
             }
             slot.refresh = Instant::now();

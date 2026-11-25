@@ -1,4 +1,6 @@
 //! Bounded terminal editor. Paste contents never become terminal actions.
+use crate::provider::contracts::ImageInput;
+
 pub const MAX_COMPOSER_BYTES: usize = crate::protocol::json::Json::FRAME_BYTES;
 const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -50,18 +52,103 @@ pub struct Editor {
     paste: bool,
     paste_start: usize,
     pub(super) pasted_ranges: Vec<std::ops::Range<usize>>,
-    pub(super) clipboard_anchor: Option<usize>,
+    pub(super) clipboard_anchor: Option<Caret>,
+    pub(super) images: Vec<DraftImage>,
+    pub(super) images_before: usize,
     paste_end: Vec<u8>,
     paste_cr: bool,
     pub overflow: bool,
     complete_right: bool,
     alt_utf8: usize,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Caret {
+    byte: usize,
+    // Images at the same byte boundary are distinct editing positions.
+    images: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DraftImage {
+    at: usize,
+    data: ImageInput,
+}
+
 impl Editor {
+    pub(super) fn caret(&self) -> Caret {
+        Caret {
+            byte: self.cursor,
+            images: self.images_before,
+        }
+    }
+
+    fn caret_at(&self, byte: usize, after_images: bool) -> Caret {
+        let images = self
+            .images
+            .partition_point(|image| image.at < byte || after_images && image.at == byte);
+        Caret { byte, images }
+    }
+
+    fn place(&mut self, caret: Caret) {
+        self.cursor = caret.byte;
+        self.images_before = caret.images;
+    }
+
+    fn move_to(&mut self, byte: usize, after_images: bool) {
+        self.place(self.caret_at(byte, after_images));
+    }
+
+    pub(super) fn attach_image(&mut self, at: Caret, image: ImageInput) {
+        if self.caret() >= at {
+            self.images_before += 1;
+        }
+        self.images.insert(
+            at.images,
+            DraftImage {
+                at: at.byte,
+                data: image,
+            },
+        );
+    }
+
+    pub(super) fn attached_images(&self) -> impl ExactSizeIterator<Item = &ImageInput> {
+        self.images.iter().map(|image| &image.data)
+    }
+
+    pub(super) fn clear_images(&mut self) {
+        self.images.clear();
+        self.images_before = 0;
+        if let Some(anchor) = &mut self.clipboard_anchor {
+            anchor.images = 0;
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.bytes.is_empty() && self.images.is_empty()
+    }
+
     pub fn set_completion(&mut self, active: bool) {
         self.complete_right = active;
     }
     pub fn replace(&mut self, begin: usize, end: usize, value: &[u8]) -> bool {
+        let start = if begin == self.cursor {
+            self.caret()
+        } else {
+            self.caret_at(begin, true)
+        };
+        let finish = if begin == end {
+            start
+        } else {
+            self.caret_at(end, false)
+        };
+        // Completion replaces a text span. Explicit image removal is handled
+        // by the editor's deletion actions.
+        start.images == finish.images && self.replace_text(start, finish, value)
+    }
+
+    fn replace_text(&mut self, start: Caret, finish: Caret, value: &[u8]) -> bool {
+        let (begin, end) = (start.byte, finish.byte);
         if self.overflow
             || begin > end
             || end > self.bytes.len()
@@ -78,9 +165,12 @@ impl Editor {
         {
             return false;
         }
-        self.adjust_pasted_ranges(begin, end, value.len());
+        self.adjust_edit(start, finish, value.len());
         self.bytes.splice(begin..end, value.iter().copied());
-        self.cursor = begin + value.len();
+        self.place(Caret {
+            byte: begin + value.len(),
+            ..start
+        });
         true
     }
     pub fn clear(&mut self) {
@@ -92,10 +182,20 @@ impl Editor {
         self.paste_start = 0;
         self.pasted_ranges.clear();
         self.clipboard_anchor = None;
+        self.clear_images();
         self.paste_end.clear();
         self.paste_cr = false;
         self.complete_right = false;
         self.alt_utf8 = 0;
+    }
+    pub(super) fn clear_text(&mut self) {
+        let mut images = std::mem::take(&mut self.images);
+        self.clear();
+        for image in &mut images {
+            image.at = 0;
+        }
+        self.images_before = images.len();
+        self.images = images;
     }
     pub fn text(&self) -> super::Result<&str> {
         std::str::from_utf8(&self.bytes).map_err(|_| "json_string_invalid")
@@ -112,12 +212,23 @@ impl Editor {
     pub fn pasting(&self) -> bool {
         self.paste
     }
-    fn adjust_pasted_ranges(&mut self, begin: usize, end: usize, replacement: usize) {
+    fn adjust_edit(&mut self, start: Caret, finish: Caret, replacement: usize) {
         if let Some(anchor) = &mut self.clipboard_anchor
-            && begin < *anchor
+            && start < *anchor
         {
-            *anchor = begin + replacement + anchor.saturating_sub(end);
+            anchor.byte = start.byte + replacement + anchor.byte.saturating_sub(finish.byte);
+            anchor.images = start.images + anchor.images.saturating_sub(finish.images);
         }
+        self.images.drain(start.images..finish.images);
+        for image in &mut self.images[start.images..] {
+            image.at = start.byte + replacement + image.at.saturating_sub(finish.byte);
+        }
+        if start.byte != finish.byte || replacement != 0 {
+            self.adjust_pasted_ranges(start.byte, finish.byte, replacement);
+        }
+    }
+
+    fn adjust_pasted_ranges(&mut self, begin: usize, end: usize, replacement: usize) {
         let first = self.pasted_ranges.partition_point(|r| r.end <= begin);
         let after = first + self.pasted_ranges[first..].partition_point(|r| r.start < end);
         self.pasted_ranges.drain(first..after);
@@ -126,10 +237,11 @@ impl Editor {
             range.end = range.end - (end - begin) + replacement;
         }
     }
-    fn erase(&mut self, begin: usize, end: usize) {
-        if begin != end {
-            self.adjust_pasted_ranges(begin, end, 0);
-            self.bytes.drain(begin..end);
+    fn erase(&mut self, start: Caret, finish: Caret) {
+        if start != finish {
+            self.adjust_edit(start, finish, 0);
+            self.bytes.drain(start.byte..finish.byte);
+            self.place(start);
         }
     }
     fn mark_paste(&mut self, start: usize) {
@@ -146,35 +258,38 @@ impl Editor {
             self.pasted_ranges.insert(index, start..end);
         }
     }
-    pub(super) fn insert_clipboard_text(&mut self, start: usize, text: &str) -> bool {
+    pub(super) fn insert_clipboard_text(&mut self, start: Caret, text: &str) -> bool {
         let clean: String = text
             .replace("\r\n", "\n")
             .replace('\r', "\n")
             .chars()
             .filter(|&ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
             .collect();
-        let cursor = self.cursor;
-        if !self.replace(start, start, clean.as_bytes()) {
+        let mut caret = self.caret();
+        if !self.replace_text(start, start, clean.as_bytes()) {
             return false;
         }
-        self.mark_paste(start);
-        self.cursor = if cursor < start {
-            cursor
-        } else {
-            cursor + clean.len()
-        };
+        self.mark_paste(start.byte);
+        if caret >= start {
+            caret.byte += clean.len();
+        }
+        self.place(caret);
         true
     }
     /// Only presentation changes. Moving inside a paste reveals it for editing.
     pub(super) fn composer_view(&self) -> (std::borrow::Cow<'_, [u8]>, usize) {
-        if self.pasted_ranges.is_empty() {
+        if self.pasted_ranges.is_empty() && self.images.is_empty() {
             return (std::borrow::Cow::Borrowed(&self.bytes), self.cursor);
         }
-        let mut display = Vec::new();
-        let mut cursor = self.cursor;
-        let mut after = 0;
+        let mut previews = Vec::new();
         for range in &self.pasted_ranges {
-            if range.start < self.cursor && self.cursor < range.end {
+            let first_inside = self.images.partition_point(|image| image.at <= range.start);
+            if range.start < self.cursor && self.cursor < range.end
+                || self
+                    .images
+                    .get(first_inside)
+                    .is_some_and(|image| image.at < range.end)
+            {
                 continue;
             }
             let Some(text) = self
@@ -184,13 +299,30 @@ impl Editor {
             else {
                 continue;
             };
-            display.extend_from_slice(&self.bytes[after..range.start]);
             let marker = format!("[pasted text · {} chars]", text.chars().count());
-            display.extend_from_slice(marker.as_bytes());
-            if range.end <= self.cursor {
-                cursor = cursor - range.len() + marker.len();
+            previews.push((range.start, range.end, marker, range.end <= self.cursor));
+        }
+        for (index, image) in self.images.iter().enumerate() {
+            let mut marker = format!("[Image #{}]", index + 1);
+            if self.bytes.get(image.at) == Some(&b'@')
+                && std::str::from_utf8(&self.bytes[..image.at])
+                    .is_ok_and(|prefix| prefix.is_empty() || prefix.ends_with(char::is_whitespace))
+            {
+                marker.push(' ');
             }
-            after = range.end;
+            previews.push((image.at, image.at, marker, index < self.images_before));
+        }
+        previews.sort_by_key(|(start, end, _, _)| (*start, *end));
+        let mut display = Vec::new();
+        let mut cursor = self.cursor;
+        let mut after = 0;
+        for (start, end, marker, before_cursor) in previews {
+            display.extend_from_slice(&self.bytes[after..start]);
+            display.extend_from_slice(marker.as_bytes());
+            if before_cursor {
+                cursor = cursor - (end - start) + marker.len();
+            }
+            after = end;
         }
         display.extend_from_slice(&self.bytes[after..]);
         (std::borrow::Cow::Owned(display), cursor)
@@ -198,7 +330,8 @@ impl Editor {
     fn insert(&mut self, ch: u8) {
         if !self.overflow && self.bytes.len() < MAX_COMPOSER_BYTES {
             self.cursor = self.cursor.min(self.bytes.len());
-            self.adjust_pasted_ranges(self.cursor, self.cursor, 1);
+            let at = self.caret();
+            self.adjust_edit(at, at, 1);
             self.bytes.insert(self.cursor, ch);
             self.cursor += 1;
         } else {
@@ -232,15 +365,44 @@ impl Editor {
             .map_or(self.bytes.len(), |i| self.cursor + i)
     }
     fn backspace(&mut self) {
-        if !self.overflow && self.cursor > 0 {
-            let previous = self.previous(self.cursor);
-            self.erase(previous, self.cursor);
-            self.cursor = previous;
+        if !self.overflow {
+            self.erase(self.previous_caret(), self.caret());
         }
     }
     fn delete(&mut self) {
-        if !self.overflow && self.cursor < self.bytes.len() {
-            self.erase(self.cursor, self.next(self.cursor));
+        if !self.overflow {
+            self.erase(self.caret(), self.next_caret());
+        }
+    }
+    fn previous_caret(&self) -> Caret {
+        let at = self.caret();
+        if at.images > 0 && self.images[at.images - 1].at == at.byte {
+            Caret {
+                images: at.images - 1,
+                ..at
+            }
+        } else if at.byte > 0 {
+            self.caret_at(self.previous(at.byte), true)
+        } else {
+            at
+        }
+    }
+
+    fn next_caret(&self) -> Caret {
+        let at = self.caret();
+        if self
+            .images
+            .get(at.images)
+            .is_some_and(|image| image.at == at.byte)
+        {
+            Caret {
+                images: at.images + 1,
+                ..at
+            }
+        } else if at.byte < self.bytes.len() {
+            self.caret_at(self.next(at.byte), false)
+        } else {
+            at
         }
     }
     fn word_left(&self) -> usize {
@@ -303,7 +465,7 @@ impl Editor {
             b"\x1b[A" | b"\x1bOA" => Some(Action::HistoryOlder),
             b"\x1b[B" | b"\x1bOB" => Some(Action::HistoryNewer),
             b"\x1b[D" | b"\x1bOD" => {
-                self.cursor = self.previous(self.cursor);
+                self.place(self.previous_caret());
                 None
             }
             b"\x1b[C" | b"\x1bOC" => {
@@ -311,23 +473,23 @@ impl Editor {
                     self.escape.clear();
                     return Some(Action::Complete);
                 }
-                self.cursor = self.next(self.cursor);
+                self.place(self.next_caret());
                 None
             }
             b"\x1b[1;5D" => {
-                self.cursor = self.word_left();
+                self.move_to(self.word_left(), false);
                 None
             }
             b"\x1b[1;5C" => {
-                self.cursor = self.word_right();
+                self.move_to(self.word_right(), true);
                 None
             }
             b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" | b"\x1b[7~" => {
-                self.cursor = self.line_start();
+                self.move_to(self.line_start(), false);
                 None
             }
             b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" | b"\x1b[8~" => {
-                self.cursor = self.line_end();
+                self.move_to(self.line_end(), true);
                 None
             }
             b"\x1b[3~" => {
@@ -371,12 +533,10 @@ impl Editor {
             if self.escape == b"\x1b" && !matches!(ch, b'[' | b'O' | b'\r' | b'\n' | 27) {
                 self.escape.clear();
                 match ch {
-                    b'b' => self.cursor = self.word_left(),
-                    b'f' => self.cursor = self.word_right(),
+                    b'b' => self.move_to(self.word_left(), false),
+                    b'f' => self.move_to(self.word_right(), true),
                     8 | 127 if !self.overflow => {
-                        let begin = self.word_left();
-                        self.erase(begin, self.cursor);
-                        self.cursor = begin;
+                        self.erase(self.caret_at(self.word_left(), false), self.caret());
                     }
                     0xc2..=0xdf => self.alt_utf8 = 1,
                     0xe0..=0xef => self.alt_utf8 = 2,
@@ -406,22 +566,18 @@ impl Editor {
                 15 => return Some(Action::ToggleTools),
                 25 => return Some(Action::CopyHistory),
                 9 => return Some(Action::FocusNext),
-                4 if self.bytes.is_empty() => return Some(Action::Eof),
+                4 if self.is_empty() => return Some(Action::Eof),
                 4 => self.delete(),
-                1 => self.cursor = self.line_start(),
-                5 => self.cursor = self.line_end(),
+                1 => self.move_to(self.line_start(), false),
+                5 => self.move_to(self.line_end(), true),
                 11 if !self.overflow => {
-                    self.erase(self.cursor, self.line_end());
+                    self.erase(self.caret(), self.caret_at(self.line_end(), true));
                 }
                 21 if !self.overflow => {
-                    let begin = self.line_start();
-                    self.erase(begin, self.cursor);
-                    self.cursor = begin;
+                    self.erase(self.caret_at(self.line_start(), false), self.caret());
                 }
                 23 if !self.overflow => {
-                    let begin = self.word_left();
-                    self.erase(begin, self.cursor);
-                    self.cursor = begin;
+                    self.erase(self.caret_at(self.word_left(), false), self.caret());
                 }
                 127 | 8 => self.backspace(),
                 b'\r' => return self.submit(),
@@ -492,15 +648,15 @@ mod paste_display_tests {
     #[test]
     fn clipboard_text_uses_character_and_line_thresholds() {
         let mut editor = Editor::default();
-        assert!(editor.insert_clipboard_text(editor.cursor, &"я".repeat(1000)));
+        assert!(editor.insert_clipboard_text(editor.caret(), &"я".repeat(1000)));
         assert!(editor.pasted_ranges.is_empty());
         editor.clear();
         let ten = ["a"; 10].join("\r\n");
-        assert!(editor.insert_clipboard_text(editor.cursor, &ten));
+        assert!(editor.insert_clipboard_text(editor.caret(), &ten));
         assert!(editor.pasted_ranges.is_empty());
         editor.clear();
         let eleven = ["a"; 11].join("\r\n");
-        assert!(editor.insert_clipboard_text(editor.cursor, &eleven));
+        assert!(editor.insert_clipboard_text(editor.caret(), &eleven));
         assert_eq!(
             editor.composer_view().0.as_ref(),
             "[pasted text · 21 chars]".as_bytes()

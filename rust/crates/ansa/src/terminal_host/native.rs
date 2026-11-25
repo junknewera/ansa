@@ -42,6 +42,11 @@ const SCREEN_BYTES: usize = 12 * 1024;
 const MAX_OUTPUT: u64 = 32 * 1024 * 1024;
 const MAX_UID_TASKS: usize = 2048;
 const RETAINED_OUTPUT: usize = 64 * 1024;
+// Retain screen rows separately from the agent's raw output byte window.
+const SHELL_HISTORY_ROWS: usize = 1024;
+// A human viewport can contain 128 × 256 VT cells of up to 22 bytes each.
+// Reserve room for UTF-8 sanitization and JSON escaping on this private reply.
+const VIEWPORT_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_READ: usize = 8192;
 
 #[derive(Serialize, Deserialize)]
@@ -68,6 +73,10 @@ enum Request {
     Interrupt,
     Close,
     Capture,
+    Viewport {
+        top: Option<usize>,
+        height: usize,
+    },
     Status,
     Read {
         after: u64,
@@ -83,9 +92,20 @@ enum Request {
 enum Response {
     Effect { value: Effect },
     Capture { screen: Screen },
+    Viewport { page: Viewport },
     Status { exit: Option<Exit> },
     Read { output: Output },
     ShellStatus { state: shell::State },
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Viewport {
+    pub scroll: usize,
+    pub history: usize,
+    pub live_top: usize,
+    pub height: usize,
+    pub text: String,
+    pub exit: Option<Exit>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -225,8 +245,14 @@ impl Worker {
         if !self.connected {
             return None;
         }
-        let response = wire::write(&mut self.socket, self.sequence, request)
-            .and_then(|_| wire::read(&mut self.socket, self.sequence));
+        let viewport = matches!(request, Request::Viewport { .. });
+        let response = wire::write(&mut self.socket, self.sequence, request).and_then(|_| {
+            if viewport {
+                wire::read_limited(&mut self.socket, self.sequence, VIEWPORT_FRAME_BYTES)
+            } else {
+                wire::read(&mut self.socket, self.sequence)
+            }
+        });
         self.sequence += 1;
         match response {
             Ok(response) => Some(response),
@@ -528,6 +554,29 @@ impl<J: Journal> Host<J, NativeBackend> {
         Ok(screen)
     }
 
+    pub(crate) fn human_viewport(
+        &mut self,
+        terminal: &Id,
+        epoch: u64,
+        top: Option<usize>,
+        height: usize,
+    ) -> Result<Viewport, &'static str> {
+        let permit = self.read_permit(Writer::Human, terminal, epoch, 0)?;
+        let worker = self
+            .backend
+            .workers
+            .get_mut(terminal)
+            .ok_or("terminal_worker_lost")?;
+        let Some(Response::Viewport { page }) = worker.call(Request::Viewport { top, height })
+        else {
+            return Err("terminal_worker_lost");
+        };
+        if !self.recheck_read(&permit) {
+            return Err("terminal_read_lease");
+        }
+        Ok(page)
+    }
+
     pub fn read_output(
         &mut self,
         writer: Writer,
@@ -577,6 +626,7 @@ fn worker() -> io::Result<()> {
     let mut socket = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
     socket.peer_addr()?;
     socket.set_nonblocking(true)?;
+    socket.set_write_timeout(Some(WRITE_BUDGET))?;
     let mut reader = wire::Reader::default();
     let deadline = Instant::now() + RPC_BUDGET;
     let (binding, launch, workspace) = loop {
@@ -709,7 +759,10 @@ fn worker() -> io::Result<()> {
                         terminal.reply(&mut socket, close_effect(clean))?;
                         break;
                     }
-                    Ok(Some(request)) => terminal.reply(&mut socket, terminal.observe(request))?,
+                    Ok(Some(request)) => {
+                        let response = terminal.observe(request);
+                        terminal.reply(&mut socket, response)?;
+                    }
                     Ok(None) => thread::sleep(TICK),
                     Err(_) => break,
                 }
@@ -766,7 +819,7 @@ enum Drain {
 
 struct WorkerTerminal {
     reader: wire::Reader,
-    parser: vt100::Parser,
+    parser: vt100::Parser<History>,
     filter: EscapeFilter,
     output: Retained,
     sequence: u64,
@@ -775,11 +828,29 @@ struct WorkerTerminal {
     shell: Option<Shell>,
 }
 
+#[derive(Default)]
+struct History {
+    discarded: usize,
+}
+
+impl vt100::Callbacks for History {
+    fn on_scroll(&mut self, _: vt100::capture::RowContents<'_>, alternate_screen: bool) {
+        if !alternate_screen {
+            self.discarded = self.discarded.saturating_add(1);
+        }
+    }
+}
+
 impl WorkerTerminal {
     fn new(reader: wire::Reader, size: Size, continuous: bool) -> Self {
         Self {
             reader,
-            parser: vt100::Parser::new(nonzero(size.rows), nonzero(size.columns), 0),
+            parser: vt100::Parser::new_with_callbacks(
+                nonzero(size.rows),
+                nonzero(size.columns),
+                if continuous { SHELL_HISTORY_ROWS } else { 0 },
+                History::default(),
+            ),
             filter: EscapeFilter::new(vec![]),
             output: Retained::default(),
             sequence: 1,
@@ -841,10 +912,50 @@ impl WorkerTerminal {
         screen
     }
 
-    fn observe(&self, request: Request) -> Response {
+    fn viewport(&mut self, top: Option<usize>, height: usize) -> Viewport {
+        let (screen, counters) = self.parser.screen_and_callbacks_mut();
+        let (rows, columns) = screen.size();
+        let height = height.clamp(1, usize::from(rows.get()));
+        let columns = columns.get();
+        let live_start = if screen.alternate_screen() {
+            0
+        } else {
+            screen
+                .rows(0, columns)
+                .enumerate()
+                .filter(|(_, line)| !line.is_empty())
+                .last()
+                .map_or(0, |(row, _)| (row + 1).saturating_sub(height))
+        };
+        let history = live_start + screen.scrollback_len();
+        let live_top = counters.discarded.saturating_add(history);
+        let scroll = top.map_or(0, |top| live_top.saturating_sub(top).min(history));
+        screen.set_scrollback(scroll.saturating_sub(live_start));
+        let text = screen
+            .rows(0, columns)
+            .skip(live_start.saturating_sub(scroll))
+            .take(height)
+            .map(|line| line.replace(char::is_control, "\u{fffd}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.set_scrollback(0);
+        Viewport {
+            scroll,
+            history,
+            live_top,
+            height,
+            text,
+            exit: self.exit.clone(),
+        }
+    }
+
+    fn observe(&mut self, request: Request) -> Response {
         match request {
             Request::Capture => Response::Capture {
                 screen: self.capture(),
+            },
+            Request::Viewport { top, height } => Response::Viewport {
+                page: self.viewport(top, height),
             },
             Request::Status => Response::Status {
                 exit: self.exit.clone(),
@@ -878,7 +989,14 @@ impl WorkerTerminal {
     }
 
     fn reply(&mut self, socket: &mut UnixStream, response: Response) -> io::Result<()> {
-        wire::write(socket, self.sequence, response)?;
+        if matches!(response, Response::Viewport { .. }) {
+            socket.set_nonblocking(false)?;
+            let sent = wire::write_limited(socket, self.sequence, response, VIEWPORT_FRAME_BYTES);
+            socket.set_nonblocking(true)?;
+            sent?;
+        } else {
+            wire::write(socket, self.sequence, response)?;
+        }
         self.sequence += 1;
         Ok(())
     }
@@ -917,10 +1035,12 @@ fn worker_loop(
             Request::Open { .. } => return Err(io::Error::other("terminal_already_open")),
             Request::Close => return Ok(End::Requested),
             Request::Capture
+            | Request::Viewport { .. }
             | Request::Read { .. }
             | Request::Status
             | Request::ShellStatus { .. } => {
-                terminal.reply(socket, terminal.observe(request))?;
+                let response = terminal.observe(request);
+                terminal.reply(socket, response)?;
                 continue;
             }
             Request::Approve { screen } => {
@@ -1054,4 +1174,79 @@ fn snapshot(screen: &vt100::Screen, through: u64) -> Screen {
 
 fn nonzero(value: u16) -> NonZeroU16 {
     NonZeroU16::new(value).expect("validated terminal size")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_keeps_its_top_row_across_output_and_resize() {
+        let mut terminal = WorkerTerminal::new(
+            wire::Reader::default(),
+            Size {
+                rows: 24,
+                columns: 80,
+            },
+            true,
+        );
+        for line in 0..SHELL_HISTORY_ROWS {
+            terminal.parser.process(format!("{line:04}\r\n").as_bytes());
+        }
+        let live = terminal.viewport(None, 10);
+        let top = live.live_top - 10;
+        let before = terminal.viewport(Some(top), 10);
+        for line in SHELL_HISTORY_ROWS..SHELL_HISTORY_ROWS + 90 {
+            terminal.parser.process(format!("{line:04}\r\n").as_bytes());
+        }
+        let after = terminal.viewport(Some(top), 80);
+        assert_eq!(after.height, 24);
+        assert_eq!(after.live_top - after.scroll, top);
+        assert_eq!(after.text.lines().next(), before.text.lines().next());
+        assert_eq!(terminal.capture().text.lines().last(), Some("1113"));
+        let oldest = terminal.viewport(Some(0), 10);
+        assert!(oldest.live_top > oldest.history);
+        assert!(oldest.text.starts_with("0067\n"));
+    }
+
+    #[test]
+    fn viewport_includes_the_live_tail_of_a_dense_screen() {
+        let mut terminal = WorkerTerminal::new(
+            wire::Reader::default(),
+            Size {
+                rows: 128,
+                columns: 256,
+            },
+            true,
+        );
+        let fill = "∑".repeat(248);
+        for line in 0..128 {
+            terminal
+                .parser
+                .process(format!("{line:03} {fill}\r\n").as_bytes());
+        }
+        let page = terminal.viewport(None, 128);
+        assert!(page.text.len() > 64 * 1024);
+        assert!(
+            page.text
+                .trim_end()
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("127 ")
+        );
+        let mut bytes = Vec::new();
+        wire::write_limited(
+            &mut bytes,
+            1,
+            Response::Viewport { page },
+            VIEWPORT_FRAME_BYTES,
+        )
+        .unwrap();
+        assert!(wire::read::<Response>(&mut bytes.as_slice(), 1).is_err());
+        assert!(matches!(
+            wire::read_limited(&mut bytes.as_slice(), 1, VIEWPORT_FRAME_BYTES).unwrap(),
+            Response::Viewport { page } if page.height == 128
+        ));
+    }
 }

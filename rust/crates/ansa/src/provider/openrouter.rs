@@ -490,10 +490,7 @@ pub(crate) fn base_body(request: &Request, instructions: &str) -> Result<Value> 
         } else if value["role"] == "user" && value["content"].is_array() {
             let parts = value["content"].as_array().ok_or("openrouter_input")?;
             let (text, images) = parts.split_first().ok_or("openrouter_input")?;
-            if text["type"] != "input_text"
-                || images.is_empty()
-                || images.len() > crate::provider::contracts::MAX_IMAGES
-            {
+            if text["type"] != "input_text" || images.is_empty() {
                 return Err("openrouter_input");
             }
             let mut content = vec![

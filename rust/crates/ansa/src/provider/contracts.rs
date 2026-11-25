@@ -8,7 +8,7 @@
 use crate::{orchestration::profile::RoleProfile, protocol::json::Json, provider::replay::Effects};
 
 pub(crate) mod image;
-pub use image::{ImageInput, MAX_IMAGE_BYTES, MAX_IMAGES};
+pub use image::{ImageInput, MAX_IMAGE_BYTES};
 
 macro_rules! id_type {
     ($name:ident) => {

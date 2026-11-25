@@ -96,7 +96,7 @@ pub struct State {
     pub scroll_limit: usize,
     pub status: String,
     pub pending: Option<CommandId>,
-    images: Vec<ImageInput>,
+    mentioned_images: Vec<ImageInput>,
     text_attachment: Option<TextAttachment>,
     attachment_loading: bool,
     attachment_submission: Option<CommandId>,
@@ -147,7 +147,7 @@ impl State {
             scroll_limit: 0,
             status: String::new(),
             pending: None,
-            images: vec![],
+            mentioned_images: vec![],
             text_attachment: None,
             attachment_loading: false,
             attachment_submission: None,
@@ -672,18 +672,24 @@ impl State {
         };
         self.turn = TurnId(format!("t_{}_{}", self.prefix, self.sequence + 1));
         let submit = Submit { text, mode };
+        let images: Vec<_> = self
+            .editor
+            .attached_images()
+            .chain(&self.mentioned_images)
+            .cloned()
+            .collect();
         let payload = if mode == AgentMode::LeadPlus
             && let Some(profile) = self.lead_profile.take()
         {
-            CommandPayload::SubmitWithRoles(submit, self.images.clone(), Box::new(profile))
-        } else if self.images.is_empty() {
+            CommandPayload::SubmitWithRoles(submit, images, Box::new(profile))
+        } else if images.is_empty() {
             CommandPayload::Submit(submit)
         } else {
             if mode == AgentMode::OrchestrationChat {
                 self.report(io, "Image attachments require Work or Plan");
                 return false;
             }
-            CommandPayload::SubmitImages(submit, self.images.clone())
+            CommandPayload::SubmitImages(submit, images)
         };
         let posted = self.post(handle, payload, replies);
         if posted {
@@ -708,11 +714,14 @@ impl State {
         posted
     }
     fn has_attachments(&self) -> bool {
-        !self.images.is_empty() || self.text_attachment.is_some()
+        !self.editor.images.is_empty()
+            || !self.mentioned_images.is_empty()
+            || self.text_attachment.is_some()
     }
 
     fn clear_attachments(&mut self) {
-        self.images.clear();
+        self.editor.clear_images();
+        self.mentioned_images.clear();
         self.text_attachment = None;
     }
 
@@ -1085,8 +1094,11 @@ impl State {
             } else {
                 "/resume unavailable · /cancel to cancel the request".into()
             }
-        } else if self.status.is_empty() && self.has_attachments() {
-            match (self.text_attachment.is_some(), self.images.len()) {
+        } else if self.status.is_empty()
+            && self.has_attachments()
+            && (self.text_attachment.is_some() || ui.is_none())
+        {
+            match (self.text_attachment.is_some(), self.editor.images.len()) {
                 (true, 0) => "Text attached · /attach --clear".into(),
                 (true, count) => format!("Text + images ({count}) attached · /attach --clear"),
                 (false, count) => format!("Image attached ({count}) · /attach --clear"),
