@@ -476,26 +476,22 @@ impl Slot {
     ) -> Option<Vec<Entry>> {
         let page = self.conversation_page.as_ref()?;
         let view = self.state.snapshot.as_ref()?;
-        let mut entries = page
-            .entries
-            .iter()
-            .map(|row| Entry {
-                role: row.role.clone(),
-                text: if row.state == "delegate_error"
-                    && let Some((title, code)) = row.text.rsplit_once('\n')
-                {
-                    format!("{title}\n{} · /agents", diagnostics::error(code))
-                } else {
-                    row.text.clone()
-                },
-                action: None,
-                edit: None,
-                output: None,
-                agent: None,
-                status: None,
-            })
-            .collect::<Vec<_>>();
-        if page.end == page.total {
+        let at_tail = page.end == page.total;
+        let current = at_tail && page.total >= view.conversation_size;
+        let draft = view
+            .submit
+            .as_ref()
+            .is_some_and(|id| id.0.starts_with("draft-"));
+        let show_tools = matches!(self.kind, Kind::Main | Kind::Fork);
+        let now = Instant::now();
+        let mut entries = super::super::tool_ui::chat(
+            &page.entries,
+            view,
+            show_tools,
+            current && !draft,
+            |operation| self.state.progress.tool_elapsed(operation, now),
+        );
+        if at_tail {
             entries.extend(
                 view.followups
                     .iter()
@@ -514,10 +510,7 @@ impl Slot {
                 && !preview.text.is_empty()
                 && preview.state != "committed"
                 && self.state.preview_request == view.request
-                && !view
-                    .submit
-                    .as_ref()
-                    .is_some_and(|id| id.0.starts_with("draft-"))
+                && !draft
             {
                 entries.push(Entry {
                     action: None,
@@ -576,12 +569,18 @@ impl Slot {
                     status: None,
                 });
             }
-            if show_activity
-                && !view
-                    .submit
-                    .as_ref()
-                    .is_some_and(|id| id.0.starts_with("draft-"))
-            {
+            let running_tool_shown = show_tools
+                && current
+                && view
+                    .tools
+                    .iter()
+                    .rev()
+                    .find_map(|activity| match activity {
+                        Activity::Started(tool) => Some(tool.name.as_str()),
+                        Activity::Finished(_) => None,
+                    })
+                    .is_some_and(|name| name != crate::tools::delegation::NAME);
+            if show_activity && !draft && !running_tool_shown {
                 entries.extend(self.live_activity(view, delegate));
             }
         }

@@ -162,6 +162,63 @@ pub(crate) fn conversation_row(row: &Entry) -> bool {
         && !draft_material(row)
 }
 
+fn conversation_tool(row: &Entry) -> bool {
+    row.role == "tool_result"
+        && !row.turn.0.starts_with("draft-")
+        && row
+            .tool
+            .as_ref()
+            .is_some_and(|tool| !tool.continued && tool.name != crate::tools::delegation::NAME)
+}
+
+fn compact_tool_result(detail: &mut ToolDetail, text: &str) -> String {
+    let Some(output) = text
+        .get(detail.content_start..)
+        .and_then(|text| Json::parse_with_limits(text, 128 * 1024, 64, 131072).ok())
+    else {
+        return String::new();
+    };
+    if matches!(detail.name.as_str(), "read_skill" | "read_skill_page")
+        && let Ok(name) = output.text_field("name")
+    {
+        detail.target = name.chars().take(64).collect();
+    }
+    let mut fields = Vec::new();
+    for key in [
+        "cleanup_unknown",
+        "cleanup_complete",
+        "timed_out",
+        "cancelled",
+        "truncated",
+    ] {
+        if let Ok(value) = output.field(key)
+            && value.boolean().is_ok()
+        {
+            fields.push((key, value.clone()));
+        }
+    }
+    if let Ok(code) = output.field("exit_code")
+        && code.dump().parse::<i32>().is_ok()
+    {
+        fields.push(("exit_code", code.clone()));
+    }
+    if output.text_field("status") == Ok("instructions_required") {
+        fields.push((
+            "status",
+            Json::string("instructions_required").expect("constant"),
+        ));
+    }
+    if output.has("error") {
+        let error = if output.text_field("error") == Ok("cancelled") {
+            "cancelled"
+        } else {
+            "error"
+        };
+        fields.push(("error", Json::string(error).expect("constant")));
+    }
+    Json::object(fields).map_or_else(|_| String::new(), |status| status.dump())
+}
+
 fn is_draft_question(role: &str, turn: &TurnId) -> bool {
     role == "user" && turn.0.starts_with("draft-") && !turn.0.starts_with("draft-revise-")
 }
@@ -336,10 +393,35 @@ impl Timeline {
                 }
                 let visible = result.record_draft(&turn, hash.finish());
                 for chunk in chunks {
-                    result.append_entry(chunk, visible);
+                    result.append_entry(chunk, visible, None);
+                }
+            } else if conversation_tool(&entry)
+                && let Some(tool) = &entry.tool
+                && !tool.last_chunk
+            {
+                let mut chunks = vec![entry];
+                while let Some(previous) = chunks.last()
+                    && let Some(tool) = &previous.tool
+                    && !tool.last_chunk
+                    && entries.peek().is_some_and(|next| {
+                        next.request == previous.request
+                            && next.role == previous.role
+                            && next.tool.as_ref().is_some_and(|next_tool| {
+                                next_tool.continued && next_tool.operation == tool.operation
+                            })
+                    })
+                {
+                    chunks.extend(entries.next());
+                }
+                let text = chunks
+                    .iter()
+                    .map(|chunk| chunk.text.as_str())
+                    .collect::<String>();
+                for chunk in chunks {
+                    result.append_entry(chunk, true, Some(&text));
                 }
             } else {
-                result.append_entry(entry, true);
+                result.append_entry(entry, true, None);
             }
         }
         Ok(result)
@@ -352,13 +434,36 @@ impl Timeline {
         self.latest_draft = Some((turn.clone(), digest));
         fresh
     }
-    fn append_entry(&mut self, entry: Entry, visible: bool) {
+    fn append_entry(&mut self, entry: Entry, visible: bool, full_text: Option<&str>) {
         let entry = std::sync::Arc::new(entry);
         if visible && conversation_row(&entry) {
             if !draft_question(&entry) && matches!(entry.role.as_str(), "assistant" | "user") {
                 self.latest_draft = None;
             }
             self.conversation.append_shared(entry.clone());
+        } else if visible
+            && conversation_tool(&entry)
+            && let Some(detail) = &entry.tool
+        {
+            let mut detail = (**detail).clone();
+            let text = compact_tool_result(&mut detail, full_text.unwrap_or(&entry.text));
+            if detail.name.starts_with("terminal_") {
+                detail.target.clear();
+            }
+            self.conversation.append(Entry {
+                turn: entry.turn.clone(),
+                request: entry.request.clone(),
+                role: entry.role.clone(),
+                state: entry.state.clone(),
+                mode: entry.mode,
+                text,
+                tool: Some(std::sync::Arc::new(ToolDetail {
+                    purpose: "".into(),
+                    content_start: 0,
+                    last_chunk: true,
+                    ..detail
+                })),
+            });
         }
         self.entries.append_shared(entry);
     }
@@ -407,6 +512,7 @@ impl Timeline {
                     }),
                 },
                 visible,
+                Some(&text),
             );
             remaining = &remaining[end..];
             offset += end;
@@ -988,6 +1094,61 @@ mod tests {
                 ..query.clone()
             });
             assert_eq!(forward.entries, latest.entries);
+        }
+    }
+    #[test]
+    fn conversation_keeps_one_compact_result_across_large_tool_output_and_fork() {
+        use crate::provider::replay::{Effects, Execution};
+        let mut timeline = Timeline::default();
+        timeline.append("user", "Question".into(), "accepted");
+        let mut detail = ToolDetail {
+            operation: "tool-1".into(),
+            name: "run_command".into(),
+            call: "call-1".into(),
+            purpose: "PURPOSE_CANARY".into(),
+            target: "example".into(),
+            phase: ToolPhase::Prepared,
+            content_start: 0,
+            continued: false,
+            last_chunk: true,
+        };
+        timeline.append_tool(
+            "tool",
+            "ARGUMENT_CANARY".into(),
+            "intent",
+            Some(detail.clone()),
+        );
+        detail.phase = ToolPhase::Finished {
+            execution: Execution::Succeeded,
+            effects: Effects::KnownResult,
+        };
+        let output = format!(
+            r#"{{"stdout":"OUTPUT_CANARY{}","exit_code":2}}"#,
+            "x".repeat(131_000)
+        );
+        let prefix = "p".repeat(128);
+        detail.content_start = prefix.len();
+        timeline.append_tool(
+            "tool_result",
+            format!("{prefix}{output}"),
+            "finished",
+            Some(detail),
+        );
+        timeline.append("assistant", "Answer".into(), "completed");
+        assert_eq!(timeline.len(), 5);
+        let restored = Timeline::load(&timeline.save().unwrap()).unwrap();
+        let query = GetTranscript {
+            before: 1,
+            limit: 1,
+            forward: true,
+        };
+        for timeline in [timeline, restored] {
+            let page = timeline.conversation_page(query.clone());
+            assert_eq!((page.begin, page.end, page.total), (1, 2, 3));
+            assert_eq!(page.entries[0].text, r#"{"exit_code":2}"#);
+            let detail = page.entries[0].tool.as_ref().unwrap();
+            assert_eq!(detail.operation, "tool-1");
+            assert!(detail.purpose.is_empty() && !detail.continued && detail.last_chunk);
         }
     }
     #[test]

@@ -365,12 +365,16 @@ def markdown_source_preview(screen, root, cwd):
 def inline_tool_details(screen, root, cwd):
     screen.send("TOOLS_TASK\r")
     until(screen, lambda frame: completed(root, "TOOLS_TASK") and ready(screen)
-          and "OMH_TOOL_OK" in frame, "completed tool turn has an assistant reply")
-    assert "get_test_value" not in body(screen) and "Arguments" not in body(screen)
+          and "OMH_TOOL_OK" in frame and "get_test_value" in frame,
+          "completed tool and assistant reply in the main chat")
+    chat = body(screen)
+    assert chat.index("TOOLS_TASK") < chat.index("get_test_value") < chat.index("OMH_TOOL_OK")
+    assert chat.count("get_test_value") == 1 and "get_test_value · done" in chat
+    assert "Arguments" not in chat and "value: OMH_FIXED_VALUE_42" not in chat
     screen.send("TOOLS_DRAFT Ж")
     until(screen, lambda frame: screen.vt.line(-4) == "  › TOOLS_DRAFT Ж", "tool draft")
     open_activity(screen)
-    until(screen, lambda _: "get_test_value" in body(screen), "compact completed tool in Activity")
+    until(screen, lambda _: "> get_test_value" in activity_body(screen), "compact completed tool in Activity")
     compact = activity_body(screen)
     headers = [line for line in compact.splitlines() if re.match(r"[>v] get_test_value\b", line)]
     assert len(headers) == 1 and "done" in headers[0], "tool lifecycle was split into duplicate rows"
@@ -413,9 +417,9 @@ def inline_tool_details(screen, root, cwd):
     assert screen.vt.line(-4) == "  › TOOLS_DRAFT Ж", "read-only output accepted Unicode, paste or deletion into the draft"
     assert body(screen) == output_before and journals(root) == before, "read-only output input changed the view or canonical journal"
     escape(screen)
-    until(screen, lambda frame: activity_open(screen) and "get_test_value" in frame, "output inspector returned to Activity")
+    until(screen, lambda _: activity_open(screen) and "get_test_value" in activity_body(screen), "output inspector returned to Activity")
     close_activity(screen)
-    assert "get_test_value" not in body(screen) and "value: OMH_FIXED_VALUE_42" not in body(screen)
+    assert "get_test_value · done" in body(screen) and "value: OMH_FIXED_VALUE_42" not in body(screen)
     assert journals(root) == before and screen.vt.line(-4) == "  › TOOLS_DRAFT Ж"
 
 
@@ -527,7 +531,7 @@ def selection_scroll(screen, root, cwd):
     assert screen.raw[at:].count(b"\x1b]52;c;") == 1
     before = journals(root)
     open_activity(screen)
-    until(screen, lambda _: "get_test_value" in body(screen), "operation history in Terminals")
+    until(screen, lambda _: "get_test_value" in activity_body(screen), "operation history in Terminals")
     assert "HISTORY_FIRST" not in activity_body(screen) and "HISTORY_SEED_33" not in activity_body(screen)
     for _ in range(8):
         screen.send(b"\x1b[5~")
@@ -536,7 +540,7 @@ def selection_scroll(screen, root, cwd):
             break
     else:
         raise AssertionError("Activity did not cross a journal page")
-    assert "get_test_value" in body(screen), "canonical operations disappeared on the older page"
+    assert "get_test_value" in activity_body(screen), "canonical operations disappeared on the older page"
     screen.send("G")
     until(screen, lambda _: activity_open(screen) and "Terminals · Events " not in body(screen),
           "return to latest operation history")
@@ -907,8 +911,9 @@ def native_terminal_panel(screen, root, cwd):
     until(screen, lambda _: ready(screen), "Esc returns focus to draft")
     screen.send(b"\x15")
     screen.send("TERMINAL_DEMO\r")
-    until(screen, lambda frame: completed(root, "TERMINAL_DEMO"), "offline terminal tool created a PTY")
-    assert "terminal_create" not in body(screen) and "ANSA_TERMINAL_READY" not in body(screen)
+    until(screen, lambda frame: completed(root, "TERMINAL_DEMO") and "terminal_create · done" in frame,
+          "offline terminal creation is summarized in chat")
+    assert "ANSA_TERMINAL_READY" not in body(screen)
     open_activity(screen)
     screen.send("s")
     until(screen, lambda frame: "Demo terminal" in frame and "ANSA_TERMINAL_READY" in body(screen),
