@@ -534,12 +534,10 @@ fn details(tool: &Tool, include_output: bool) -> super::carbon::OutputView {
         text,
     }
 }
-fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mut Vec<Entry>) {
-    let arrow = if expanded { "v" } else { ">" };
-    let target = preview(&tool.detail.target, 140);
-    let edit = parsed_edit(tool).map(std::sync::Arc::new);
+fn tool_header(tool: &Tool, arrow: &str, edit: Option<&EditView>, elapsed: &str) -> Entry {
+    let target = preview(&tool.detail.target, if arrow.is_empty() { 64 } else { 140 });
     let mut title = format!(
-        "{arrow} {}{}{} · ",
+        "{arrow}{}{}{} · ",
         if edit.is_some() {
             "Edited"
         } else {
@@ -548,7 +546,7 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         if target.is_empty() { "" } else { " " },
         target,
     );
-    if let Some(edit) = &edit {
+    if let Some(edit) = edit {
         title.push_str(&format!("(+{} -{}) · ", edit.diff.added, edit.diff.removed));
     }
     let start = title.len();
@@ -569,15 +567,28 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
         }
     });
     let end = start + status(tool).len();
-    title.push_str(&elapsed(&tool.detail.operation));
+    title.push_str(elapsed);
+    let mut header = entry(title, None, presentation_role(tool));
+    header.status = Some(start..end);
+    header
+}
+
+fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mut Vec<Entry>) {
+    let arrow = if expanded { "v " } else { "> " };
+    let edit = parsed_edit(tool).map(std::sync::Arc::new);
+    let mut header = tool_header(
+        tool,
+        arrow,
+        edit.as_deref(),
+        &elapsed(&tool.detail.operation),
+    );
     let action = if edit.is_some() {
         format!("diff:{}", tool.key)
     } else {
         tool.key.clone()
     };
-    let mut header = entry(title, Some(action.clone()), presentation_role(tool));
+    header.action = Some(action.clone());
     header.edit = edit.clone();
-    header.status = Some(start..end);
     out.push(header);
     if !tool.uncertain
         && !tool.volatile_outcome
@@ -703,7 +714,61 @@ fn show(tool: &Tool, expanded: bool, elapsed: &impl Fn(&str) -> String, out: &mu
 
 use crate::session::timeline::{conversation_row, draft_material};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Chat { tools: bool },
+    Activity,
+}
+
+fn group_label(surface: Surface, name: &str) -> Option<&'static str> {
+    if read(name) {
+        Some("Read and search")
+    } else if matches!(surface, Surface::Chat { .. }) && name.starts_with("terminal_") {
+        Some("Terminal")
+    } else {
+        None
+    }
+}
+
 pub(super) fn project(
+    entries: &[transcript::Entry],
+    view: &Snapshot,
+    expanded: &BTreeSet<String>,
+    all: bool,
+    current: bool,
+    elapsed: impl Fn(&str) -> String,
+) -> Vec<Entry> {
+    project_rows(
+        Surface::Activity,
+        entries,
+        view,
+        expanded,
+        all,
+        current,
+        elapsed,
+    )
+}
+
+pub(super) fn chat(
+    entries: &[transcript::Entry],
+    view: &Snapshot,
+    tools: bool,
+    current: bool,
+    elapsed: impl Fn(&str) -> String,
+) -> Vec<Entry> {
+    project_rows(
+        Surface::Chat { tools },
+        entries,
+        view,
+        &BTreeSet::new(),
+        false,
+        tools && current,
+        elapsed,
+    )
+}
+
+fn project_rows(
+    surface: Surface,
     entries: &[transcript::Entry],
     view: &Snapshot,
     expanded: &BTreeSet<String>,
@@ -716,8 +781,24 @@ pub(super) fn project(
     let mut items = Vec::new();
     let mut drafts = BTreeSet::new();
     for row in entries {
+        let is_tool = matches!(row.role.as_str(), "tool" | "tool_result");
+        if is_tool && surface == (Surface::Chat { tools: false }) {
+            continue;
+        }
         let Some(detail) = &row.tool else {
-            let is_tool = matches!(row.role.as_str(), "tool" | "tool_result");
+            if matches!(surface, Surface::Chat { .. }) {
+                let text = if row.state == "delegate_error"
+                    && let Some((title, code)) = row.text.rsplit_once('\n')
+                {
+                    format!("{title}\n{} · /agents", super::diagnostics::error(code))
+                } else if is_tool {
+                    row.text.lines().next().unwrap_or_default().into()
+                } else {
+                    row.text.clone()
+                };
+                items.push(Item::Text(entry(text, None, &row.role)));
+                continue;
+            }
             if draft_material(row) {
                 if drafts.insert(row.turn.0.as_str()) {
                     let proposal = entry(
@@ -842,6 +923,11 @@ pub(super) fn project(
     }
     // Snapshot repairs a lost notification. It never demotes a durable outcome.
     for activity in view.tools.iter().filter(|_| current) {
+        if surface != Surface::Activity
+            && matches!(activity, Activity::Started(tool) if tool.name == crate::tools::delegation::NAME)
+        {
+            continue;
+        }
         let Some(request) = &view.request else {
             break;
         };
@@ -959,15 +1045,20 @@ pub(super) fn project(
         };
         let first = &tools[*index];
         let mut end = at + 1;
-        if read(&first.detail.name) {
+        let group = group_label(surface, &first.detail.name);
+        if let Some(label) = group {
             while let Some(Item::Tool(index)) = items.get(end) {
-                if !read(&tools[*index].detail.name) || tools[*index].request != first.request {
+                if group_label(surface, &tools[*index].detail.name) != Some(label)
+                    || tools[*index].request != first.request
+                {
                     break;
                 }
                 end += 1;
             }
         }
-        if end > at + 1 {
+        if end > at + 1
+            && let Some(label) = group
+        {
             let key = format!("group:{}", first.key);
             let open = all || expanded.contains(&key);
             let group: Vec<&Tool> = items[at..end]
@@ -981,7 +1072,8 @@ pub(super) fn project(
                 .iter()
                 .any(|tool| tool.running && matches!(tool.detail.phase, ToolPhase::Prepared));
             let problems = group.iter().filter(|tool| failed(tool)).count();
-            let state = if problems > 0 {
+            let activity = surface == Surface::Activity;
+            let mut state = if problems > 0 {
                 format!(" · issues: {problems}")
             } else if active {
                 " · running".into()
@@ -993,6 +1085,23 @@ pub(super) fn project(
             } else {
                 " · done ✓".into()
             };
+            if !activity && problems > 0 {
+                if group.iter().any(|tool| {
+                    tool.uncertain
+                        || matches!(
+                            tool.detail.phase,
+                            ToolPhase::Finished {
+                                effects: Effects::Unknown,
+                                ..
+                            }
+                        )
+                }) {
+                    state.push_str(" · unknown result");
+                }
+                if active {
+                    state.push_str(" · running");
+                }
+            }
             let mut seen = BTreeSet::new();
             let targets = group
                 .iter()
@@ -1001,12 +1110,14 @@ pub(super) fn project(
                 .take(3)
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut title = format!(
-                "{} Read and search · {} {}",
-                if open { "v" } else { ">" },
-                group.len(),
-                calls(group.len())
-            );
+            let arrow = if !activity {
+                ""
+            } else if open {
+                "v "
+            } else {
+                "> "
+            };
+            let mut title = format!("{arrow}{label} · {} {}", group.len(), calls(group.len()));
             let start = title.len() + " · ".len();
             title.push_str(&state);
             let end = title.len();
@@ -1016,7 +1127,7 @@ pub(super) fn project(
             }
             let mut header = entry(
                 title,
-                Some(key),
+                activity.then_some(key),
                 if group
                     .iter()
                     .any(|tool| presentation_role(tool) == "tool_error")
@@ -1038,7 +1149,7 @@ pub(super) fn project(
             header.status = Some(start..end);
             result.push(header);
             for tool in group {
-                if open || failed(tool) {
+                if activity && (open || failed(tool)) {
                     let begin = result.len();
                     show(
                         tool,
@@ -1056,13 +1167,20 @@ pub(super) fn project(
                     }
                 }
             }
-        } else {
+        } else if surface == Surface::Activity {
             show(
                 first,
                 all || expanded.contains(&first.key),
                 &elapsed,
                 &mut result,
             );
+        } else {
+            result.push(tool_header(
+                first,
+                "",
+                None,
+                &elapsed(&first.detail.operation),
+            ));
         }
         at = end;
     }
@@ -1710,6 +1828,22 @@ mod tests {
             String::new()
         });
         assert!(super::tests::text(&first).contains("Arguments (excerpt)"));
+    }
+    #[test]
+    fn chat_groups_terminal_calls_without_actions_or_output() {
+        let phase = ToolPhase::Finished {
+            execution: Execution::Succeeded,
+            effects: Effects::KnownResult,
+        };
+        let rows = [
+            row("send", "terminal_input", phase, "COMMAND_CANARY"),
+            row("read", "terminal_read", phase, "OUTPUT_CANARY"),
+        ];
+        let chat = chat(&rows, &view(), true, false, |_| String::new());
+        assert_eq!(chat.len(), 1);
+        assert!(chat[0].text.starts_with("Terminal · 2 calls · done"));
+        assert!(chat[0].action.is_none() && chat[0].output.is_none());
+        assert!(!chat[0].text.contains("CANARY"));
     }
     #[test]
     fn terminal_activity_keeps_plan_links_and_draft_material_without_parent_chat() {

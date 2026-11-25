@@ -306,8 +306,8 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     until(screen, lambda text: '› VISUAL_TASK\n\n    PARAGRAPH' in text, 'both modified Enter keys insert in the draft')
     assert journals(root) == before_submit
     screen.send(b'\r')
-    until(screen, lambda text: completed(root, prompt) and answer in text, 'committed colored final text')
-    assert 'get_test_value' not in visible(screen)
+    until(screen, lambda text: completed(root, prompt) and answer in text
+          and 'get_test_value · done' in text, 'short tool status and final text in chat')
     answer_fg = screen.vt.attribute(answer)[0]
     user_bg = screen.vt.attribute('VISUAL_TASK', last=True)[1]
     assert user_bg is not None and not screen.vt.attribute('VISUAL_TASK', last=True)[2]
@@ -324,21 +324,21 @@ def colored_lifecycle(binary, adapter, root, home, cwd, screens):
     native_background(screen, 'VISUAL_DRAFT Ж')
     before = journals(root)
     open_activity(screen)
-    until(screen, lambda text: 'get_test_value' in text and 'done' in text, 'committed tool in Activity')
-    headers = [screen.vt.line(row) for row in range(3, screen.vt.rows - 5) if 'get_test_value' in screen.vt.line(row)]
+    until(screen, lambda text: '▸ get_test_value' in text and 'done' in text, 'committed tool in Activity')
+    headers = [screen.vt.line(row) for row in range(3, screen.vt.rows - 5) if '▸ get_test_value' in screen.vt.line(row)]
     assert len(headers) == 1 and '▸' in headers[0] and 'done' in headers[0], headers
     target_fg = screen.vt.attribute('get_test_value')[0]
     status_fg = screen.vt.attribute('done')[0]
     assert target_fg is not None and status_fg is not None and target_fg != answer_fg
     snapshot(screen, 'compact')
-    click_text(screen, 'get_test_value')
+    click_text(screen, '▸ get_test_value')
     until(screen, lambda text: 'Arguments' in text and 'Output' in text and '▾' in text, 'colored Activity expansion')
     assert screen.vt.attribute('VISUAL_DRAFT Ж')[1] == input_bg
     snapshot(screen, 'expanded')
-    click_text(screen, 'get_test_value')
+    click_text(screen, '▾ get_test_value')
     until(screen, lambda text: 'Arguments' not in text and '▸' in text, 'colored inline collapse')
     close_activity(screen)
-    assert 'get_test_value' not in visible(screen)
+    assert 'get_test_value · done' in visible(screen)
     row, column = screen.vt.location(answer)
     mouse(screen, 0, column, row)
     mouse(screen, 32, column + len(answer) - 1, row)
