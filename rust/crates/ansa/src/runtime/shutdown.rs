@@ -112,7 +112,7 @@ impl Handle {
         let sender = match &command.payload {
             CommandPayload::Cancel(_) => &self.cancel,
             CommandPayload::GetSnapshot(_) => &self.snapshot,
-            CommandPayload::Resume(_) => &self.resume,
+            CommandPayload::Resume(_) | CommandPayload::ResumeUnknown(..) => &self.resume,
             CommandPayload::GetTranscript(_)
             | CommandPayload::GetTimeline(_)
             | CommandPayload::GetConversation(_)

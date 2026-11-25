@@ -1613,33 +1613,68 @@ pub async fn unknown_restart() {
     .unwrap();
     runtime.ready().await.unwrap();
     let handle = runtime.handle();
-    let target = submit(&handle, "submit", "fixture", "turn").await;
+    post(
+        &handle,
+        "submit",
+        CommandPayload::Submit(Submit {
+            text: "fixture".into(),
+            mode: AgentMode::Plan,
+        }),
+        "turn",
+        PostStatus::Accepted,
+    )
+    .await;
+    let EventPayload::CommandAccepted {
+        request: Some(target),
+        ..
+    } = until(&handle, |p| {
+        matches!(p, EventPayload::CommandAccepted { .. })
+    })
+    .await
+    .payload
+    else {
+        panic!("missing request");
+    };
     until(&handle, |p| {
         matches!(p, EventPayload::RecoveryRequired { .. })
     })
     .await;
     until(&handle, |p| matches!(p, EventPayload::FrontendSnapshot(s)
-        if s.command.is_none() && s.state == "paused" && s.recovery_operation.is_some() && !s.resume_available
+        if s.command.is_none() && s.state == "paused" && s.recovery_operation.is_some() && s.resume_available
     )).await;
     finish(&mut runtime).await;
     let tools = make_tools();
+    let gate = Arc::new(Gate::default());
+    let acquisition = gate.clone();
+    let generations = Arc::new(AtomicUsize::new(0));
+    let generated = generations.clone();
     let mut runtime = Runtime::new(
         "offline".into(),
         configuration(&tools),
         tools,
-        generator(2),
+        Arc::new(move |request, _, _| {
+            generated.fetch_add(1, Ordering::SeqCst);
+            native::load(&saved_response(request, Some("RECOVERED"), 0))
+        }),
         Limits::default(),
-        options,
+        Options {
+            plan_guard: Some(Arc::new(move || {
+                acquisition.hold(&Cancel::default());
+                Ok(Box::new(()))
+            })),
+            ..options
+        },
     )
     .unwrap();
     runtime.ready().await.unwrap();
     let handle = runtime.handle();
     let view = snapshot(&handle, "unknown-restart").await;
-    assert!(view.recovery_operation.is_some() && !view.resume_available && !view.worker_busy);
+    assert!(view.resume_available && !view.worker_busy);
+    let operation = view.recovery_operation.unwrap();
     post(
         &handle,
         "resume",
-        CommandPayload::Resume(target),
+        CommandPayload::Resume(target.clone()),
         "turn",
         PostStatus::Accepted,
     )
@@ -1648,6 +1683,56 @@ pub async fn unknown_restart() {
     if let EventPayload::RuntimeError { diagnostic, .. } = error.payload {
         assert_eq!(diagnostic, "recovery_required");
     }
+    post(
+        &handle,
+        "stop",
+        CommandPayload::Cancel(target.clone()),
+        "turn",
+        PostStatus::Accepted,
+    )
+    .await;
+    until(&handle, |p| matches!(p, EventPayload::Cancelled { .. })).await;
+    let resume = CommandPayload::ResumeUnknown(target.clone(), operation);
+    post(
+        &handle,
+        "recover",
+        resume.clone(),
+        "turn",
+        PostStatus::Accepted,
+    )
+    .await;
+    let started = gate.clone();
+    tokio::task::spawn_blocking(move || started.wait())
+        .await
+        .unwrap();
+    post(
+        &handle,
+        "stop-recovery",
+        CommandPayload::Cancel(target),
+        "turn",
+        PostStatus::Accepted,
+    )
+    .await;
+    until(&handle, |p| matches!(p, EventPayload::Cancelled { .. })).await;
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while snapshot(&handle, "lease-settled").await.worker_busy {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(generations.load(Ordering::SeqCst), 0);
+    post(
+        &handle,
+        "recover-again",
+        resume,
+        "turn",
+        PostStatus::Accepted,
+    )
+    .await;
+    until(&handle, |p| matches!(p, EventPayload::Done)).await;
+    assert_eq!(generations.load(Ordering::SeqCst), 1);
     finish(&mut runtime).await;
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
@@ -1691,7 +1776,7 @@ pub async fn unresolved_restart() {
     .await;
     let handle = runtime.handle();
     let view = snapshot(&handle, "unresolved").await;
-    assert!(view.recovery_operation.is_some() && !view.resume_available && !view.worker_busy);
+    assert!(view.recovery_operation.is_some() && view.resume_available && !view.worker_busy);
     post(
         &handle,
         "resume",

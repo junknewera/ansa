@@ -167,7 +167,23 @@ pub(crate) struct AuthJob {
 }
 pub(crate) enum PlanTarget {
     Submit(RuntimeCommand),
-    Resume(CommandId),
+    Resume(Resume),
+}
+#[derive(Clone)]
+pub(crate) struct Resume {
+    pub command: CommandId,
+    pub unknown: Option<OperationId>,
+    pub from_cancelled: bool,
+}
+impl Resume {
+    pub fn matches_phase(&self, phase: &str) -> bool {
+        phase
+            == if self.from_cancelled {
+                "cancelled"
+            } else {
+                "paused"
+            }
+    }
 }
 pub(crate) enum Completion {
     Plan {
@@ -599,9 +615,20 @@ impl Workers {
                                         &current.operation_run,
                                         current.operation_offset as u64,
                                     )?;
-                                    let batch = match PreparedBatch::prepare_checked(
-                                        response, tools, &mut ids,
-                                    ) {
+                                    let repeat = response.calls().iter().position(|call| {
+                                        Json::parse(&call.arguments).is_ok_and(|args| {
+                                            current.repeats_unknown_call(&call.name, &args)
+                                        })
+                                    });
+                                    let prepared = if let Some(index) = repeat {
+                                        Err(PrepareError::Invalid {
+                                            index,
+                                            message: "This invocation has an unknown outcome. Inspect the current state before making changes.".into(),
+                                        })
+                                    } else {
+                                        PreparedBatch::prepare_checked(response, tools, &mut ids)
+                                    };
+                                    let batch = match prepared {
                                         Ok(batch) => batch,
                                         Err(PrepareError::Fatal(code)) => return Err(code),
                                         Err(PrepareError::Invalid { index, message }) => {

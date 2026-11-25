@@ -2472,6 +2472,24 @@ def siwc_terminal_exec(screen, root, cwd):
     _, [manual], _ = submit("TEST_EXEC_CREATE_BASH")
     _, [after_manual], _ = submit("TEST_EXEC_DIFF_MANUAL", "Run git diff --stat · exit 0")
     assert manual["terminal"] == after_manual["terminal"] and "review.txt" in after_manual["output"]
+    start = len(records(root))
+    screen.send("TEST_EXEC_UNKNOWN\r")
+    until(screen, lambda frame: "[Continue]" in frame and "Tool outcome unknown" in frame,
+          "unknown terminal outcome offers contextual continuation")
+    row = next(row for row in range(screen.vt.rows) if "[Continue]" in screen.vt.line(row))
+    click(screen, screen.vt.line(row).index("[Continue]") + 1, row)
+    until(screen, lambda _: completed(root, "TEST_EXEC_UNKNOWN"), "continue the same turn")
+    recovered = records(root)[start:]
+    outcome = [row["result"] for row in recovered if row["kind"] == "outcome"]
+    assert [result["effects"].lexeme for result in outcome] == ["1", "2"]
+    assert len([row for row in recovered if row["kind"] == "intent"]) == 2
+    resume, = [row for row in recovered if row["kind"] == "resume"]
+    assert resume["unknown_operation"] == outcome[-1]["operation"]
+    rejected, = [row for row in recovered if row["kind"] == "tool_batch_rejected"]
+    assert "unknown outcome" in rejected["message"]
+    assert (cwd / "recovered-prefix").read_text() == "known\n"
+    assert (cwd / "recovered-unknown").read_text() == "partial\n"
+    assert not (cwd / "recovered-skipped").exists()
     local(screen, "/exit")
     return "normal"
 

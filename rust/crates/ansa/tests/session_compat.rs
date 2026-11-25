@@ -121,6 +121,56 @@ fn cpp_golden_journals() {
     }
 }
 #[test]
+fn explicit_recovery_retires_only_the_addressed_operation_and_reopens() {
+    let resume = Json::parse(
+        r#"{"kind":"resume","turn":"t1","command":"recover1","unknown_operation":"run1:op:1"}"#,
+    )
+    .unwrap();
+    for trace in ["effect-unknown", "outstanding-intent"] {
+        let root = Root::new();
+        let mut s = state();
+        let mut journal = Journal::open(&root.journal(), |_| Ok(()), None).unwrap();
+        for event in events(trace) {
+            s.apply(&event).unwrap();
+            journal.append(&event).unwrap();
+        }
+        if trace == "outstanding-intent" {
+            let stopped = Json::parse(r#"{"kind":"cancel","turn":"t1"}"#).unwrap();
+            s.apply(&stopped).unwrap();
+            journal.append(&stopped).unwrap();
+        }
+        let wrong = resume
+            .with("unknown_operation", Json::string("run1:op:2").unwrap())
+            .unwrap();
+        assert_eq!(s.apply(&wrong), Err("session_recovery_operation"));
+        assert_eq!(s.unknown_operation(), Some("run1:op:1"));
+        s.apply(&resume).unwrap();
+        journal.append(&resume).unwrap();
+        assert_eq!(s.unknown_operation(), None);
+        let turn = s.turn.as_ref().unwrap();
+        assert_eq!(turn.stage, "generating");
+        assert_eq!(turn.operation_offset, 1);
+        assert_eq!(turn.previous_results.len(), 1);
+        assert_eq!(
+            turn.previous_results[0].result.effects(),
+            ansa::provider::replay::Effects::Unknown
+        );
+        assert_eq!(
+            turn.previous_results[0].dispatched,
+            trace == "effect-unknown"
+        );
+        drop(journal);
+        let mut reopened = state();
+        let journal = Journal::open(&root.journal(), |e| reopened.apply(e), None).unwrap();
+        assert_eq!(journal.diagnostic(), "");
+        assert_eq!(reopened.unknown_operation(), None);
+        assert_eq!(
+            reopened.turn.unwrap().next.save().unwrap(),
+            turn.next.save().unwrap()
+        );
+    }
+}
+#[test]
 fn legacy_replay_preserves_the_original_per_response_call_bound() {
     let events = events("completed");
     let accepted = events[1]

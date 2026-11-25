@@ -69,6 +69,12 @@ impl Progress {
             self.pending_resume = Some((command, target, now));
         }
     }
+    pub fn resume_pending(&self) -> bool {
+        self.pending_resume.is_some()
+    }
+    pub fn clear_resume(&mut self) {
+        self.pending_resume = None;
+    }
     pub fn observe(&mut self, view: &Snapshot, now: Instant) {
         if let Some(command) = &self.pending {
             if view.submit.as_ref() != Some(command) {
@@ -103,6 +109,9 @@ impl Progress {
             }
         } else if let Some(clock) = &mut self.clock {
             clock.stopped.get_or_insert(now);
+        }
+        if view.state == "completed" {
+            self.clear_resume();
         }
         for activity in &view.tools {
             match activity {

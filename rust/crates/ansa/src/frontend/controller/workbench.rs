@@ -58,6 +58,14 @@ fn resumable_request(view: &Snapshot) -> Option<&RequestId> {
     .flatten()
 }
 
+fn recoverable_request(view: &Snapshot) -> Option<(&RequestId, &OperationId)> {
+    (matches!(view.state.as_str(), "paused" | "cancelled")
+        && view.resume_available
+        && !view.storage_failed)
+        .then(|| view.request.as_ref().zip(view.recovery_operation.as_ref()))
+        .flatten()
+}
+
 struct Slot {
     skill_commands: Arc<[commands::SkillCommand]>,
     id: String,
@@ -81,6 +89,7 @@ struct Slot {
     follow_accepted_submit: Option<CommandId>,
     chat_priority: Option<(CommandId, crate::frontend::sessions::Priority)>,
     pending_summary: Option<PendingSummary>,
+    pending_resume_post: Option<(CommandId, bool)>,
     admissions: Vec<(String, bool)>,
     closed: bool,
     closing: bool,
@@ -135,6 +144,7 @@ impl Slot {
             follow_accepted_submit: None,
             chat_priority: None,
             pending_summary: None,
+            pending_resume_post: None,
             admissions: Vec::new(),
             closed: false,
             closing: false,
@@ -210,6 +220,7 @@ impl Slot {
             || self.ready_refresh
             || self.pending_prompt.is_some()
             || self.state.awaiting()
+            || self.state.progress.resume_pending()
             || self.state.snapshot.as_ref().is_none_or(|s| {
                 s.worker_busy
                     || !matches!(
@@ -306,6 +317,13 @@ impl Slot {
             };
             if !internal {
                 self.admissions.push((id.0.clone(), code.is_none()));
+            }
+            let cancel_resume = self
+                .pending_resume_post
+                .take_if(|(command, _)| *command == id)
+                .is_some_and(|(_, cancel)| cancel);
+            if cancel_resume && code.is_none() {
+                self.cancel(io);
             }
             if self
                 .state
@@ -452,7 +470,9 @@ impl Slot {
         }
     }
     fn cancel(&mut self, io: &Io) {
-        if self.state.awaiting() {
+        if let Some((_, cancel)) = &mut self.pending_resume_post {
+            *cancel = true;
+        } else if self.state.awaiting() {
             self.state.deferred_cancel = true;
             self.state.post_read(
                 &self.handle,
@@ -544,6 +564,9 @@ impl Slot {
                         "Session storage error · {}",
                         diagnostics::error(&view.diagnostic)
                     )
+                } else if recoverable_request(view).is_some() {
+                    "Tool outcome unknown · continue from saved context and inspect what changed"
+                        .into()
                 } else if view.recovery_operation.is_some() {
                     "Tool outcome unknown · verify the operation before continuing".into()
                 } else if view.diagnostic == "tool_round_limit" {
@@ -551,7 +574,9 @@ impl Slot {
                 } else {
                     format!("Work paused · {}", diagnostics::error(&view.diagnostic))
                 };
-                let next = if view.storage_failed || view.recovery_operation.is_some() {
+                let next = if recoverable_request(view).is_some() {
+                    ""
+                } else if view.storage_failed || view.recovery_operation.is_some() {
                     "/sessions for details"
                 } else if view.diagnostic == "tool_batch_limit" && view.resume_available {
                     "Increase or remove tool_calls in config, then reopen ANSA"
@@ -580,11 +605,16 @@ impl Slot {
                     agent: None,
                     status: None,
                 });
-                if let Some(request) = resumable_request(view) {
+                let action = recoverable_request(view)
+                    .map(|(request, operation)| format!("resume:{}:{}", request.0, operation.0))
+                    .or_else(|| {
+                        resumable_request(view).map(|request| format!("resume:{}", request.0))
+                    });
+                if let Some(action) = action {
                     entries.push(Entry {
                         role: "notice".into(),
                         text: "[Continue]".into(),
-                        action: Some(format!("resume:{}", request.0)),
+                        action: Some(action),
                         edit: None,
                         output: None,
                         agent: None,
@@ -2394,7 +2424,13 @@ impl Workbench {
     }
 
     fn resume_request(&mut self, target: RequestId) {
+        self.post_resume(CommandPayload::Resume(target));
+    }
+    fn post_resume(&mut self, payload: CommandPayload) {
         let slot = &mut self.slots[self.current];
+        if slot.pending_resume_post.is_some() || slot.state.progress.resume_pending() {
+            return;
+        }
         let draft = slot
             .state
             .snapshot
@@ -2402,15 +2438,16 @@ impl Workbench {
             .and_then(|snapshot| snapshot.submit.as_ref())
             .filter(|submit| submit.0.starts_with("draft-"))
             .cloned();
-        let resume = slot
-            .state
-            .command(&slot.handle, CommandPayload::Resume(target));
+        let resume = slot.state.command(&slot.handle, payload);
         let resume_id = resume.command.clone();
-        if slot
+        if !slot
             .state
             .post_command(&slot.handle, resume, &mut slot.replies, false)
-            && let Some(submit) = draft
         {
+            return;
+        }
+        slot.pending_resume_post = Some((resume_id.clone(), false));
+        if let Some(submit) = draft {
             self.planning_context = Some(PlanningContext {
                 profile: None,
                 pending_draft: None,

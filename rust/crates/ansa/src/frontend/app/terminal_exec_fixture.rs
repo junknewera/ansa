@@ -19,6 +19,37 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
         vec![json!({"type":"message","id":format!("message-{index}"),
             "role":"assistant","status":"completed","content":[{"type":"output_text","text":"Fixture complete."}]})]
     };
+    if prompt == crate::provider::replay::RECOVERY_NOTICE {
+        if input
+            .last()
+            .and_then(|row| row["output"].as_str())
+            .is_some_and(|output| {
+                output.contains("tool_arguments_rejected") && output.contains("unknown outcome")
+            })
+        {
+            return Ok(done());
+        }
+        let outputs = input[..start]
+            .iter()
+            .rev()
+            .take_while(|row| row["type"] == "function_call_output")
+            .map(|row| {
+                serde_json::from_str::<Value>(row["output"].as_str().unwrap_or_default())
+                    .map_err(|_| "fixture_exec_output")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !matches!(outputs.as_slice(), [skipped, unknown, known]
+            if skipped["error"] == "not_started_after_unknown_outcome"
+                && unknown["error"] == "terminal_exec_interrupted"
+                && known["exit_code"] == 0)
+        {
+            return Err("fixture_exec_recovery");
+        }
+        return Ok(call(
+            crate::terminal_host::tools::EXEC,
+            json!({"command": "printf 'partial\\n' >> recovered-unknown; exit 23"}),
+        ));
+    }
     let results: Vec<Value> = input[start + 1..]
         .iter()
         .filter(|row| row["type"] == "function_call_output")
@@ -117,6 +148,22 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
                 "lifetime_seconds":0,"idle_seconds":0
             }),
         ));
+    }
+    if prompt == "TEST_EXEC_UNKNOWN" {
+        return Ok([
+            "printf 'known\\n' >> recovered-prefix",
+            "printf 'partial\\n' >> recovered-unknown; exit 23",
+            "touch recovered-skipped",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, command)| {
+            json!({"type":"function_call","id":format!("item-{index}-{i}"),
+                "call_id":format!("call-{index}-{i}"),"namespace":"omh",
+                "name":crate::terminal_host::tools::EXEC,
+                "arguments":json!({"command":command}).to_string(), "status":"completed"})
+        })
+        .collect());
     }
     let command = match prompt {
         "TEST_EXEC_DIFF"

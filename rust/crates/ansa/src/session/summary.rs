@@ -365,14 +365,30 @@ pub(crate) fn read(
                     };
                 }
                 "resume" => {
+                    let recovery = event.has("unknown_operation");
                     need(
                         stage != Stage::Completed
-                            && (stage != Stage::Cancelled || !queued.is_empty())
-                            && !unknown_effect
-                            && outstanding.is_none(),
+                            && (stage != Stage::Cancelled || !queued.is_empty() || recovery)
+                            && (unknown_effect || outstanding.is_some()) == recovery,
                         "session_resume",
                     )?;
                     need(valid_id(event.text_field("command")?), "session_resume")?;
+                    if recovery {
+                        expected = Some(
+                            canonical
+                                .as_ref()
+                                .and_then(|state| state.turn.as_ref())
+                                .ok_or("session_recovery_operation")?
+                                .next
+                                .clone(),
+                        );
+                        results.clear();
+                        response = None;
+                        final_text = None;
+                        stage = Stage::Generating;
+                        unknown_effect = false;
+                        outstanding = None;
+                    }
                     while results.last().is_some_and(|result| {
                         !result.dispatched && result.result.effects() == Effects::NotStarted
                     }) {

@@ -96,7 +96,7 @@ pub(crate) struct Owner {
     deferred_completions: VecDeque<Completion>,
     pending_receipt: Option<SubmitReceipt>,
     cancelling: Option<CommandId>,
-    resuming: Option<CommandId>,
+    resuming: Option<Resume>,
     plan_admission_pending: bool,
     plan_workspace: Option<Box<dyn Send>>,
     generation: u64,
@@ -266,7 +266,28 @@ impl Owner {
     }
     fn can_cancel(&self) -> bool {
         self.request().is_some()
-            && !matches!(self.phase.as_str(), "completed" | "cancelled" | "finishing")
+            && (!matches!(self.phase.as_str(), "completed" | "cancelled" | "finishing")
+                || self.resuming.is_some())
+    }
+    fn resume_matches(&self, unknown: Option<&OperationId>) -> bool {
+        (self.phase == "paused" || (self.phase == "cancelled" && unknown.is_some()))
+            && self.recovery.as_ref() == unknown
+            && unknown.is_none_or(|operation| {
+                !self.starting
+                    && !self.busy()
+                    && self.pending_outcome.is_none()
+                    && self
+                        .state
+                        .turn
+                        .as_ref()
+                        .and_then(|turn| turn.recoverable_unknown())
+                        == Some(operation.0.as_str())
+            })
+    }
+    fn resume_is_current(&self, resume: &Resume) -> bool {
+        resume.matches_phase(&self.phase)
+            && self.cancelling.is_none()
+            && self.resume_matches(resume.unknown.as_ref())
     }
     fn can_act(&self) -> bool {
         !self.shutting_down
@@ -335,10 +356,11 @@ impl Owner {
             compactions: self.state.compactions,
             storage_failed: self.storage_failed,
             durable: self.storing.is_none() && !self.storage_failed,
-            resume_available: self.phase == "paused"
-                && self.recovery.is_none()
-                && !self.storage_failed
-                && self.state.turn.is_some(),
+            resume_available: !self.storage_failed
+                && !self.options.inspect_only
+                && !self.starting
+                && self.state.turn.is_some()
+                && self.resume_matches(self.recovery.as_ref()),
             mode: current
                 .filter(|receipt| !receipt.internal && receipt.mode != AgentMode::OrchestrationChat)
                 .map_or(self.state.user_mode, |receipt| receipt.mode),
@@ -889,6 +911,13 @@ impl Owner {
         self.tools.signal_cancel();
         self.finish_preview("discarded", false);
         self.cancelling = Some(command);
+        if self
+            .storing
+            .as_ref()
+            .is_none_or(|pending| pending.kind != Kind::Resume)
+        {
+            self.resuming = None;
+        }
         self.phase = "cancelled".into();
         self.pending_pause = None;
         if self.state.pending_followups().next().is_some() && self.recovery.is_none() {
@@ -1268,17 +1297,21 @@ impl Owner {
                     query: page.query,
                 }));
             }
-            CommandPayload::Resume(target) => {
-                if self.phase != "paused"
-                    || self.request().as_ref() != Some(target)
-                    || self.turn() != command.turn
-                {
+            CommandPayload::Resume(target) | CommandPayload::ResumeUnknown(target, _) => {
+                if self.request().as_ref() != Some(target) || self.turn() != command.turn {
                     return Ok(PostStatus::StaleTarget);
                 }
                 if self.resuming.is_some() || self.plan_admission_pending {
                     return Ok(PostStatus::QueueFull);
                 }
-                if self.storage_failed || self.recovery.is_some() {
+                let unknown = match &command.payload {
+                    CommandPayload::ResumeUnknown(_, operation) => Some(operation.clone()),
+                    _ => None,
+                };
+                if self.phase != "paused" && (self.phase != "cancelled" || unknown.is_none()) {
+                    return Ok(PostStatus::StaleTarget);
+                }
+                if self.storage_failed || !self.resume_matches(unknown.as_ref()) {
                     self.reject(
                         command,
                         if self.storage_failed {
@@ -1305,7 +1338,11 @@ impl Owner {
                 {
                     self.reject(command, "resume_id_limit");
                 } else {
-                    self.resuming = Some(command.command.clone());
+                    self.resuming = Some(Resume {
+                        command: command.command.clone(),
+                        unknown,
+                        from_cancelled: self.phase == "cancelled",
+                    });
                 }
             }
         }
@@ -1653,8 +1690,8 @@ impl Owner {
             self.permit = None;
             return self.advance(workers);
         }
-        if let Some(command) = self.resuming.take() {
-            if self.phase != "paused" || self.recovery.is_some() {
+        if let Some(resume) = self.resuming.take() {
+            if !self.resume_is_current(&resume) {
                 return Ok(());
             }
             let plan_mode = self.state.turn.as_ref().is_some_and(|turn| {
@@ -1662,7 +1699,7 @@ impl Owner {
             });
             if plan_mode && !self.tools.plan_ready() {
                 self.emit(EventPayload::RuntimeError {
-                    command: Some(command),
+                    command: Some(resume.command),
                     diagnostic: "terminal_workspace_busy".into(),
                 });
                 return Ok(());
@@ -1671,12 +1708,24 @@ impl Owner {
                 && self.plan_workspace.is_none()
                 && let Some(plan) = &workers.plan
             {
-                plan.try_send(PlanTarget::Resume(command))
+                plan.try_send(PlanTarget::Resume(resume.clone()))
                     .map_err(|_| "plan_worker_queue")?;
+                self.resuming = Some(resume);
                 self.plan_admission_pending = true;
                 return Ok(());
             }
-            let mut fields = vec![("command", Json::string(&command.0)?)];
+            let mut fields = vec![("command", Json::string(&resume.command.0)?)];
+            if let Some(operation) = &resume.unknown {
+                let turn = self.state.turn.as_ref().ok_or("runtime_turn")?;
+                if let Err(code) = turn.recovery_request(&operation.0) {
+                    self.emit(EventPayload::RuntimeError {
+                        command: Some(resume.command),
+                        diagnostic: code.into(),
+                    });
+                    return Ok(());
+                }
+                fields.push(("unknown_operation", Json::string(&operation.0)?));
+            }
             if self
                 .state
                 .turn
@@ -1685,7 +1734,7 @@ impl Owner {
             {
                 fields.extend(self.limits.tool_budget_fields()?);
             }
-            self.resuming = Some(command.clone());
+            self.resuming = Some(resume);
             return self.record(workers, Kind::Resume, "resume", fields);
         }
         if let Some(code) = self.pending_pause.take()
@@ -2064,6 +2113,15 @@ impl Owner {
             }
             Kind::Resume => {
                 self.recovered_pause = false;
+                self.recovery = None;
+                if self
+                    .resuming
+                    .as_ref()
+                    .is_some_and(|resume| resume.unknown.is_some())
+                {
+                    self.owned_intent = false;
+                    self.permit = None;
+                }
                 self.resume_epoch += 1;
                 self.turn_stop = Cancel::default();
                 self.gate.reset();
@@ -2077,9 +2135,9 @@ impl Owner {
                     .ok_or("runtime_turn")?
                     .stage
                     .clone();
-                if let Some(command) = self.resuming.take() {
+                if let Some(resume) = self.resuming.take() {
                     self.emit(EventPayload::CommandAccepted {
-                        command,
+                        command: resume.command,
                         request: self.request(),
                     });
                 }
@@ -2147,29 +2205,32 @@ impl Owner {
                     (PlanTarget::Submit(command), Err(code)) => {
                         self.reject_pending_submit(&command, code)
                     }
-                    (PlanTarget::Resume(command), Ok(lease))
-                        if self.phase == "paused"
-                            && self.recovery.is_none()
-                            && self.tools.plan_ready() =>
-                    {
-                        self.plan_workspace = Some(lease);
-                        self.resuming = Some(command);
+                    (PlanTarget::Resume(resume), result) => {
+                        if self
+                            .resuming
+                            .as_ref()
+                            .is_some_and(|pending| pending.command == resume.command)
+                        {
+                            if !self.resume_is_current(&resume) {
+                                self.resuming = None;
+                            } else {
+                                match result {
+                                    Ok(lease) if self.tools.plan_ready() => {
+                                        self.plan_workspace = Some(lease)
+                                    }
+                                    result => {
+                                        let code =
+                                            result.err().unwrap_or("terminal_workspace_busy");
+                                        self.resuming = None;
+                                        self.emit(EventPayload::RuntimeError {
+                                            command: Some(resume.command),
+                                            diagnostic: code.into(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
-                    (PlanTarget::Resume(command), Err(code)) => {
-                        self.emit(EventPayload::RuntimeError {
-                            command: Some(command),
-                            diagnostic: code.into(),
-                        })
-                    }
-                    (PlanTarget::Resume(command), Ok(_))
-                        if self.phase == "paused" && self.recovery.is_none() =>
-                    {
-                        self.emit(EventPayload::RuntimeError {
-                            command: Some(command),
-                            diagnostic: "terminal_workspace_busy".into(),
-                        });
-                    }
-                    _ => {}
                 }
             }
             Completion::Stored(value) => self.stored(value)?,

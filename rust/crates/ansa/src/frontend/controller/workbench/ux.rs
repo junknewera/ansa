@@ -407,10 +407,22 @@ impl Workbench {
             self.result_scroll = Some(slot.state.scroll);
         }
         if let Some(request) = key.strip_prefix("resume:") {
-            if let Some(target) = self.resume_target().filter(|target| target.0 == request) {
+            let payload = if let Some((id, operation)) = request.split_once(':') {
+                slot.state
+                    .snapshot
+                    .as_ref()
+                    .and_then(recoverable_request)
+                    .filter(|(target, op)| target.0 == id && op.0 == operation)
+                    .map(|(target, op)| CommandPayload::ResumeUnknown(target.clone(), op.clone()))
+            } else {
+                self.resume_target()
+                    .filter(|target| target.0 == request)
+                    .map(CommandPayload::Resume)
+            };
+            if let Some(payload) = payload {
                 self.result_selected = None;
                 self.slots[self.current].show_latest();
-                self.resume_request(target);
+                self.post_resume(payload);
             }
         } else if let Some(id) = key.strip_prefix("agent:") {
             self.open_agent(id);

@@ -127,14 +127,42 @@ pub fn continuation(
     {
         return Err("replay_admission");
     }
+    append_results(response, &results.results, None)
+}
+
+pub(crate) fn recovery_continuation(
+    response: &AdmittedResponse,
+    results: &[ToolResult],
+    unknown: &str,
+) -> Result<Request, &'static str> {
+    if response.receipt.request_fingerprint != response.request.fingerprint()?
+        || results.len() != response.calls.len()
+        || results
+            .iter()
+            .filter(|r| r.effects == Effects::Unknown)
+            .count()
+            != 1
+    {
+        return Err("replay_admission");
+    }
+    append_results(response, results, Some(unknown))
+}
+
+pub(crate) const RECOVERY_NOTICE: &str = "Continue the original task. The tool marked unknown may have had partial effects. Inspect the current state first. Do not repeat that invocation. The remaining calls from that tool batch were skipped.";
+
+fn append_results(
+    response: &AdmittedResponse,
+    results: &[ToolResult],
+    unknown: Option<&str>,
+) -> Result<Request, &'static str> {
     let mut seen = std::collections::HashSet::new();
     let mut input = response.request.input.clone();
     input.extend(response.items.iter().map(|i| i.value().clone()));
-    for (call, result) in response.calls.iter().zip(&results.results) {
+    for (call, result) in response.calls.iter().zip(results) {
         if result.call_id != call.call_id
             || result.operation_id.is_empty()
             || !seen.insert(&result.operation_id)
-            || result.effects == Effects::Unknown
+            || (result.effects == Effects::Unknown && Some(result.operation_id.as_str()) != unknown)
         {
             return Err("replay_result_mismatch");
         };
@@ -142,6 +170,12 @@ pub fn continuation(
             ("type", Json::string("function_call_output")?),
             ("call_id", Json::string(&result.call_id)?),
             ("output", Json::string(&result.output)?),
+        ])?);
+    }
+    if unknown.is_some() {
+        input.push(Json::object(vec![
+            ("role", Json::string("user")?),
+            ("content", Json::string(RECOVERY_NOTICE)?),
         ])?);
     }
     response.request.clone().with_input(input)
