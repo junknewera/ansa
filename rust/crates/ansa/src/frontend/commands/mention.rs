@@ -78,17 +78,12 @@ impl<'a> Mention<'a> {
             return None;
         }
         let text = editor.text().ok()?;
-        let argument = if text.trim_start().starts_with('/') {
-            super::skill_argument(skills, text)?
-        } else {
-            text
-        };
-        let offset = text.len() - argument.len();
-        let (begin, token) = tokens(argument)
-            .map(|(begin, token)| (offset + begin, token))
-            .find(|(begin, token)| {
-                *begin < editor.cursor && editor.cursor <= begin + token.len()
-            })?;
+        if !super::accepts_file_mentions(text, skills) {
+            return None;
+        }
+        let (begin, token) = tokens(text).find(|(begin, token)| {
+            *begin < editor.cursor && editor.cursor <= begin + token.len()
+        })?;
         let query = text.get(begin..editor.cursor)?;
         let path = decode(&query[1..]);
         if !workspace_path(&path) {

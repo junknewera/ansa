@@ -30,15 +30,21 @@ def install_skill(path, detail):
 
 
 @contextmanager
-def carbon(binary, root, home, cwd, *args):
+def carbon(binary, root, home, cwd, *args, color=False):
     # Do not inherit provider credentials, config overrides, or proxy settings.
     env = dict(HOME=str(home), XDG_STATE_HOME=str(root / "xdg"),
-               PATH=os.environ.get("PATH", os.defpath), TERM="xterm", LC_ALL="C", NO_COLOR="1")
+               PATH=os.environ.get("PATH", os.defpath), TERM="xterm", LC_ALL="C")
+    if not color:
+        env["NO_COLOR"] = "1"
     size = (120, 36)
     screen = Pty(str(binary), root, home, cwd, "", size=size,
                  argv=["--offline", "--cwd", str(cwd), *args], base_env=env)
     try:
-        screen.vt = Terminal(*size)
+        if color:
+            from carbon_visual_pty import StyledTerminal
+            screen.vt = StyledTerminal(*size)
+        else:
+            screen.vt = Terminal(*size)
         until(screen, lambda frame: "ANSA" in frame and "Tab mode" in frame and ready(screen),
               "offline Carbon ready")
         yield screen
@@ -153,12 +159,62 @@ def skill_and_attachment(binary):
         assert journals(root) == saved, "reopen or completion rewrote the journal"
 
 
+def inline_skills(binary):
+    with tempfile.TemporaryDirectory(prefix="ansa-inline-skills-", dir="/tmp") as directory:
+        root = Path(directory)
+        home, cwd = roots(root)
+        catalog = home / ".ansa/skills"
+        (home / ".ansa").mkdir(mode=0o700)
+        catalog.mkdir(mode=0o700)
+        for name, description in (("writing-review", OLD_DETAIL), ("edit-check", "Check edits")):
+            folder = catalog / name
+            folder.mkdir(mode=0o700)
+            source = folder / "SKILL.md"
+            source.write_text(f"---\nname: {name}\ndescription: {description}\n---\nRead the draft.\n")
+            source.chmod(0o600)
+
+        with carbon(binary, root, home, cwd, color=True) as screen:
+            local(screen, "/plan")
+            until(screen, lambda _: "Plan" in screen.vt.line(-2), "Plan mode selected")
+            before = journals(root)
+            screen.send(f"{SKILL} /e")
+            until(screen, lambda frame: "Tab/→ complete" in frame and "/edit-check" in body(screen),
+                  "skill completion after the first slash skill")
+            assert not any(label in body(screen) for label in ("/effort", "/exit"))
+            screen.send(b"\t")
+            until(screen, lambda _: screen.vt.line(-4) == f"  › {SKILL} /edit-check",
+                  "completion keeps the first skill")
+            suffix = f" Проверь /exit {SKILL}/notes {SKILL}"
+            draft = f"{SKILL} /edit-check{suffix}"
+            screen.send(suffix)
+            until(screen, lambda _: screen.vt.line(-4) == f"  › {draft}", "two skills and an ordinary path in the draft")
+            first = screen.vt.attrs[-4][screen.vt.line(-4).index(SKILL)][0]
+            second = screen.vt.attribute("/edit-check")[0]
+            plain = screen.vt.attribute("Проверь")[0]
+            assert first == second and first != plain, "recognized skill tokens share their own foreground"
+            assert screen.vt.attribute("/exit")[0] == plain
+            assert screen.vt.attribute(f"{SKILL}/notes")[0] == plain
+            assert journals(root) == before, "completing a skill dispatched a turn"
+
+            screen.send(b"\r")
+            until(screen, lambda _: any(row["kind"] == "done" for row in records(root)),
+                  "Enter submits the exact trailing skill and the task")
+            accepted, = [row for row in records(root) if row["kind"] == "accepted"]
+            assert accepted["mode"] == "plan"
+            prompt = accepted["text"]
+            assert prompt.startswith("Use the pinned local skills `writing-review`, `edit-check` for this request.")
+            assert "First call read_skill for each name in the listed order" in prompt
+            assert prompt.endswith(f"\nUser task: {draft}")
+            assert accepted["next"]["input"][-1] == {"role": "user", "content": prompt}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path, help="already built ansa executable")
     args = parser.parse_args()
     skill_and_attachment(args.binary.resolve())
-    print("PASS: Carbon skill completion, text attachment, and pinned reopen")
+    inline_skills(args.binary.resolve())
+    print("PASS: Carbon skill completion, highlighting, multiple skills, attachments, and pinned reopen")
 
 
 if __name__ == "__main__":

@@ -1058,9 +1058,9 @@ def completion_and_help(screen, root, cwd):
     screen.send(b"\x15")
     screen.send("Проверь /mo потом")
     screen.send(b"\x1b[D" * len(" потом"))
-    until(screen, lambda frame: "/model" in body(screen) and "Tab/→ complete" in frame, "completion at a middle word boundary")
-    screen.send(b"\t")
-    until(screen, lambda frame: screen.vt.line(-4) == "  › Проверь /model потом", "middle completion preserves prefix and suffix")
+    until(screen, lambda _: screen.vt.line(-4) == "  › Проверь /mo потом", "middle draft is visible")
+    paint_quiet(screen)
+    assert "/model" not in body(screen) and "Tab/→ complete" not in visible(screen)
     assert journals(root) == before
     screen.send(b"\x05\x15")
     screen.send("?")
