@@ -319,6 +319,7 @@ fn events() -> Result<Json> {
         operation: "operation".into(),
         call_id: "call".into(),
         name: "safe".into(),
+        target: String::new(),
     };
     let finished = Finished {
         operation: "operation".into(),

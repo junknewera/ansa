@@ -2356,6 +2356,77 @@ def siwc_direct_edit_check(screen, root, cwd):
     return "normal"
 
 
+def siwc_terminal_exec(screen, root, cwd):
+    (cwd / "kept").mkdir()
+    (cwd / "kept/check-fixture.sh").write_text(
+        "printf 'checking workspace\\nerror[E0061]: fixture failure\\n' >&2\nexit 7\n")
+    report = cwd / "review.txt"
+    report.write_text("before\n")
+    subprocess.run(["git", "init", "-q"], cwd=cwd, check=True)
+    subprocess.run(["git", "config", "core.pager", "cat"], cwd=cwd, check=True)
+    subprocess.run(["git", "add", "review.txt"], cwd=cwd, check=True)
+    report.write_text("after\n")
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "terminal fixture ready")
+
+    def submit(prompt, shown=None, running=False):
+        until(screen, lambda _: ready(screen, "gpt-6.2-sol")
+              and "Ctrl+C stop" not in screen.vt.line(-2), "idle before " + prompt)
+        start = len(records(root))
+        timestamp = time.monotonic()
+        screen.send(prompt + "\r")
+        if running:
+            until(screen, lambda frame: "Run printf" in frame and "running" in frame,
+                  "in-flight shell command has one short row")
+        until(screen, lambda frame: completed(root, prompt) and "Fixture complete." in frame
+              and "Ctrl+C stop" not in screen.vt.line(-2)
+              and (shown is None or shown in frame), "completed " + prompt)
+        elapsed = time.monotonic() - timestamp
+        rows = records(root)[start:]
+        calls = [row["invocation"]["name"] for row in rows if row["kind"] == "intent"]
+        results = [json.loads(row["result"]["output"]) for row in rows if row["kind"] == "outcome"]
+        rounds = sum(row["kind"] == "response" for row in rows)
+        return calls, results, {"provider_rounds": rounds, "wall_seconds": elapsed}
+
+    calls, [cold], _ = submit("TEST_EXEC_DIFF", "Run git diff --stat · exit 0")
+    assert calls == ["terminal_exec"]
+    calls, [diff], direct = submit("TEST_EXEC_DIFF_WARM", "Run git diff --stat · exit 0")
+    assert calls == ["terminal_exec"] and direct["provider_rounds"] == 2
+    assert diff["exit_code"] == 0 and "review.txt" in diff["output"] and not diff["truncated"]
+    calls, old, legacy = submit("TEST_EXEC_LEGACY_DIFF")
+    assert calls[:4] == ["terminal_list", "terminal_capture", "terminal_input", "terminal_read"]
+    assert legacy["provider_rounds"] == len(calls) + 1 and legacy["provider_rounds"] >= 5
+    text = "".join(result["output"]["text"] for result in old[3:])
+    assert "review.txt" in text and "1 file changed" in text
+    screen.observations.append({"terminal_exec": direct, "legacy_terminal_tools": legacy})
+
+    calls, _, _ = submit("TEST_EXEC_SPLIT")
+    assert calls == ["terminal_input"] * 4
+    _, [changed], _ = submit("TEST_EXEC_SET")
+    _, [state], _ = submit("TEST_EXEC_STATE")
+    _, [long], _ = submit("TEST_EXEC_LONG", running=True)
+    _, [failed], _ = submit("TEST_EXEC_FAIL", "error[E0061]: fixture failure")
+    assert {item["terminal"] for item in [cold, diff, changed, state, long, failed]} == {diff["terminal"]}
+    assert state["output"] == "kept:remembered\n" and long["output"] == "START\nEND\n"
+    assert failed["exit_code"] == 7 and "checking workspace" in failed["output"]
+    assert " · exit 7" in body(screen) and "checking workspace" not in body(screen)
+    _, [background], _ = submit("TEST_EXEC_BACKGROUND")
+    assert background["exit_code"] == 0 and background["output"].startswith("now\n")
+    marker = cwd / "kept/child-marker"
+    until(screen, lambda _: marker.is_file() and marker.read_text() == "alive\n",
+          "background writer keeps its stream after the foreground result")
+    _, [closed], _ = submit("TEST_EXEC_CLOSE_FIRST")
+    assert closed["receipt"]["effect"]["state"] == "applied"
+    _, [reopened], _ = submit("TEST_EXEC_DIFF_REOPEN", "Run git diff --stat · exit 0")
+    assert reopened["terminal"] != diff["terminal"] and "review.txt" in reopened["output"]
+    _, [closed], _ = submit("TEST_EXEC_CLOSE_AUTO")
+    assert closed["receipt"]["effect"]["state"] == "applied"
+    _, [manual], _ = submit("TEST_EXEC_CREATE_BASH")
+    _, [after_manual], _ = submit("TEST_EXEC_DIFF_MANUAL", "Run git diff --stat · exit 0")
+    assert manual["terminal"] == after_manual["terminal"] and "review.txt" in after_manual["output"]
+    local(screen, "/exit")
+    return "normal"
+
+
 def siwc_orchestration(screen, root, cwd):
     until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "GPT ready without a network call")
     screen.send(b"\t\t")
@@ -2619,6 +2690,7 @@ def main():
              ("siwc-orchestration", siwc_orchestration),
              ("siwc-orchestration-direct", siwc_orchestration_direct),
              ("siwc-direct-edit-check", siwc_direct_edit_check),
+             ("siwc-terminal-exec", siwc_terminal_exec),
              ("siwc-orchestrate-plus", siwc_orchestrate_plus),
              ("siwc-orchestrate-plus-budget", siwc_orchestrate_plus_budget),
              ("siwc-orchestrate-plus-budget-configured", lambda screen, root, cwd: siwc_orchestrate_plus_budget(screen, root, cwd, capped=True)),
@@ -2626,7 +2698,7 @@ def main():
              ("siwc-orchestrate-plus-plan-only", siwc_orchestrate_plus_plan_only),
              ("siwc-orchestrate-plus-blocked", siwc_orchestrate_plus_blocked),
              ("siwc-orchestrate-plus-blocked-rejected", lambda *args: siwc_orchestrate_plus_blocked(*args, reject=True))]
-    transport_cases = {"openrouter-orchestration", "siwc-orchestration", "siwc-orchestration-direct", "siwc-direct-edit-check",
+    transport_cases = {"openrouter-orchestration", "siwc-orchestration", "siwc-orchestration-direct", "siwc-direct-edit-check", "siwc-terminal-exec",
                        *(name for name, _ in cases if name.startswith("siwc-orchestrate-plus"))}
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -2660,6 +2732,8 @@ def main():
                     seed_siwc(home)
                 if name == "siwc-direct-edit-check":
                     (root / "direct-edit-check").touch()
+                if name == "siwc-terminal-exec":
+                    (root / "terminal-exec").touch()
                 if name == "siwc-orchestration":
                     nested = home / "Workspace/pet/ansa"
                     nested.mkdir(parents=True)

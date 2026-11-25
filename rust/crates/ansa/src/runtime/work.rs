@@ -672,6 +672,19 @@ impl Workers {
                                         operation: OperationId(invocation.operation.clone()),
                                         call_id: invocation.call.clone(),
                                         name: invocation.name.clone(),
+                                        target: if invocation.name
+                                            == crate::terminal_host::tools::EXEC
+                                        {
+                                            invocation
+                                                .arguments
+                                                .text_field("command")
+                                                .unwrap_or_default()
+                                                .chars()
+                                                .take(160)
+                                                .collect()
+                                        } else {
+                                            String::new()
+                                        },
                                     };
                                     if tool_gate.begin(&identity, Some((&started, value))) {
                                         let combined = Cancel::combined(&stop, &lease_stop);

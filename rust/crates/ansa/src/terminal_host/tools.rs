@@ -11,6 +11,7 @@ use crate::{
         FileJournal, Host, HostMode, Lifecycle, OperationStatus,
         native::{MAX_READ, NativeBackend},
         protocol::{Action, Binding, Effect, Id, Intent, Launch, MAX_INPUT, Size, Writer},
+        shell,
     },
     tools::{
         invocation::Invocation,
@@ -23,10 +24,12 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 type Result<T> = std::result::Result<T, &'static str>;
 pub(crate) type Owner = Arc<Mutex<Host<FileJournal, NativeBackend>>>;
+pub(crate) const EXEC: &str = "terminal_exec";
 
 pub(crate) fn add_agent_instructions(epoch: &mut crate::provider::request::Epoch) {
     epoch.instructions = epoch.instructions.replacen(
@@ -35,8 +38,11 @@ pub(crate) fn add_agent_instructions(epoch: &mut crate::provider::request::Epoch
         1,
     );
     epoch.instructions.push_str(concat!(
-        "\n\nWhen terminal tools are advertised, use the conversation's one terminal for shell commands, ",
-        "interactive programs, and connections. Call terminal_list first. If no terminal exists, ",
+        "\n\nFor files and code, prefer search_files, list_directory and read_file. ",
+        "Use terminal_exec for a foreground shell command. It opens a Bash shell when needed, ",
+        "keeps its working directory and environment, and returns fresh output and exit_code. ",
+        "Call it directly without listing or reading the terminal first. ",
+        "For interactive programs or connections, Call terminal_list first. If no terminal exists, ",
         "open an interactive shell by name from PATH (e.g. bash) in the working directory. Reuse its current terminal ID and writer epoch ",
         "across commands and user messages. Check the active program and working directory before entering commands. ",
         "A terminal_input receipt confirms byte delivery. Check the output to tell when the command finishes. ",
@@ -171,6 +177,7 @@ pub(crate) fn workspace_writer(owner: &Owner) -> crate::tools::files::WorkspaceW
 enum Tool {
     Create,
     Input,
+    Exec,
     Resize,
     Interrupt,
     Close,
@@ -211,6 +218,11 @@ impl Tool {
                     ("encoding", "string"),
                     ("data", "string"),
                 ],
+            ),
+            Self::Exec => (
+                EXEC,
+                "Run one foreground command in the session's Bash shell and return new output and exit_code. Working directory and shell variables persist.",
+                &[("command", "string")],
             ),
             Self::Resize => (
                 "terminal_resize",
@@ -267,7 +279,7 @@ impl Tool {
     fn mutating(self) -> bool {
         matches!(
             self,
-            Self::Create | Self::Input | Self::Resize | Self::Interrupt | Self::Close
+            Self::Create | Self::Input | Self::Exec | Self::Resize | Self::Interrupt | Self::Close
         )
     }
 }
@@ -290,6 +302,7 @@ pub fn register(registry: &mut Registry, owner: Owner, conversation: &Path) -> R
     for tool in [
         Tool::Create,
         Tool::Input,
+        Tool::Exec,
         Tool::Resize,
         Tool::Interrupt,
         Tool::Close,
@@ -403,6 +416,10 @@ impl Mutation {
 
 enum Arguments {
     Mutate(Mutation),
+    Exec {
+        bytes: Vec<u8>,
+        action: Action,
+    },
     List,
     Operation(Id),
     Observe {
@@ -415,6 +432,14 @@ enum Arguments {
 
 impl Arguments {
     fn parse(tool: Tool, args: &Json) -> Result<Self> {
+        if matches!(tool, Tool::Exec) {
+            let bytes = args.text_field("command")?.as_bytes();
+            let action = Action::exec(bytes).ok_or("terminal_exec_command")?;
+            return Ok(Self::Exec {
+                bytes: bytes.to_vec(),
+                action,
+            });
+        }
         let id = |field| Id::try_from(args.text_field(field)?.to_owned());
         let size = || -> Result<Size> {
             let rows = u16::try_from(args.usize_field("rows")?).map_err(|_| "terminal_size")?;
@@ -516,11 +541,15 @@ impl Arguments {
 
 fn invoke(owner: &Owner, tool: Tool, invocation: &Invocation, stop: &Cancel) -> Result<Outcome> {
     let args = Arguments::parse(tool, &invocation.arguments)?;
+    if let Arguments::Exec { bytes, action } = args {
+        return execute_command(owner, invocation, bytes, action, stop);
+    }
     let mut owner = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
     if stop.cancelled() {
         return Ok(Outcome::not_started());
     }
     let output = match args {
+        Arguments::Exec { .. } => unreachable!("handled shell command"),
         Arguments::Mutate(mutation) => {
             let (intent, bytes) = mutation.intent(&owner, invocation)?;
             let status =
@@ -564,6 +593,27 @@ fn invoke(owner: &Owner, tool: Tool, invocation: &Invocation, stop: &Cancel) -> 
 }
 
 fn recover(owner: &Owner, tool: Tool, invocation: &Invocation) -> Result<Outcome> {
+    if matches!(tool, Tool::Exec) {
+        let owner = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
+        let operation = Id::try_from(invocation.operation.clone())?;
+        let digest = crate::protocol::legacy_json_v1::sha256(invocation.save()?.dump().as_bytes());
+        let prior = owner.operation_record(&operation);
+        if let Some(prior) = prior
+            && (prior.intent.invocation_digest.as_deref() != Some(&digest)
+                || !matches!(prior.intent.action, Action::Exec { .. }))
+        {
+            return Err("terminal_operation_conflict");
+        }
+        return Ok(
+            if prior
+                .is_some_and(|prior| prior.status == OperationStatus::Durable(Effect::NotStarted))
+            {
+                Outcome::not_started()
+            } else {
+                unknown_command("terminal_exec_interrupted")
+            },
+        );
+    }
     let Arguments::Mutate(mutation) = Arguments::parse(tool, &invocation.arguments)? else {
         return Err("terminal_recovery_tool");
     };
@@ -573,6 +623,168 @@ fn recover(owner: &Owner, tool: Tool, invocation: &Invocation) -> Result<Outcome
         .matching_receipt(&intent, &bytes)?
         .unwrap_or(OperationStatus::Unresolved);
     Ok(receipt(&intent, status))
+}
+
+fn execute_command(
+    owner: &Owner,
+    invocation: &Invocation,
+    bytes: Vec<u8>,
+    action: Action,
+    stop: &Cancel,
+) -> Result<Outcome> {
+    let operation = Id::try_from(invocation.operation.clone())?;
+    let (terminal, epoch, created) = {
+        let mut host = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
+        if stop.cancelled() {
+            return Ok(Outcome::not_started());
+        }
+        if host.operation(&operation).is_some() {
+            return Err("terminal_operation_conflict");
+        }
+        if let Some((id, current)) = host
+            .terminals()
+            .iter()
+            .find(|(_, terminal)| terminal.lifecycle != Lifecycle::Closed)
+        {
+            (id.clone(), current.epoch, false)
+        } else {
+            let create_operation = Id::try_from(format!(
+                "exec_shell:{}",
+                super::protocol::sha256(operation.as_str().as_bytes())
+            ))?;
+            let terminal = host.terminal_id(&create_operation);
+            let launch = Launch {
+                label: "Shell".into(),
+                cwd: host.binding().workspace.clone(),
+                argv: shell::ARGV.into_iter().map(str::to_owned).collect(),
+                size: Size {
+                    rows: 24,
+                    columns: 80,
+                },
+                lifetime_seconds: 0,
+                idle_seconds: 0,
+            };
+            let create = exec_intent(
+                &host,
+                invocation,
+                create_operation,
+                terminal.clone(),
+                0,
+                Action::Create { launch },
+            )?;
+            let status =
+                host.execute_if(Writer::Agent, create.clone(), &[], || !stop.cancelled())?;
+            if status != OperationStatus::Durable(Effect::Applied) {
+                return Ok(receipt(&create, status));
+            }
+            (terminal, 1, true)
+        }
+    };
+    let poll = Duration::from_millis(20);
+    let startup = Instant::now() + Duration::from_secs(3);
+    loop {
+        if stop.cancelled() {
+            return Ok(Outcome::not_started());
+        }
+        let state = owner
+            .lock()
+            .map_err(|_| "terminal_owner_unavailable")?
+            .shell_status(&terminal, epoch, None)?;
+        match state {
+            shell::State::Ready => break,
+            shell::State::Busy if created && Instant::now() < startup => stop.wait(poll),
+            shell::State::Busy => return Err("terminal_exec_shell_busy"),
+            _ => return Err("terminal_exec_shell_unavailable"),
+        }
+    }
+    let status = {
+        let mut host = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
+        let intent = exec_intent(
+            &host,
+            invocation,
+            operation.clone(),
+            terminal.clone(),
+            epoch,
+            action,
+        )?;
+        host.execute_if(Writer::Agent, intent, &bytes, || !stop.cancelled())?
+    };
+    match status {
+        OperationStatus::Durable(Effect::Delivered { .. }) => {}
+        OperationStatus::Durable(Effect::NotStarted) => return Err("terminal_exec_shell_busy"),
+        _ => return Ok(unknown_command("terminal_exec_delivery_unknown")),
+    }
+    let deadline =
+        Instant::now() + Duration::from_secs(u64::from(super::protocol::MAX_LIFETIME_SECONDS));
+    let start_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if Instant::now() >= deadline {
+            if let Ok(mut host) = owner.lock() {
+                host.emergency_stop();
+            }
+            return Ok(unknown_command("terminal_exec_deadline"));
+        }
+        let polled = owner
+            .lock()
+            .map_or(Err("terminal_owner_unavailable"), |mut host| {
+                host.shell_status(&terminal, epoch, Some(operation.clone()))
+            });
+        match polled {
+            Ok(shell::State::Finished {
+                exit_code,
+                output,
+                truncated,
+            }) => {
+                return Ok(Outcome::succeeded(
+                    json!({
+                        "terminal": terminal, "exit_code": exit_code,
+                        "output": output, "truncated": truncated
+                    })
+                    .to_string(),
+                ));
+            }
+            Ok(shell::State::Running) if !stop.cancelled() => stop.wait(poll),
+            Ok(shell::State::Starting) if !stop.cancelled() => {
+                if Instant::now() >= start_deadline {
+                    if let Ok(mut host) = owner.lock() {
+                        host.emergency_stop();
+                    }
+                    return Ok(unknown_command("terminal_exec_start_unconfirmed"));
+                }
+                stop.wait(poll);
+            }
+            _ => return Ok(unknown_command("terminal_exec_interrupted")),
+        }
+    }
+}
+
+fn exec_intent(
+    owner: &Host<FileJournal, NativeBackend>,
+    invocation: &Invocation,
+    operation: Id,
+    terminal: Id,
+    epoch: u64,
+    action: Action,
+) -> Result<Intent> {
+    Ok(Intent {
+        operation,
+        terminal,
+        epoch,
+        writer: Writer::Agent,
+        binding: owner.binding().clone(),
+        invocation_digest: Some(super::protocol::sha256(
+            invocation.save()?.dump().as_bytes(),
+        )),
+        action,
+    })
+}
+
+fn unknown_command(code: &'static str) -> Outcome {
+    Outcome::from_bytes(
+        Execution::Failed,
+        Effects::Unknown,
+        json!({"error":code}).to_string().into_bytes(),
+    )
 }
 
 fn status_value(status: OperationStatus) -> Value {

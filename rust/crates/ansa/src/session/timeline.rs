@@ -201,6 +201,20 @@ fn compact_tool_result(detail: &mut ToolDetail, text: &str) -> String {
         && code.dump().parse::<i32>().is_ok()
     {
         fields.push(("exit_code", code.clone()));
+        if detail.name == crate::terminal_host::tools::EXEC
+            && code.dump() != "0"
+            && let Ok(output) = output.text_field("output")
+            && let Some(line) = output
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("error") || line.starts_with("fatal:"))
+                .or_else(|| output.lines().map(str::trim).find(|line| !line.is_empty()))
+        {
+            let diagnostic: String = line.chars().take(72).collect();
+            if let Ok(diagnostic) = Json::string(&diagnostic) {
+                fields.push(("diagnostic", diagnostic));
+            }
+        }
     }
     if output.text_field("status") == Ok("instructions_required") {
         fields.push((
@@ -447,7 +461,9 @@ impl Timeline {
         {
             let mut detail = (**detail).clone();
             let text = compact_tool_result(&mut detail, full_text.unwrap_or(&entry.text));
-            if detail.name.starts_with("terminal_") {
+            if detail.name.starts_with("terminal_")
+                && detail.name != crate::terminal_host::tools::EXEC
+            {
                 detail.target.clear();
             }
             self.conversation.append(Entry {

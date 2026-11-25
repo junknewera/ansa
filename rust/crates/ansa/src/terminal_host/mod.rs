@@ -6,6 +6,7 @@ pub mod daemon;
 mod evidence;
 pub mod native;
 pub mod protocol;
+mod shell;
 pub mod tools;
 mod wire;
 pub(crate) mod workspace;
@@ -508,7 +509,7 @@ impl<J: Journal, B: Backend> Host<J, B> {
                     && terminal.writer == Writer::Human
                     && screen.through >= terminal.visible_after
             }
-            Action::Input { count, .. } => {
+            Action::Input { count, .. } | Action::Exec { count, .. } => {
                 intent.writer == terminal.writer
                     && (terminal.launch.session_lifetime()
                         || terminal.input_bytes + count <= MAX_TERMINAL_INPUT)
@@ -536,7 +537,7 @@ impl<J: Journal, B: Backend> Host<J, B> {
                     },
                 );
             }
-            Action::Input { count, .. } => {
+            Action::Input { count, .. } | Action::Exec { count, .. } => {
                 self.terminals
                     .get_mut(&intent.terminal)
                     .expect("admitted lease")

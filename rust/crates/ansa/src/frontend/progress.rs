@@ -419,6 +419,7 @@ mod tests {
             operation: "operation".into(),
             call_id: "call".into(),
             name: "run_command".into(),
+            target: String::new(),
         };
         v.tools = vec![Activity::Started(started.clone())];
         progress.observe(&v, start);
@@ -471,6 +472,7 @@ mod tests {
                 operation: operation.clone(),
                 call_id: "c".into(),
                 name: "read_file".into(),
+                target: String::new(),
             };
             progress.project(&mut view, Activity::Started(started), now);
             if n < RECENT_TOOL_ACTIVITY {
@@ -502,6 +504,7 @@ mod tests {
             operation: "op".into(),
             call_id: "call".into(),
             name: "read_file".into(),
+            target: String::new(),
         };
         progress.project(&mut v, Activity::Started(started.clone()), start);
         v.state = "executing".into();

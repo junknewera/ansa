@@ -804,6 +804,7 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
     ansa_linux::fs::private_directory(&cwd).map_err(|_| "fixture_workspace")?;
     let plus = root.join("orchestration-plus").is_file();
     let direct_edit = root.join("direct-edit-check").is_file();
+    let terminal_exec = root.join("terminal-exec").is_file();
     let inputs = if root.join("fixture-image-model").is_file() {
         vec!["text", "image"]
     } else {
@@ -882,9 +883,11 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                     {
                         return Err("fixture_format");
                     }
-                    if plus || direct_edit {
+                    if plus || direct_edit || terminal_exec {
                         let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let items = if direct_edit {
+                        let items = if terminal_exec {
+                            terminal_exec_fixture::items(input, index)?
+                        } else if direct_edit {
                             direct_edit_fixture::items(&request, input, index)?
                         } else if trace.with_file_name("orchestration-plus-budget").is_file() {
                             plus_budget_fixture::items(&request, input, index)?
@@ -1074,6 +1077,8 @@ mod direct_edit_fixture;
 mod plus_budget_fixture;
 #[cfg(feature = "frontend-test-adapter")]
 mod search_fixture;
+#[cfg(feature = "frontend-test-adapter")]
+mod terminal_exec_fixture;
 
 #[cfg(feature = "frontend-test-adapter")]
 fn plus_fixture_response(
