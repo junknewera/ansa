@@ -274,6 +274,12 @@ pub(crate) fn export(path: &Path, compiled: &Snapshot, fixture: &Snapshot) -> Re
                     }
                 }
                 "pause" => fields.push(("diagnostic", event.field("diagnostic")?.clone())),
+                "resume" if event.has("unknown_operation") => {
+                    fields.push((
+                        "unknown_operation",
+                        event.field("unknown_operation")?.clone(),
+                    ));
+                }
                 _ => {}
             }
             records.push(Json::object(fields)?);

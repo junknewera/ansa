@@ -302,7 +302,9 @@ impl State {
         if new_turn {
             self.pending = Some(command.command.clone());
         }
-        if let CommandPayload::Resume(target) = &command.payload {
+        if let CommandPayload::Resume(target) | CommandPayload::ResumeUnknown(target, _) =
+            &command.payload
+        {
             self.progress
                 .resume_sent(command.command.clone(), target.clone(), Instant::now());
         }
@@ -574,7 +576,7 @@ impl State {
                 if let Some(target) = self
                     .snapshot
                     .as_ref()
-                    .filter(|v| v.resume_available)
+                    .filter(|v| v.resume_available && v.recovery_operation.is_none())
                     .and_then(|v| v.request.clone())
                 {
                     self.post(handle, CommandPayload::Resume(target), replies);
@@ -895,6 +897,7 @@ impl State {
             {
                 self.accept_attachments(command);
             }
+            EventPayload::Cancelled { .. } => self.progress.clear_resume(),
             EventPayload::RuntimeError {
                 command,
                 diagnostic,

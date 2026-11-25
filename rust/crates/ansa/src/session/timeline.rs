@@ -766,6 +766,7 @@ impl Timeline {
                     effects: result.result.effects(),
                 };
                 detail.content_start = prefix.len();
+                self.names.insert(detail.operation.clone(), detail.clone());
                 if detail.name == crate::tools::delegation::NAME && result.dispatched {
                     let (state, text) = delegate_notice(&detail.target, &result.result);
                     self.append("notice", text, state);
@@ -776,6 +777,27 @@ impl Timeline {
                     "finished",
                     Some(detail),
                 );
+            }
+            "resume" if event.has("unknown_operation") => {
+                let operation = event.text_field("unknown_operation")?;
+                if let Some(detail) = self.names.get_mut(operation)
+                    && detail.phase == ToolPhase::Prepared
+                {
+                    use crate::provider::replay::{Effects, Execution};
+                    let prefix = format!("{} Failed Unknown\n", detail.name);
+                    detail.phase = ToolPhase::Finished {
+                        execution: Execution::Failed,
+                        effects: Effects::Unknown,
+                    };
+                    detail.content_start = prefix.len();
+                    let detail = detail.clone();
+                    self.append_tool(
+                        "tool_result",
+                        format!("{prefix}{}", codec_v1::UNRESOLVED_TOOL_OUTPUT),
+                        "finished",
+                        Some(detail),
+                    );
+                }
             }
             "done" => {
                 let text = std::mem::take(&mut self.final_text);

@@ -2,6 +2,8 @@
 use super::{Result, need, num};
 pub use crate::provider::native::{load as load_response, save as save_response};
 pub use crate::tools::invocation::Invocation;
+pub(super) const UNRESOLVED_TOOL_OUTPUT: &str =
+    r#"{"error":"tool_outcome_missing","effects":"unknown"}"#;
 use crate::{
     protocol::json::Json,
     provider::{

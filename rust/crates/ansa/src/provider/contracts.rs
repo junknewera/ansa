@@ -178,6 +178,7 @@ pub enum CommandPayload {
     Cancel(RequestId),
     GetSnapshot(u64),
     Resume(RequestId),
+    ResumeUnknown(RequestId, OperationId),
     GetTranscript(GetTranscript),
     GetMessageReceipt(CommandId),
 }
@@ -286,6 +287,11 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
     match &command.payload {
         CommandPayload::Cancel(id) | CommandPayload::Resume(id) if !valid_id(&id.0) => {
             Err("request_id")
+        }
+        CommandPayload::ResumeUnknown(id, operation)
+            if !valid_id(&id.0) || operation.0.is_empty() || operation.0.len() > 256 =>
+        {
+            Err("recovery_operation")
         }
         CommandPayload::GetMessageReceipt(id) if !valid_id(&id.0) => Err("command_id"),
         CommandPayload::Submit(submit)

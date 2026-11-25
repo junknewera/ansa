@@ -288,6 +288,88 @@ pub struct SavedTurn {
     pub resume_operation: usize,
 }
 impl SavedTurn {
+    pub(crate) fn recoverable_unknown(&self) -> Option<&str> {
+        if !matches!(self.stage.as_str(), "tools" | "cancelled") || self.tools_response.is_none() {
+            return None;
+        }
+        if let Some(intent) = &self.intent {
+            return self
+                .results
+                .iter()
+                .all(|r| r.dispatched && r.result.effects() == Effects::KnownResult)
+                .then_some(intent.operation.as_str());
+        }
+        let (last, prefix) = self.results.split_last()?;
+        (last.dispatched
+            && last.result.effects() == Effects::Unknown
+            && prefix
+                .iter()
+                .all(|r| r.dispatched && r.result.effects() == Effects::KnownResult))
+        .then(|| last.result.operation_id())
+    }
+
+    fn unresolved_result(&self) -> Option<SavedResult> {
+        self.intent.as_ref().map(|intent| SavedResult {
+            result: crate::provider::replay::ToolResult::new(
+                intent.operation.clone(),
+                intent.call.clone(),
+                super::codec_v1::UNRESOLVED_TOOL_OUTPUT.into(),
+                Execution::Failed,
+                Effects::Unknown,
+            ),
+            // The journal certifies the intent, and delivery remains unknown.
+            dispatched: false,
+        })
+    }
+
+    pub(crate) fn recovery_request(&self, operation: &str) -> Result<Request> {
+        need(
+            self.recoverable_unknown() == Some(operation),
+            "session_recovery_operation",
+        )?;
+        let response = self
+            .tools_response
+            .as_ref()
+            .ok_or("session_recovery_operation")?;
+        let mut results = self
+            .results
+            .iter()
+            .map(|r| r.result.clone())
+            .collect::<Vec<_>>();
+        results.extend(self.unresolved_result().map(|r| r.result));
+        for (index, call) in response.calls().iter().enumerate().skip(results.len()) {
+            results.push(crate::provider::replay::ToolResult::new(
+                format!(
+                    "{}:op:{}",
+                    self.operation_run,
+                    self.operation_offset + index + 1
+                ),
+                call.call_id.clone(),
+                r#"{"error":"not_started_after_unknown_outcome","applied":false}"#.into(),
+                Execution::Cancelled,
+                Effects::NotStarted,
+            ));
+        }
+        crate::provider::replay::recovery_continuation(response, &results, operation)
+    }
+
+    pub(crate) fn repeats_unknown_call(&self, name: &str, arguments: &Json) -> bool {
+        self.previous_results
+            .iter()
+            .filter(|result| result.result.effects() == Effects::Unknown)
+            .any(|result| {
+                self.next.input.iter().any(|item| {
+                    item.text_field("type") == Ok("function_call")
+                        && item.text_field("call_id") == Ok(result.result.call_id())
+                        && item.text_field("name") == Ok(name)
+                        && item
+                            .text_field("arguments")
+                            .and_then(Json::parse)
+                            .is_ok_and(|old| old == *arguments)
+                })
+            })
+    }
+
     /// A rejected batch has no intents or outcomes. Its native calls still
     /// need matching outputs before the provider can correct the request.
     pub(crate) fn rejected_batch_request(
@@ -1748,6 +1830,10 @@ impl State {
                     let call = response.calls().get(index).ok_or("session_intent_stage")?;
                     let invocation = Invocation::load(event.field("invocation")?)?;
                     need(
+                        !current.repeats_unknown_call(&invocation.name, &invocation.arguments),
+                        "session_repeated_unknown_call",
+                    )?;
+                    need(
                         invocation.operation
                             == format!(
                                 "{}:op:{}",
@@ -1901,10 +1987,16 @@ impl State {
                 }
                 "resume" => {
                     let id = event.text_field("command")?;
+                    let recovery = event
+                        .has("unknown_operation")
+                        .then(|| event.text_field("unknown_operation"))
+                        .transpose()?;
                     need(
                         current.stage != "completed"
-                            && (current.stage != "cancelled" || pending_followup)
-                            && !unknown
+                            && (current.stage != "cancelled"
+                                || pending_followup
+                                || recovery.is_some())
+                            && unknown == recovery.is_some()
                             && valid_id(id)
                             && !current.resumes.contains(id)
                             && current.resumes.len() < 4096,
@@ -1917,6 +2009,22 @@ impl State {
                         )?;
                         (current.round_limit, current.call_limit) = configured_tool_budget(event)?;
                         current.legacy_tool_limits = false;
+                    }
+                    if let Some(operation) = recovery {
+                        current.next = current.recovery_request(operation)?;
+                        if let Some(result) = current.unresolved_result() {
+                            current.results.push(result);
+                        }
+                        current.intent = None;
+                        let response = current
+                            .tools_response
+                            .take()
+                            .ok_or("session_recovery_operation")?;
+                        current.operation_offset += response.calls().len();
+                        current.previous_results.append(&mut current.results);
+                        current.response = None;
+                        current.rejected_response = None;
+                        current.stage = "generating".into();
                     }
                     current.resumes.insert(id.into());
                     current.resume_round = current.rounds;
