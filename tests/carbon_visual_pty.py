@@ -638,10 +638,14 @@ def inline_edit(binary, adapter, root, home, cwd, screens):
         until(paused, lambda text: 'terminal_item_count' in text and 'paused' in paused.vt.line(-2),
               'provider failure paused the request')
         assert 'Continue' in paused.vt.line(-1) and 'Ctrl+C' in paused.vt.line(-1)
-        paused.send('NEXT_TURN Ж\r')
-        until(paused, lambda text: paused.vt.line(-4) == '  › NEXT_TURN Ж', 'paused draft preserved')
+        paused.send('PAUSED_NOTE Ж\r')
+        until(paused, lambda text: '◷ PAUSED_NOTE Ж' in text and paused.vt.line(-4) == '  ›',
+              'paused follow-up saved in the chat')
         assert sum(row['kind'] == 'accepted' for row in records(failed_root)) == 1
+        assert [row['text'] for row in records(failed_root) if row['kind'] == 'queued'] == ['PAUSED_NOTE Ж']
         snapshot(paused, 'paused')
+        paused.send('UNSENT_DRAFT')
+        until(paused, lambda _: paused.vt.line(-4) == '  › UNSENT_DRAFT', 'unsent draft is separate')
         paused.child.send_signal(signal.SIGINT)
         until(paused, lambda text: paused.vt.line(-4) == '  ›' and 'paused' in paused.vt.line(-2),
               'Ctrl+C cleared the draft and retained the paused request')

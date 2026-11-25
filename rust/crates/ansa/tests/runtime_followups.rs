@@ -1312,6 +1312,112 @@ async fn targeted_interrupt_reads_pending_message_but_without_one_stays_stopped(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn followup_queued_during_pause_waits_for_continue() {
+    followup_on_paused_turn(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_during_pause_keeps_queued_messages_in_history_without_dispatch() {
+    followup_on_paused_turn(true).await;
+}
+
+async fn followup_on_paused_turn(cancel: bool) {
+    let root = fixture::Root::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let cancel_gate = Arc::new(fixture::Gate::default());
+    let held_cancel = cancel_gate.clone();
+    let provider: Generate = Arc::new(move |request, _, _| {
+        if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err("http_timeout");
+        }
+        assert!(has_user(request, "First message") && has_user(request, "Follow-up"));
+        native::load(&fixture::saved_response(
+            request,
+            Some("Resumed with the follow-up"),
+            0,
+        ))
+    });
+    let mut runtime = fixture::setup(
+        Arc::new(AtomicUsize::new(0)),
+        None,
+        provider,
+        Limits::default(),
+        Options {
+            directory: Some(root.journal()),
+            journal: Some(Arc::new(move |point, kind| {
+                if point == Point::BeforeSync && kind == "cancel" {
+                    held_cancel.hold(&Cancel::default());
+                }
+                Ok(())
+            })),
+            ..Options::default()
+        },
+    )
+    .await;
+    let handle = runtime.handle();
+    let target = fixture::submit(&handle, "submit", "First message", "turn").await;
+    fixture::until(&handle, |p| matches!(p, EventPayload::RuntimeError { diagnostic, .. } if diagnostic == "http_timeout")).await;
+    steer(&handle, "note", &target, "Follow-up").await;
+    let view = fixture::snapshot(&handle, "saved_note").await;
+    assert_eq!(view.state, "paused");
+    assert_eq!(view.followups[0].text, "Follow-up");
+    assert_eq!(view.followups[0].state, "queued");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    if cancel {
+        fixture::post(
+            &handle,
+            "cancel",
+            CommandPayload::Cancel(target.clone()),
+            "turn",
+            PostStatus::Accepted,
+        )
+        .await;
+        let gate = cancel_gate.clone();
+        tokio::task::spawn_blocking(move || gate.wait())
+            .await
+            .unwrap();
+        let late_message = fixture::command(
+            &handle,
+            "late_note",
+            CommandPayload::Steer(Steer {
+                target: target.clone(),
+                text: "Late follow-up".into(),
+            }),
+            "turn",
+        );
+        let admission = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            handle.post(late_message.clone()),
+        )
+        .await;
+        cancel_gate.release();
+        assert_eq!(admission.unwrap().unwrap(), PostStatus::StaleTarget);
+        fixture::until(&handle, |p| matches!(p, EventPayload::Cancelled { .. })).await;
+        assert_eq!(
+            handle.post(late_message).await.unwrap(),
+            PostStatus::StaleTarget
+        );
+        let view = fixture::snapshot(&handle, "cancelled_note").await;
+        assert_eq!(view.state, "cancelled");
+        assert_eq!(view.followups[0].state, "cancelled");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    } else {
+        fixture::post(
+            &handle,
+            "resume",
+            CommandPayload::Resume(target),
+            "turn",
+            PostStatus::Accepted,
+        )
+        .await;
+        fixture::until(&handle, |p| matches!(p, EventPayload::Done)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+    fixture::finish(&mut runtime).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn pending_message_survives_restart_without_automatic_dispatch() {
     let root = fixture::Root::new();
     let gate = Arc::new(fixture::Gate::default());

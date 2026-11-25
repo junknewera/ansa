@@ -27,6 +27,11 @@ struct PendingStore {
     known: Option<SavedResult>,
 }
 
+struct Cancellation {
+    command: CommandId,
+    dismiss_followups: bool,
+}
+
 fn child_tool_receipt(saved: &SavedResult, detail: Option<&ToolDetail>) -> ChildToolReceipt {
     let result = &saved.result;
     let tool = detail.map_or("unknown", |detail| detail.name.as_str());
@@ -95,7 +100,7 @@ pub(crate) struct Owner {
     selection_stop: Option<Cancel>,
     deferred_completions: VecDeque<Completion>,
     pending_receipt: Option<SubmitReceipt>,
-    cancelling: Option<CommandId>,
+    cancelling: Option<Cancellation>,
     resuming: Option<Resume>,
     plan_admission_pending: bool,
     plan_workspace: Option<Box<dyn Send>>,
@@ -675,9 +680,11 @@ impl Owner {
         if self.phase != "cancelled" {
             self.phase = "paused".into();
         }
-        if let Some(id) = self.cancelling.take() {
+        if let Some(cancel) = self.cancelling.take() {
             self.phase = "cancelled".into();
-            self.emit(EventPayload::Cancelled { command: id });
+            self.emit(EventPayload::Cancelled {
+                command: cancel.command,
+            });
         }
         self.emit(EventPayload::RuntimeError {
             command: self
@@ -910,7 +917,16 @@ impl Owner {
         self.turn_stop.cancel();
         self.tools.signal_cancel();
         self.finish_preview("discarded", false);
-        self.cancelling = Some(command);
+        let dismiss_followups = (self.phase == "paused" && self.recovery.is_none())
+            || self
+                .state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.receipt.mode.leads());
+        self.cancelling = Some(Cancellation {
+            command,
+            dismiss_followups,
+        });
         if self
             .storing
             .as_ref()
@@ -924,7 +940,7 @@ impl Owner {
             self.recovered_pause = false;
         }
         if self.storage_failed {
-            let command = self.cancelling.take().expect("owned cancel");
+            let command = self.cancelling.take().expect("owned cancel").command;
             self.emit(EventPayload::Cancelled { command });
             self.snapshot(None);
         }
@@ -1036,10 +1052,16 @@ impl Owner {
                 {
                     return Ok(PostStatus::StaleTarget);
                 }
-                if self.state.turn.as_ref().is_some_and(|turn| {
-                    turn.receipt.mode.leads()
-                        && (self.cancelling.is_some() || turn.stage == "cancelled")
-                }) {
+                if self
+                    .cancelling
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.dismiss_followups)
+                    || self
+                        .state
+                        .turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.stage == "cancelled" && self.recovery.is_none())
+                {
                     return Ok(PostStatus::StaleTarget);
                 }
                 if self.storage_failed {
@@ -1531,20 +1553,18 @@ impl Owner {
             }
             return Ok(());
         }
-        let cancelling_lead = self.cancelling.is_some()
-            && self
-                .state
-                .turn
-                .as_ref()
-                .is_some_and(|turn| turn.receipt.mode.leads());
-        if cancelling_lead && let Some(command) = self.new_followups.pop_front() {
+        let dismiss_followups = self
+            .cancelling
+            .as_ref()
+            .is_some_and(|cancel| cancel.dismiss_followups);
+        if dismiss_followups && let Some(command) = self.new_followups.pop_front() {
             // Cancel has already closed the dispatch gate. Finish admitting
             // previously reserved questions so the cancel record covers them.
             return self.queue_followup(workers, command);
         }
         if self.cancelling.is_some() && self.state.turn.is_some() {
             let mut fields = vec![];
-            if cancelling_lead {
+            if dismiss_followups {
                 let ids = self
                     .state
                     .pending_followups()
@@ -1750,6 +1770,7 @@ impl Owner {
         if !self.shutting_down
             && !self.recovered_pause
             && self.recovery.is_none()
+            && self.phase != "paused"
             && self.state.pending_followups().next().is_some()
         {
             let messages = self.state.pending_followups().cloned().collect::<Vec<_>>();
@@ -1933,8 +1954,14 @@ impl Owner {
                 submitted.turn.clone(),
                 None,
             );
-            if let Some(command) = self.cancelling.take() {
-                self.emit_at(EventPayload::Cancelled { command }, submitted.turn, None);
+            if let Some(cancel) = self.cancelling.take() {
+                self.emit_at(
+                    EventPayload::Cancelled {
+                        command: cancel.command,
+                    },
+                    submitted.turn,
+                    None,
+                );
             }
             self.snapshot(None);
             return Ok(());
@@ -2106,8 +2133,13 @@ impl Owner {
             Kind::Cancel => {
                 self.plan_workspace = None;
                 self.phase = "cancelled".into();
-                if let Some(command) = self.cancelling.take() {
-                    self.emit(EventPayload::Cancelled { command });
+                if let Some(cancel) = self.cancelling.take() {
+                    if cancel.dismiss_followups {
+                        self.recovered_pause = false;
+                    }
+                    self.emit(EventPayload::Cancelled {
+                        command: cancel.command,
+                    });
                 }
                 self.snapshot(None);
             }

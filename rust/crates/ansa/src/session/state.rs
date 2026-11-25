@@ -1927,7 +1927,6 @@ impl State {
                 "cancel" => {
                     need(current.stage != "completed", "session_cancel_completed")?;
                     if event.has("dismissed") {
-                        need(current.receipt.mode.leads(), "session_side_reply")?;
                         let ids = event.field("dismissed")?.elements()?;
                         let pending = self
                             .followups

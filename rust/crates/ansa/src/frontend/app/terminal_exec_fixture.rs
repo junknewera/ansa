@@ -19,7 +19,15 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
         vec![json!({"type":"message","id":format!("message-{index}"),
             "role":"assistant","status":"completed","content":[{"type":"output_text","text":"Fixture complete."}]})]
     };
-    if prompt == crate::provider::replay::RECOVERY_NOTICE {
+    if prompt == crate::provider::replay::RECOVERY_NOTICE
+        || prompt == "Проверь сохранившийся результат"
+    {
+        let notice = input[..=start]
+            .iter()
+            .rposition(|row| {
+                row["role"] == "user" && row["content"] == crate::provider::replay::RECOVERY_NOTICE
+            })
+            .ok_or("fixture_exec_recovery_notice")?;
         if input
             .last()
             .and_then(|row| row["output"].as_str())
@@ -29,7 +37,7 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
         {
             return Ok(done());
         }
-        let outputs = input[..start]
+        let outputs = input[..notice]
             .iter()
             .rev()
             .take_while(|row| row["type"] == "function_call_output")

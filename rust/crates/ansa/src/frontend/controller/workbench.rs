@@ -309,6 +309,7 @@ impl Slot {
                 Ok(PostStatus::Closed) if internal && (self.closed || self.closing) => None,
                 Ok(PostStatus::QueueFull) => Some("command_queue_full"),
                 Ok(PostStatus::Closed) => Some("runtime_closed"),
+                Ok(PostStatus::StaleTarget) if submit => Some("message_target_changed"),
                 Ok(PostStatus::StaleTarget) => Some("stale_cancel_target"),
                 Ok(PostStatus::StaleIncarnation) => Some("stale_incarnation"),
                 Ok(PostStatus::CommandIdLimit) => Some("submit_id_limit"),
@@ -3160,11 +3161,14 @@ impl Workbench {
     }
 
     fn route_text(&mut self, text: &str, io: &Io) -> (bool, bool) {
-        if !text.trim_start().starts_with('/')
-            && !text.trim().is_empty()
-            && self.collecting_orchestration()
-        {
-            return (self.chat_during_orchestration(text, io), false);
+        if !text.trim_start().starts_with('/') && !text.trim().is_empty() {
+            let slot = &mut self.slots[self.current];
+            if text.trim() != "?" && slot.state.followup_target().is_some() {
+                return slot.state.text(text, &slot.handle, io, &mut slot.replies);
+            }
+            if self.collecting_orchestration() {
+                return (self.chat_during_orchestration(text, io), false);
+            }
         }
         if !text.trim_start().starts_with('/')
             && (self.slots[self.current].pending_summary.is_some()
