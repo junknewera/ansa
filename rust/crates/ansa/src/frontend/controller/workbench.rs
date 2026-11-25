@@ -5459,8 +5459,23 @@ impl Workbench {
                 if matches!(self.panel, Some(Panel::Activity(_))) {
                     self.tool_press = self.activity_press(mouse.column, mouse.row);
                 }
-                // Text selection needs one complete paint. Activity actions
-                // can use the same hit target across an in-flight redraw.
+                if self.menu.is_none()
+                    && self.focus == Focus::Chat
+                    && let Some(frame) = self.displayed.as_ref()
+                    && frame.chat_bounds.is_some_and(|(begin, end, right)| {
+                        mouse.row >= begin && mouse.row < end && mouse.column < right
+                    })
+                    && let Some((_, key)) = frame
+                        .tool_actions
+                        .iter()
+                        .find(|(row, key)| *row == mouse.row && key.starts_with("resume:"))
+                {
+                    // The release validates the request against the current
+                    // snapshot, even if another frame is already being drawn.
+                    self.tool_press = Some((mouse.column, mouse.row, key.clone(), None, None));
+                    return;
+                }
+                // Attachment chips and selection use a complete paint.
                 if !self.frames.is_empty() {
                     return;
                 }
@@ -5609,7 +5624,8 @@ impl Workbench {
                 if let Some((column, row, key, edit, output)) = self.tool_press.take()
                     && (column, row) == (mouse.column, mouse.row)
                 {
-                    if matches!(self.panel, Some(Panel::Activity(_))) {
+                    if matches!(self.panel, Some(Panel::Activity(_))) && !key.starts_with("resume:")
+                    {
                         self.activate_activity(key, edit, output, io);
                     } else {
                         self.activate_result(key, edit, output, io);
