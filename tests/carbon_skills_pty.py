@@ -91,10 +91,15 @@ def skill_and_attachment(binary):
             local(screen, f"/attach --text {reference.name}")
             until(screen, lambda frame: "Text attached" in frame, "text attachment loaded")
             suggest_skill(screen)
-            screen.send(b"\t")
+            screen.send(b"\x15")
+            local(screen, "/skills")
+            until(screen, lambda frame: "Skills" in frame and SKILL in body(screen),
+                  "skills picker shows the pinned slash command")
+            assert "/model" not in body(screen), "picker includes a built-in command"
+            screen.send(b"\x1b[B" * 5 + b"\r")
             until(screen, lambda frame: screen.vt.line(-4) == f"  › {SKILL}"
-                  and "Tab/→ complete" not in frame, "Tab inserts the skill without submitting")
-            assert journals(root) == before, "/attach or Tab dispatched a turn"
+                  and "Enter insert" not in frame, "picker inserts the skill without submitting")
+            assert journals(root) == before, "/attach or /skills dispatched a turn"
             screen.send(f" {TASK} @sam")
             until(screen, lambda _: reference.name in body(screen), "file completion within a slash skill")
             screen.send(b"\t")
@@ -137,6 +142,11 @@ def skill_and_attachment(binary):
         reference.unlink()
         with carbon(binary, root, home, cwd, "--session", session) as reopened:
             until(reopened, lambda _: user_history(reopened), "saved user history after reopen")
+            local(reopened, "/skills")
+            until(reopened, lambda _: OLD_DETAIL in body(reopened), "picker uses the reopened pin")
+            assert NEW_DETAIL not in body(reopened)
+            reopened.send(b"\x1b")
+            until(reopened, lambda frame: "Enter insert" not in frame, "close skills picker")
             suggest_skill(reopened)
             reopened.send(b"\x15")  # Clear the completion draft before /exit.
             until(reopened, lambda _: reopened.vt.line(-4) == "  ›", "empty composer before exit")

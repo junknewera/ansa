@@ -1541,6 +1541,7 @@ fn recent_plan_links_scans_the_entire_inventory() {
 }
 
 pub(super) struct ArchivedPlan {
+    pub owner: String,
     pub run: String,
     pub plan: Plan,
     pub prompt: String,
@@ -1593,6 +1594,7 @@ pub(super) fn archived_plan(
             Ok(None)
         };
         return Ok(ArchivedPlan {
+            owner,
             run: id.into(),
             plan: run.plan().clone(),
             prompt,

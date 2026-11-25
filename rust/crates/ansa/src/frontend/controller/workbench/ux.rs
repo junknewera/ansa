@@ -17,7 +17,9 @@ impl ConversationAgent {
 }
 
 pub(super) struct CandidateView {
+    owner: String,
     run: String,
+    commit: String,
     heading: String,
     title: String,
     rows: Arc<Vec<crate::frontend::diff::Row>>,
@@ -34,7 +36,7 @@ fn step_progress(label: &str, view: &orchestration::RunView) -> String {
 }
 
 impl CandidateView {
-    pub(super) fn new(run: String, candidate: orchestration::Candidate) -> Self {
+    pub(super) fn new(owner: String, run: String, candidate: orchestration::Candidate) -> Self {
         use crate::frontend::diff::{Kind, patch_rows};
         let rows = patch_rows(&candidate.diff);
         let added = rows.iter().filter(|row| row.kind == Kind::Add).count();
@@ -48,11 +50,10 @@ impl CandidateView {
             (format!("{heading} · project snapshot → ansa-result"), None)
         } else {
             let text = format!(
-                "Candidate {}\nCheckout {}\n\n{}\n\nAfter checking this candidate, run\n/accept {run} {}",
+                "Candidate {}\nCheckout {}\n\n{}",
                 candidate.commit,
                 candidate.workspace.display(),
                 candidate.manual_checks.join("\n\n"),
-                candidate.commit,
             );
             (
                 format!("{heading} · Manual checks pending"),
@@ -63,7 +64,9 @@ impl CandidateView {
             )
         };
         Self {
+            owner,
             run,
+            commit: candidate.commit,
             heading,
             title,
             rows: Arc::new(rows),
@@ -196,6 +199,13 @@ impl Workbench {
                         Some(format!("output:manual:{}", review.run)),
                         Some(manual.clone()),
                     ));
+                    if review.owner == slot.id {
+                        review_entries.push(result_entry(
+                            "Confirm checks".into(),
+                            Some(format!("checks:{}", review.run)),
+                            None,
+                        ));
+                    }
                 }
                 entries.splice(index..index, review_entries);
             }
@@ -214,6 +224,13 @@ impl Workbench {
                 entries.push(result_entry(
                     "Approved plan".into(),
                     Some("plan:active".into()),
+                    None,
+                ));
+            }
+            if collecting {
+                entries.push(result_entry(
+                    "Clarify plan".into(),
+                    Some(format!("clarify:{}", view.id)),
                     None,
                 ));
             }
@@ -442,6 +459,28 @@ impl Workbench {
                 self.jobs.spawn_blocking(move || Job::ArchivedPlan {
                     token,
                     result: orchestration::archived_plan(&factory, parent, &run, &stop),
+                });
+            }
+        } else if let Some(run) = key.strip_prefix("clarify:") {
+            if self.collecting_orchestration()
+                && !self.clarification_pending
+                && self
+                    .orchestration_views
+                    .get(&slot.id)
+                    .is_some_and(|view| view.id == run)
+            {
+                self.navigation_editor.clear();
+                self.menu = Some(Menu::Clarify { run: run.into() });
+            }
+        } else if let Some(run) = key.strip_prefix("checks:") {
+            if let Some(candidate) = slot.candidate_reviews.iter().find(|candidate| {
+                candidate.run == run && candidate.owner == slot.id && candidate.manual.is_some()
+            }) {
+                self.operational_frame = None;
+                self.last_frame = None;
+                self.menu = Some(Menu::ConfirmChecks {
+                    run: candidate.run.clone(),
+                    commit: candidate.commit.clone(),
                 });
             }
         } else if let Some(run) = key.strip_prefix("candidate:") {

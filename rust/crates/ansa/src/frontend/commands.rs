@@ -74,12 +74,8 @@ const COMMANDS: &[Command] = &[
         description: "Copy the confirmed transcript",
     },
     Command {
-        name: "/accept",
-        description: "Confirm manual checks for a completed plan",
-    },
-    Command {
-        name: "/clarify",
-        description: "Send an instruction within the approved plan",
+        name: "/skills",
+        description: "Browse skills available in this conversation",
     },
     Command {
         name: "/help",
@@ -100,14 +96,6 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "/orchestrate+",
         description: "Configure role models or give the lead a task",
-    },
-    Command {
-        name: "/propose",
-        description: "Prepare a plan with explicit approval before execution",
-    },
-    Command {
-        name: "/propose+",
-        description: "Prepare an approval-based plan with configured role models",
     },
     Command {
         name: "/attach",
@@ -178,7 +166,17 @@ pub(super) fn skill_choices(profile: Option<&crate::harness::Pinned>) -> Vec<Ski
             let built_in = COMMANDS.iter().any(|cmd| cmd.name == canonical(&label))
                 || matches!(
                     label.as_str(),
-                    "/basic" | "/status" | "/cancel" | "/quit" | "/agent" | "/run" | "/send"
+                    "/basic"
+                        | "/status"
+                        | "/cancel"
+                        | "/quit"
+                        | "/agent"
+                        | "/run"
+                        | "/send"
+                        | "/propose"
+                        | "/propose+"
+                        | "/clarify"
+                        | "/accept"
                 );
             (!built_in).then(|| Choice {
                 label,
@@ -363,6 +361,26 @@ impl Completion {
 }
 pub fn help(selected: usize) -> Popup {
     help_with_commands(selected, available(false))
+}
+
+pub(super) fn skills(items: &[SkillCommand]) -> Popup {
+    Popup {
+        title: "Skills".into(),
+        subtitle: if items.is_empty() {
+            "No skills in this conversation"
+        } else {
+            ""
+        }
+        .into(),
+        items: items.to_vec(),
+        selected: 0,
+        footer: if items.is_empty() {
+            "Esc close · /new loads ~/.ansa/skills"
+        } else {
+            "↑/↓ select · Enter insert · Esc close"
+        }
+        .into(),
+    }
 }
 
 pub(crate) fn help_with_commands(selected: usize, commands: &[Command]) -> Popup {
