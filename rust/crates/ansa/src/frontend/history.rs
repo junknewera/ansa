@@ -1,9 +1,26 @@
 //! Input recall reads bounded canonical pages; it never writes a second history.
 use super::{input::Editor, protocol_v1::*};
 
-struct Draft {
+pub(super) struct Draft {
     bytes: Vec<u8>,
     cursor: usize,
+    pasted_ranges: Vec<std::ops::Range<usize>>,
+}
+impl Draft {
+    pub(super) fn capture(editor: &Editor) -> Self {
+        Self {
+            bytes: editor.bytes.clone(),
+            cursor: editor.cursor,
+            pasted_ranges: editor.pasted_ranges.clone(),
+        }
+    }
+
+    pub(super) fn restore(self, editor: &mut Editor) {
+        editor.clear();
+        editor.bytes = self.bytes;
+        editor.cursor = self.cursor;
+        editor.pasted_ranges = self.pasted_ranges;
+    }
 }
 struct Pending {
     query: GetTranscript,
@@ -32,10 +49,7 @@ impl History {
             if !older {
                 return;
             }
-            self.draft = Some(Draft {
-                bytes: editor.bytes.clone(),
-                cursor: editor.cursor,
-            });
+            self.draft = Some(Draft::capture(editor));
             self.anchor = total;
         }
         if older {
@@ -48,9 +62,7 @@ impl History {
         }
         if self.target == 0 {
             let draft = self.draft.take().expect("active recall");
-            editor.clear();
-            editor.bytes = draft.bytes;
-            editor.cursor = draft.cursor;
+            draft.restore(editor);
             self.reset();
         }
     }
@@ -59,10 +71,7 @@ impl History {
         self.pending = None;
         self.target = self.selected;
         if self.selected == 0 && self.draft.is_some() {
-            self.draft = Some(Draft {
-                bytes: editor.bytes.clone(),
-                cursor: editor.cursor,
-            });
+            self.draft = Some(Draft::capture(editor));
         }
     }
     pub fn query(&mut self) -> Option<GetTranscript> {

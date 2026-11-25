@@ -49,6 +49,15 @@ fn display_title(text: &str) -> String {
         .collect()
 }
 
+fn resumable_request(view: &Snapshot) -> Option<&RequestId> {
+    (view.state == "paused"
+        && view.resume_available
+        && !view.storage_failed
+        && view.recovery_operation.is_none())
+    .then_some(view.request.as_ref())
+    .flatten()
+}
+
 struct Slot {
     skill_commands: Arc<[commands::SkillCommand]>,
     id: String,
@@ -302,17 +311,16 @@ impl Slot {
                 .state
                 .pending_draft
                 .as_ref()
-                .is_some_and(|(pending, _, _)| *pending == id)
+                .is_some_and(|(pending, _)| *pending == id)
                 && (!submit || code.is_some() || self.follow_accepted_submit.as_ref() != Some(&id))
             {
-                let (_, bytes, cursor) = self
+                let (_, draft) = self
                     .state
                     .pending_draft
                     .take()
                     .expect("checked pending draft");
                 if code.is_some() {
-                    self.state.editor.bytes = bytes;
-                    self.state.editor.cursor = cursor;
+                    draft.restore(&mut self.state.editor);
                 } else if self.state.pending.as_ref() != Some(&id) {
                     // A Steer reply follows its journal write. Submit replies
                     // only acknowledge queueing; the runtime event confirms it.
@@ -546,7 +554,7 @@ impl Slot {
                 let next = if view.storage_failed || view.recovery_operation.is_some() {
                     "/sessions for details"
                 } else if view.diagnostic == "tool_batch_limit" && view.resume_available {
-                    "Increase or remove tool_calls in config, reopen ANSA, then /retry"
+                    "Increase or remove tool_calls in config, then reopen ANSA"
                 } else if view.diagnostic == "terminal_workspace_quarantined" {
                     "Inspect the terminal lease in this workspace with ansa --workspace-lease"
                 } else if matches!(
@@ -554,20 +562,35 @@ impl Slot {
                     "tool_failed" | "task_path_scope" | "terminal_workspace_busy"
                 ) {
                     "/cancel this turn and send a new request"
-                } else if view.resume_available {
-                    "/retry to continue"
+                } else if resumable_request(view).is_some() {
+                    ""
                 } else {
                     "/sessions for details"
                 };
                 entries.push(Entry {
                     role: "notice".into(),
-                    text: format!("{reason}\n{next}"),
+                    text: if next.is_empty() {
+                        reason
+                    } else {
+                        format!("{reason}\n{next}")
+                    },
                     action: None,
                     edit: None,
                     output: None,
                     agent: None,
                     status: None,
                 });
+                if let Some(request) = resumable_request(view) {
+                    entries.push(Entry {
+                        role: "notice".into(),
+                        text: "[Continue]".into(),
+                        action: Some(format!("resume:{}", request.0)),
+                        edit: None,
+                        output: None,
+                        agent: None,
+                        status: None,
+                    });
+                }
             }
             let running_tool_shown = show_tools
                 && current
@@ -684,6 +707,7 @@ struct PlanningContext {
     profile: Option<RoleProfile>,
     pending_draft: Option<RuntimeCommand>,
     resume: Option<CommandId>,
+    preserve_draft: bool,
     awaiting_context: bool,
     submit: CommandId,
     turn: TurnId,
@@ -734,6 +758,7 @@ enum Job {
     },
     Attachment {
         owner: RuntimeIncarnation,
+        from_clipboard: bool,
         result: Result<attachments::Attachment>,
     },
     ManualAccepted {
@@ -756,6 +781,7 @@ enum Job {
     OrchestrationPlan {
         owner: String,
         token: u64,
+        preserve_draft: bool,
         result: Result<Proposal>,
     },
     OrchestrationDone {
@@ -1338,6 +1364,7 @@ impl Workbench {
         let slot = &mut self.slots[self.current];
         slot.sending_mention = false;
         if !slot.state.editor.bytes.is_empty()
+            || slot.state.editor.clipboard_anchor.is_some()
             || slot.state.editor.overflow
             || slot.state.editor.pasting()
             || slot.state.editor.escape_pending()
@@ -2261,8 +2288,8 @@ impl Workbench {
             .state
             .snapshot
             .as_ref()
-            .filter(|view| view.resume_available)
-            .and_then(|view| view.request.clone())
+            .and_then(resumable_request)
+            .cloned()
     }
     fn resume_request(&mut self, target: RequestId) {
         let slot = &mut self.slots[self.current];
@@ -2286,6 +2313,7 @@ impl Workbench {
                 profile: None,
                 pending_draft: None,
                 resume: Some(resume_id),
+                preserve_draft: true,
                 awaiting_context: false,
                 command: submit.clone(),
                 turn: TurnId(submit.0.clone()),
@@ -2606,6 +2634,8 @@ impl Workbench {
             profile,
             pending_draft,
             resume: None,
+            // Repairs use the saved proposal's prompt and leave the composer available.
+            preserve_draft: repair,
             awaiting_context: false,
             submit: id.clone(),
             turn,
@@ -3541,7 +3571,11 @@ impl Workbench {
                 intent.awaiting_context && &intent.command == command && intent.owner == id
             })
             && let Some(PlanningContext {
-                owner, turn, token, ..
+                owner,
+                turn,
+                token,
+                preserve_draft,
+                ..
             }) = self.planning_context.take()
         {
             let factory = self.factory.clone();
@@ -3551,6 +3585,7 @@ impl Workbench {
             self.jobs.spawn_blocking(move || Job::OrchestrationPlan {
                 owner,
                 token,
+                preserve_draft,
                 result: (|| {
                     stop.check()?;
                     let draft = seed
@@ -3714,9 +3749,8 @@ impl Workbench {
                 ..
             } if slot.follow_accepted_submit.as_ref() == Some(command) => {
                 slot.follow_accepted_submit = None;
-                if let Some((_, bytes, cursor)) = slot.state.pending_draft.take() {
-                    slot.state.editor.bytes = bytes;
-                    slot.state.editor.cursor = cursor;
+                if let Some((_, draft)) = slot.state.pending_draft.take() {
+                    draft.restore(&mut slot.state.editor);
                 }
             }
             EventPayload::ResyncRequired { .. } => {
@@ -3865,11 +3899,19 @@ impl Workbench {
                 }
                 self.refresh_completion();
             }
-            Job::Attachment { owner, result } => {
+            Job::Attachment {
+                owner,
+                from_clipboard,
+                result,
+            } => {
+                let active = self.slots[self.current].handle.incarnation() == &owner;
                 if let Some(slot) = self.slots.iter_mut().find(|slot| {
                     slot.handle.incarnation() == &owner && !slot.closed && !slot.closing
                 }) {
-                    slot.attachment_loaded(result, io);
+                    slot.attachment_loaded(result, from_clipboard, io);
+                }
+                if active && from_clipboard {
+                    self.refresh_completion();
                 }
             }
             Job::ManualAccepted {
@@ -3981,6 +4023,7 @@ impl Workbench {
             Job::OrchestrationPlan {
                 owner,
                 token,
+                preserve_draft,
                 result,
             } => {
                 if self.modal_token != token
@@ -3995,8 +4038,10 @@ impl Workbench {
                     Ok(proposal) => {
                         if proposal.plan.is_plan_only() {
                             let slot = &mut self.slots[self.current];
-                            slot.state.editor.clear();
-                            slot.state.input_history.reset();
+                            if !preserve_draft {
+                                slot.state.editor.clear();
+                                slot.state.input_history.reset();
+                            }
                             slot.state.status.clear();
                             slot.show_latest();
                             self.refinement = None;
@@ -4015,12 +4060,17 @@ impl Workbench {
                                 true,
                                 io,
                             ) {
+                                if let Some(context) = &mut self.planning_context {
+                                    context.preserve_draft = preserve_draft;
+                                }
                                 return;
                             }
                         }
                         let slot = &mut self.slots[self.current];
-                        slot.state.editor.clear();
-                        slot.state.input_history.reset();
+                        if !preserve_draft {
+                            slot.state.editor.clear();
+                            slot.state.input_history.reset();
+                        }
                         self.refinement = None;
                         self.show_orchestration_plan(
                             &proposal.plan,
@@ -5414,6 +5464,27 @@ impl Workbench {
                 if !self.frames.is_empty() {
                     return;
                 }
+                if self.menu.is_none()
+                    && let Some(button) = self
+                        .displayed
+                        .as_ref()
+                        .and_then(|frame| frame.image_button(mouse.column, mouse.row))
+                {
+                    let slot = &mut self.slots[self.current];
+                    if slot.id == button.owner
+                        && !slot.state.attachment_loading
+                        && slot.state.attachment_submission.is_none()
+                        && slot
+                            .state
+                            .images
+                            .get(button.index)
+                            .is_some_and(|image| image.sha256() == button.digest)
+                    {
+                        slot.state.images.remove(button.index);
+                        slot.state.status.clear();
+                    }
+                    return;
+                }
                 let tab = self
                     .displayed
                     .as_ref()
@@ -6276,10 +6347,20 @@ impl Workbench {
                 && self.focus == Focus::Inspector
                 && (matches!(&self.panel, Some(Panel::EditDiff { .. }))
                     || matches!(&self.panel, Some(Panel::Files(files)) if files.tab == 1)),
-            terminal_shortcut: self
-                .available_commands()
-                .iter()
-                .any(|command| command.name == "/terminals"),
+            terminal_shortcut: true,
+            draft_images: (!slot.state.images.is_empty()
+                && !slot.state.attachment_loading
+                && slot.state.attachment_submission.is_none())
+            .then(|| {
+                (
+                    slot.id.clone(),
+                    slot.state
+                        .images
+                        .iter()
+                        .map(|image| image.sha256().to_owned())
+                        .collect(),
+                )
+            }),
             side_chat: parent.map(|parent| carbon::SideChat {
                 parent_history: parent
                     .state
@@ -6945,6 +7026,10 @@ pub(in crate::frontend) async fn run_session(
                             // Modal/read-only navigation never edits a draft.
                             if byte.is_ascii() && !work.input_editor().escape_pending() && !work.input_editor().pasting() {
                                 let jumping = matches!(&work.panel, Some(Panel::Files(files)) if files.jump.is_some());
+                                if byte == 22 && !work.navigating() {
+                                    work.paste_clipboard(io);
+                                    continue;
+                                }
                                 if byte == 7 && work.focus == Focus::Chat && work.menu.is_none() && work.completion.is_none() {
                                     work.open_activity();
                                     continue;

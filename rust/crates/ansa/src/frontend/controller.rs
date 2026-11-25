@@ -110,7 +110,7 @@ pub struct State {
     mode_ready: bool,
     printed: Option<RequestId>,
     first: bool,
-    pending_draft: Option<(CommandId, Vec<u8>, usize)>,
+    pending_draft: Option<(CommandId, super::history::Draft)>,
     last_pause: String,
     wait_clock: WaitClock,
     explicit_status: bool,
@@ -637,7 +637,7 @@ impl State {
                     replies,
                 );
                 if posted && io.raw.is_some() {
-                    self.pending_draft = Some((id, self.editor.bytes.clone(), self.editor.cursor));
+                    self.pending_draft = Some((id, super::history::Draft::capture(&self.editor)));
                     self.status.clear();
                 }
                 return (posted, false);
@@ -698,7 +698,7 @@ impl State {
                 self.pending_draft = self
                     .pending
                     .clone()
-                    .map(|id| (id, self.editor.bytes.clone(), self.editor.cursor));
+                    .map(|id| (id, super::history::Draft::capture(&self.editor)));
             }
         }
         if !posted {
@@ -1098,13 +1098,13 @@ impl State {
         let visible = self.reading.as_deref().unwrap_or(&entries);
         let frame = if let Some(ui) = ui {
             let (input, cursor) = if ui.drafting_plan {
-                (&[][..], 0)
+                (std::borrow::Cow::Borrowed(&[][..]), 0)
             } else {
-                (self.editor.bytes.as_slice(), self.editor.cursor)
+                self.editor.composer_view()
             };
             carbon::layout_workspace(
                 visible,
-                input,
+                &input,
                 cursor,
                 &status,
                 self.scroll,
@@ -1227,7 +1227,12 @@ pub async fn run(
                     // lose its reply. Explicit/user commands still report Closed.
                     let expected_close=internal_read&&(closed||finished)&&matches!(&result,Ok(PostStatus::Closed));
                     let code=if expected_close||retry_read {None}else{match result {Ok(PostStatus::Accepted|PostStatus::Duplicate)=>None,Ok(PostStatus::QueueFull)=>Some("command_queue_full"),Ok(PostStatus::Closed)=>Some("runtime_closed"),Ok(PostStatus::StaleTarget)=>Some("stale_cancel_target"),Ok(PostStatus::StaleIncarnation)=>Some("stale_incarnation"),Ok(PostStatus::CommandIdLimit)=>Some("submit_id_limit"),Ok(PostStatus::CommandConflict)=>Some("command_id_conflict"),Err(code)=>Some(code)}};
-                    if state.pending_draft.as_ref().is_some_and(|(draft,_,_)|draft==&id){let (_,bytes,cursor)=state.pending_draft.take().expect("checked");if code.is_some(){state.editor.bytes=bytes;state.editor.cursor=cursor;}}
+                    if state.pending_draft.as_ref().is_some_and(|(draft, _)| draft == &id) {
+                        let (_, draft) = state.pending_draft.take().expect("checked");
+                        if code.is_some() {
+                            draft.restore(&mut state.editor);
+                        }
+                    }
                     if let Some(code)=code {
                         state.input_history.retry(Some(&id));
                         state.copy.rejected(&id);

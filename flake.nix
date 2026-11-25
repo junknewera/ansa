@@ -41,6 +41,8 @@
           ANSA_AUTH_FIXTURES = ./tests/fixtures/auth;
           ANSA_SESSION_FIXTURES = ./tests/fixtures/sessions;
           ANSA_ANALYSIS_PYTHON = "${analysisFor pkgs}/bin/python3";
+          ANSA_WL_PASTE_BIN = "${pkgs.wl-clipboard}/bin/wl-paste";
+          ANSA_XCLIP_BIN = "${pkgs.xclip}/bin/xclip";
           ANSA_MATUGEN = "${pkgs.matugen}/bin/matugen";
           ANSA_PANEL_EDITOR = "${pkgs.neovim}/bin/nvim";
           ANSA_TEST_BASH = "${pkgs.bashInteractive}/bin/bash";

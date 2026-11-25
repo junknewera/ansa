@@ -40,6 +40,7 @@ pub struct Frame {
     viewport: Option<(usize, usize)>,
     cursor_row: usize,
     status_rows: Vec<usize>,
+    image_buttons: Vec<ImageButton>,
     panes: Vec<Option<PaneRow>>,
     themed: bool,
     selection_style: Option<String>,
@@ -49,6 +50,23 @@ pub struct Frame {
     terminal_rows: std::collections::BTreeSet<usize>,
     pub(super) image: Option<super::graphics::Placement>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ImageButton {
+    row: usize,
+    columns: std::ops::Range<usize>,
+    pub owner: String,
+    pub index: usize,
+    pub digest: String,
+}
+
+impl Frame {
+    pub(super) fn image_button(&self, column: usize, row: usize) -> Option<&ImageButton> {
+        self.image_buttons
+            .iter()
+            .find(|button| button.row == row && button.columns.contains(&column))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ChatRows {
     wrapped: std::sync::Arc<[ChatRow]>,
@@ -200,6 +218,7 @@ impl Frame {
                 }
             }
             self.status_rows.clone_from(&live.status_rows);
+            self.image_buttons.clone_from(&live.image_buttons);
         }
     }
     pub fn paint(&self, previous: usize) -> String {
@@ -968,6 +987,7 @@ fn layout_impl(
         inspector_content_rows: 0,
         viewport: full.then_some(size),
         cursor_row,
+        image_buttons: Vec::new(),
         status_rows: if full {
             vec![max_rows - 4, max_rows - 3, max_rows - 1]
         } else {
@@ -1154,6 +1174,7 @@ pub struct Workspace {
     pub result_selected: Option<String>,
     pub wide_diff: bool,
     pub terminal_shortcut: bool,
+    pub draft_images: Option<(String, Vec<String>)>,
     pub side_chat: Option<SideChat>,
 }
 
@@ -2194,7 +2215,49 @@ pub fn layout_workspace(
     } else {
         notice
     };
-    let notice_line = if notice.is_empty()
+    let mut image_buttons = Vec::new();
+    let notice_line = if let Some((owner, images)) = &ui.draft_images
+        && ui.focus == Focus::Chat
+        && ui.popup.is_none()
+        && !ui.exit_confirmation
+        && !ui.drafting_plan
+        && height > rows.len()
+    {
+        let mut line = String::new();
+        let mut used = 0;
+        let chip_width = if notice.is_empty() {
+            inner_width
+        } else {
+            inner_width.saturating_sub(cells(notice).min(inner_width / 2) + 1)
+        };
+        for (index, digest) in images.iter().enumerate() {
+            let chip = if images.len() == 1 {
+                "[Image ×]".to_owned()
+            } else {
+                format!("[Image {} ×]", index + 1)
+            };
+            let end = used + cells(&chip);
+            if end > chip_width {
+                break;
+            }
+            image_buttons.push(ImageButton {
+                row: rows.len(),
+                columns: inset.len() + used..inset.len() + end,
+                owner: owner.clone(),
+                index,
+                digest: digest.clone(),
+            });
+            line.push_str(&styled(&chip, AMBER, color));
+            line.push(' ');
+            used = end + 1;
+        }
+        line.push_str(&styled(
+            &clipped(notice, inner_width.saturating_sub(used)),
+            MUTED,
+            color,
+        ));
+        line
+    } else if notice.is_empty()
         && ui.focus == Focus::Chat
         && ui.popup.is_none()
         && ui.suggestions.is_none()
@@ -2263,6 +2326,7 @@ pub fn layout_workspace(
     Some(Frame {
         lines: rows,
         status_rows: vec![height - 2, height - 1],
+        image_buttons,
         image: None,
         panes,
         themed: false,

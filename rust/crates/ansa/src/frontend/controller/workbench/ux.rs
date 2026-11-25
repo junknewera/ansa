@@ -406,7 +406,13 @@ impl Workbench {
         if self.result_selected.is_some() && self.result_scroll.is_none() {
             self.result_scroll = Some(slot.state.scroll);
         }
-        if let Some(id) = key.strip_prefix("agent:") {
+        if let Some(request) = key.strip_prefix("resume:") {
+            if let Some(target) = self.resume_target().filter(|target| target.0 == request) {
+                self.result_selected = None;
+                self.slots[self.current].show_latest();
+                self.resume_request(target);
+            }
+        } else if let Some(id) = key.strip_prefix("agent:") {
             self.open_agent(id);
         } else if let Some(operation) = key.strip_prefix("image:") {
             let source = slot.activity_page().and_then(|page| {
@@ -567,11 +573,12 @@ impl Workbench {
         }
     }
     pub(super) fn available_commands(&self) -> &'static [commands::Command] {
-        commands::available(true)
+        commands::available()
     }
     pub(super) fn refresh_completion(&mut self) {
         let editor = &self.slots[self.current].state.editor;
-        let suppressed = self.input_closed
+        let suppressed = editor.pasting()
+            || self.input_closed
             || self.terminating
             || self.menu.is_some()
             || self.focus != Focus::Chat
