@@ -620,7 +620,28 @@ impl Arguments {
 fn invoke(owner: &Owner, tool: Tool, invocation: &Invocation, stop: &Cancel) -> Result<Outcome> {
     let args = Arguments::parse(tool, &invocation.arguments)?;
     if let Arguments::Exec { bytes, action } = args {
-        return execute_command(owner, invocation, bytes, action, stop);
+        return match execute_command(owner, invocation, bytes, action, stop) {
+            // These errors reject admission before the requested command is
+            // delivered. After delivery we always return an explicit receipt.
+            Err(
+                code @ ("terminal_exec_shell_busy"
+                | "terminal_exec_shell_unavailable"
+                | "terminal_read_lease"
+                | "terminal_worker_lost"
+                | "terminal_lease"
+                | "terminal_unknown"
+                | "terminal_quarantined"),
+            ) => {
+                if stop.cancelled() {
+                    Ok(Outcome::not_started())
+                } else {
+                    Ok(Outcome::failed_known(
+                        json!({"error":code, "applied":false}).to_string(),
+                    ))
+                }
+            }
+            result => result,
+        };
     }
     let mut owner = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
     if stop.cancelled() {
@@ -711,6 +732,7 @@ fn execute_command(
     stop: &Cancel,
 ) -> Result<Outcome> {
     let operation = Id::try_from(invocation.operation.clone())?;
+    let poll = Duration::from_millis(20);
     let (terminal, epoch, created) = {
         let mut host = owner.lock().map_err(|_| "terminal_owner_unavailable")?;
         if stop.cancelled() {
@@ -728,13 +750,46 @@ fn execute_command(
                 }).to_string(),
             ));
         }
-        if let Some((id, current)) = host
+        let mut current = host
             .terminals()
             .iter()
             .find(|(_, terminal)| terminal.lifecycle != Lifecycle::Closed)
-        {
-            (id.clone(), current.epoch, false)
+            .map(|(id, terminal)| (id.clone(), terminal.epoch));
+        if let Some((terminal, epoch)) = &current {
+            match host.shell_status(terminal, *epoch, None)? {
+                shell::State::Ready => {}
+                shell::State::Exited {
+                    cleanup_known: true,
+                } => {
+                    let cleanup = Id::try_from(format!(
+                        "exec_close:{}",
+                        super::protocol::sha256(operation.as_str().as_bytes())
+                    ))?;
+                    let close = exec_intent(
+                        &host,
+                        invocation,
+                        cleanup,
+                        terminal.clone(),
+                        *epoch,
+                        Action::Close,
+                    )?;
+                    let status =
+                        host.execute_if(Writer::Agent, close.clone(), &[], || !stop.cancelled())?;
+                    if status != OperationStatus::Durable(Effect::Applied) {
+                        return Ok(receipt(&close, status));
+                    }
+                    current = None;
+                }
+                shell::State::Busy => return Err("terminal_exec_shell_busy"),
+                _ => return Err("terminal_exec_shell_unavailable"),
+            }
+        }
+        if let Some((terminal, epoch)) = current {
+            (terminal, epoch, false)
         } else {
+            if stop.cancelled() {
+                return Ok(Outcome::not_started());
+            }
             let create_operation = Id::try_from(format!(
                 "exec_shell:{}",
                 super::protocol::sha256(operation.as_str().as_bytes())
@@ -767,21 +822,22 @@ fn execute_command(
             (terminal, 1, true)
         }
     };
-    let poll = Duration::from_millis(20);
-    let startup = Instant::now() + Duration::from_secs(3);
-    loop {
-        if stop.cancelled() {
-            return Ok(Outcome::not_started());
-        }
-        let state = owner
-            .lock()
-            .map_err(|_| "terminal_owner_unavailable")?
-            .shell_status(&terminal, epoch, None)?;
-        match state {
-            shell::State::Ready => break,
-            shell::State::Busy if created && Instant::now() < startup => stop.wait(poll),
-            shell::State::Busy => return Err("terminal_exec_shell_busy"),
-            _ => return Err("terminal_exec_shell_unavailable"),
+    if created {
+        let startup = Instant::now() + Duration::from_secs(3);
+        loop {
+            if stop.cancelled() {
+                return Ok(Outcome::not_started());
+            }
+            let state = owner
+                .lock()
+                .map_err(|_| "terminal_owner_unavailable")?
+                .shell_status(&terminal, epoch, None)?;
+            match state {
+                shell::State::Ready => break,
+                shell::State::Busy if Instant::now() < startup => stop.wait(poll),
+                shell::State::Busy => return Err("terminal_exec_shell_busy"),
+                _ => return Err("terminal_exec_shell_unavailable"),
+            }
         }
     }
     let status = {
@@ -840,9 +896,25 @@ fn execute_command(
                 }
                 stop.wait(poll);
             }
-            _ => return Ok(unknown_command("terminal_exec_interrupted")),
+            state => return Ok(interrupted_command(owner, &terminal, state)),
         }
     }
+}
+
+fn interrupted_command(owner: &Owner, terminal: &Id, state: Result<shell::State>) -> Outcome {
+    if !matches!(
+        state,
+        Ok(shell::State::Exited {
+            cleanup_known: true
+        })
+    ) && let Ok(host) = owner.lock()
+        && host.terminals().contains_key(terminal)
+    {
+        // Request cleanup and fence writers, keeping the worker available
+        // for a durable Close receipt.
+        host.stop_handle().request();
+    }
+    unknown_command("terminal_exec_interrupted")
 }
 
 fn exec_intent(

@@ -275,7 +275,11 @@ pub(crate) fn export(path: &Path, compiled: &Snapshot, fixture: &Snapshot) -> Re
                 }
                 "pause" => fields.push(("diagnostic", event.field("diagnostic")?.clone())),
                 "resume" => {
-                    for key in ["unknown_operation", "rejected_terminal_operation"] {
+                    for key in [
+                        "unknown_operation",
+                        "rejected_terminal_operation",
+                        "automatic",
+                    ] {
                         if event.has(key) {
                             fields.push((key, event.field(key)?.clone()));
                         }

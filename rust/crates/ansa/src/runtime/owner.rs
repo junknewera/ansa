@@ -605,7 +605,34 @@ impl Owner {
             self.emit(EventPayload::Preview(value));
         }
     }
-    fn show_outcome(&mut self, result: &SavedResult) {
+    fn automatic_terminal_resume(&self) -> Option<Resume> {
+        if self.starting
+            || self.options.inspect_only
+            || self.shutting_down
+            || self.closing.mode.load(Ordering::Acquire) == 2
+            || self.phase == "cancelled"
+            || self.cancelling.is_some()
+            || self.turn_stop.cancelled()
+            || self.pending_pause.is_some()
+        {
+            return None;
+        }
+        let turn = self
+            .state
+            .turn
+            .as_ref()
+            .filter(|turn| turn.resumes.len() < 4096)?;
+        let operation = turn.automatic_terminal_recovery()?;
+        let digest = crate::protocol::legacy_json_v1::sha256(operation.as_bytes());
+        Some(Resume {
+            command: CommandId(format!("auto-terminal-{}", &digest[..32])),
+            unknown: Some(OperationId(operation.into())),
+            from_cancelled: false,
+            automatic: true,
+        })
+    }
+
+    fn show_outcome(&mut self, result: &SavedResult, recovery_required: bool) {
         if !result.dispatched {
             return;
         }
@@ -620,10 +647,12 @@ impl Owner {
         self.emit(EventPayload::ToolFinished(finished.clone()));
         if finished.effects == Effects::Unknown {
             self.recovery = Some(finished.operation.clone());
-            self.emit(EventPayload::RecoveryRequired {
-                operation: finished.operation,
-                effects: Effects::Unknown,
-            });
+            if recovery_required {
+                self.emit(EventPayload::RecoveryRequired {
+                    operation: finished.operation,
+                    effects: Effects::Unknown,
+                });
+            }
         }
     }
     fn reject(&self, command: &RuntimeCommand, code: &str) {
@@ -1369,6 +1398,7 @@ impl Owner {
                         command: command.command.clone(),
                         unknown,
                         from_cancelled: self.phase == "cancelled",
+                        automatic: false,
                     });
                 }
             }
@@ -1551,7 +1581,7 @@ impl Owner {
         }
         if self.storage_failed {
             if let Some(value) = self.pending_outcome.take() {
-                self.show_outcome(&value);
+                self.show_outcome(&value, true);
             }
             if self.tool.is_none() {
                 self.release_auth(workers)?;
@@ -1716,7 +1746,13 @@ impl Owner {
             return self.advance(workers);
         }
         if let Some(resume) = self.resuming.take() {
-            if !self.resume_is_current(&resume) {
+            if !self.resume_is_current(&resume)
+                || resume.automatic
+                    && (self.shutting_down || self.closing.mode.load(Ordering::Acquire) == 2)
+            {
+                if resume.automatic {
+                    self.snapshot(None);
+                }
                 return Ok(());
             }
             let plan_mode = self.state.turn.as_ref().is_some_and(|turn| {
@@ -1740,6 +1776,9 @@ impl Owner {
                 return Ok(());
             }
             let mut fields = vec![("command", Json::string(&resume.command.0)?)];
+            if resume.automatic {
+                fields.push(("automatic", Json::parse("true")?));
+            }
             if let Some(operation) = &resume.unknown {
                 let turn = self.state.turn.as_ref().ok_or("runtime_turn")?;
                 if let Err(code) = turn.recovery_request(&operation.0) {
@@ -1747,6 +1786,9 @@ impl Owner {
                         command: Some(resume.command),
                         diagnostic: code.into(),
                     });
+                    if resume.automatic {
+                        self.snapshot(None);
+                    }
                     return Ok(());
                 }
                 fields.push(("unknown_operation", Json::string(&operation.0)?));
@@ -1762,11 +1804,12 @@ impl Owner {
                 }
                 fields.push(("rejected_terminal_operation", Json::string(operation)?));
             }
-            if self
-                .state
-                .turn
-                .as_ref()
-                .is_some_and(|turn| turn.renew_tool_budget_on_resume())
+            if !resume.automatic
+                && self
+                    .state
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.renew_tool_budget_on_resume())
             {
                 fields.extend(self.limits.tool_budget_fields()?);
             }
@@ -1986,7 +2029,7 @@ impl Owner {
             Ok(receipt) => receipt,
             Err(code) => {
                 if let Some(outcome) = done.known.or(pending.known) {
-                    self.show_outcome(&outcome);
+                    self.show_outcome(&outcome, true);
                 }
                 if done.kind != Kind::Accepted {
                     self.pending_receipt = None;
@@ -2092,6 +2135,7 @@ impl Owner {
             Kind::Outcome => {
                 self.owned_intent = false;
                 self.permit = None;
+                let automatic = self.automatic_terminal_resume();
                 if !self.starting {
                     let result = self
                         .state
@@ -2100,7 +2144,7 @@ impl Owner {
                         .and_then(|t| t.results.last())
                         .ok_or("runtime_outcome")?
                         .clone();
-                    self.show_outcome(&result);
+                    self.show_outcome(&result, automatic.is_none());
                 }
                 self.recovery = self
                     .state
@@ -2110,7 +2154,11 @@ impl Owner {
                     if self.phase != "cancelled" {
                         self.phase = "paused".into();
                     }
-                    self.snapshot(None);
+                    if let Some(resume) = automatic {
+                        self.resuming = Some(resume);
+                    } else {
+                        self.snapshot(None);
+                    }
                 }
             }
             Kind::Done => {
@@ -2184,10 +2232,14 @@ impl Owner {
                     .stage
                     .clone();
                 if let Some(resume) = self.resuming.take() {
-                    self.emit(EventPayload::CommandAccepted {
-                        command: resume.command,
-                        request: self.request(),
-                    });
+                    if resume.automatic {
+                        self.snapshot(None);
+                    } else {
+                        self.emit(EventPayload::CommandAccepted {
+                            command: resume.command,
+                            request: self.request(),
+                        });
+                    }
                 }
             }
             Kind::Response

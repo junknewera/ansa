@@ -52,6 +52,9 @@ struct Run {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum State {
     Unavailable,
+    Exited {
+        cleanup_known: bool,
+    },
     Busy,
     Ready,
     Starting,
@@ -222,6 +225,15 @@ PS2='$(builtin printf "continue\n" > "$__ansa_directory/status")'"${PS2-> }"
                 }
             }
             _ => State::Unavailable,
+        }
+    }
+
+    pub(super) fn finish_from_exit(&mut self, exit_code: i32) {
+        if let Some(run) = self.run.as_mut().filter(|run| run.started)
+            && run.exit_code.is_none()
+        {
+            run.exit_code = Some(exit_code);
+            let _ = fs::remove_file(self.directory.join("pending"));
         }
     }
 

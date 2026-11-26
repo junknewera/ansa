@@ -35,6 +35,16 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
                 output.contains("tool_arguments_rejected") && output.contains("unknown outcome")
             })
         {
+            return Ok(call(
+                crate::terminal_host::tools::EXEC,
+                json!({"command": "printf 'inspection continued\n'"}),
+            ));
+        }
+        if input
+            .last()
+            .and_then(|row| row["output"].as_str())
+            .is_some_and(|output| output.contains("inspection continued"))
+        {
             return Ok(done());
         }
         let outputs = input[..notice]
@@ -55,7 +65,7 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
         }
         return Ok(call(
             crate::terminal_host::tools::EXEC,
-            json!({"command": "printf 'partial\\n' >> recovered-unknown; exit 23"}),
+            json!({"command": "printf 'partial\\n' >> recovered-unknown; sleep 0.6; kill -KILL $$"}),
         ));
     }
     let results: Vec<Value> = input[start + 1..]
@@ -160,7 +170,7 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
     if prompt == "TEST_EXEC_UNKNOWN" {
         return Ok([
             "printf 'known\\n' >> recovered-prefix",
-            "printf 'partial\\n' >> recovered-unknown; exit 23",
+            "printf 'partial\\n' >> recovered-unknown; sleep 0.6; kill -KILL $$",
             "touch recovered-skipped",
         ]
         .into_iter()
@@ -185,6 +195,10 @@ pub(super) fn items(input: &[Value], index: usize) -> Result<Vec<Value>> {
             r#"for ((i=1; i<=60; i++)); do printf 'SHELL_HISTORY_%02d\n' "$i"; done"#
         }
         "TEST_EXEC_FAIL" => "sh check-fixture.sh",
+        "TEST_EXEC_TIMEOUT_EXIT" => {
+            r#"timeout 0.2s sleep 4; rc=$?; printf 'timed out\n'; exit "$rc""#
+        }
+        "TEST_EXEC_AFTER_TIMEOUT" => r#"printf 'new shell\n'"#,
         "TEST_EXEC_BACKGROUND" => {
             r#"(sleep 0.05; printf '%064000d\n' 0; printf 'alive\n' > child-marker) & printf 'now\n'"#
         }

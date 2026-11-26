@@ -372,10 +372,13 @@ impl NativeBackend {
         if self.stop.quarantined.load(Ordering::Acquire) {
             return Err("terminal_workspace_quarantined");
         }
-        self.workspace_claim
-            .as_ref()
-            .map(|claim| claim.write_descendant(root, relative))
-            .transpose()
+        let Some(claim) = &self.workspace_claim else {
+            return Ok(None);
+        };
+        if self.stop.stopped.load(Ordering::Acquire) {
+            return Err("terminal_workspace_busy");
+        }
+        claim.write_descendant(root, relative).map(Some)
     }
 }
 
@@ -506,14 +509,27 @@ impl<J: Journal> Host<J, NativeBackend> {
             .ok_or("terminal_unknown")?
             .visible_after;
         self.read_permit(Writer::Agent, terminal, epoch, after)?;
-        let worker = self
+        let response = self
             .backend
             .workers
             .get_mut(terminal)
-            .ok_or("terminal_worker_lost")?;
-        match worker.call(Request::ShellStatus { operation }) {
-            Some(Response::ShellStatus { state }) => Ok(state),
-            _ => Err("terminal_worker_lost"),
+            .and_then(|worker| worker.call(Request::ShellStatus { operation }));
+        match response {
+            Some(Response::ShellStatus { state }) => {
+                if matches!(
+                    state,
+                    shell::State::Exited {
+                        cleanup_known: false
+                    }
+                ) {
+                    self.backend.stop.request();
+                }
+                Ok(state)
+            }
+            _ => {
+                self.backend.stop.request();
+                Err("terminal_worker_lost")
+            }
         }
     }
 
@@ -733,6 +749,9 @@ fn worker() -> io::Result<()> {
         )?;
         worker_loop(&mut socket, &mut terminal, &mut pty, &launch)
     })();
+    let naturally_exited = terminal.shell.is_some()
+        && matches!(&handling, Ok(End::Automatic(EndReason::ProgramExited)))
+        && observe_shell_exit(&pty);
     let outcome = pty.shutdown();
     let clean = outcome.shell_reaped && reap_descendants().is_ok();
     match handling {
@@ -745,10 +764,24 @@ fn worker() -> io::Result<()> {
                     break;
                 }
             }
+            let status = pty.exit_status().and_then(|status| status.code());
+            // A command such as `exit "$rc"` bypasses the Bash completion
+            // hook. An observed normal exit can finish a started invocation
+            // after cleanup. An EOF followed by shutdown or a signal cannot.
+            terminal.poll_shell()?;
+            if naturally_exited
+                && clean
+                && let Some(status) = status
+            {
+                if let Some(shell) = &mut terminal.shell {
+                    shell.finish_from_exit(status);
+                }
+                terminal.poll_shell()?;
+            }
             terminal.exit = Some(Exit {
                 reason,
                 cleanup_known: clean,
-                status: pty.exit_status().and_then(|status| status.code()),
+                status,
             });
             drop(pty);
             // The shell and all owned descendants are finished. Retain the
@@ -774,6 +807,19 @@ fn worker() -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other("terminal_cleanup_unknown"))
+    }
+}
+
+fn observe_shell_exit(pty: &PtySession) -> bool {
+    // The slave can close just before the leader becomes waitable. Give
+    // that exit a short window before shutdown signals could change it.
+    let until = Instant::now() + 16 * TICK;
+    loop {
+        match pty.exited() {
+            Ok(true) => return true,
+            Ok(false) if Instant::now() < until => thread::sleep(TICK),
+            _ => return false,
+        }
     }
 }
 
@@ -960,19 +1006,23 @@ impl WorkerTerminal {
             Request::Status => Response::Status {
                 exit: self.exit.clone(),
             },
-            Request::ShellStatus { operation } => Response::ShellStatus {
-                state: self
+            Request::ShellStatus { operation } => {
+                let state = self
                     .shell
                     .as_ref()
                     .map_or(shell::State::Unavailable, |shell| {
-                        let state = shell.state(operation.as_ref());
-                        if self.exit.is_some() && !matches!(state, shell::State::Finished { .. }) {
-                            shell::State::Unavailable
-                        } else {
-                            state
+                        shell.state(operation.as_ref())
+                    });
+                let state = match (&self.exit, state) {
+                    (Some(exit), state) if !matches!(state, shell::State::Finished { .. }) => {
+                        shell::State::Exited {
+                            cleanup_known: exit.cleanup_known,
                         }
-                    }),
-            },
+                    }
+                    (_, state) => state,
+                };
+                Response::ShellStatus { state }
+            }
             Request::Read { after, limit } => self.output.read(after, limit).map_or(
                 Response::Effect {
                     value: Effect::NotStarted,
@@ -1179,6 +1229,46 @@ fn nonzero(value: u16) -> NonZeroU16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_terminal_keeps_workspace_fenced_until_close_receipt() {
+        let base = std::env::temp_dir().join(format!("ansa-stop-claim-{}", std::process::id()));
+        fs::create_private_leaf(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let workspace = base.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let id = Id::try_from("stop-fixture".to_owned()).unwrap();
+        let binding = Binding::attached(id.clone(), workspace.to_str().unwrap().into());
+        let registry = base.join("registry");
+        let mut backend = NativeBackend::new(PathBuf::new(), registry.clone());
+        backend.workspace_claim =
+            Some(super::super::workspace::Claim::acquire(&registry, &binding, None).unwrap());
+        let (worker, _peer) = UnixStream::pair().unwrap();
+        backend.stop.register(&id, &worker).unwrap();
+        assert!(
+            backend
+                .write_descendant(&workspace, Path::new(""))
+                .unwrap()
+                .is_some()
+        );
+        backend.stop.request();
+        assert!(!backend.stop.quiescent());
+        assert!(matches!(
+            backend.write_descendant(&workspace, Path::new("")),
+            Err("terminal_workspace_busy")
+        ));
+        // The normal Close path unregisters the worker and releases the
+        // claim after persisting the cleanup result.
+        backend.stop.remove(&id);
+        backend.receipt_committed();
+        assert!(
+            backend
+                .write_descendant(&workspace, Path::new(""))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn viewport_keeps_its_top_row_across_output_and_resize() {
