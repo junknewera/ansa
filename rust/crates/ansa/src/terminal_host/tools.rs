@@ -18,10 +18,13 @@ use crate::{
         registry::{Definition, Outcome, Policy, Recovery, Registry},
     },
 };
+use ansa_linux::local::{self, WorkspaceWrite};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -67,6 +70,8 @@ pub(crate) fn open_for(
         |path: &Path| NativeBackend::new(executable.clone(), registry.clone()).with_evidence(path);
     let mut archived = BTreeMap::new();
     let mut next_generation = 1;
+    let conversation =
+        ansa_linux::fs::private_directory(directory).map_err(|_| "terminal_store_chain")?;
     if restoring {
         let last = terminal_store_generation(directory)?;
         for generation in 1..=last {
@@ -94,7 +99,14 @@ pub(crate) fn open_for(
                                 && op.status == OperationStatus::Durable(Effect::NotStarted)
                         })
             });
-            if !reusable {
+            let retired = retired_generation(
+                &previous,
+                &conversation,
+                &registry,
+                generation,
+                !reusable && generation == last,
+            )?;
+            if !reusable && !retired {
                 if generation != last {
                     return Err("terminal_store_chain");
                 }
@@ -106,9 +118,75 @@ pub(crate) fn open_for(
         next_generation = last + 1;
     }
     let path = terminal_store_path(directory, next_generation);
-    let mut host = Host::create_in_mode(&path, binding, backend(&path), HostMode::Conversation)?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("terminal_store_chain")?;
+    // An incomplete store must never be counted as the next generation.
+    let mut nonce = [0; 16];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| "terminal_random")?;
+    let pending = format!(".terminal-host-{}", super::protocol::sha256(&nonce));
+    let mut host = Host::create_in_mode(
+        &directory.join(&pending),
+        binding,
+        backend(&path),
+        HostMode::Conversation,
+    )?;
+    local::publish_directory(&conversation, &pending, name)
+        .map_err(|_| "terminal_store_publish")?;
     host.archived_operations = archived;
     Ok(Arc::new(Mutex::new(host)))
+}
+
+// A restored store owns no PTY. The workspace lock and its durable claim
+// records are the authority for whether a replacement can acquire write
+// access. Retire the old generation separately from its operation journal
+// so its original results, including unknown effects, remain recoverable.
+fn retired_generation(
+    previous: &Host<FileJournal, NativeBackend>,
+    conversation: &File,
+    registry: &Path,
+    generation: usize,
+    can_retire: bool,
+) -> Result<bool> {
+    let name = format!("terminal-retired-v1-{generation}");
+    let saved = local::read(conversation, &name, 64).map_err(|_| "terminal_store_chain")?;
+    if saved.is_none() && !can_retire {
+        return Ok(false);
+    }
+    let verified = previous
+        .recovery()
+        .is_some_and(|recovery| recovery.tail == super::Tail::End)
+        && previous
+            .operations
+            .values()
+            .all(|operation| matches!(operation.status, OperationStatus::Durable(_)));
+    if let Some(saved) = saved {
+        if !verified || saved != previous.journal.retirement_anchor()?.as_bytes() {
+            return Err("terminal_store_chain");
+        }
+        local::publish_recovered(conversation, &name, &saved)
+            .map_err(|_| "terminal_store_chain")?;
+        return Ok(true);
+    }
+    if !verified {
+        return Ok(false);
+    }
+    let workspace = Path::new(&previous.binding().workspace);
+    let _lease = match WorkspaceWrite::acquire(registry, workspace, workspace) {
+        Ok(lease) => lease,
+        Err("terminal_workspace_busy" | "terminal_workspace_quarantined") => return Ok(false),
+        Err(code) => return Err(code),
+    };
+    local::publish_recovered(
+        conversation,
+        &name,
+        previous.journal.retirement_anchor()?.as_bytes(),
+    )
+    .map_err(|_| "terminal_store_chain")?;
+    Ok(true)
 }
 
 const TERMINAL_STORE: &str = "terminal-host-v1";

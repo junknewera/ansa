@@ -950,7 +950,22 @@ def native_terminal_panel(screen, root, cwd):
     local(resumed, "/exit")
     resumed.result = resumed.finish()
     assert resumed.result["exit"] == 0 and resumed.result["termios_restored"]
-    assert (restarted_host / "closed-v1.json").is_file()
+    seal = restarted_host / "closed-v1.json"
+    assert seal.is_file()
+    # Model a shutdown interrupted between releasing the workspace lease and sealing the store.
+    seal.unlink()
+    recovered = start(screen.child.args[0], root, home, cwd,
+                      argv_extra=["--session", session.parents[1].name])
+    screen.additional_screens.append(("recovered-unsealed", recovered))
+    recovered.send("TERMINAL_DEMO\r")
+    fresh_host = session.parents[1] / "terminal-host-v1-3"
+    until(recovered, lambda frame: (fresh_host / "0001.json").is_file()
+          and "terminal_create · done" in frame, "same conversation opens a shell after lease release")
+    assert (session.parents[1] / "terminal-retired-v1-2").is_file()
+    local(recovered, "/exit")
+    recovered.result = recovered.finish()
+    assert recovered.result["exit"] == 0 and recovered.result["termios_restored"]
+    assert (fresh_host / "closed-v1.json").is_file()
     live_terminal_default(screen, root, cwd)
     return "normal"
 

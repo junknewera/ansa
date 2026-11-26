@@ -96,6 +96,13 @@ impl FileJournal {
         let m = self.directory.metadata().map_err(|_| "terminal_store")?;
         Ok((m.dev(), m.ino()))
     }
+    pub(super) fn retirement_anchor(&self) -> Result<String, &'static str> {
+        let (device, inode) = self.identity()?;
+        Ok(sha256(
+            format!("{}:{}:{}:{}", device, inode, self.sequence, self.previous).as_bytes(),
+        ))
+    }
+
     /// Reserve a fresh private store. Existing headers and remnants require an
     /// explicit open and never become permission to start a replacement host.
     pub(super) fn create(

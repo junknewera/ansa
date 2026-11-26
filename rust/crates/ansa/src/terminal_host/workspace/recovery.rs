@@ -520,6 +520,70 @@ mod tests {
     }
 
     #[test]
+    fn released_workspace_restores_a_fresh_terminal_in_the_same_conversation() {
+        use crate::terminal_host::tools;
+        let fx = Fixture::new(Effect::Unknown);
+        let mut settings = crate::config::AgentSettings::defaults(&fx.workspace, &fx.base);
+        settings.directory = fx.base.join("state");
+        let directory = fx.store.parent().unwrap();
+        let retired = directory.join("terminal-retired-v1-1");
+        let operation = "operation".to_owned().try_into().unwrap();
+        let (lease, claim) = fx.publish(false);
+
+        for held in [Some(lease), None] {
+            let host = tools::open_for(&settings, "fixture", directory, true).unwrap();
+            assert!(host.lock().unwrap().quarantined());
+            assert_eq!(tools::terminal_store_generation(directory), Ok(1));
+            assert!(!retired.exists());
+            drop(held);
+        }
+
+        let boot = boot_id().unwrap();
+        release(&fx.registry, &fx.workspace, &boot, 0, &claim, true).unwrap();
+        let write =
+            local::WorkspaceWrite::acquire(&fx.registry, &fx.workspace, &fx.workspace).unwrap();
+        let host = tools::open_for(&settings, "fixture", directory, true).unwrap();
+        assert!(host.lock().unwrap().quarantined());
+        assert!(!retired.exists());
+        drop((host, write));
+        // An interrupted initialization can leave a staging directory.
+        fs::create_private_leaf(&directory.join(".terminal-host-interrupted")).unwrap();
+
+        for generation in [2, 3] {
+            let owner = tools::open_for(&settings, "fixture", directory, true).unwrap();
+            assert_eq!(tools::terminal_store_generation(directory), Ok(generation));
+            assert!(
+                tools::workspace_writer(&owner)(&fx.workspace)
+                    .unwrap()
+                    .is_none()
+            );
+            let host = owner.lock().unwrap();
+            assert!(!host.quarantined());
+            assert!(host.recovery().is_none());
+            assert!(host.terminals().is_empty());
+            assert_eq!(
+                host.operation(&operation),
+                Some(OperationStatus::Durable(Effect::Unknown))
+            );
+        }
+        assert!(retired.is_file());
+        let mut writer = super::super::writer(&fx.registry, &fx.workspace, &fx.workspace).unwrap();
+        writer.begin(&"d".repeat(64)).unwrap();
+        std::fs::write(fx.workspace.join("continued.txt"), b"same workspace").unwrap();
+        writer.finish().unwrap();
+
+        // Even a prefix that now appears to have launched nothing must match
+        // the archived generation's original journal.
+        std::fs::remove_file(fx.store.join("0001.json")).unwrap();
+        std::fs::remove_file(fx.store.join("0000.json")).unwrap();
+        assert!(matches!(
+            tools::open_for(&settings, "fixture", directory, true),
+            Err("terminal_store_chain")
+        ));
+        assert_eq!(tools::terminal_store_generation(directory), Ok(3));
+    }
+
+    #[test]
     fn prior_boot_unknown_requires_exact_confirmation_and_preserves_receipt_and_other_writers() {
         let boot = boot_id().unwrap();
         for legacy in [false, true] {
