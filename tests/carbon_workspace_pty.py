@@ -2487,30 +2487,23 @@ def siwc_terminal_exec(screen, root, cwd):
     _, [manual], _ = submit("TEST_EXEC_CREATE_BASH")
     _, [after_manual], _ = submit("TEST_EXEC_DIFF_MANUAL", "Run git diff --stat · exit 0")
     assert manual["terminal"] == after_manual["terminal"] and "review.txt" in after_manual["output"]
+    _, [timed_out], _ = submit("TEST_EXEC_TIMEOUT_EXIT", "exit 124")
+    assert timed_out["exit_code"] == 124 and timed_out["output"] == "timed out\n"
+    _, [fresh], _ = submit("TEST_EXEC_AFTER_TIMEOUT")
+    assert fresh["exit_code"] == 0 and fresh["output"] == "new shell\n"
+    assert fresh["terminal"] != timed_out["terminal"]
     start = len(records(root))
     screen.send("TEST_EXEC_UNKNOWN\r")
-    until(screen, lambda frame: "Enter · Continue" in frame and "Tool outcome unknown" in frame,
-          "unknown terminal outcome offers contextual continuation")
-    screen.send(b"\t" * 4)
-    until(screen, lambda _: "Review plan" in screen.vt.line(-2), "select Review plan during the paused turn")
-    followup = "Проверь сохранившийся результат"
-    screen.send(followup + "\r")
-    until(screen, lambda frame: f"◷ {followup}" in frame and "Enter · Continue" in frame
-          and "› " + followup not in screen.vt.line(-4), "Enter saves the message in the chat during the pause")
-    queued = records(root)[start:]
-    assert [row["text"] for row in queued if row["kind"] == "queued"] == [followup]
-    assert [row["text"] for row in queued if row["kind"] == "accepted"] == ["TEST_EXEC_UNKNOWN"]
-    assert [row["kind"] for row in queued].count("response") == 1
-    screen.send("\r")
-    until(screen, lambda _: completed(root, "TEST_EXEC_UNKNOWN"), "continue the same turn")
+    until(screen, lambda frame: completed(root, "TEST_EXEC_UNKNOWN") and "Fixture complete." in frame,
+          "the agent receives the unknown result and continues without Enter")
     recovered = records(root)[start:]
-    steered, = [row for row in recovered if row["kind"] == "steered"]
-    assert steered["next"]["input"][-1] == {"role": "user", "content": followup}
     outcome = [row["result"] for row in recovered if row["kind"] == "outcome"]
-    assert [result["effects"].lexeme for result in outcome] == ["1", "2"]
-    assert len([row for row in recovered if row["kind"] == "intent"]) == 2
+    assert [result["effects"].lexeme for result in outcome] == ["1", "2", "1"]
+    assert len([row for row in recovered if row["kind"] == "intent"]) == 3
+    assert json.loads(outcome[-1]["output"])["output"] == "inspection continued\n"
     resume, = [row for row in recovered if row["kind"] == "resume"]
-    assert resume["unknown_operation"] == outcome[-1]["operation"]
+    assert resume["automatic"] and resume["unknown_operation"] == outcome[1]["operation"]
+    assert all(row["kind"] != "pause" for row in recovered)
     rejected, = [row for row in recovered if row["kind"] == "tool_batch_rejected"]
     assert "unknown outcome" in rejected["message"]
     assert (cwd / "recovered-prefix").read_text() == "known\n"

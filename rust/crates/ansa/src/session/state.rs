@@ -308,6 +308,17 @@ impl SavedTurn {
         .then(|| last.result.operation_id())
     }
 
+    pub(crate) fn automatic_terminal_recovery(&self) -> Option<&str> {
+        if self.stage != "tools" || self.paused || self.intent.is_some() {
+            return None;
+        }
+        let (result, prefix) = self.results.split_last()?;
+        let call = self.tools_response.as_ref()?.calls().get(prefix.len())?;
+        (call.name == crate::terminal_host::tools::EXEC && call.call_id == result.result.call_id())
+            .then(|| self.recoverable_unknown())
+            .flatten()
+    }
+
     fn unresolved_result(&self) -> Option<SavedResult> {
         self.intent.as_ref().map(|intent| SavedResult {
             result: crate::provider::replay::ToolResult::new(
@@ -2062,6 +2073,16 @@ impl State {
                             && current.resumes.len() < 4096,
                         "session_resume",
                     )?;
+                    let automatic = event.has("automatic");
+                    if automatic {
+                        need(
+                            event.field("automatic")?.boolean()?
+                                && recovery.is_some()
+                                && recovery == current.automatic_terminal_recovery()
+                                && !event.has("tool_budget_version"),
+                            "session_terminal_recovery",
+                        )?;
+                    }
                     if event.has("tool_budget_version") {
                         need(
                             current.renew_tool_budget_on_resume(),
@@ -2095,7 +2116,6 @@ impl State {
                         current.stage = "generating".into();
                     }
                     current.resumes.insert(id.into());
-                    current.resume_round = current.rounds;
                     while current
                         .results
                         .last()
@@ -2103,7 +2123,10 @@ impl State {
                     {
                         current.results.pop();
                     }
-                    current.resume_operation = current.operation_offset + current.results.len();
+                    if !automatic {
+                        current.resume_round = current.rounds;
+                        current.resume_operation = current.operation_offset + current.results.len();
+                    }
                     current.paused = false;
                     current.diagnostic.clear();
                 }
@@ -2327,7 +2350,7 @@ fn lead_replays_on_an_existing_journal_without_exporting_delegate_to_forks() {
 
 #[cfg(test)]
 #[test]
-fn resume_recovers_a_saved_terminal_lease_rejection_without_replaying_the_batch() {
+fn terminal_recovery_preserves_saved_results_budget_and_cancellation() {
     use crate::{
         provider::{native, replay::ToolResult, request::Descriptor},
         terminal_host::tools::EXEC,
@@ -2421,6 +2444,63 @@ fn resume_recovers_a_saved_terminal_lease_rejection_without_replaying_the_batch(
                 .unwrap(),
         )
         .unwrap();
+    let mut automatic = state.clone();
+    let unknown = SavedResult {
+        result: ToolResult::new(
+            invocation.operation.clone(),
+            invocation.call.clone(),
+            r#"{"error":"terminal_exec_interrupted"}"#.into(),
+            Execution::Failed,
+            Effects::Unknown,
+        ),
+        dispatched: true,
+    };
+    automatic
+        .apply(
+            &event("outcome")
+                .with("result", unknown.save().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    let auto_resume = event("resume")
+        .with("command", Json::string("auto-terminal").unwrap())
+        .unwrap()
+        .with(
+            "unknown_operation",
+            Json::string(&invocation.operation).unwrap(),
+        )
+        .unwrap()
+        .with("automatic", Json::parse("true").unwrap())
+        .unwrap();
+    let mut cancelled = automatic.clone();
+    cancelled.apply(&event("cancel")).unwrap();
+    assert_eq!(
+        cancelled.apply(&auto_resume),
+        Err("session_terminal_recovery")
+    );
+    let before = automatic.turn.as_ref().unwrap();
+    assert_eq!(
+        before.automatic_terminal_recovery(),
+        Some(invocation.operation.as_str())
+    );
+    let budget = (
+        before.resume_round,
+        before.resume_operation,
+        before.legacy_tool_limits,
+    );
+    automatic.apply(&auto_resume).unwrap();
+    let after = automatic.turn.as_ref().unwrap();
+    assert_eq!(
+        (
+            after.resume_round,
+            after.resume_operation,
+            after.legacy_tool_limits
+        ),
+        budget
+    );
+    assert_eq!(after.stage, "generating");
+    assert!(after.repeats_unknown_call(EXEC, &invocation.arguments));
+
     let receipt = SavedResult {
         result: ToolResult::new(
             invocation.operation.clone(),

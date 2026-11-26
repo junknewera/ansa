@@ -174,6 +174,7 @@ pub(crate) struct Resume {
     pub command: CommandId,
     pub unknown: Option<OperationId>,
     pub from_cancelled: bool,
+    pub automatic: bool,
 }
 impl Resume {
     pub fn matches_phase(&self, phase: &str) -> bool {
