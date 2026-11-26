@@ -431,7 +431,80 @@ impl SavedTurn {
         next_request(response, &results)
     }
 
+    pub(crate) fn has_dispatched_rejection(&self) -> bool {
+        self.stage == "tools"
+            && self.results.last().is_some_and(|result| {
+                result.dispatched && result.result.effects() == Effects::NotStarted
+            })
+    }
+
+    pub(crate) fn rejected_terminal_operation(&self) -> Option<&str> {
+        if self.stage != "tools" || self.intent.is_some() {
+            return None;
+        }
+        let (last, prefix) = self.results.split_last()?;
+        let call = self.tools_response.as_ref()?.calls().get(prefix.len())?;
+        (call.name == crate::terminal_host::tools::EXEC
+            && call.call_id == last.result.call_id()
+            && last.dispatched
+            && last.result.effects() == Effects::NotStarted
+            && prefix
+                .iter()
+                .all(|item| item.dispatched && item.result.effects() == Effects::KnownResult)
+            && Json::parse(last.result.output())
+                .is_ok_and(|value| value.text_field("error") == Ok("terminal_read_lease")))
+        .then(|| last.result.operation_id())
+    }
+
+    fn tool_continuation(&self, response: &AdmittedResponse, skipped: &str) -> Result<Request> {
+        let mut results = self.results.clone();
+        for (index, call) in response.calls().iter().enumerate().skip(results.len()) {
+            results.push(SavedResult {
+                result: crate::provider::replay::ToolResult::new(
+                    format!(
+                        "{}:op:{}",
+                        self.operation_run,
+                        self.operation_offset + index + 1
+                    ),
+                    call.call_id.clone(),
+                    skipped.into(),
+                    Execution::Cancelled,
+                    Effects::NotStarted,
+                ),
+                dispatched: false,
+            });
+        }
+        next_request(response, &results)
+    }
+
+    pub(crate) fn terminal_recovery_request(&self, operation: &str) -> Result<Request> {
+        need(
+            self.rejected_terminal_operation() == Some(operation),
+            "session_terminal_recovery",
+        )?;
+        let response = self
+            .tools_response
+            .as_ref()
+            .ok_or("session_terminal_recovery")?;
+        let mut request = self.tool_continuation(
+            response,
+            r#"{"error":"not_started_after_terminal_rejection","applied":false}"#,
+        )?;
+        request.input.push(Json::object(vec![
+            ("role", Json::string("user")?),
+            ("content", Json::string(concat!(
+                "Continue the original task. The previous shell is unavailable. ",
+                "Use read_file, list_directory or search_files to inspect the workspace. ",
+                "If an earlier tool outcome is unknown, inspect the current state before making changes."
+            ))?),
+        ])?);
+        request.with_input_bounds()
+    }
+
     pub(crate) fn pause_diagnostic(&self) -> &str {
+        if self.rejected_terminal_operation().is_some() {
+            return "terminal_read_lease";
+        }
         if self.diagnostic == "tool_failed"
             && let Some(result) = self.results.last()
             && result.result.effects() == Effects::NotStarted
@@ -800,24 +873,7 @@ impl State {
             "recovery_required",
         )?;
         let mut next = if let Some(response) = &current.tools_response {
-            let mut results = current.results.clone();
-            for (index, call) in response.calls().iter().enumerate().skip(results.len()) {
-                results.push(SavedResult {
-                    result: crate::provider::replay::ToolResult::new(
-                        format!(
-                            "{}:op:{}",
-                            current.operation_run,
-                            current.operation_offset + index + 1
-                        ),
-                        call.call_id.clone(),
-                        r#"{"error":"not_started_user_followup"}"#.into(),
-                        Execution::Cancelled,
-                        Effects::NotStarted,
-                    ),
-                    dispatched: false,
-                });
-            }
-            next_request(response, &results)?
+            current.tool_continuation(response, r#"{"error":"not_started_user_followup"}"#)?
         } else if let Some(response) = &current.response {
             let mut request = response.request().clone();
             request
@@ -1990,12 +2046,17 @@ impl State {
                         .has("unknown_operation")
                         .then(|| event.text_field("unknown_operation"))
                         .transpose()?;
+                    let terminal_recovery = event
+                        .has("rejected_terminal_operation")
+                        .then(|| event.text_field("rejected_terminal_operation"))
+                        .transpose()?;
                     need(
                         current.stage != "completed"
                             && (current.stage != "cancelled"
                                 || pending_followup
                                 || recovery.is_some())
                             && unknown == recovery.is_some()
+                            && !(recovery.is_some() && terminal_recovery.is_some())
                             && valid_id(id)
                             && !current.resumes.contains(id)
                             && current.resumes.len() < 4096,
@@ -2009,12 +2070,20 @@ impl State {
                         (current.round_limit, current.call_limit) = configured_tool_budget(event)?;
                         current.legacy_tool_limits = false;
                     }
-                    if let Some(operation) = recovery {
-                        current.next = current.recovery_request(operation)?;
+                    let next = if let Some(operation) = recovery {
+                        let next = current.recovery_request(operation)?;
                         if let Some(result) = current.unresolved_result() {
                             current.results.push(result);
                         }
                         current.intent = None;
+                        Some(next)
+                    } else {
+                        terminal_recovery
+                            .map(|operation| current.terminal_recovery_request(operation))
+                            .transpose()?
+                    };
+                    if let Some(next) = next {
+                        current.next = next;
                         let response = current
                             .tools_response
                             .take()
@@ -2254,4 +2323,199 @@ fn lead_replays_on_an_existing_journal_without_exporting_delegate_to_forks() {
             Ok("Implement the change")
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn resume_recovers_a_saved_terminal_lease_rejection_without_replaying_the_batch() {
+    use crate::{
+        provider::{native, replay::ToolResult, request::Descriptor},
+        terminal_host::tools::EXEC,
+    };
+
+    let tools = Advertisement {
+        revision: "fixture-tools".into(),
+        descriptors: vec![Descriptor {
+            name: EXEC.into(),
+            description: "Run a command".into(),
+            revision: "ansa_terminal_attached_v1".into(),
+            schema: Json::parse(r#"{"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}"#).unwrap(),
+        }],
+    };
+    let base = Request::new(
+        crate::frontend::app::binding(),
+        Epoch {
+            id: "terminal-recovery".into(),
+            instructions: "Fixture".into(),
+            exact_state: Json::parse("{}").unwrap(),
+        },
+        tools,
+        vec![],
+    )
+    .unwrap();
+    let mut state = State::new(
+        "session".into(),
+        base,
+        Advertisement {
+            revision: String::new(),
+            descriptors: vec![],
+        },
+    );
+    state.apply(&state.initialization().unwrap()).unwrap();
+    let request = state
+        .request_for("Check the files", AgentMode::Basic)
+        .unwrap();
+    let accept = Json::parse(r#"{"kind":"accepted","command":"submit","turn":"t","request":"request_1","request_number":1,"text":"Check the files","mode":"basic","operation_run":"run","compact":false}"#).unwrap();
+    state
+        .apply(&accept.with("next", request.save().unwrap()).unwrap())
+        .unwrap();
+    let call = |id, command| {
+        serde_json::json!({
+            "type":"function_call","id":format!("item-{id}"),"call_id":id,"namespace":"omh",
+            "name":EXEC,"arguments":serde_json::json!({"command":command}).to_string(),"status":"completed"
+        })
+    };
+    let response = native::load(
+        &Json::object(vec![
+            ("request", request.save().unwrap()),
+            ("id", Json::string("response").unwrap()),
+            (
+                "model",
+                Json::string(&request.binding.returned_model).unwrap(),
+            ),
+            (
+                "items",
+                Json::parse(
+                    &serde_json::json!([call("first", "pwd"), call("second", "touch skipped")])
+                        .to_string(),
+                )
+                .unwrap(),
+            ),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let event =
+        |kind| Json::parse(&serde_json::json!({"turn":"t","kind":kind}).to_string()).unwrap();
+    state
+        .apply(
+            &event("response")
+                .with(
+                    "response",
+                    super::codec_v1::save_response(&response).unwrap(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    let invocation = Invocation {
+        operation: "run:op:1".into(),
+        call: "first".into(),
+        name: EXEC.into(),
+        revision: "ansa_terminal_attached_v1".into(),
+        arguments: Json::parse(r#"{"command":"pwd"}"#).unwrap(),
+    };
+    state
+        .apply(
+            &event("intent")
+                .with("invocation", invocation.save().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    let receipt = SavedResult {
+        result: ToolResult::new(
+            invocation.operation.clone(),
+            invocation.call,
+            r#"{"error":"terminal_read_lease"}"#.into(),
+            Execution::Failed,
+            Effects::NotStarted,
+        ),
+        dispatched: true,
+    };
+    state
+        .apply(
+            &event("outcome")
+                .with("result", receipt.save().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    state
+        .apply(
+            &event("pause")
+                .with("diagnostic", Json::string("tool_failed").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    let page = state
+        .timeline
+        .conversation_page(crate::provider::contracts::GetTranscript {
+            before: 0,
+            limit: 12,
+            forward: true,
+        });
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| entry.text == r#"{"error":"terminal_read_lease"}"#)
+    );
+    let turn = state.turn.as_ref().unwrap();
+    assert_eq!(turn.pause_diagnostic(), "terminal_read_lease");
+    assert_eq!(turn.rejected_terminal_operation(), Some("run:op:1"));
+    let resume = event("resume")
+        .with("command", Json::string("resume").unwrap())
+        .unwrap();
+    let wrong = resume
+        .clone()
+        .with(
+            "rejected_terminal_operation",
+            Json::string("run:op:2").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(state.apply(&wrong), Err("session_terminal_recovery"));
+    let mut legacy = state.clone();
+    legacy.apply(&resume).unwrap();
+    assert_eq!(legacy.turn.as_ref().unwrap().stage, "tools");
+    let recovered = resume
+        .with(
+            "rejected_terminal_operation",
+            Json::string(&invocation.operation).unwrap(),
+        )
+        .unwrap();
+    state.apply(&recovered).unwrap();
+    let reopened_resume = recovered
+        .clone()
+        .with("command", Json::string("resume-after-reopen").unwrap())
+        .unwrap();
+    legacy.apply(&reopened_resume).unwrap();
+    assert_eq!(
+        legacy.turn.as_ref().unwrap().next.save().unwrap(),
+        state.turn.as_ref().unwrap().next.save().unwrap()
+    );
+
+    let turn = state.turn.as_ref().unwrap();
+    assert_eq!(turn.stage, "generating");
+    assert!(turn.results.is_empty() && turn.intent.is_none());
+    assert_eq!(turn.previous_results.len(), 1);
+    assert_eq!(
+        turn.previous_results[0].result.effects(),
+        Effects::NotStarted
+    );
+    assert_eq!(turn.operation_offset, 2);
+    let request = &turn.next.input;
+    assert_eq!(
+        request[request.len() - 3].text_field("output"),
+        Ok(r#"{"error":"terminal_read_lease"}"#)
+    );
+    assert_eq!(
+        request[request.len() - 2].text_field("output"),
+        Ok(r#"{"error":"not_started_after_terminal_rejection","applied":false}"#)
+    );
+    assert!(
+        request
+            .last()
+            .unwrap()
+            .text_field("content")
+            .unwrap()
+            .contains("Use read_file")
+    );
+    assert!(state.apply(&recovered).is_err());
 }

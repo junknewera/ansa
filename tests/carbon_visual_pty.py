@@ -850,11 +850,12 @@ def retry_after_edit(binary, adapter, root, home, cwd, screens):
     screen.send('EDIT_AND_REPLY\r')
     until(screen, lambda _: 'http_transfer' in screen.vt.line(-1),
           'interrupted reply explains the transport failure')
-    until(screen, lambda text: 'Work paused' in text and '[Continue]' in text,
-          'the main conversation offers a Continue action below the cause')
+    until(screen, lambda text: 'Work paused' in text and 'Enter · Continue' in text,
+          'the main conversation shows the recovery shortcut below the cause')
+    assert screen.vt.attribute('Enter · Continue')[0] == (133, 220, 177)
     assert (cwd / 'edit-target.rs').read_text() == 'fn main() {\n    new();\n}\n'
     marker.unlink()
-    click_text(screen, '[Continue]')
+    screen.send('\r')
     until(screen, lambda text: completed(root, 'EDIT_AND_REPLY') and 'EDIT_DONE' in text,
           'retry delivers the reply after the saved edit')
     rows = records(root)

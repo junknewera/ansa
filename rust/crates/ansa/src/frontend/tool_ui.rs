@@ -197,6 +197,23 @@ fn status(tool: &Tool) -> &'static str {
     if tool.uncertain {
         return "unknown result (effect_unknown)";
     }
+    if tool.detail.name == crate::terminal_host::tools::EXEC
+        && matches!(
+            tool.detail.phase,
+            ToolPhase::Finished {
+                execution: Execution::Failed,
+                effects: Effects::NotStarted | Effects::KnownResult
+            }
+        )
+        && tool.output_json.as_ref().is_some_and(|value| {
+            matches!(
+                value.text_field("error"),
+                Ok("terminal_read_lease" | "terminal_workspace_quarantined")
+            )
+        })
+    {
+        return "not run · shell unavailable";
+    }
     match tool.detail.phase {
         ToolPhase::Prepared if tool.running => "running",
         ToolPhase::Prepared => "prepared",

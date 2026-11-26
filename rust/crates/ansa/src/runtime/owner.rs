@@ -277,6 +277,11 @@ impl Owner {
     fn resume_matches(&self, unknown: Option<&OperationId>) -> bool {
         (self.phase == "paused" || (self.phase == "cancelled" && unknown.is_some()))
             && self.recovery.as_ref() == unknown
+            && (unknown.is_some()
+                || self.state.pending_followups().next().is_some()
+                || self.state.turn.as_ref().is_none_or(|turn| {
+                    !turn.has_dispatched_rejection() || turn.rejected_terminal_operation().is_some()
+                }))
             && unknown.is_none_or(|operation| {
                 !self.starting
                     && !self.busy()
@@ -1745,6 +1750,17 @@ impl Owner {
                     return Ok(());
                 }
                 fields.push(("unknown_operation", Json::string(&operation.0)?));
+            } else if let Some(turn) = self.state.turn.as_ref()
+                && let Some(operation) = turn.rejected_terminal_operation()
+            {
+                if let Err(code) = turn.terminal_recovery_request(operation) {
+                    self.emit(EventPayload::RuntimeError {
+                        command: Some(resume.command),
+                        diagnostic: code.into(),
+                    });
+                    return Ok(());
+                }
+                fields.push(("rejected_terminal_operation", Json::string(operation)?));
             }
             if self
                 .state

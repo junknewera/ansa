@@ -223,10 +223,14 @@ fn compact_tool_result(detail: &mut ToolDetail, text: &str) -> String {
         ));
     }
     if output.has("error") {
-        let error = if output.text_field("error") == Ok("cancelled") {
-            "cancelled"
-        } else {
-            "error"
+        let error = match output.text_field("error") {
+            Ok("cancelled") => "cancelled",
+            Ok(code @ ("terminal_read_lease" | "terminal_workspace_quarantined"))
+                if detail.name == crate::terminal_host::tools::EXEC =>
+            {
+                code
+            }
+            _ => "error",
         };
         fields.push(("error", Json::string(error).expect("constant")));
     }

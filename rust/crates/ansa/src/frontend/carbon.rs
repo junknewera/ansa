@@ -1234,6 +1234,8 @@ impl TranscriptPaint {
                 if text.starts_with("    ") { SKY } else { MUTED }
             } else if tool {
                 tool_ink(&entry.role)
+            } else if entry.role == "continue_action" {
+                MINT
             } else if entry.role.starts_with("activity:")
                 || matches!(
                     entry.role.as_str(),
