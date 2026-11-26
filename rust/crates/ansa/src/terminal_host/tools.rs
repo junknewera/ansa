@@ -641,6 +641,15 @@ fn execute_command(
         if host.operation(&operation).is_some() {
             return Err("terminal_operation_conflict");
         }
+        if host.quarantined() {
+            return Ok(Outcome::failed_known(
+                json!({
+                    "error": "terminal_workspace_quarantined",
+                    "applied": false,
+                    "message": "The session terminal is unavailable. Use read_file, list_directory or search_files to inspect the workspace."
+                }).to_string(),
+            ));
+        }
         if let Some((id, current)) = host
             .terminals()
             .iter()
@@ -834,4 +843,47 @@ fn rejected(code: &'static str) -> Outcome {
         effect,
         json!({"error":code}).to_string().into_bytes(),
     )
+}
+
+#[cfg(test)]
+#[test]
+fn quarantined_terminal_exec_returns_a_known_rejection_without_creating_a_shell() {
+    let sandbox =
+        std::env::temp_dir().join(format!("ansa-terminal-quarantined-{}", std::process::id()));
+    std::fs::create_dir(&sandbox).unwrap();
+    let sandbox = sandbox.canonicalize().unwrap();
+    let workspace = sandbox.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let binding = Binding::attached(
+        Id::try_from("quarantined-session".to_owned()).unwrap(),
+        workspace.to_str().unwrap().into(),
+    );
+    let journal = sandbox.join("journal");
+    let backend = NativeBackend::new(std::env::current_exe().unwrap(), sandbox.join("workspaces"));
+    let owner = Arc::new(Mutex::new(
+        Host::create_in_mode(&journal, binding, backend, HostMode::Conversation).unwrap(),
+    ));
+    owner.lock().unwrap().emergency_stop();
+    let invocation = Invocation {
+        operation: "quarantined:op:1".into(),
+        call: "call".into(),
+        name: EXEC.into(),
+        revision: "ansa_terminal_attached_v1".into(),
+        arguments: Json::parse(r#"{"command":"touch should-not-run"}"#).unwrap(),
+    };
+    let result = invoke(&owner, Tool::Exec, &invocation, &Cancel::default());
+    let empty = owner.lock().unwrap().terminals().is_empty();
+    drop(owner);
+    let marker = workspace.join("should-not-run").exists();
+    std::fs::remove_dir_all(&sandbox).unwrap();
+    let result = result.unwrap();
+    assert_eq!(result.execution, Execution::Failed);
+    assert_eq!(result.effects, Effects::KnownResult);
+    let output = Json::parse(std::str::from_utf8(&result.output).unwrap()).unwrap();
+    assert_eq!(
+        output.text_field("error"),
+        Ok("terminal_workspace_quarantined")
+    );
+    assert_eq!(output.field("applied").unwrap().boolean(), Ok(false));
+    assert!(empty && !marker);
 }

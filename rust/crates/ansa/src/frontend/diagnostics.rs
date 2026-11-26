@@ -182,6 +182,7 @@ fn explanation(code: &str) -> &'static str {
         "terminal_workspace_quarantined" => {
             "Workspace writes blocked after an unresolved terminal operation"
         }
+        "terminal_read_lease" => "The previous shell is unavailable. The command did not run",
         "task_path_scope" => "Path outside the assignment",
         "terminal_worker_lost" => "Lost connection to the terminal",
         "cli_output_stalled" => "Output stalled before the message was delivered",

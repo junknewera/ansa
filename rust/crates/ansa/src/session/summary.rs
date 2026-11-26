@@ -373,7 +373,7 @@ pub(crate) fn read(
                         "session_resume",
                     )?;
                     need(valid_id(event.text_field("command")?), "session_resume")?;
-                    if recovery {
+                    if recovery || event.has("rejected_terminal_operation") {
                         expected = Some(
                             canonical
                                 .as_ref()

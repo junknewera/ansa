@@ -66,6 +66,12 @@ fn recoverable_request(view: &Snapshot) -> Option<(&RequestId, &OperationId)> {
         .flatten()
 }
 
+fn continue_action(view: &Snapshot) -> Option<String> {
+    recoverable_request(view)
+        .map(|(request, operation)| format!("resume:{}:{}", request.0, operation.0))
+        .or_else(|| resumable_request(view).map(|request| format!("resume:{}", request.0)))
+}
+
 struct Slot {
     skill_commands: Arc<[commands::SkillCommand]>,
     id: String,
@@ -560,6 +566,7 @@ impl Slot {
                 });
             }
             if diagnostics::needs_attention(view) {
+                let action = continue_action(view);
                 let reason = if view.storage_failed {
                     format!(
                         "Session storage error · {}",
@@ -575,21 +582,19 @@ impl Slot {
                 } else {
                     format!("Work paused · {}", diagnostics::error(&view.diagnostic))
                 };
-                let next = if recoverable_request(view).is_some() {
+                let next = if view.diagnostic == "tool_batch_limit" && view.resume_available {
+                    "Increase or remove tool_calls in config, then reopen ANSA"
+                } else if action.is_some() {
                     ""
                 } else if view.storage_failed || view.recovery_operation.is_some() {
                     "/sessions for details"
-                } else if view.diagnostic == "tool_batch_limit" && view.resume_available {
-                    "Increase or remove tool_calls in config, then reopen ANSA"
                 } else if view.diagnostic == "terminal_workspace_quarantined" {
                     "Inspect the terminal lease in this workspace with ansa --workspace-lease"
                 } else if matches!(
                     view.diagnostic.as_str(),
                     "tool_failed" | "task_path_scope" | "terminal_workspace_busy"
                 ) {
-                    "/cancel this turn and send a new request"
-                } else if resumable_request(view).is_some() {
-                    ""
+                    "Send a message to continue from the saved results"
                 } else {
                     "/sessions for details"
                 };
@@ -606,15 +611,14 @@ impl Slot {
                     agent: None,
                     status: None,
                 });
-                let action = recoverable_request(view)
-                    .map(|(request, operation)| format!("resume:{}:{}", request.0, operation.0))
-                    .or_else(|| {
-                        resumable_request(view).map(|request| format!("resume:{}", request.0))
-                    });
                 if let Some(action) = action {
                     entries.push(Entry {
-                        role: "notice".into(),
-                        text: "[Continue]".into(),
+                        role: "continue_action".into(),
+                        text: if self.can_continue_from_composer() {
+                            "Enter · Continue".into()
+                        } else {
+                            "Continue when the composer is empty".into()
+                        },
                         action: Some(action),
                         edit: None,
                         output: None,
@@ -669,6 +673,18 @@ impl Slot {
             agent: None,
             status: None,
         })
+    }
+
+    fn can_continue_from_composer(&self) -> bool {
+        self.state.editor.is_empty()
+            && self.state.editor.clipboard_anchor.is_none()
+            && !self.state.attachment_loading
+            && self.state.attachment_submission.is_none()
+            && !self.state.has_attachments()
+            && self.state.pending_draft.is_none()
+            && !self.sending_mention
+            && self.pending_resume_post.is_none()
+            && !self.state.progress.resume_pending()
     }
 
     fn activity_page(&self) -> Option<&TranscriptPage> {
@@ -5324,6 +5340,18 @@ impl Workbench {
             }
         }
     }
+    fn keyboard_continue(&self) -> Option<String> {
+        let slot = &self.slots[self.current];
+        if self.focus != Focus::Chat
+            || self.menu.is_some()
+            || self.result_selected.is_some()
+            || !slot.can_continue_from_composer()
+        {
+            return None;
+        }
+        slot.state.snapshot.as_ref().and_then(continue_action)
+    }
+
     fn enter(&mut self, io: &Io) -> Option<String> {
         if self.menu.is_none()
             && self.focus == Focus::Chat
@@ -5534,6 +5562,10 @@ impl Workbench {
                 Some(Panel::Image { .. }) => self.copy_image_path(io),
                 _ => {}
             }
+            return None;
+        }
+        if let Some(action) = self.keyboard_continue() {
+            self.activate_result(action, None, None, io);
             return None;
         }
         let slot = &mut self.slots[self.current];
@@ -6580,6 +6612,8 @@ impl Workbench {
                 ""
             } else if !slot.state.editor.is_empty() {
                 "Ctrl+C clear draft"
+            } else if self.keyboard_continue().is_some() {
+                "Enter continue"
             } else if self.collecting_orchestration() || slot.interruptible() {
                 "Ctrl+C stop"
             } else {

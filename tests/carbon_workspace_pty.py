@@ -2474,20 +2474,19 @@ def siwc_terminal_exec(screen, root, cwd):
     assert manual["terminal"] == after_manual["terminal"] and "review.txt" in after_manual["output"]
     start = len(records(root))
     screen.send("TEST_EXEC_UNKNOWN\r")
-    until(screen, lambda frame: "[Continue]" in frame and "Tool outcome unknown" in frame,
+    until(screen, lambda frame: "Enter · Continue" in frame and "Tool outcome unknown" in frame,
           "unknown terminal outcome offers contextual continuation")
     screen.send(b"\t" * 4)
     until(screen, lambda _: "Review plan" in screen.vt.line(-2), "select Review plan during the paused turn")
     followup = "Проверь сохранившийся результат"
     screen.send(followup + "\r")
-    until(screen, lambda frame: f"◷ {followup}" in frame and "[Continue]" in frame
+    until(screen, lambda frame: f"◷ {followup}" in frame and "Enter · Continue" in frame
           and "› " + followup not in screen.vt.line(-4), "Enter saves the message in the chat during the pause")
     queued = records(root)[start:]
     assert [row["text"] for row in queued if row["kind"] == "queued"] == [followup]
     assert [row["text"] for row in queued if row["kind"] == "accepted"] == ["TEST_EXEC_UNKNOWN"]
     assert [row["kind"] for row in queued].count("response") == 1
-    row = next(row for row in range(screen.vt.rows) if "[Continue]" in screen.vt.line(row))
-    click(screen, screen.vt.line(row).index("[Continue]") + 1, row)
+    screen.send("\r")
     until(screen, lambda _: completed(root, "TEST_EXEC_UNKNOWN"), "continue the same turn")
     recovered = records(root)[start:]
     steered, = [row for row in recovered if row["kind"] == "steered"]
