@@ -3,7 +3,7 @@
 use super::{
     Result,
     catalog::CatalogEntry,
-    codec_v1::{Invocation, SavedResult, load_response, next_request},
+    codec_v1::{Invocation, SavedResult, next_request},
     journal_v1::inspect_read_only,
     need,
     state::State,
@@ -18,7 +18,7 @@ use crate::{
         responses::AdmittedResponse,
     },
 };
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SummaryStatus {
@@ -112,14 +112,13 @@ pub(crate) fn read(
     let mut outstanding: Option<(String, String)> = None;
     let mut stage = Stage::Empty;
     let mut expected: Option<Request> = None;
-    let mut response: Option<AdmittedResponse> = None;
+    let mut response: Option<Arc<AdmittedResponse>> = None;
     let mut results: Vec<SavedResult> = Vec::new();
     let mut request_id = String::new();
     let mut queued: Vec<(String, String)> = Vec::new();
     let mut paused = false;
     let mut configuration: Option<Request> = None;
     let mut canonical: Option<State> = None;
-    let mut plan = false;
     let result = inspect_read_only(
         path,
         budget,
@@ -254,7 +253,6 @@ pub(crate) fn read(
                 response = None;
                 results.clear();
                 request_id = event.text_field("request")?.into();
-                plan = event.has("mode") && event.text_field("mode")? == "plan";
                 paused = false;
                 let question = if internal {
                     super::state::displayed_handoff_question(text)
@@ -293,7 +291,13 @@ pub(crate) fn read(
                         stage == Stage::Generating && !paused && outstanding.is_none(),
                         "session_response_stage",
                     )?;
-                    let admitted = load_response(event.field("response")?)?;
+                    // The canonical reducer just admitted this exact record; don't
+                    // decode the complete request, history and response again.
+                    let admitted = canonical
+                        .as_ref()
+                        .and_then(|s| s.turn.as_ref())
+                        .and_then(|turn| turn.response.clone())
+                        .ok_or("session_response_stage")?;
                     need(
                         admitted.request().save()?
                             == expected

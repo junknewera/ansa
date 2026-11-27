@@ -299,6 +299,7 @@ impl OpenRouter {
     }
 
     pub(crate) fn generate(&self, request: &Request, stop: &Cancel) -> Result<AdmittedResponse> {
+        use crate::provider::structured::FinalFormat;
         if !self.accepts_binding(&request.binding) {
             return Err("openrouter_binding");
         }
@@ -339,7 +340,9 @@ impl OpenRouter {
         }
         // The tool turn is complete on its own. A plain stop here only selects
         // the strict-final request; that unconstrained text is never admitted.
-        if request.final_format().is_some() && !request.tools.descriptors.is_empty() {
+        let child_tool_phase = request.final_format() == Some(FinalFormat::ChildResult)
+            && !request.tools.descriptors.is_empty();
+        if child_tool_phase {
             let response = self.send("POST", API, Some(body.clone()), None, stop)?;
             if choice(&response, model)?["finish_reason"] == "tool_calls" {
                 return decode(request, &response).map(attach_context);
@@ -348,13 +351,18 @@ impl OpenRouter {
         }
         if request.final_format().is_some() {
             apply_final_format(request, &mut body)?;
-            if !request.tools.descriptors.is_empty() {
+            // Plan requests offer skills alongside the strict final schema. A
+            // plain stop must pass plan admission; no speculative POST or retry.
+            if child_tool_phase {
                 body["tool_choice"] = json!("none");
             }
         }
         let response = self.send("POST", API, Some(body), None, stop)?;
         let admitted = decode(request, &response)?;
-        if request.final_format().is_some() && !admitted.calls().is_empty() {
+        if request.final_format().is_some()
+            && (child_tool_phase || request.tools.descriptors.is_empty())
+            && !admitted.calls().is_empty()
+        {
             return Err("openrouter_final_has_tools");
         }
         Ok(attach_context(admitted))
@@ -384,9 +392,8 @@ pub(crate) fn tool_value(descriptor: &Descriptor) -> Result<Value> {
 }
 
 pub(crate) fn apply_final_format(request: &Request, body: &mut Value) -> Result<()> {
-    let wire: Value =
-        serde_json::from_str(&request.json()?.dump()).map_err(|_| "openrouter_wire")?;
-    let format = &wire["text"]["format"];
+    let format = request.final_format().ok_or("openrouter_wire")?.format()?;
+    let format: Value = serde_json::from_str(&format.dump()).map_err(|_| "openrouter_wire")?;
     body["response_format"] = json!({"type":"json_schema","json_schema":{"name":format["name"],"strict":true,"schema":format["schema"]}});
     Ok(())
 }
@@ -773,6 +780,85 @@ mod tests {
             Err("openrouter_binding")
         ));
         assert_eq!(count.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn plan_with_skills_uses_one_generation_per_round_and_requires_a_strict_final() {
+        use crate::tools::{
+            admission::{OperationIds, PreparedBatch},
+            skills::Catalog,
+        };
+        struct FixtureSkill;
+        impl Catalog for FixtureSkill {
+            fn list(&self) -> Value {
+                unreachable!()
+            }
+            fn read(&self, name: &str) -> Result<Value> {
+                assert_eq!(name, "review");
+                Ok(json!({"body":"pinned procedure"}))
+            }
+            fn read_page(&self, _: &str, _: usize) -> Result<Value> {
+                unreachable!()
+            }
+        }
+        let posts = Arc::new(AtomicUsize::new(0));
+        let seen = posts.clone();
+        let route = OpenRouter::new(Secret::new("synthetic-fixture-key-0123456789".into()), Arc::new(move |req, _| {
+            if req.url == CATALOG {
+                return Ok(reply(json!({"data":{"id":MODEL,"endpoints":[{"tag":ENDPOINT,"provider_name":PROVIDER,"supported_parameters":["structured_outputs","response_format","tools","tool_choice"]}]}})));
+            }
+            assert_eq!(req.url, API);
+            let body: Value = serde_json::from_str(req.body.expose()).unwrap();
+            let schema = &body["response_format"]["json_schema"];
+            if schema["name"] == "ansa_native_schema_probe" { return Ok(reply(response(r#"{"value":"schema-enforced"}"#))); }
+            assert_eq!(schema["name"], "ansa_orchestration_plan_v1");
+            assert_eq!(schema["strict"], true);
+            assert!(body["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "read_skill"));
+            assert_ne!(body["tool_choice"], "none");
+            Ok(reply(match seen.fetch_add(1, Ordering::SeqCst) {
+                0 | 2 => {
+                    if let Some(last) = body["messages"].as_array().unwrap().last().filter(|m| m["role"] == "tool") {
+                        assert_eq!(last["tool_call_id"], "one");
+                        assert_eq!(last["content"], r#"{"body":"pinned procedure"}"#);
+                    } else { assert_eq!(seen.load(Ordering::SeqCst), 1); }
+                    response(r#"{"schema_version":1,"summary":"Inspect","steps":[{"id":"s1","task":"Read","access":"read","paths":[],"depends_on":[],"acceptance":"Checked"}],"checks":[],"manual_checks":[]}"#)
+                }
+                1 => json!({"id":"skill","model":MODEL,"provider":PROVIDER,"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"type":"function","id":"one","function":{"name":"read_skill","arguments":r#"{"name":"review"}"#}}]}}]}),
+                3 => response("not a plan"),
+                _ => panic!("unexpected additional generation"),
+            }))
+        })).unwrap();
+        let mut request = request(&route).with_final_format(Some(FinalFormat::OrchestrationPlan));
+        let mut registry = crate::tools::registry::Registry::new();
+        crate::tools::skills::register(&mut registry, Some(Arc::new(FixtureSkill))).unwrap();
+        request.tools = registry.snapshot().advertisement().clone();
+        let stop = Cancel::default();
+        assert!(
+            route
+                .generate(&request, &stop)
+                .unwrap()
+                .orchestration_plan()
+                .is_ok()
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        let call = route.generate(&request, &stop).unwrap();
+        let saved = native::load(&native::save(&call).unwrap()).unwrap();
+        let batch = PreparedBatch::prepare(
+            &saved,
+            registry.snapshot(),
+            &mut OperationIds::new("plan", 0).unwrap(),
+        )
+        .unwrap();
+        let next = crate::provider::replay::continuation(&saved, &batch.execute(false)).unwrap();
+        assert_eq!(next.tools, request.tools);
+        assert_eq!(next.final_format(), request.final_format());
+        route
+            .generate(&next, &stop)
+            .unwrap()
+            .orchestration_plan()
+            .unwrap();
+        assert!(route.generate(&request, &stop).is_err());
+        assert_eq!(posts.load(Ordering::SeqCst), 4);
     }
 
     #[test]

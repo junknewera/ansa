@@ -141,6 +141,9 @@ impl ForkSeed {
     pub fn source_turn(&self) -> &TurnId {
         &self.source_turn
     }
+    pub(crate) fn request_ref(&self) -> &Request {
+        &self.request
+    }
     pub fn request(&self) -> Result<Request> {
         Ok((*self.request).clone())
     }

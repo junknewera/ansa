@@ -413,9 +413,7 @@ impl Factory {
         }
         if seed
             .as_ref()
-            .map(ForkSeed::request)
-            .transpose()?
-            .is_some_and(|r| r.binding.account != self.account)
+            .is_some_and(|s| s.request_ref().binding.account != self.account)
         {
             return Err("session_provider_context");
         }
@@ -1232,9 +1230,9 @@ impl Factory {
     ) -> Result<Created> {
         let initial_epoch = agent_epoch(&self.settings)?;
         let source_configuration = restored
-            .clone()
-            .or(seed.as_ref().map(ForkSeed::request).transpose()?);
-        if let Some(source) = &source_configuration
+            .as_ref()
+            .or_else(|| seed.as_ref().map(ForkSeed::request_ref));
+        if let Some(source) = source_configuration
             && base_state(&source.epoch.exact_state)? != base_state(&initial_epoch.exact_state)?
         {
             return Err("session_configuration_mismatch");
@@ -1244,11 +1242,11 @@ impl Factory {
         } else {
             crate::harness::select_with_notice(
                 &self.settings,
-                source_configuration.as_ref(),
+                source_configuration,
                 self.harness_trial.as_deref(),
             )?
         };
-        let wants_terminals = source_configuration.as_ref().map_or(
+        let wants_terminals = source_configuration.map_or(
             kind == Kind::Main && self.new_main_uses_terminal(),
             |source| {
                 source
@@ -1288,7 +1286,7 @@ impl Factory {
                         registry,
                         &self.settings.directory,
                         &self.settings.cwd,
-                        source_configuration.as_ref().map(|request| &request.tools),
+                        source_configuration.map(|request| &request.tools),
                         &self.stop,
                     )?;
                 }
@@ -1297,7 +1295,7 @@ impl Factory {
         )?;
         // Resume/fork retains the exact saved tool catalogue. Adding a compiled
         // tool only affects new sessions; saved descriptors cannot install code.
-        let tools = if let Some(source) = &source_configuration {
+        let tools = if let Some(source) = source_configuration {
             tools
                 .compatible(&source.tools)
                 .ok_or("session_fork_tools")?
@@ -1323,11 +1321,10 @@ impl Factory {
         {
             seed = Some(source.restricted_tools(tools.advertisement())?);
         }
-        let base = restored.or(seed.as_ref().map(ForkSeed::request).transpose()?);
-        let mut epoch = base
+        let base = restored
             .as_ref()
-            .map(|r| r.epoch.clone())
-            .unwrap_or(initial_epoch);
+            .or_else(|| seed.as_ref().map(ForkSeed::request_ref));
+        let mut epoch = base.map(|r| r.epoch.clone()).unwrap_or(initial_epoch);
         if base.is_none()
             && let Some(profile) = &profile
         {
@@ -1336,14 +1333,11 @@ impl Factory {
         if base.is_none() && terminal.is_some() {
             terminals::add_agent_instructions(&mut epoch);
         }
-        let mut bound = base
-            .as_ref()
-            .map(|r| r.binding.clone())
-            .unwrap_or_else(app::binding);
+        let mut bound = base.map(|r| r.binding.clone()).unwrap_or_else(app::binding);
         if kind != Kind::Console
             && let Some(route) = &self.openrouter
         {
-            if let Some(request) = &base {
+            if let Some(request) = base {
                 if !route.accepts_binding(&request.binding) {
                     return Err("session_provider_context");
                 }
@@ -1416,7 +1410,6 @@ impl Factory {
             self.enable_delegation(&mut options, &selected.id, shared_writer);
         }
         options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&self.settings));
-        options.fork_seed = seed;
         if kind == Kind::Main {
             options.autocompact_percent = self.initial_autocompact;
         }
@@ -1430,11 +1423,12 @@ impl Factory {
                 }
             });
         }
-        let effort = match &base {
+        let effort = match base {
             Some(request) => request.effort.clone(),
             None if kind == Kind::Main => self.initial_effort.clone(),
             None => None,
         };
+        options.fork_seed = seed;
         let skill_commands = super::commands::skill_choices(
             profile
                 .as_deref()
