@@ -2325,6 +2325,43 @@ def siwc_orchestrate_plus_implement(screen, root, cwd):
     return "normal"
 
 
+def siwc_skill_modes(screen, root, cwd, proposal=False):
+    until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "synthetic SIWC conversation ready")
+    # A newer source cannot change what the lead, planner, or a future child reads.
+    source = root / "home/.ansa/skills/inspect-picture/SKILL.md"
+    source.unlink()
+    if proposal:
+        local(screen, "/plan")
+    command = "/propose" if proposal else "/orchestrate+"
+    local(screen, command + " Inspect /inspect-picture")
+    until(screen, lambda frame: ("Refine" if proposal else "SIWC_CARBON_DONE") in frame,
+          "pinned procedure read before final response")
+    rows = records(root)
+    accepted, = [r for r in rows if r["kind"] == "accepted"]
+    assert accepted["text"].startswith("Use the pinned local skill `inspect-picture`")
+    skills = {"list_skills", "read_skill", "read_skill_page"}
+    advertised = {tool["name"] for tool in accepted["next"]["tools"]["descriptors"]}
+    if proposal:
+        assert accepted["mode"] == "plan" and advertised == skills
+    else:
+        assert accepted["orchestration_plus"] and skills | {"delegate_task"} <= advertised
+        # Same selection via an ordinary message while the mode remains active.
+        until(screen, lambda frame: any(r["kind"] == "done" for r in records(root)) and "Ctrl+C stop" not in screen.vt.line(-2), "first lead turn settled")
+        local(screen, "/inspect-picture Again")
+        until(screen, lambda _: len([r for r in records(root) if r["kind"] == "done"]) == 2 and "Ctrl+C stop" not in screen.vt.line(-2),
+              "direct slash skill in Orchestrate+")
+        screen.send("DIRECT_SIWC_FIXTURE\r")
+        until(screen, lambda frame: "DIRECT_SIWC_DONE" in frame, "scoped helper used the parent's pin")
+        scoped, = [r for r in records(root) if r["kind"] == "init" and
+                   r["configuration"]["epoch"]["exact_state"].get("orchestration_skills")]
+        tools = {tool["name"] for tool in scoped["configuration"]["tools"]["descriptors"]}
+        assert skills <= tools and tools <= skills | {"list_directory", "read_file", "search_files", "git_snapshot"}
+    rows = records(root)
+    outcomes = [json.loads(r["result"]["output"]) for r in rows if r["kind"] == "outcome"]
+    assert sum(v.get("body", "").endswith("ORIGINAL_END") for v in outcomes) == (1 if proposal else 3)
+    assert any(r["kind"] == "intent" and r["invocation"]["name"] == "read_skill_page" for r in rows)
+
+
 def siwc_orchestration_direct(screen, root, cwd):
     prompt = "DIRECT_SIWC_FIXTURE"
     until(screen, lambda _: ready(screen, "gpt-6.2-sol"), "synthetic SIWC conversation is ready")
@@ -2775,6 +2812,8 @@ def main():
              ("openrouter-orchestration", openrouter_orchestration),
              ("siwc-orchestration", siwc_orchestration),
              ("siwc-orchestration-direct", siwc_orchestration_direct),
+             ("siwc-skill-lead", siwc_skill_modes),
+             ("siwc-skill-proposal", lambda *args: siwc_skill_modes(*args, proposal=True)),
              ("siwc-direct-edit-check", siwc_direct_edit_check),
              ("siwc-terminal-exec", siwc_terminal_exec),
              ("siwc-orchestrate-plus", siwc_orchestrate_plus),
@@ -2784,7 +2823,7 @@ def main():
              ("siwc-orchestrate-plus-plan-only", siwc_orchestrate_plus_plan_only),
              ("siwc-orchestrate-plus-blocked", siwc_orchestrate_plus_blocked),
              ("siwc-orchestrate-plus-blocked-rejected", lambda *args: siwc_orchestrate_plus_blocked(*args, reject=True))]
-    transport_cases = {"openrouter-orchestration", "siwc-orchestration", "siwc-orchestration-direct", "siwc-direct-edit-check", "siwc-terminal-exec",
+    transport_cases = {"siwc-skill-lead", "siwc-skill-proposal", "openrouter-orchestration", "siwc-orchestration", "siwc-orchestration-direct", "siwc-direct-edit-check", "siwc-terminal-exec",
                        *(name for name, _ in cases if name.startswith("siwc-orchestrate-plus"))}
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -2816,6 +2855,14 @@ def main():
                 cwd.chmod(0o700)
                 if name.startswith("siwc-"):
                     seed_siwc(home)
+                if name.startswith("siwc-skill-"):
+                    skills = home / ".ansa/skills"
+                    skills.mkdir(mode=0o700)
+                    folder = skills / "inspect-picture"
+                    folder.mkdir(mode=0o700)
+                    source = folder / "SKILL.md"
+                    source.write_text("---\nname: inspect-picture\ndescription: Inspect\n---\n" + "x" * 18_000 + "ORIGINAL_END")
+                    source.chmod(0o600)
                 if name == "siwc-direct-edit-check":
                     (root / "direct-edit-check").touch()
                 if name == "siwc-terminal-exec":

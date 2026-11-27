@@ -213,6 +213,64 @@ pub(crate) fn select(
     select_with_notice(settings, saved, trial).map(|(profile, _)| profile)
 }
 
+fn load_pin(
+    dir: &File,
+    catalogs: &Path,
+    scope: &str,
+    pin: &str,
+) -> Result<(Manifest, Option<String>, directory_skills::DirectorySkills)> {
+    use directory_skills::DirectorySkills;
+    if !digest_ok(pin) {
+        return Err("harness_profile_identity");
+    }
+    let mut legacy_revision = None;
+    let mut directory_skills = DirectorySkills::default();
+    let manifest = match load_manifest(dir, scope, pin) {
+        Err("harness_revision_missing") => {
+            let catalogs = match private_directory(catalogs) {
+                Ok(catalogs) => catalogs,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err("harness_revision_missing");
+                }
+                Err(_) => return Err("skill_snapshot_read"),
+            };
+            (legacy_revision, directory_skills) =
+                DirectorySkills::load(catalogs, scope, pin)?.ok_or("harness_revision_missing")?;
+            load_or_empty(dir, scope, legacy_revision.as_deref())?
+        }
+        result => result?,
+    };
+    if directory_skills
+        .entries()
+        .any(|(name, _)| manifest.skills.iter().any(|s| s.name == name))
+    {
+        return Err("skill_snapshot_invalid");
+    }
+    Ok((manifest, legacy_revision, directory_skills))
+}
+
+/// Children may run in temporary worktrees. Resolve a pinned catalog only in
+/// the owning project, not by scanning the task workspace or the live skills.
+pub(crate) fn child_pin(settings: &AgentSettings, id: &Json) -> Result<Arc<Pinned>> {
+    let scope = scope(&settings.cwd);
+    if id.usize_field("version")? != 1 || id.text_field("scope")? != scope {
+        return Err("harness_profile_identity");
+    }
+    let pin = id.text_field("revision")?;
+    let path = settings.directory.join("harness-profiles").join(&scope);
+    let directory = private_directory(&path).map_err(|_| "harness_store_unavailable")?;
+    let (manifest, legacy_revision, directory_skills) =
+        load_pin(&directory, &path.join("catalogs"), &scope, pin)?;
+    Ok(Arc::new(Pinned {
+        directory,
+        revision: pin.into(),
+        manifest,
+        directory_skills,
+        legacy_revision,
+        trial: None,
+    }))
+}
+
 pub(crate) fn select_with_notice(
     settings: &AgentSettings,
     saved: Option<&Request>,
@@ -256,21 +314,8 @@ pub(crate) fn select_with_notice(
     let mut directory_skills = DirectorySkills::default();
     let (revision, manifest) = if let Some(pin) = selected {
         let dir = directory.as_ref().ok_or("harness_store_unavailable")?;
-        let manifest = match load_manifest(dir, &scope, pin) {
-            Err("harness_revision_missing") => {
-                let catalogs = match private_directory(&catalogs) {
-                    Ok(catalogs) => catalogs,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        return Err("harness_revision_missing");
-                    }
-                    Err(_) => return Err("skill_snapshot_read"),
-                };
-                (legacy_revision, directory_skills) = DirectorySkills::load(catalogs, &scope, pin)?
-                    .ok_or("harness_revision_missing")?;
-                load_or_empty(dir, &scope, legacy_revision.as_deref())?
-            }
-            result => result?,
-        };
+        let manifest;
+        (manifest, legacy_revision, directory_skills) = load_pin(dir, &catalogs, &scope, pin)?;
         (Some(pin.to_owned()), manifest)
     } else if let Some((proposal, arm)) = trial {
         // Frozen harness experiments must not pick up files from the live catalog.
@@ -289,12 +334,6 @@ pub(crate) fn select_with_notice(
         (None, empty_manifest(&scope))
     };
     let legacy_name = |name: &str| manifest.skills.iter().any(|s| s.name == name);
-    if directory_skills
-        .entries()
-        .any(|(name, _)| legacy_name(name))
-    {
-        return Err("skill_snapshot_invalid");
-    }
     // Only a new ordinary conversation discovers files. Resume and fork rely
     // exclusively on the pinned digest, even after deletion of the source tree.
     let mut notice = None;

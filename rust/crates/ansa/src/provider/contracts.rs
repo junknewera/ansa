@@ -34,12 +34,16 @@ pub enum AgentMode {
     Basic,
     Plan,
     OrchestrationChat,
+    OrchestrationSkillChat,
     Lead,
     LeadPlus,
 }
 impl AgentMode {
     pub(crate) fn read_only(self) -> bool {
-        matches!(self, Self::Plan | Self::OrchestrationChat)
+        self == Self::Plan || self.orchestration_chat()
+    }
+    pub(crate) fn orchestration_chat(self) -> bool {
+        matches!(self, Self::OrchestrationChat | Self::OrchestrationSkillChat)
     }
     pub(crate) fn leads(self) -> bool {
         matches!(self, Self::Lead | Self::LeadPlus)
@@ -116,6 +120,7 @@ pub struct PlanDraft {
     pub(crate) instructions: String,
     pub(crate) format: crate::provider::structured::FinalFormat,
     pub(crate) previous_prompt: Option<String>,
+    pub(crate) skill_tools: bool,
     pub(crate) skill: Option<String>,
     pub(crate) profile: Option<String>,
 }
@@ -126,6 +131,9 @@ impl PlanDraft {
             ("instructions", Json::string(&self.instructions)?),
             ("format", Json::string(self.format.name())?),
         ];
+        if self.skill_tools {
+            fields.push(("skill_tools", Json::parse("true")?));
+        }
         if let Some(prompt) = &self.previous_prompt {
             fields.push(("previous_prompt", Json::string(prompt)?));
         }
@@ -153,6 +161,7 @@ impl PlanDraft {
         Ok(Self {
             instructions: value.text_field("instructions")?.to_owned(),
             format,
+            skill_tools: value.has("skill_tools") && value.field("skill_tools")?.boolean()?,
             previous_prompt: optional_text("previous_prompt")?,
             skill: optional_text("skill")?,
             profile: optional_text("profile")?,
@@ -314,7 +323,7 @@ pub fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
                 }
                 profile.validate()?;
             }
-            if submit.mode == AgentMode::OrchestrationChat
+            if submit.mode.orchestration_chat()
                 && !matches!(command.payload, CommandPayload::Submit(_))
             {
                 return Err("submit_mode");

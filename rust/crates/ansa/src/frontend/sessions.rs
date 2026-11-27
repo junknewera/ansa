@@ -13,8 +13,8 @@ use crate::{
     },
     terminal_host::tools as terminals,
     tools::files::{
-        LocalExtensions, TaskScope, WorkspaceWriter, local_task_tools_with_writer,
-        local_tools_extended,
+        LocalExtensions, TaskExtensions, TaskScope, WorkspaceWriter, local_tools_extended,
+        scoped_tools,
     },
 };
 use std::{
@@ -413,9 +413,7 @@ impl Factory {
         }
         if seed
             .as_ref()
-            .map(ForkSeed::request)
-            .transpose()?
-            .is_some_and(|r| r.binding.account != self.account)
+            .is_some_and(|s| s.request_ref().binding.account != self.account)
         {
             return Err("session_provider_context");
         }
@@ -724,6 +722,7 @@ impl Factory {
             instructions,
             format,
             previous_prompt: None,
+            skill_tools: false,
             skill: None,
             profile: None,
         }
@@ -916,7 +915,7 @@ impl Factory {
             .with("orchestration_parent", Json::string(parent)?)?
             .with("orchestration_writes", paths(writes)?)?
             .with("orchestration_reads", paths(reads)?)?;
-        if assignment.access == crate::orchestration::plan::Access::Read
+        let git_snapshot = assignment.access == crate::orchestration::plan::Access::Read
             && reads.is_empty()
             && workspace == self.settings.cwd
             && (!matches!(&kind, ChildKind::Direct { .. })
@@ -925,8 +924,8 @@ impl Factory {
                         tool.name.as_str(),
                         "run_command" | "terminal_create" | "git_snapshot"
                     )
-                }))
-        {
+                }));
+        if git_snapshot {
             epoch.exact_state = epoch
                 .exact_state
                 .with("orchestration_git_snapshot", Json::parse("true")?)?;
@@ -963,14 +962,30 @@ impl Factory {
             }
             _ => None,
         };
-        let tools = local_task_tools_with_writer(
+        let pin = crate::harness::saved_identity(&source.epoch.exact_state)?;
+        let profile = if let Some((id, _)) =
+            pin.filter(|_| crate::tools::skills::advertised(&source.tools).is_ok())
+        {
+            let profile = crate::harness::child_pin(&self.settings, id)?;
+            epoch.exact_state = epoch.exact_state.with("orchestration_skills", id.clone())?;
+            epoch.instructions.push_str("\nUse list_skills to find applicable procedures in the parent's pinned catalog. Read them with read_skill and follow next_offset with read_skill_page. Procedures do not expand your assigned scope.");
+            Some(profile)
+        } else {
+            None
+        };
+        let skill_commands = super::commands::skill_choices(profile.as_deref());
+        let tools = scoped_tools(
             settings,
             epoch.clone(),
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
             scope,
-            shared_writer,
+            TaskExtensions {
+                git_snapshot,
+                writer: shared_writer,
+                skills: profile.map(|p| p as Arc<_>),
+            },
         )?;
         let configuration = Request::new(
             source.binding.clone(),
@@ -1001,7 +1016,7 @@ impl Factory {
             runtime,
             selected,
             kind: Kind::Agent,
-            skill_commands: Vec::new(),
+            skill_commands,
             skill_notice: None,
             parent: Some(parent.into()),
         })
@@ -1074,15 +1089,25 @@ impl Factory {
             .descriptors
             .iter()
             .any(|tool| tool.name == "git_snapshot");
-        let tools = crate::tools::files::local_task_tools_with_git(
+        let profile = provenance
+            .has("orchestration_skills")
+            .then(|| {
+                crate::harness::child_pin(&self.settings, provenance.field("orchestration_skills")?)
+            })
+            .transpose()?;
+        let skill_commands = super::commands::skill_choices(profile.as_deref());
+        let tools = scoped_tools(
             settings,
             configuration.epoch.clone(),
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
             scope,
-            advertised_git,
-            None,
+            TaskExtensions {
+                git_snapshot: advertised_git,
+                writer: None,
+                skills: profile.map(|p| p as Arc<_>),
+            },
         )?
         .compatible(&configuration.tools)
         .ok_or("session_fork_tools")?;
@@ -1113,7 +1138,7 @@ impl Factory {
             runtime,
             selected,
             kind: Kind::Agent,
-            skill_commands: Vec::new(),
+            skill_commands,
             skill_notice: None,
             parent: Some(parent),
         })
@@ -1205,9 +1230,9 @@ impl Factory {
     ) -> Result<Created> {
         let initial_epoch = agent_epoch(&self.settings)?;
         let source_configuration = restored
-            .clone()
-            .or(seed.as_ref().map(ForkSeed::request).transpose()?);
-        if let Some(source) = &source_configuration
+            .as_ref()
+            .or_else(|| seed.as_ref().map(ForkSeed::request_ref));
+        if let Some(source) = source_configuration
             && base_state(&source.epoch.exact_state)? != base_state(&initial_epoch.exact_state)?
         {
             return Err("session_configuration_mismatch");
@@ -1217,11 +1242,11 @@ impl Factory {
         } else {
             crate::harness::select_with_notice(
                 &self.settings,
-                source_configuration.as_ref(),
+                source_configuration,
                 self.harness_trial.as_deref(),
             )?
         };
-        let wants_terminals = source_configuration.as_ref().map_or(
+        let wants_terminals = source_configuration.map_or(
             kind == Kind::Main && self.new_main_uses_terminal(),
             |source| {
                 source
@@ -1261,7 +1286,7 @@ impl Factory {
                         registry,
                         &self.settings.directory,
                         &self.settings.cwd,
-                        source_configuration.as_ref().map(|request| &request.tools),
+                        source_configuration.map(|request| &request.tools),
                         &self.stop,
                     )?;
                 }
@@ -1270,7 +1295,7 @@ impl Factory {
         )?;
         // Resume/fork retains the exact saved tool catalogue. Adding a compiled
         // tool only affects new sessions; saved descriptors cannot install code.
-        let tools = if let Some(source) = &source_configuration {
+        let tools = if let Some(source) = source_configuration {
             tools
                 .compatible(&source.tools)
                 .ok_or("session_fork_tools")?
@@ -1296,11 +1321,10 @@ impl Factory {
         {
             seed = Some(source.restricted_tools(tools.advertisement())?);
         }
-        let base = restored.or(seed.as_ref().map(ForkSeed::request).transpose()?);
-        let mut epoch = base
+        let base = restored
             .as_ref()
-            .map(|r| r.epoch.clone())
-            .unwrap_or(initial_epoch);
+            .or_else(|| seed.as_ref().map(ForkSeed::request_ref));
+        let mut epoch = base.map(|r| r.epoch.clone()).unwrap_or(initial_epoch);
         if base.is_none()
             && let Some(profile) = &profile
         {
@@ -1309,14 +1333,11 @@ impl Factory {
         if base.is_none() && terminal.is_some() {
             terminals::add_agent_instructions(&mut epoch);
         }
-        let mut bound = base
-            .as_ref()
-            .map(|r| r.binding.clone())
-            .unwrap_or_else(app::binding);
+        let mut bound = base.map(|r| r.binding.clone()).unwrap_or_else(app::binding);
         if kind != Kind::Console
             && let Some(route) = &self.openrouter
         {
-            if let Some(request) = &base {
+            if let Some(request) = base {
                 if !route.accepts_binding(&request.binding) {
                     return Err("session_provider_context");
                 }
@@ -1389,7 +1410,6 @@ impl Factory {
             self.enable_delegation(&mut options, &selected.id, shared_writer);
         }
         options.plan_guard = Some(crate::terminal_host::workspace::plan_guard(&self.settings));
-        options.fork_seed = seed;
         if kind == Kind::Main {
             options.autocompact_percent = self.initial_autocompact;
         }
@@ -1403,11 +1423,17 @@ impl Factory {
                 }
             });
         }
-        let effort = match &base {
+        let effort = match base {
             Some(request) => request.effort.clone(),
             None if kind == Kind::Main => self.initial_effort.clone(),
             None => None,
         };
+        options.fork_seed = seed;
+        let skill_commands = super::commands::skill_choices(
+            profile
+                .as_deref()
+                .filter(|_| crate::tools::skills::advertised(tools.advertisement()).is_ok()),
+        );
         let configuration = Request::new(bound, epoch, tools.advertisement().clone(), vec![])?
             .with_effort(effort)?;
         let runtime = Runtime::new(
@@ -1424,7 +1450,7 @@ impl Factory {
         )?;
         self.retain_terminal_owner(&selected.id, terminal)?;
         Ok(Created {
-            skill_commands: super::commands::skill_choices(profile.as_deref()),
+            skill_commands,
             skill_notice,
             runtime,
             selected,

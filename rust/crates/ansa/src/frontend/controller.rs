@@ -684,7 +684,7 @@ impl State {
         } else if images.is_empty() {
             CommandPayload::Submit(submit)
         } else {
-            if mode == AgentMode::OrchestrationChat {
+            if mode.orchestration_chat() {
                 self.report(io, "Image attachments require Work or Plan");
                 return false;
             }

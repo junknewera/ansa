@@ -175,39 +175,31 @@ fn is_system_command(name: &str) -> bool {
         )
 }
 
-fn is_skill_prompt(text: &str) -> bool {
-    !text
-        .split_whitespace()
-        .next()
-        .is_some_and(is_system_command)
-        && skill_request(text).is_none()
-        && agent_task(text).is_none()
+fn task_command(word: &str) -> bool {
+    matches!(
+        word,
+        "/orchestrate" | "/orchestrate+" | "/propose" | "/propose+"
+    )
 }
 
-// Painting only needs the leading command context. Consult the rest of a
-// long draft only when the bounded prefix cuts through that context.
+fn is_skill_prompt(text: &str) -> bool {
+    let first = text.split_whitespace().next().unwrap_or("");
+    (task_command(first) || !is_system_command(first)) && skill_request(text).is_none()
+}
+
+// Only the first word establishes command context. A partial $name still
+// needs the task argument to determine whether this is legacy delegation.
 pub(super) fn skill_prompt_prefix(prefix: &str, input: &[u8]) -> bool {
     if prefix.len() == input.len() {
         return is_skill_prompt(prefix);
     }
     let prefix = prefix.trim_start();
-    if let Some((first, _)) = prefix.split_once(char::is_whitespace) {
-        if is_system_command(first) {
-            return false;
-        }
-        if !first.starts_with('$')
-            && !matches!(
-                first.to_lowercase().as_str(),
-                "запусти" | "попроси" | "поручи" | "spawn" | "launch"
-            )
-        {
-            return true;
-        }
-        if !is_skill_prompt(prefix) {
-            return false;
-        }
-    } else if prefix.len() > 65 {
-        // No built-in command or delegation name can fill this first word.
+    if let Some((first, _)) = prefix.split_once(char::is_whitespace)
+        && !first.starts_with('$')
+    {
+        return task_command(first) || !is_system_command(first);
+    }
+    if prefix.len() > 65 && !prefix.contains(char::is_whitespace) {
         return true;
     }
     std::str::from_utf8(input).is_ok_and(is_skill_prompt)
@@ -259,7 +251,14 @@ pub(super) fn skill_tokens<'a>(
 }
 
 pub(super) fn invoke_skills(skills: &[SkillCommand], text: &str) -> Option<String> {
-    if skills.is_empty() || !is_skill_prompt(text) {
+    if skills.is_empty()
+        || !text.contains('/')
+        || text
+            .split_whitespace()
+            .next()
+            .is_some_and(is_system_command)
+        || skill_request(text).is_some()
+    {
         return None;
     }
     let text = text.trim();
@@ -557,6 +556,18 @@ mod tests {
                 .contains("call read_skill with name `mod`")
         );
         assert!(invoke_skills(&skills, "/model /mod").is_none());
+        for command in ["/orchestrate", "/orchestrate+", "/propose", "/propose+"] {
+            let text = format!("{command} inspect /mod");
+            assert!(
+                invoke_skills(&skills, &text).is_none(),
+                "keep the outer command"
+            );
+            assert!(Completion::at_with_skills(&editor(&text), available(), &skills).is_some());
+            assert!(skill_prompt_prefix(
+                &text[..command.len() + 1],
+                text.as_bytes()
+            ));
+        }
         assert!(Completion::at_with_skills(&editor("path/mod"), available(), &skills).is_none());
     }
 
@@ -573,7 +584,11 @@ mod tests {
         );
         assert!(prompt.ends_with(text));
         assert!(invoke_skills(&skills, r"@some\ /route \/grill-me /route.txt").is_none());
-        assert!(invoke_skills(&skills, "Запусти субагента: проверь /route").is_none());
+        assert!(
+            invoke_skills(&skills, "Запусти субагента: проверь /route")
+                .unwrap()
+                .contains("call read_skill")
+        );
         let draft = editor("Проверь /grill-me");
         assert!(
             Completion::at_with_skills(&draft, available(), &skills)

@@ -483,11 +483,11 @@ pub(super) fn execute(
     progress: watch::Sender<Option<RunView>>,
     inbox: Clarifications,
 ) -> Result<Completed> {
-    let source = proposal.seed.request()?;
-    factory.check_orchestration_context(&source)?;
+    let source = proposal.seed.request_ref();
+    factory.check_orchestration_context(source)?;
     proposal.plan.execution_ready()?;
     if proposal.profile.is_none() {
-        factory.require_orchestration_route(&source, stop)?;
+        factory.require_orchestration_route(source, stop)?;
     }
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_time()

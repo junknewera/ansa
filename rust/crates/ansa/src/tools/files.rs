@@ -495,45 +495,40 @@ pub fn local_task_tools(
     worker: &Path,
     scope: TaskScope,
 ) -> Result<Arc<Snapshot>> {
-    local_task_tools_with_writer(settings, epoch, session, auth, worker, scope, None)
-}
-
-pub(crate) fn local_task_tools_with_writer(
-    settings: AgentSettings,
-    epoch: Epoch,
-    session: &Path,
-    auth: &Path,
-    worker: &Path,
-    scope: TaskScope,
-    shared_writer: Option<WorkspaceWriter>,
-) -> Result<Arc<Snapshot>> {
-    let advertised = epoch.exact_state.has("orchestration_git_snapshot")
+    let git_snapshot = epoch.exact_state.has("orchestration_git_snapshot")
         && epoch
             .exact_state
             .field("orchestration_git_snapshot")?
             .boolean()?;
-    local_task_tools_with_git(
+    scoped_tools(
         settings,
         epoch,
         session,
         auth,
         worker,
         scope,
-        advertised,
-        shared_writer,
+        TaskExtensions {
+            git_snapshot,
+            ..Default::default()
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn local_task_tools_with_git(
+#[derive(Default)]
+pub(crate) struct TaskExtensions {
+    pub git_snapshot: bool,
+    pub writer: Option<WorkspaceWriter>,
+    pub skills: Option<Arc<dyn super::skills::Catalog>>,
+}
+
+pub(crate) fn scoped_tools(
     settings: AgentSettings,
     epoch: Epoch,
     session: &Path,
     auth: &Path,
     worker: &Path,
     scope: TaskScope,
-    advertised_git: bool,
-    shared_writer: Option<WorkspaceWriter>,
+    extensions: TaskExtensions,
 ) -> Result<Arc<Snapshot>> {
     if !settings.cwd.starts_with(&scope.root) {
         return Err("task_workspace");
@@ -542,16 +537,22 @@ pub(crate) fn local_task_tools_with_git(
     if !scope.writes.is_empty() {
         names.push("edit_file");
     }
-    if scope.writes.is_empty() && scope.reads.is_empty() && advertised_git {
+    if scope.writes.is_empty() && scope.reads.is_empty() && extensions.git_snapshot {
         names.push("git_snapshot");
     }
     let mut host = local_host(settings, epoch, session, auth, worker, None)?;
     host.scope = Some(scope);
-    host.shared_writer = shared_writer;
+    host.shared_writer = extensions.writer;
+    if extensions.skills.is_some() {
+        names.extend(super::skills::NAMES);
+    }
     let host = Arc::new(host);
     Ok(register_local_tools(host.clone(), |registry| {
         if names.contains(&"git_snapshot") {
             super::git_snapshot::register(registry, host)?;
+        }
+        if let Some(profile) = extensions.skills {
+            super::skills::register(registry, Some(profile))?;
         }
         Ok(())
     })?

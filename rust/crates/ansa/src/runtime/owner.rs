@@ -372,7 +372,7 @@ impl Owner {
                 && self.state.turn.is_some()
                 && self.resume_matches(self.recovery.as_ref()),
             mode: current
-                .filter(|receipt| !receipt.internal && receipt.mode != AgentMode::OrchestrationChat)
+                .filter(|receipt| !receipt.internal && !receipt.mode.orchestration_chat())
                 .map_or(self.state.user_mode, |receipt| receipt.mode),
             transcript_size: self.state.transcript().len(),
             preview: self.preview.clone(),
@@ -896,6 +896,14 @@ impl Owner {
                     delegate(&request, roles.as_ref(), invocation, stop)
                 }),
             )?
+        } else if current.receipt.mode == AgentMode::OrchestrationSkillChat
+            || current
+                .receipt
+                .draft
+                .as_ref()
+                .is_some_and(|draft| draft.skill_tools)
+        {
+            self.plan_tools.named_tools(&crate::tools::skills::NAMES)
         } else if current.next.tools.revision == self.plan_tools.advertisement().revision {
             self.plan_tools.clone()
         } else {
@@ -1553,8 +1561,14 @@ impl Owner {
                 if internal {
                     fields.push(("handoff", Json::parse("true")?));
                 }
-                if submitted.mode == AgentMode::OrchestrationChat {
-                    fields.push(("orchestration_chat", Json::parse("true")?));
+                if submitted.mode.orchestration_chat() {
+                    // Legacy true is the original, tool-free progress chat.
+                    let version = if submitted.mode == AgentMode::OrchestrationSkillChat {
+                        Json::string("skills_v1")?
+                    } else {
+                        Json::parse("true")?
+                    };
+                    fields.push(("orchestration_chat", version));
                 }
                 if submitted.mode.leads() {
                     fields.push(("orchestration_lead", Json::parse("true")?));
@@ -2371,7 +2385,8 @@ impl Owner {
                     Err(code) => self.pause(code),
                     Ok(ProviderValue::Response(response)) => {
                         let current = self.state.turn.as_ref().ok_or("runtime_turn")?;
-                        if current.receipt.draft.is_some()
+                        if response.calls().is_empty()
+                            && current.receipt.draft.is_some()
                             && current.receipt.mode == AgentMode::Plan
                             && !response.orchestration_plan()?.is_read_only()
                         {
@@ -3037,6 +3052,7 @@ async fn native_draft_keeps_compacted_context_and_cancels_with_submit_queue_full
                 instructions: "Draft a read-only plan.".into(),
                 format: FinalFormat::OrchestrationPlanWithReadFolder,
                 previous_prompt: None,
+                skill_tools: false,
                 skill: None,
                 profile: None,
             }),
