@@ -629,20 +629,7 @@ impl Timeline {
                         )
                     })
                     .collect();
-                self.final_text = if response.calls().is_empty()
-                    && response.request().final_format()
-                        == Some(crate::provider::structured::FinalFormat::ChildResult)
-                {
-                    let result = response.child_result()?;
-                    let mut text = result.summary;
-                    for finding in result.findings {
-                        text.push_str("\n- ");
-                        text.push_str(&finding);
-                    }
-                    text
-                } else {
-                    super::state::display_response(&response)?
-                };
+                self.final_text = super::state::display_response(&response)?;
                 for item in response.items() {
                     let item = item.value();
                     if item.text_field("type")? == "reasoning" && item.has("summary") {

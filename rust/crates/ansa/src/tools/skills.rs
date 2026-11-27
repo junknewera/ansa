@@ -3,13 +3,44 @@ use super::{
     files::error,
     registry::{Definition, Outcome, Policy, Registry},
 };
-use crate::{protocol::json::Json, provider::request::Descriptor};
+use crate::{
+    protocol::json::Json,
+    provider::request::{Advertisement, Descriptor},
+};
 use std::sync::Arc;
 
 const LIST_SCHEMA: &str =
     r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#;
 const READ_SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}"#;
 const PAGE_SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string"},"offset":{"type":"integer"}},"required":["name","offset"],"additionalProperties":false}"#;
+
+pub(crate) const NAMES: [&str; 3] = ["list_skills", "read_skill", "read_skill_page"];
+
+/// Replay and execution must agree on the exact compiled read-only subset.
+pub(crate) fn advertised(parent: &Advertisement) -> Result<&'static Advertisement, &'static str> {
+    static SKILLS: std::sync::LazyLock<Advertisement> = std::sync::LazyLock::new(|| {
+        let mut registry = Registry::new();
+        register(&mut registry, None).expect("compiled skill descriptors");
+        registry.snapshot().advertisement().clone()
+    });
+    SKILLS
+        .descriptors
+        .iter()
+        .all(|descriptor| parent.descriptors.contains(descriptor))
+        .then_some(&*SKILLS)
+        .ok_or("skill_tools_unavailable")
+}
+
+pub(crate) fn chat_tools(
+    parent: &Advertisement,
+    with_skills: bool,
+) -> Result<Advertisement, &'static str> {
+    if with_skills {
+        Ok(advertised(parent)?.clone())
+    } else {
+        Ok(Registry::new().snapshot().advertisement().clone())
+    }
+}
 
 pub(crate) trait Catalog: Send + Sync {
     fn list(&self) -> serde_json::Value;

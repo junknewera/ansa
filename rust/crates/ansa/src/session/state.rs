@@ -33,7 +33,9 @@ use std::{
 };
 pub const COMPACT_ITEM_THRESHOLD: usize = Request::MAX_ITEMS - 2 * 64 - 16;
 pub(crate) fn display_response(response: &AdmittedResponse) -> Result<String> {
-    if response.request().epoch.exact_state.text_field("purpose") == Ok("orchestration_plan") {
+    if response.calls().is_empty()
+        && response.request().epoch.exact_state.text_field("purpose") == Ok("orchestration_plan")
+    {
         Ok(format!(
             "**Proposed plan**\n\n{}",
             response.orchestration_plan()?.markdown()
@@ -963,14 +965,14 @@ impl State {
                 ("format", Json::string(draft.format.name())?),
                 ("purpose", Json::string("orchestration_plan")?),
             ])?;
-            let empty = crate::tools::registry::Registry::new().snapshot();
+            let tools = crate::tools::skills::chat_tools(&self.plan_tools, draft.skill_tools)?;
             (
                 Epoch {
                     id: sha256(provenance.dump().as_bytes()),
                     instructions: format!("{}{}", self.epoch.instructions, draft.instructions),
                     exact_state: provenance,
                 },
-                empty.advertisement().clone(),
+                tools,
             )
         } else if internal {
             let stopped = stopped_handoff(text);
@@ -996,13 +998,16 @@ impl State {
                 },
                 empty.advertisement().clone(),
             )
-        } else if mode == AgentMode::OrchestrationChat {
+        } else if mode.orchestration_chat() {
             let provenance = Json::object(vec![
                 ("base_epoch", Json::string(&self.epoch.id)?),
                 ("base_state", self.epoch.exact_state.clone()),
                 ("purpose", Json::string("orchestration_chat")?),
             ])?;
-            let empty = crate::tools::registry::Registry::new().snapshot();
+            let tools = crate::tools::skills::chat_tools(
+                &self.plan_tools,
+                mode == AgentMode::OrchestrationSkillChat,
+            )?;
             (
                 Epoch {
                     id: sha256(provenance.dump().as_bytes()),
@@ -1013,7 +1018,7 @@ impl State {
                     ),
                     exact_state: provenance,
                 },
-                empty.advertisement().clone(),
+                tools,
             )
         } else if mode.leads() {
             let tools = delegation::advertise(&self.configuration.tools, delegate_revision)?;
@@ -1574,22 +1579,28 @@ impl State {
                 None
             };
             if event.has("orchestration_chat") {
+                let version = event.field("orchestration_chat")?;
+                let with_skills = version.text() == Ok("skills_v1");
                 need(
-                    event.field("orchestration_chat")?.boolean()?
+                    (with_skills || version.boolean()?)
                         && mode == AgentMode::Plan
                         && !internal
                         && !event.has("draft")
                         && self.configuration.final_format().is_none(),
                     "session_orchestration_chat",
                 )?;
-                mode = AgentMode::OrchestrationChat;
+                mode = if with_skills {
+                    AgentMode::OrchestrationSkillChat
+                } else {
+                    AgentMode::OrchestrationChat
+                };
             }
             if internal {
                 need(
                     event.field("handoff")?.boolean()? && mode == AgentMode::Plan,
                     "session_handoff",
                 )?;
-            } else if mode != AgentMode::OrchestrationChat {
+            } else if !mode.orchestration_chat() {
                 self.user_mode = mode;
             }
             let draft = if event.has("draft") {
@@ -1832,7 +1843,10 @@ impl State {
                         response.request().save()? == expected.save()?,
                         "session_response_request",
                     )?;
-                    if current.receipt.draft.is_some() && current.receipt.mode == AgentMode::Plan {
+                    if response.calls().is_empty()
+                        && current.receipt.draft.is_some()
+                        && current.receipt.mode == AgentMode::Plan
+                    {
                         need(
                             response.orchestration_plan()?.is_read_only(),
                             "plan_mode_read_only",
@@ -2219,7 +2233,10 @@ fn cancelling_a_delegation_keeps_an_answer_and_rejects_a_late_reply() {
 #[cfg(test)]
 #[test]
 fn orchestration_chat_replays_exact_context_without_changing_mode() {
-    let tools = crate::frontend::app::pure_tools().unwrap();
+    use crate::tools::{registry::Registry, skills};
+    let mut registry = Registry::new();
+    skills::register(&mut registry, None).unwrap();
+    let tools = registry.snapshot();
     let configuration = Request::new(
         crate::frontend::app::binding(),
         Epoch {
@@ -2255,6 +2272,25 @@ fn orchestration_chat_replays_exact_context_without_changing_mode() {
         ("compact", Json::parse("false").unwrap()),
     ])
     .unwrap();
+    let skill_request = state
+        .request_for(text, AgentMode::OrchestrationSkillChat)
+        .unwrap();
+    let mut newer = state.clone();
+    let skill_event = accepted
+        .with("orchestration_chat", Json::string("skills_v1").unwrap())
+        .unwrap();
+    assert_eq!(newer.apply(&skill_event), Err("session_request_conflict"));
+    newer
+        .apply(
+            &skill_event
+                .with("next", skill_request.save().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(newer.user_mode, AgentMode::Basic);
+    let scoped = newer.turn.as_ref().unwrap();
+    assert_eq!(scoped.receipt.mode, AgentMode::OrchestrationSkillChat);
+    assert_eq!(scoped.next.tools, *tools.advertisement());
     let tampered = accepted
         .with(
             "next",

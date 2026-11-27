@@ -2572,7 +2572,9 @@ impl Workbench {
         self.refinement = None;
         slot.state.mode = match slot.state.mode {
             _ if review => AgentMode::Basic,
-            AgentMode::Basic | AgentMode::OrchestrationChat => AgentMode::Plan,
+            AgentMode::Basic | AgentMode::OrchestrationChat | AgentMode::OrchestrationSkillChat => {
+                AgentMode::Plan
+            }
             AgentMode::Plan if can_orchestrate => AgentMode::Lead,
             AgentMode::Lead => AgentMode::LeadPlus,
             AgentMode::Plan | AgentMode::LeadPlus => AgentMode::Basic,
@@ -2724,6 +2726,7 @@ impl Workbench {
         if repair {
             draft.instructions.push_str("\nRevise the preceding implementation plan. Keep requested_outcome as implementation. Include the requested code changes as scoped write steps and at least one executable test in command_checks. The corrected proposal will be shown for approval before any work starts.");
         }
+        draft.skill_tools = !self.slots[self.current].skill_commands.is_empty();
         draft.previous_prompt = previous_prompt;
         draft.profile = match profile.as_ref().map(RoleProfile::encode).transpose() {
             Ok(profile) => profile.map(|value| value.dump()),
@@ -2972,7 +2975,11 @@ impl Workbench {
         slot.state.explicit_status = false;
         let posted = slot.state.submit_text(
             text,
-            AgentMode::OrchestrationChat,
+            if slot.skill_commands.is_empty() {
+                AgentMode::OrchestrationChat
+            } else {
+                AgentMode::OrchestrationSkillChat
+            },
             &slot.handle,
             io,
             &mut slot.replies,
@@ -3160,23 +3167,9 @@ impl Workbench {
     }
 
     fn text(&mut self, text: &str, io: &Io) -> (bool, bool) {
-        let slot = &self.slots[self.current];
-        if let Some(prompt) = commands::invoke_skills(&slot.skill_commands, text) {
-            if !matches!(slot.state.mode, AgentMode::Basic | AgentMode::Plan)
-                || self.orchestration_mode.is_some()
-                || self.refinement.is_some()
-                || self.orchestration_stop.is_some()
-            {
-                self.report(io, "Invoke skills in Work or Plan");
-                return (false, false);
-            }
-            self.route_text(&prompt, io)
-        } else {
-            self.route_text(text, io)
-        }
-    }
-
-    fn route_text(&mut self, text: &str, io: &Io) -> (bool, bool) {
+        let agent_task = commands::agent_task(text).is_some();
+        let prompt = commands::invoke_skills(&self.slots[self.current].skill_commands, text);
+        let text = prompt.as_deref().unwrap_or(text);
         if !text.trim_start().starts_with('/') && !text.trim().is_empty() {
             let slot = &mut self.slots[self.current];
             if text.trim() != "?" && slot.state.followup_target().is_some() {
@@ -3205,7 +3198,7 @@ impl Workbench {
             && self.orchestration_mode.is_none()
             && (mode.leads()
                 || mode == AgentMode::Basic
-                    && commands::agent_task(text).is_some()
+                    && agent_task
                     && matches!(self.slots[self.current].kind, Kind::Main | Kind::Fork))
         {
             return self.lead_message(text, if mode.leads() { mode } else { AgentMode::Lead }, io);
@@ -3215,7 +3208,7 @@ impl Workbench {
             && !text.trim_start().starts_with('/')
             && (self.orchestration_mode.is_some()
                 || self.refinement.is_some()
-                || commands::agent_task(text).is_some()
+                || agent_task
                 || delegation.is_some())
         {
             return (
@@ -3391,6 +3384,9 @@ impl Workbench {
                     return (false, false);
                 }
                 self.refinement = None;
+                let expanded =
+                    commands::invoke_skills(&self.slots[self.current].skill_commands, raw_argument);
+                let task = expanded.as_deref().unwrap_or(raw_argument.trim_start());
                 if command.starts_with("/orchestrate") {
                     let mode = if command == "/orchestrate+" {
                         AgentMode::LeadPlus
@@ -3403,7 +3399,7 @@ impl Workbench {
                     slot.state.mode_ready = true;
                     self.factory.set_editor_mode(mode);
                     if !argument.is_empty() {
-                        return self.lead_message(raw_argument.trim_start(), mode, io);
+                        return self.lead_message(task, mode, io);
                     }
                     self.report(io, "Orchestrate");
                     return (true, false);
@@ -3423,10 +3419,7 @@ impl Workbench {
                     self.report(io, "Enter the task to propose");
                     (true, false)
                 } else {
-                    (
-                        self.start_orchestration_plan(raw_argument.trim_start(), None, false, io),
-                        false,
-                    )
+                    (self.start_orchestration_plan(task, None, false, io), false)
                 }
             }
             "/model" => {

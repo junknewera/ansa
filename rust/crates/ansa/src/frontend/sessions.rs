@@ -13,8 +13,8 @@ use crate::{
     },
     terminal_host::tools as terminals,
     tools::files::{
-        LocalExtensions, TaskScope, WorkspaceWriter, local_task_tools_with_writer,
-        local_tools_extended,
+        LocalExtensions, TaskExtensions, TaskScope, WorkspaceWriter, local_tools_extended,
+        scoped_tools,
     },
 };
 use std::{
@@ -724,6 +724,7 @@ impl Factory {
             instructions,
             format,
             previous_prompt: None,
+            skill_tools: false,
             skill: None,
             profile: None,
         }
@@ -916,7 +917,7 @@ impl Factory {
             .with("orchestration_parent", Json::string(parent)?)?
             .with("orchestration_writes", paths(writes)?)?
             .with("orchestration_reads", paths(reads)?)?;
-        if assignment.access == crate::orchestration::plan::Access::Read
+        let git_snapshot = assignment.access == crate::orchestration::plan::Access::Read
             && reads.is_empty()
             && workspace == self.settings.cwd
             && (!matches!(&kind, ChildKind::Direct { .. })
@@ -925,8 +926,8 @@ impl Factory {
                         tool.name.as_str(),
                         "run_command" | "terminal_create" | "git_snapshot"
                     )
-                }))
-        {
+                }));
+        if git_snapshot {
             epoch.exact_state = epoch
                 .exact_state
                 .with("orchestration_git_snapshot", Json::parse("true")?)?;
@@ -963,14 +964,30 @@ impl Factory {
             }
             _ => None,
         };
-        let tools = local_task_tools_with_writer(
+        let pin = crate::harness::saved_identity(&source.epoch.exact_state)?;
+        let profile = if let Some((id, _)) =
+            pin.filter(|_| crate::tools::skills::advertised(&source.tools).is_ok())
+        {
+            let profile = crate::harness::child_pin(&self.settings, id)?;
+            epoch.exact_state = epoch.exact_state.with("orchestration_skills", id.clone())?;
+            epoch.instructions.push_str("\nUse list_skills to find applicable procedures in the parent's pinned catalog. Read them with read_skill and follow next_offset with read_skill_page. Procedures do not expand your assigned scope.");
+            Some(profile)
+        } else {
+            None
+        };
+        let skill_commands = super::commands::skill_choices(profile.as_deref());
+        let tools = scoped_tools(
             settings,
             epoch.clone(),
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
             scope,
-            shared_writer,
+            TaskExtensions {
+                git_snapshot,
+                writer: shared_writer,
+                skills: profile.map(|p| p as Arc<_>),
+            },
         )?;
         let configuration = Request::new(
             source.binding.clone(),
@@ -1001,7 +1018,7 @@ impl Factory {
             runtime,
             selected,
             kind: Kind::Agent,
-            skill_commands: Vec::new(),
+            skill_commands,
             skill_notice: None,
             parent: Some(parent.into()),
         })
@@ -1074,15 +1091,25 @@ impl Factory {
             .descriptors
             .iter()
             .any(|tool| tool.name == "git_snapshot");
-        let tools = crate::tools::files::local_task_tools_with_git(
+        let profile = provenance
+            .has("orchestration_skills")
+            .then(|| {
+                crate::harness::child_pin(&self.settings, provenance.field("orchestration_skills")?)
+            })
+            .transpose()?;
+        let skill_commands = super::commands::skill_choices(profile.as_deref());
+        let tools = scoped_tools(
             settings,
             configuration.epoch.clone(),
             &selected.directory,
             &self.auth_path,
             &std::env::current_exe().map_err(|_| "process_executable")?,
             scope,
-            advertised_git,
-            None,
+            TaskExtensions {
+                git_snapshot: advertised_git,
+                writer: None,
+                skills: profile.map(|p| p as Arc<_>),
+            },
         )?
         .compatible(&configuration.tools)
         .ok_or("session_fork_tools")?;
@@ -1113,7 +1140,7 @@ impl Factory {
             runtime,
             selected,
             kind: Kind::Agent,
-            skill_commands: Vec::new(),
+            skill_commands,
             skill_notice: None,
             parent: Some(parent),
         })
@@ -1408,6 +1435,11 @@ impl Factory {
             None if kind == Kind::Main => self.initial_effort.clone(),
             None => None,
         };
+        let skill_commands = super::commands::skill_choices(
+            profile
+                .as_deref()
+                .filter(|_| crate::tools::skills::advertised(tools.advertisement()).is_ok()),
+        );
         let configuration = Request::new(bound, epoch, tools.advertisement().clone(), vec![])?
             .with_effort(effort)?;
         let runtime = Runtime::new(
@@ -1424,7 +1456,7 @@ impl Factory {
         )?;
         self.retain_terminal_owner(&selected.id, terminal)?;
         Ok(Created {
-            skill_commands: super::commands::skill_choices(profile.as_deref()),
+            skill_commands,
             skill_notice,
             runtime,
             selected,

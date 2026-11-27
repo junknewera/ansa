@@ -9,7 +9,6 @@ use crate::{
         native,
         request::{Binding, Descriptor, Request},
         responses::AdmittedResponse,
-        structured::FinalFormat,
     },
 };
 use serde_json::{Value, json};
@@ -340,9 +339,7 @@ impl OpenRouter {
         }
         // The tool turn is complete on its own. A plain stop here only selects
         // the strict-final request; that unconstrained text is never admitted.
-        if request.final_format() == Some(FinalFormat::ChildResult)
-            && !request.tools.descriptors.is_empty()
-        {
+        if request.final_format().is_some() && !request.tools.descriptors.is_empty() {
             let response = self.send("POST", API, Some(body.clone()), None, stop)?;
             if choice(&response, model)?["finish_reason"] == "tool_calls" {
                 return decode(request, &response).map(attach_context);
@@ -579,9 +576,9 @@ pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResp
         // Only the validated tool calls advance the turn. The final phase
         // still requires the provider-enforced child result schema.
         if !message["content"].is_null()
-            && !message["content"].as_str().is_some_and(|text| {
-                text.trim().is_empty() || request.final_format() == Some(FinalFormat::ChildResult)
-            })
+            && !message["content"]
+                .as_str()
+                .is_some_and(|text| text.trim().is_empty() || request.final_format().is_some())
         {
             return Err("openrouter_mixed_output");
         }
@@ -621,6 +618,7 @@ pub(crate) fn decode(request: &Request, response: &Value) -> Result<AdmittedResp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::structured::FinalFormat;
     use crate::{
         context::legacy_compact::{CompactedContext, summary_request_at},
         provider::request::Epoch,

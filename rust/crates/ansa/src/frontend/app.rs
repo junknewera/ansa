@@ -960,12 +960,17 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                     let item = if trace.with_file_name("paged-search").is_file() {
                         let index = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         search_fixture::item(&request, input, index)?
-                    } else if name.is_none() && skill_fixture {
-                        json!({"type":"function_call","id":"fixture-skill-item","call_id":"fixture-skill-call","namespace":"omh","name":"read_skill","arguments":r#"{"name":"inspect-picture"}"#,"status":"completed"})
-                    } else if name.is_none()
-                        && skill_result
-                        && let Some(offset) = output["next_offset"].as_u64()
+                    } else if skill_fixture
+                        || (direct_child
+                            && last["type"] != "function_call_output"
+                            && request["tools"][0]["tools"]
+                                .as_array()
+                                .is_some_and(|tools| {
+                                    tools.iter().any(|tool| tool["name"] == "read_skill")
+                                }))
                     {
+                        json!({"type":"function_call","id":"fixture-skill-item","call_id":"fixture-skill-call","namespace":"omh","name":"read_skill","arguments":r#"{"name":"inspect-picture"}"#,"status":"completed"})
+                    } else if skill_result && let Some(offset) = output["next_offset"].as_u64() {
                         let arguments =
                             json!({"name":"inspect-picture","offset":offset}).to_string();
                         json!({"type":"function_call","id":format!("fixture-skill-page-item-{offset}"),"call_id":format!("fixture-skill-page-{offset}"),"namespace":"omh","name":"read_skill_page","arguments":arguments,"status":"completed"})
@@ -1013,14 +1018,14 @@ pub fn siwc_carbon_fixture(root: &Path, session: Option<&str>) -> Result<i32> {
                         json!({"type":"function_call","id":format!("call-item-{round}"),"call_id":format!("fixture-call-{round}"),"namespace":"omh","name":"list_directory","arguments":arguments,"status":"completed"})
                     } else {
                         let answer = match name {
-                        Some("ansa_orchestration_plan_v3") if request["tools"] == json!([]) =>
+                        Some("ansa_orchestration_plan_v3") if request["tools"] == json!([]) || skill_result && output["body"].is_string() =>
                             json!({"schema_version":1,"summary":"SIWC_CARBON_PLAN","steps":[
                                 {"id":"one","task":"Inspect the fixture","access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"},
                                 {"id":"two","task":if last["content"] == "Inspect Workspace/pet" { "Inspect nested project instructions" } else { "Check the fixture again" },"access":"read","paths":[],"depends_on":[],"acceptance":"Read returned"}
                             ],"checks":[],"manual_checks":[],"command_checks":[],"read_folder":match last["content"].as_str() {
                                 Some("Inspect Workspace/pet" | "UNNAMED_READ_SCOPE") => Some("Workspace/pet"), _ => None
                             }}).to_string(),
-                        Some("ansa_child_result_v1") if output["entries"].is_array() =>
+                        Some("ansa_child_result_v1") if output["entries"].is_array() || skill_result && output["body"].is_string() =>
                             r#"{"status":"completed","summary":"SIWC_HELPER_DONE","findings":[]}"#.into(),
                         None if direct => {
                             if last["call_id"] != "fixture-direct-call" || output["status"] != "completed"
